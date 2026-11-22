@@ -13,7 +13,7 @@
 //                         staging pass copies them into a small device ring. The outputs equal the
 //                         resident ones bit for bit (the Op's results do not depend on where a record lives).
 //
-// Tiers (FileExpertSource): a pinned RAM pool (LRU) above the file and, when device_cache_bytes is set, a
+// Tiers (FileExpertSource): a pinned RAM pool (frequency-aware, expert_tiers.h) above the file and, when device_cache_bytes is set, a
 // pool of device frames above that (frequency first, expert_tiers.h). Records in a frame are read by the Op
 // in place; a record the policy wants in a frame is copied there from its RAM slot on a copy stream while the
 // call's own Op reads it from RAM, and is usable from the next call. The file reads of a call run on a small
@@ -32,7 +32,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <cstdio>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::dsv4 {
@@ -92,8 +94,12 @@ struct FileExpertOptions {
     // At most this many records are promoted to the VRAM tier per call (a prefill chunk routes most of the
     // experts, which would otherwise be copied in whole).
     std::uint32_t max_promotions = 16;
-    // The use counts of the VRAM policy are halved every this many calls.
-    std::uint32_t age_period = 1U << 14;
+    // The residency policy of both tiers (expert_tiers.h): the RAM eviction, whether RAM and VRAM hold distinct
+    // records, the aging of the use counts (halved every tiers.age_period calls).
+    TierPolicyOptions tiers;
+    // A file to write the routed-expert access sequence to (tests/models/dsv4/test_expert_trace_replay.cpp replays it
+    // against other policies); NINFER_DSV4_EXPERT_TRACE names one when this is empty. No tracing when both are empty.
+    std::string trace_path;
 };
 
 class FileExpertSource final : public ExpertSource {
@@ -129,12 +135,20 @@ public:
         return frame_pool_.bytes + staging_.bytes + static_cast<std::uint64_t>(experts_) * (sizeof(std::int32_t) + sizeof(void*));
     }
     [[nodiscard]] std::uint32_t device_frames() const noexcept { return frames_; }
+    // Sets the size of the VRAM tier after construction (whole frames; replaces options.device_cache_bytes): the
+    // engine sizes it from the device memory that is free once the forward's state and workspace exist. Forgets
+    // what the tier held; call it before the first prepare(). Throws, leaving the tier as it was, when the pool
+    // cannot be allocated.
+    void set_device_cache_bytes(std::uint64_t bytes);
+    // The record stride of the largest layer: what one frame of the VRAM tier and one RAM slot cost.
+    [[nodiscard]] std::uint64_t slot_bytes() const noexcept { return slot_bytes_; }
 
 private:
     class ReadPool;
     void release() noexcept; // frees the pinned and device allocations (also on a failed construction)
     void issue_ids_copy(const std::int32_t* ids_device, std::int32_t count, cudaStream_t stream);
     void poll_copies();
+    void trace_call(std::uint32_t layer, const std::vector<std::uint8_t>& routed);
 
     const artifact::Reader& reader_;
     std::vector<ExpertBank> banks_;
@@ -164,6 +178,7 @@ private:
     const std::uint8_t** table_device_ = nullptr; // device [E]: the call's record addresses
     const std::uint8_t** table_host_   = nullptr; // pinned [E]
     std::int32_t* ids_host_            = nullptr; // pinned [max_entries]
+    std::FILE* trace_ = nullptr;
     Stats stats_;
 };
 

@@ -28,11 +28,12 @@ inline constexpr std::uint64_t kDsv4HostReserveBytes = 4ULL << 30;
 // Device memory left free beside the weights, the forward's state and workspace (CUDA context,
 // display, kernels' scratch).
 inline constexpr std::uint64_t kDsv4DeviceReserveBytes = 1ULL << 30;
-// The expert records' device tier takes the device memory left after the weights, less this reserve for the
-// forward's state and workspace, the KV and the CUDA context, up to the cap (about 1500 records of the
-// IQ2_XXS build at 12 GiB). Nothing is taken when less than the reserve is free.
-inline constexpr std::uint64_t kDsv4ExpertVramReserveBytes = 5ULL << 30;
-inline constexpr std::uint64_t kDsv4ExpertVramMaxBytes     = 16ULL << 30;
+// The expert records' device tier is sized last, from the device memory that is free once the weights, the
+// forward's state and workspace, and the KV exist: it takes what is free less this headroom (the decode graphs
+// and kernel scratch allocated on first use, the CUDA context's growth, the display), up to the cap (about 1700
+// records of the IQ2_XXS build at 16 GiB). Nothing is taken when less than the headroom is free.
+inline constexpr std::uint64_t kDsv4ExpertVramHeadroomBytes = 2ULL << 30;
+inline constexpr std::uint64_t kDsv4ExpertVramMaxBytes      = 16ULL << 30;
 // The largest prompt chunk one forward call takes; it sizes the call's workspace.
 inline constexpr std::uint32_t kDsv4MaxPrefillChunk = 2048;
 
@@ -154,6 +155,11 @@ inline std::uint64_t dsv4_min_expert_cache_bytes(std::span<const std::uint64_t> 
     for (const std::uint64_t stride : record_strides) { largest = std::max(largest, stride); }
     const std::uint64_t slots = std::min<std::uint64_t>(experts, static_cast<std::uint64_t>(experts_per_token) * chunk);
     return slots * largest;
+}
+
+// The device tier of the expert records for `free_device_bytes` free once everything else is allocated.
+inline std::uint64_t dsv4_expert_vram_bytes(std::uint64_t free_device_bytes) {
+    return free_device_bytes > kDsv4ExpertVramHeadroomBytes ? std::min(free_device_bytes - kDsv4ExpertVramHeadroomBytes, kDsv4ExpertVramMaxBytes) : 0;
 }
 
 inline std::string dsv4_gib(std::uint64_t bytes) {

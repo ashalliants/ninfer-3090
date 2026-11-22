@@ -6,6 +6,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -26,6 +28,26 @@ std::int32_t* device_minus_ones(std::uint32_t count) {
     cuda_require(cudaMalloc(&p, static_cast<std::size_t>(count) * sizeof(std::int32_t)), "cudaMalloc");
     cuda_require(cudaMemset(p, 0xFF, static_cast<std::size_t>(count) * sizeof(std::int32_t)), "cudaMemset");
     return p;
+}
+
+// NINFER_DSV4_TIER_POLICY (lru, lfu, segmented, lfuda) and NINFER_DSV4_TIER_EXCLUSIVE (0, 1) override the policy, to compare
+// them on the same build (the trace replay in tests/models/dsv4 is the offline way).
+void apply_policy_env(TierPolicyOptions& tiers) {
+    if (const char* env = std::getenv("NINFER_DSV4_TIER_POLICY"); env != nullptr && env[0] != '\0') {
+        const std::string name(env);
+        if (name == "lru") {
+            tiers.ram_eviction = RamEviction::Lru;
+        } else if (name == "lfu") {
+            tiers.ram_eviction = RamEviction::Lfu;
+        } else if (name == "segmented") {
+            tiers.ram_eviction = RamEviction::Segmented;
+        } else if (name == "lfuda") {
+            tiers.ram_eviction = RamEviction::Lfuda;
+        } else {
+            throw std::invalid_argument("NINFER_DSV4_TIER_POLICY must be lru, lfu, segmented or lfuda, not '" + name + "'");
+        }
+    }
+    if (const char* env = std::getenv("NINFER_DSV4_TIER_EXCLUSIVE"); env != nullptr && env[0] != '\0') { tiers.exclusive = env[0] != '0'; }
 }
 
 using Clock = std::chrono::steady_clock;
@@ -143,6 +165,7 @@ ops::MoeExpertSource ResidentExpertSource::prepare(std::uint32_t layer, const st
 FileExpertSource::FileExpertSource(const artifact::Reader& reader, std::span<const ExpertBank> banks, std::uint32_t experts,
                                    FileExpertOptions options)
     : reader_(reader), banks_(banks.begin(), banks.end()), experts_(experts), options_(options), policy_(1, 0, 0) {
+    apply_policy_env(options_.tiers);
     for (const auto& bank : banks_) {
         if (bank.record_stride == 0 || bank.experts != experts_) { throw std::invalid_argument("FileExpertSource: a bank is not a file bank"); }
         slot_bytes_ = std::max<std::uint64_t>(slot_bytes_, bank.record_stride);
@@ -164,7 +187,7 @@ FileExpertSource::FileExpertSource(const artifact::Reader& reader, std::span<con
         void* device = nullptr;
         cuda_require(cudaHostGetDevicePointer(&device, cache_host_, 0), "cudaHostGetDevicePointer");
         cache_device_ = static_cast<std::uint8_t*>(device);
-        policy_       = ExpertTierPolicy(static_cast<std::uint32_t>(banks_.size()) * experts_, slots_, frames_, options_.age_period);
+        policy_       = ExpertTierPolicy(static_cast<std::uint32_t>(banks_.size()) * experts_, slots_, frames_, options_.tiers);
         staging_      = DeviceBuffer(static_cast<std::size_t>(options_.staging_slots) * slot_bytes_);
         if (frames_ > 0) { frame_pool_ = DeviceBuffer(static_cast<std::size_t>(frames_) * slot_bytes_); }
         cuda_require(cudaMalloc(reinterpret_cast<void**>(&frames_device_), experts_ * sizeof(std::int32_t)), "cudaMalloc");
@@ -183,6 +206,15 @@ FileExpertSource::FileExpertSource(const artifact::Reader& reader, std::span<con
         options_.read_threads = 1;
 #endif
         pool_ = std::make_unique<ReadPool>(options_.read_threads);
+        if (options_.trace_path.empty()) {
+            if (const char* env = std::getenv("NINFER_DSV4_EXPERT_TRACE")) { options_.trace_path = env; }
+        }
+        if (!options_.trace_path.empty()) {
+            trace_ = std::fopen(options_.trace_path.c_str(), "wb");
+            if (trace_ == nullptr) { throw std::runtime_error("FileExpertSource: cannot write the trace " + options_.trace_path); }
+            const std::uint32_t head[4] = {0x5458444EU /* "NDXT" */, 1, static_cast<std::uint32_t>(banks_.size()), experts_};
+            std::fwrite(head, sizeof(std::uint32_t), 4, trace_);
+        }
     } catch (...) { // the destructor does not run for a constructor that throws
         release();
         throw;
@@ -193,6 +225,8 @@ FileExpertSource::~FileExpertSource() { release(); }
 
 void FileExpertSource::release() noexcept {
     pool_.reset();
+    if (trace_ != nullptr) { std::fclose(trace_); }
+    trace_ = nullptr;
     if (copy_stream_ != nullptr) { cudaStreamSynchronize(copy_stream_); }
     for (const Batch& b : batches_) { cudaEventDestroy(b.event); }
     for (const cudaEvent_t e : free_events_) { cudaEventDestroy(e); }
@@ -208,6 +242,29 @@ void FileExpertSource::release() noexcept {
     cudaFreeHost(cache_host_);
     ids_event_ = nullptr, copy_stream_ = nullptr, frames_device_ = nullptr, frames_host_ = nullptr;
     table_device_ = nullptr, table_host_ = nullptr, ids_host_ = nullptr, cache_host_ = nullptr;
+}
+
+// One call of the trace: the layer and the distinct routed experts (u16 each, little endian).
+void FileExpertSource::trace_call(std::uint32_t layer, const std::vector<std::uint8_t>& routed) {
+    std::vector<std::uint16_t> record(2, 0);
+    record[0] = static_cast<std::uint16_t>(layer);
+    for (std::uint32_t e = 0; e < experts_; ++e) {
+        if (routed[e] != 0) { record.push_back(static_cast<std::uint16_t>(e)); }
+    }
+    record[1] = static_cast<std::uint16_t>(record.size() - 2);
+    std::fwrite(record.data(), sizeof(std::uint16_t), record.size(), trace_);
+}
+
+void FileExpertSource::set_device_cache_bytes(std::uint64_t bytes) {
+    if (copy_stream_ != nullptr) { cudaStreamSynchronize(copy_stream_); }
+    poll_copies();
+    const auto frames = static_cast<std::uint32_t>(bytes / slot_bytes_);
+    DeviceBuffer pool;
+    if (frames > 0) { pool = DeviceBuffer(static_cast<std::size_t>(frames) * slot_bytes_); }
+    frame_pool_ = std::move(pool);
+    frames_     = frames;
+    policy_.resize_frames(frames);
+    options_.device_cache_bytes = static_cast<std::uint64_t>(frames) * slot_bytes_;
 }
 
 void FileExpertSource::clear_cache() {
@@ -265,6 +322,8 @@ ops::MoeExpertSource FileExpertSource::prepare(std::uint32_t layer, const std::i
         const std::int32_t e = ids_host_[i];
         if (e >= 0 && static_cast<std::uint32_t>(e) < experts_) { routed[static_cast<std::size_t>(e)] = 1; }
     }
+
+    if (trace_ != nullptr) { trace_call(layer, routed); }
 
     // Count the uses first (so a miss never evicts a record this call needs), then give the misses slots and
     // read them, in file order, all at once.

@@ -7,7 +7,7 @@
 // that continues a prompt with the model's own words (NINFER_DSV4_TOKENS: space-separated ids, default
 // "The capital of France is" with a BOS; NINFER_DSV4_NEW: tokens to generate, default 8; prints them).
 // The expert tiers are set by NINFER_DSV4_RAM_GB (pinned RAM tier, default 8), NINFER_DSV4_VRAM_GB (device frame
-// pool, default 12; 0 has none), NINFER_DSV4_READ_THREADS (parallel preads, default 1: on a hard disk concurrent reads slow it down about 4x,
+// pool, default: what is free once the forward exists less 2 GiB, as the engine sizes it; 0 has none), NINFER_DSV4_READ_THREADS (parallel preads, default 1: on a hard disk concurrent reads slow it down about 4x,
 // on a SATA SSD 8 to 16 threads read 1.5x faster) and NINFER_DSV4_ZC
 // (zero-copy misses of the Op, default 0). Prints the time per token and the tier hit counts of each phase
 // (cold decode, a second decode of the same text with the caches warm, and a fixed-routing probe).
@@ -18,6 +18,7 @@
 #include "core/device.h"
 #include "models/dsv4/execution/forward.h"
 #include "models/dsv4/model.h"
+#include "runtime/engine/dsv4_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -105,7 +106,9 @@ int main() {
 
     dsv4::FileExpertOptions options;
     options.cache_bytes        = static_cast<std::uint64_t>(env_number("NINFER_DSV4_RAM_GB", 8) * double(1ULL << 30));
-    options.device_cache_bytes = static_cast<std::uint64_t>(env_number("NINFER_DSV4_VRAM_GB", 12) * double(1ULL << 30));
+    // NINFER_DSV4_VRAM_GB unset: the engine's sizing, what is free once the forward exists less a headroom (below).
+    const bool vram_from_free = std::getenv("NINFER_DSV4_VRAM_GB") == nullptr;
+    options.device_cache_bytes = static_cast<std::uint64_t>(env_number("NINFER_DSV4_VRAM_GB", 0) * double(1ULL << 30));
     options.read_threads       = static_cast<std::uint32_t>(env_number("NINFER_DSV4_READ_THREADS", 1));
     options.zero_copy_misses   = static_cast<std::int32_t>(env_number("NINFER_DSV4_ZC", 0));
     dsv4::FileExpertSource experts(reader, banks, model->config().experts, options);
@@ -114,6 +117,11 @@ int main() {
     forward_options.limits = {.max_context = 2048, .max_chunk = 64};
     if (const char* env = std::getenv("NINFER_DSV4_ENGRAM_DIR"); env != nullptr && env[0] != '\0') { forward_options.engram_dir = env; }
     dsv4::Forward forward(*model, experts, forward_options, stream);
+    if (vram_from_free) {
+        std::size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        experts.set_device_cache_bytes(ninfer::runtime::dsv4_expert_vram_bytes(free_bytes));
+    }
     std::printf("Engram injection: %s\n", forward.engram_applied() ? "applied" : "not applied (reduced quality)");
     std::printf("forward state and workspace: %.2f GB; expert tiers: %u RAM slots, %u device frames, %u read threads\n",
                 static_cast<double>(forward.device_bytes()) / 1e9, experts.cache_slots(), experts.device_frames(), options.read_threads);

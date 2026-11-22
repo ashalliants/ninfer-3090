@@ -1,8 +1,8 @@
 // Written for NInfer-3090.
 //
 // The residency policy of the DeepSeek-V4.1-Flash expert tiers (src/models/dsv4/execution/expert_tiers.h):
-// RAM slots evict the least recently used record that the call did not use and no copy holds; VRAM frames
-// take a record when one is free, else only one used more often than the least used frame.
+// RAM slots evict the lowest priority record (by default: fewest uses, with dynamic aging) that the call did not use and
+// no copy holds; VRAM frames take a record when one is free, else only one used more often than the least used frame.
 
 #include "models/dsv4/execution/expert_tiers.h"
 
@@ -10,6 +10,8 @@
 #include <initializer_list>
 
 using ninfer::models::dsv4::ExpertTierPolicy;
+using ninfer::models::dsv4::RamEviction;
+using ninfer::models::dsv4::TierPolicyOptions;
 
 namespace {
 
@@ -31,8 +33,15 @@ void route(ExpertTierPolicy& p, std::initializer_list<std::uint32_t> keys) {
     }
 }
 
+TierPolicyOptions with(RamEviction e, bool exclusive = false) {
+    TierPolicyOptions o;
+    o.ram_eviction = e;
+    o.exclusive    = exclusive;
+    return o;
+}
+
 void ram_lru() {
-    ExpertTierPolicy p(16, 3, 0);
+    ExpertTierPolicy p(16, 3, 0, with(RamEviction::Lru));
     route(p, {0, 1});
     route(p, {2});
     check(p.ram_of(0) >= 0 && p.ram_of(1) >= 0 && p.ram_of(2) >= 0, "three keys fit three slots");
@@ -47,6 +56,89 @@ void ram_lru() {
     p.begin_call();
     for (const std::uint32_t k : {4U, 5U, 6U, 7U}) { p.touch(k); }
     check(p.acquire_ram(7) == ExpertTierPolicy::kNone, "no slot is free when the call uses them all");
+}
+
+// Hot records that a stream of once-used records would flush from an LRU pool (six scan records between two uses of
+// the hot ones, in a pool of four) survive it under a frequency-aware policy.
+void ram_scan_resistance() {
+    for (const RamEviction e : {RamEviction::Lru, RamEviction::Lfu, RamEviction::Segmented, RamEviction::Lfuda}) {
+        ExpertTierPolicy p(256, 4, 0, with(e));
+        for (int i = 0; i < 8; ++i) { route(p, {0, 1}); } // two hot records
+        std::uint32_t scan = 10;
+        int resident       = 0;
+        for (int round = 0; round < 10; ++round) {
+            for (int i = 0; i < 6; ++i) { route(p, {scan++}); }
+            resident += (p.ram_of(0) >= 0 ? 1 : 0) + (p.ram_of(1) >= 0 ? 1 : 0); // are they still there when used again?
+            route(p, {0, 1});
+        }
+        if (e == RamEviction::Lru) {
+            check(resident == 0, "LRU loses the hot records to the scan");
+        } else {
+            check(resident == 20, "a frequency-aware policy keeps the hot records through the scan");
+        }
+    }
+}
+
+// The hot set moves: records that were hot long ago do not stay forever (Lfuda's aging; Lfu's halving).
+void ram_follows_the_workload() {
+    TierPolicyOptions o = with(RamEviction::Lfuda);
+    o.age_period        = 64;
+    ExpertTierPolicy p(64, 3, 0, o);
+    for (int i = 0; i < 20; ++i) { route(p, {0, 1, 2}); }
+    for (int round = 0; round < 40; ++round) { route(p, {10, 11, 12}); }
+    check(p.ram_of(10) >= 0 && p.ram_of(11) >= 0 && p.ram_of(12) >= 0, "the new hot set replaced the old one");
+    check(p.ram_of(0) < 0 && p.ram_of(1) < 0 && p.ram_of(2) < 0, "the old hot set left");
+}
+
+void ram_segmented_protects_repeats() {
+    ExpertTierPolicy p(32, 3, 0, with(RamEviction::Segmented));
+    route(p, {0});
+    route(p, {0}); // used twice: protected
+    route(p, {1});
+    route(p, {2});
+    route(p, {3}); // evicts a once-used key (1, the older), not the protected 0
+    check(p.ram_of(0) >= 0 && p.ram_of(1) < 0 && p.ram_of(2) >= 0 && p.ram_of(3) >= 0, "a once-used key leaves before a repeated one");
+}
+
+// With exclusive tiers the slot of a record that also has a frame is the first to be reused.
+void ram_exclusive_prefers_framed_records() {
+    ExpertTierPolicy p(32, 3, 2, with(RamEviction::Lfuda, true));
+    for (int i = 0; i < 5; ++i) { route(p, {0}); }
+    route(p, {1, 2});
+    (void)p.admit_frame(0); // key 0 is the most used and is now served from a frame
+    route(p, {3});
+    check(p.ram_of(0) < 0 && p.ram_of(1) >= 0 && p.ram_of(2) >= 0 && p.ram_of(3) >= 0, "the framed record gave up its RAM slot");
+    check(p.frame_of(0) >= 0, "and keeps its frame");
+    ExpertTierPolicy q(32, 3, 2, with(RamEviction::Lfuda, false));
+    for (int i = 0; i < 5; ++i) { route(q, {0}); }
+    route(q, {1, 2});
+    (void)q.admit_frame(0);
+    route(q, {3});
+    check(q.ram_of(0) >= 0, "an inclusive policy keeps it");
+}
+
+void frames_resize_after_construction() {
+    ExpertTierPolicy p(32, 4, 0);
+    route(p, {0});
+    check(!p.admit_frame(0), "no frames yet");
+    p.resize_frames(2);
+    check(p.frames() == 2 && p.admit_frame(0).has_value(), "frames added after construction are used");
+    p.resize_frames(0);
+    check(p.frame_of(0) < 0 && !p.admit_frame(0), "and removed again");
+}
+
+void frame_margin_slows_promotion() {
+    TierPolicyOptions o = with(RamEviction::Lfuda);
+    o.frame_margin      = 2;
+    ExpertTierPolicy p(32, 8, 1, o);
+    route(p, {0});
+    (void)p.admit_frame(0);
+    route(p, {1});
+    route(p, {1});
+    route(p, {1});
+    check(!p.admit_frame(1), "a margin of 2 needs more than two extra uses");
+    route(p, {1});
+    check(p.admit_frame(1).has_value(), "three extra uses take the frame");
 }
 
 void ram_holds() {
@@ -144,6 +236,12 @@ void no_frames_never_admits() {
 
 int main() {
     ram_lru();
+    ram_scan_resistance();
+    ram_follows_the_workload();
+    ram_segmented_protects_repeats();
+    ram_exclusive_prefers_framed_records();
+    frames_resize_after_construction();
+    frame_margin_slows_promotion();
     ram_holds();
     frames_fill_then_frequency();
     frames_are_protected_within_a_call();

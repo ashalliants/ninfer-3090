@@ -89,12 +89,8 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
     models::dsv4::FileExpertOptions expert_options;
     expert_options.cache_bytes = wanted.expert_cache_bytes;
     expert_options.max_entries = static_cast<std::int32_t>(config.experts_per_token * wanted.prefill_chunk);
-    // The device tier: what is free after the weights beyond the reserve (NINFER_DSV4_EXPERT_VRAM_MIB overrides it, 0 turns
-    // it off). Parallel reads help drives that serve several requests at once and hurt a hard disk, so they are opt-in
-    // (NINFER_DSV4_READ_THREADS, default 1).
-    expert_options.device_cache_bytes =
-        after_weights > kDsv4ExpertVramReserveBytes ? std::min(after_weights - kDsv4ExpertVramReserveBytes, kDsv4ExpertVramMaxBytes) : 0;
-    if (const char* env = std::getenv("NINFER_DSV4_EXPERT_VRAM_MIB")) { expert_options.device_cache_bytes = std::strtoull(env, nullptr, 10) << 20; }
+    // Parallel reads help drives that serve several requests at once and hurt a hard disk, so they are opt-in
+    // (NINFER_DSV4_READ_THREADS, default 1). The device tier is sized below, once the forward exists.
     if (const char* env = std::getenv("NINFER_DSV4_READ_THREADS")) {
         expert_options.read_threads = static_cast<std::uint32_t>(std::max(1L, std::strtol(env, nullptr, 10)));
     }
@@ -123,6 +119,12 @@ ConstructedDsv4 construct_dsv4(const EngineOptions& options, DeviceContext& devi
     instance->program = std::make_unique<models::dsv4::Program>(*instance->forward, device, program_options);
     program.complete();
     device.synchronize();
+
+    // The device tier takes what is free now (the forward's state and workspace are allocated) less the headroom;
+    // NINFER_DSV4_EXPERT_VRAM_MIB sets it, 0 turns it off.
+    std::uint64_t expert_vram = dsv4_expert_vram_bytes(device_free());
+    if (const char* env = std::getenv("NINFER_DSV4_EXPERT_VRAM_MIB")) { expert_vram = std::strtoull(env, nullptr, 10) << 20; }
+    instance->experts->set_device_cache_bytes(expert_vram);
 
     std::vector<std::string> warnings;
     if (!instance->forward->engram_applied()) {
