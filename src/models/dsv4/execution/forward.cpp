@@ -66,9 +66,10 @@ public:
     ~ForkJoin() {
         if (!joined_) { (void)try_join(); }
     }
+    // Armed until the join has succeeded: a failed join throws and the destructor tries it again.
     void join() {
-        joined_ = true;
         cuda_ok(try_join(), "join");
+        joined_ = true;
     }
 
 private:
