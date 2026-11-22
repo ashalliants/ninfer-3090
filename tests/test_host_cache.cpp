@@ -1,6 +1,7 @@
 #include "core/cgroup_memory.h"
 #include "runtime/engine/host_cache.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/qwen4_exp_instance.h"
 
 #include <filesystem>
 #include <fstream>
@@ -411,6 +412,24 @@ int check_flash_next_options_refused() {
                           both.find("--ngram-prefetch") != std::string::npos,
                       "two Flash-Next flags were not both named in one refusal");
 
+    // Flash-Next itself refuses the DeepSeek-V4-only --engram-dir.
+    {
+        // A baseline Flash-Next accepts, so the refusal below can only come from --engram-dir.
+        ninfer::EngineOptions next;
+        next.artifact_path = "flash-next.ninfer";
+        next.kv_cache = ninfer::KvCacheStorage::Int8Group64;
+        const auto why = [](const ninfer::EngineOptions& value) {
+            try {
+                ninfer::runtime::validate_qwen4_exp_options(value);
+            } catch (const std::invalid_argument& error) { return std::string(error.what()); }
+            return std::string();
+        };
+        const std::string baseline = why(next);
+        if (!baseline.empty()) { std::cerr << baseline << '\n'; }
+        failures += check(baseline.empty(), "the Flash-Next baseline was refused");
+        next.flash_next.engram_dir = "engram";
+        failures += check(why(next).find("--engram-dir") != std::string::npos, "Flash-Next accepted --engram-dir");
+    }
     options.flash_next.vram_headroom_bytes = 64ULL << 20;
     failures += check(refusal(options).find("--fit-context") != std::string::npos,
                       "--vram-headroom-mib without --fit-context was not refused naming --fit-context");
