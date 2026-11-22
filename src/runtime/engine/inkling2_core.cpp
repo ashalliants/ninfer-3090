@@ -408,6 +408,13 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     }
     // The adapters are read (and any unsupported one refused) before the weights load; uploaded after it.
     if (options_.loras.size() > 8) { throw std::invalid_argument("Inkling-2 loads at most eight LoRA adapters"); }
+    // The adapters are one Program-wide selection, set per request; batched decode runs several requests in one
+    // forward and cannot apply one request's adapters to its column alone. Refused, not run without them: the CLI and
+    // ninfer serve reach this through EngineOptions (serve's --lora also serves the Qwen3.5 models, which batch it).
+    if (options_.max_concurrency > 1 && (!options_.loras.empty() || !options_.grafts.empty())) {
+        throw std::invalid_argument("Inkling-2 --lora and --graft need --max-concurrency 1: batched decode (--max-concurrency " +
+                                    std::to_string(options_.max_concurrency) + ") cannot apply a request's adapters to its column alone");
+    }
     // A request selects an adapter by name, so each one needs a name of its own: an empty or repeated one would be
     // uploaded yet never selectable. Checked here too, since EngineOptions reaches this without the CLI parser.
     const auto check_names = [](const auto& sources, const char* what) {

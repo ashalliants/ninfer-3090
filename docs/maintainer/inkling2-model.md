@@ -1224,7 +1224,8 @@ captured graph (one per batch width B, captured on first use) therefore reads th
 the step table, and serves every combination of slots. Prefill stays one request at a time. A new request prefills one chunk
 (eager, in its own slot) between decode steps, round robin among those still prefilling. The rollback buffers and
 taps are a single copy, but they are unused, because with N > 1 there is no drafter (`--spec dspark` is accepted and
-noted in the startup log, and every request decodes plain). Prefix reuse keeps one snapshot per slot. A prompt
+noted in the startup log, and every request decodes plain). `--lora` and `--graft` are refused with N > 1: the adapters
+are one Program-wide selection set per request, which a batched forward cannot apply to one column alone. Prefix reuse keeps one snapshot per slot. A prompt
 resumes only from the snapshot of the slot it is given, since the global caches below it are that slot's own. The
 scheduler gives a prompt the free slot whose snapshot it extends (the longest such snapshot), or else an empty slot,
 or else the slot released longest ago.

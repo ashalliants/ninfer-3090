@@ -118,6 +118,25 @@ int main() {
         }
         std::printf("solo runs done\n");
         {
+            // Adapters are one Program-wide, per-request selection that batched decode cannot apply per column: a LoRA or
+            // a graft with --max-concurrency > 1 is refused before anything loads, naming both options.
+            const auto refused = [&](const ninfer::EngineOptions& o) {
+                try {
+                    ninfer::Engine engine(o);
+                } catch (const std::invalid_argument& e) {
+                    const std::string what = e.what();
+                    return what.find("--lora") != std::string::npos && what.find("--graft") != std::string::npos &&
+                           what.find("--max-concurrency 1") != std::string::npos;
+                }
+                return false;
+            };
+            auto with_lora = base_options(artifact), with_graft = base_options(artifact);
+            with_lora.max_concurrency = with_graft.max_concurrency = 2;
+            with_lora.loras.push_back({"l", "missing-adapter"});
+            with_graft.grafts.push_back({"g", "missing.safetensors"});
+            check(refused(with_lora) && refused(with_graft), "a LoRA or a graft with --max-concurrency 2 is refused");
+        }
+        {
             auto options            = base_options(artifact);
             options.max_concurrency = 4;
             ninfer::Engine engine(options);
