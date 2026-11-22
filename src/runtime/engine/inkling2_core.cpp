@@ -555,7 +555,10 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
             if (!built) {
                 // fit_context_floor bounds the search from below: a context under it is refused, not started.
                 const std::uint32_t floor_steps = (options_.fit_context_floor + kFitStep - 1) / kFitStep;
-                std::uint32_t lo = 0, hi = options_.max_context / kFitStep; // in kFitStep units: lo fits (0: none known)
+                // In kFitStep units: lo fits (0: none known), hi does not, or is past max_context. hi rounds up, so with a
+                // max_context off the step the largest multiple under it is still a candidate (only max_context itself
+                // was tried above).
+                std::uint32_t lo = 0, hi = (options_.max_context + kFitStep - 1) / kFitStep;
                 if (floor_steps > 0) {
                     if (floor_steps >= hi || !fits(chunks.back(), floor_steps * kFitStep)) {
                         throw std::runtime_error("inkling2: --max-concurrency " + std::to_string(slots_) + ": the context floor of " +
