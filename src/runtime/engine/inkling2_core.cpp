@@ -15,7 +15,6 @@
 #include "models/inkling2/program/text_program.h"
 #include "models/inkling2/program/vision_program.h"
 
-#include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
 
@@ -534,7 +533,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         // Measuring knob (the low-bit KV trial, docs/maintainer/inkling2-model.md): a parse_kv_quant spec, simulated or real.
         if (const char* kvq = std::getenv("NINFER_INKLING2_KVQ"); kvq != nullptr && *kvq != '\0') {
             ink::parse_kv_quant(model_->config(), kvq, limits);
-            std::fprintf(stderr, "inkling2: EXPERIMENTAL low-bit KV spec '%s'\n", kvq);
+            load_.notes.push_back(std::string("experimental | NINFER_INKLING2_KVQ ") + kvq + " (lossy, measuring only)");
         }
         if (!prefill_is_fp32(options_.kv_rings, options_.prefill_math)) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
         limits.slots = slots_;
