@@ -1258,8 +1258,14 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
 // Decode widths 1..17 at the model's shape and top 8 over 40 experts at random (so an expert gets from one entry to
 // several tiles' worth): every column of a T-column call, weighted, and every entry's unweighted output are byte-equal
 // to the column's own T = 1 call (the per-entry kernels), for NVFP4 records untiled and tiled and for BF16 banks.
+// Widths 33, 40 and 41 (264, 320 and 328 entries) take the expert discovery's multi-chunk path (more entries than a
+// block's threads, the last chunk partial): their first 32 columns route only among experts 0..31, so experts 32..39
+// are first seen in the second chunk.
 void test_expert_widths(bool nvfp4) {
-    const int h = 2304, inter = 1152, experts = 40, k = 8, max_cols = 17;
+    const int h = 2304, inter = 1152, experts = 40, k = 8, max_cols = 41, first_chunk_cols = 256 / k;
+    std::vector<int> widths;
+    for (int cols = 1; cols <= 17; ++cols) { widths.push_back(cols); }
+    for (const int cols : {33, 40, 41}) { widths.push_back(cols); }
     ninfer::ops::SituExpertBank bank;
     bank.experts = experts, bank.hidden = h, bank.intermediate = inter;
     ninfer::DeviceBuffer records, bgu, bd;
@@ -1291,15 +1297,20 @@ void test_expert_widths(bool nvfp4) {
             ninfer::ops::nvfp4_tile_records(bank, static_cast<std::uint8_t*>(records.p), scratch.p, nullptr);
         }
         int differ = 0;
-        for (int cols = 1; cols <= max_cols; ++cols) {
+        for (const int cols : widths) {
             std::vector<int> ids(static_cast<std::size_t>(k) * cols);
             for (int c = 0; c < cols; ++c) { // k distinct experts per column, as the router gives
+                const int pool = cols > first_chunk_cols && c < first_chunk_cols ? 32 : experts;
                 for (int i = 0; i < k; ++i) {
                     int e = 0;
-                    do { e = std::min(experts - 1, static_cast<int>(uniform(0.0F, 1.0F) * experts)); } while (
+                    do { e = std::min(pool - 1, static_cast<int>(uniform(0.0F, 1.0F) * pool)); } while (
                         std::find(ids.begin() + c * k, ids.begin() + c * k + i, e) != ids.begin() + c * k + i);
                     ids[c * k + i] = e;
                 }
+            }
+            if (cols > first_chunk_cols) {
+                check(std::any_of(ids.begin() + first_chunk_cols * k, ids.end(), [](int e) { return e >= 32; }),
+                      "moe_situ_experts widths: T " + std::to_string(cols) + " has an expert first seen past the first chunk");
             }
             ninfer::DeviceBuffer did = t::to_device_i32(ids);
             const Tensor tz = dz.tensor({h, max_cols}).slice(1, 0, cols), tw(dw.b.p, DType::FP32, {k, cols}), tid(did.p, DType::I32, {k, cols});
@@ -1320,7 +1331,7 @@ void test_expert_widths(bool nvfp4) {
             }
             check(cudaDeviceSynchronize() == cudaSuccess, "moe_situ_experts widths: a launch failed");
         }
-        const std::string label = std::string("moe_situ_experts ") + (nvfp4 ? (tiled ? "NVFP4 tiled" : "NVFP4") : "BF16") + " T 1..17 top 8 of 40";
+        const std::string label = std::string("moe_situ_experts ") + (nvfp4 ? (tiled ? "NVFP4 tiled" : "NVFP4") : "BF16") + " T 1..17, 33, 40, 41 top 8 of 40";
         check(differ == 0, label + ": " + std::to_string(differ) + " columns differ from their own T = 1 call");
         std::printf("%-44s every column and entry bit-exact with T = 1\n", label.c_str());
     }
