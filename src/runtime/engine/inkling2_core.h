@@ -105,6 +105,8 @@ private:
     std::unique_ptr<models::inkling2::Model> model_;
     std::unique_ptr<models::inkling2::Frontend> frontend_;
     cudaStream_t stream_ = nullptr;
+    // The prefix-reuse snapshots' device-to-host copies (TextProgram::save_async), beside the forwards on stream_.
+    cudaStream_t copy_stream_ = nullptr;
     struct Programs;
     void build_programs(models::inkling2::ProgramLimits limits, std::unique_ptr<models::inkling2::DenseWeightsQ8>& dense,
                         const models::inkling2::VisionConfig* vision, bool dspark);
@@ -119,6 +121,7 @@ private:
     std::uint32_t drafter_window_ = 0; // the drafter's global window (0: the whole context), chosen at startup
     std::int32_t slots_ = 1;           // max_concurrency: the text Program's slots
     std::uint32_t requested_context_ = 0; // max_context as asked, before fitting the slots
+    std::size_t snapshot_host_bytes_ = 0; // the prefix-reuse snapshots' pinned host memory (build_programs)
     std::size_t free_after_weights_  = 0; // device memory free before the programs (measured with several slots)
 
     mutable std::mutex mutex_;

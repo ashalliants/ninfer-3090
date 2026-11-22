@@ -145,8 +145,9 @@ public:
     // The state a forward from a position needs, copied (prefix reuse): every sliding visit's K/V for the last
     // sliding_window - 1 positions and every visit's convolution histories. The global visits' caches are indexed by
     // position and not copied: they stay valid while no forward writes below the snapshot's position.
+    // The copy is in pinned host memory: a snapshot costs no device memory.
     struct Snapshot {
-        DeviceBuffer memory; // snapshot_bytes()
+        PinnedHostBuffer memory;    // snapshot_bytes()
         std::int64_t position = -1; // -1: holds nothing
     };
     [[nodiscard]] std::size_t snapshot_bytes() const;
@@ -154,8 +155,15 @@ public:
     [[nodiscard]] DeviceArena& workspace() noexcept { return workspace_; }
     // Its top limits.lend_bytes (empty without): free between forwards even while a forward's results are being read.
     [[nodiscard]] DeviceSpan lent() noexcept;
-    // Copies the state at position() into `snapshot` (its memory snapshot_bytes() or more).
-    void save(Snapshot& snapshot) const;
+    // Copies the state at position() into `snapshot` (its memory snapshot_bytes() or more), in this Program's stream
+    // order (the forwards after it wait for the copy).
+    void save(Snapshot& snapshot);
+    // The same copy without holding this Program's stream (one slot only): the convolution histories go to a device
+    // staging buffer in stream order, then everything to `snapshot` on `copy` (the caller's stream; it must outlive
+    // the copy), each sliding visit's rings in visit order. The forwards go on meanwhile: the first that would write
+    // ring slots the copy still reads waits for that visit's copy, visit by visit; restore(), reset(), select() and
+    // the next save wait for all of it, so the snapshot is never read before its copy is complete.
+    void save_async(Snapshot& snapshot, cudaStream_t copy);
     // Continues from the snapshot's position with the state it copied; the global caches below that position must
     // be as they were when it was saved. Forwards from there compute what a sequence never cut would.
     void restore(const Snapshot& snapshot);
@@ -196,6 +204,9 @@ private:
     // With rollback saving on: x (a convolution's input [C, T]) after the saved history.
     void save_input(Tensor& saved, const Tensor& x);
     void copy_tap(std::uint32_t visit, const Tensor& value);
+    // save_async's copy: settle_copy() drops it once complete; wait_copy() orders this Program's stream after all of it.
+    void settle_copy();
+    void wait_copy();
 
     const Model& model_;
     const TextConfig& config_;
@@ -222,6 +233,14 @@ private:
     // The decode graph: step_ holds {int64 position, int32 token} it reads; start_offset_ points at that position
     // while the graph is captured (the Ops add it to their host start of 0), and is null otherwise.
     DeviceBuffer step_;
+    // save_async: the histories' device staging, an event per sliding visit once its rings are copied and one for the
+    // whole copy, the first position the copy reads, and (during one forward) whether visits wait for their copy.
+    DeviceBuffer hist_stage_;
+    PinnedHostBuffer copy_descriptors_; // the copy kernels' GatherCopy list (host_gather.h)
+    std::vector<cudaEvent_t> ring_copied_;
+    cudaEvent_t state_ready_ = nullptr, copy_done_ = nullptr;
+    bool copy_pending_ = false, ring_wait_ = false;
+    std::int64_t copy_first_ = 0;
     // The decode graphs (each captured on its first use) and their logits: index 2 * taps + split, taps the tap copies,
     // split the split attention (positions past ops::kSplitMinKeys; the single block before).
     cudaGraphExec_t decode_graph_[4] = {nullptr, nullptr, nullptr, nullptr};

@@ -14,6 +14,7 @@
 #include "ninfer/ops/tensor_core_fp32.h"
 
 #include "core/copy_batch.h"
+#include "core/host_gather.h"
 
 #include <algorithm>
 #include <array>
@@ -254,6 +255,7 @@ DeviceSpan TextProgram::lent() noexcept {
 
 void TextProgram::select(std::int32_t slot) {
     if (slot < 0 || slot >= limits_.slots) { throw std::out_of_range("inkling2: no such slot"); }
+    wait_copy();
     if (!state_.empty()) { positions_[static_cast<std::size_t>(slot_)] = position_; }
     slot_     = slot;
     state_    = std::span<VisitState>(all_state_).subspan(static_cast<std::size_t>(slot) * config_.num_layer_visits, config_.num_layer_visits);
@@ -262,6 +264,15 @@ void TextProgram::select(std::int32_t slot) {
 }
 
 TextProgram::~TextProgram() {
+    // A copy still reading the state (save_async) ends first.
+    // A copy may still run after wait_copy() (a stream wait) cleared copy_pending_: it reads this Program's buffers.
+    if (copy_done_ != nullptr) { (void)cudaEventSynchronize(copy_done_); }
+    for (cudaEvent_t e : ring_copied_) {
+        if (e != nullptr) { cudaEventDestroy(e); }
+    }
+    for (cudaEvent_t e : {state_ready_, copy_done_}) {
+        if (e != nullptr) { cudaEventDestroy(e); }
+    }
     for (cudaGraphExec_t graph : decode_graph_) {
         if (graph != nullptr) { cudaGraphExecDestroy(graph); }
     }
@@ -284,6 +295,7 @@ void TextProgram::set_adapters(AdapterSelection adapters) {
 }
 
 void TextProgram::reset() {
+    wait_copy(); // the forwards from 0 write ring slots the copy may still read
     for (auto& s : state_) {
         for (Tensor* t : {&s.k_hist, &s.v_hist, &s.attn_hist, &s.mlp_hist}) {
             if (cudaMemsetAsync(t->data, 0, t->bytes(), stream_) != cudaSuccess) { throw std::runtime_error("inkling2: cannot clear state"); }
@@ -316,9 +328,10 @@ std::size_t TextProgram::snapshot_bytes() const {
     return total;
 }
 
-void TextProgram::save(Snapshot& snapshot) const {
-    if (snapshot.memory.bytes < snapshot_bytes()) { throw std::invalid_argument("inkling2: the snapshot is too small"); }
-    auto* out = static_cast<std::byte*>(snapshot.memory.p);
+void TextProgram::save(Snapshot& snapshot) {
+    if (snapshot.memory.size() < snapshot_bytes()) { throw std::invalid_argument("inkling2: the snapshot is too small"); }
+    wait_copy();
+    auto* out = static_cast<std::byte*>(snapshot.memory.data());
     CopyBatch copies(stream_);
     const std::int64_t first = std::max<std::int64_t>(0, position_ - (config_.sliding_window - 1));
     for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
@@ -343,9 +356,121 @@ void TextProgram::save(Snapshot& snapshot) const {
     snapshot.position = position_;
 }
 
+void TextProgram::save_async(Snapshot& snapshot, cudaStream_t copy) {
+    if (snapshot.memory.size() < snapshot_bytes()) { throw std::invalid_argument("inkling2: the snapshot is too small"); }
+    if (limits_.slots > 1) { throw std::logic_error("inkling2: save_async with several slots"); }
+    // The staging, the events and the copy descriptors are the previous copy's until it has completed, which a stream
+    // wait (wait_copy) does not tell the host: it waits on the copy's event itself (done by now, but for two saves
+    // within one copy's time).
+    if (copy_done_ != nullptr && cudaEventSynchronize(copy_done_) != cudaSuccess) { throw std::runtime_error("inkling2: snapshot copy failed"); }
+    copy_pending_ = false;
+    const auto check = [](cudaError_t e, const char* what) {
+        if (e != cudaSuccess) { throw std::runtime_error(std::string("inkling2: snapshot copy: ") + what + ": " + cudaGetErrorString(e)); }
+    };
+    const std::size_t visits = config_.num_layer_visits;
+    if (copy_done_ == nullptr) {
+        ring_copied_.assign(visits, nullptr);
+        for (std::size_t v = 0; v < visits; ++v) {
+            if (config_.local[config_.physical(static_cast<std::uint32_t>(v))]) { check(cudaEventCreateWithFlags(&ring_copied_[v], cudaEventDisableTiming), "event"); }
+        }
+        check(cudaEventCreateWithFlags(&state_ready_, cudaEventDisableTiming), "event");
+        check(cudaEventCreateWithFlags(&copy_done_, cudaEventDisableTiming), "event");
+    }
+    std::size_t hist_bytes = 0;
+    for (const VisitState& s : state_) { hist_bytes += s.k_hist.bytes() + s.v_hist.bytes() + s.attn_hist.bytes() + s.mlp_hist.bytes(); }
+    if (hist_stage_.bytes < hist_bytes) { hist_stage_ = DeviceBuffer(hist_bytes); }
+    // Built on the host first: the histories' device-to-device staging (they change with every forward; a few MB, one
+    // kernel in stream order), then the copy to the host in save()'s layout, visit by visit, each sliding visit's
+    // rings followed by its event.
+    const std::int64_t first = std::max<std::int64_t>(0, position_ - (config_.sliding_window - 1));
+    std::vector<GatherCopy> copies;
+    std::vector<std::pair<std::size_t, std::size_t>> launches; // [begin, end) of copies, and the visit whose event follows
+    std::vector<std::size_t> launch_visit;
+    const auto add = [&](void* to, const void* from, std::size_t bytes) {
+        const std::size_t row = bytes % 2048 == 0 ? 2048 : bytes; // rows, so that pieces can split a long copy
+        copies.push_back({to, from, row, row, row, bytes / row});
+    };
+    {
+        auto* at = static_cast<std::byte*>(hist_stage_.p);
+        for (const VisitState& s : state_) {
+            for (const Tensor* t : {&s.k_hist, &s.v_hist, &s.attn_hist, &s.mlp_hist}) {
+                add(at, t->data, t->bytes());
+                at += t->bytes();
+            }
+        }
+        launches.emplace_back(0, copies.size());
+        launch_visit.push_back(visits + 1); // the staging: no event
+    }
+    require_identity_mapped(snapshot.memory.data()); // the copy kernel writes it by its host address
+    auto* out          = static_cast<std::byte*>(snapshot.memory.data());
+    const auto* staged = static_cast<const std::byte*>(hist_stage_.p);
+    std::size_t begin  = copies.size();
+    for (std::size_t v = 0; v < visits; ++v) {
+        const VisitState& s = state_[v];
+        const std::size_t h = s.k_hist.bytes() + s.v_hist.bytes() + s.attn_hist.bytes() + s.mlp_hist.bytes();
+        add(out, staged, h);
+        out += h, staged += h;
+        if (ring_copied_[v] == nullptr) { continue; }
+        const std::size_t column = static_cast<std::size_t>(s.k_cache.nb[1]);
+        for (const Tensor* t : {&s.k_cache, &s.v_cache}) {
+            auto* base = out;
+            ring_runs(first, position_ - first, t->ne[1], [&](std::int64_t slot, std::int64_t run) {
+                add(base, static_cast<const std::byte*>(t->data) + static_cast<std::size_t>(slot) * column, static_cast<std::size_t>(run) * column);
+                base += static_cast<std::size_t>(run) * column;
+            });
+            out += column * (config_.sliding_window - 1);
+        }
+        launches.emplace_back(begin, copies.size());
+        launch_visit.push_back(v);
+        begin = copies.size();
+    }
+    if (begin < copies.size()) {
+        launches.emplace_back(begin, copies.size());
+        launch_visit.push_back(visits); // copy_done_ follows
+    }
+    // In pieces of at most 256 KiB (a block takes whole pieces), their list in pinned memory that the kernels read
+    // until they complete.
+    std::vector<GatherCopy> pieces;
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    for (const auto& [b, e] : launches) {
+        std::vector<GatherCopy> part(copies.begin() + static_cast<std::ptrdiff_t>(b), copies.begin() + static_cast<std::ptrdiff_t>(e));
+        split_gather_copies(part, 256U << 10);
+        spans.emplace_back(pieces.size(), pieces.size() + part.size());
+        pieces.insert(pieces.end(), part.begin(), part.end());
+    }
+    if (copy_descriptors_.size() < pieces.size() * sizeof(GatherCopy)) { copy_descriptors_ = PinnedHostBuffer(pieces.size() * sizeof(GatherCopy)); }
+    auto* descriptors = static_cast<GatherCopy*>(copy_descriptors_.data());
+    std::copy(pieces.begin(), pieces.end(), descriptors);
+    const auto span_of = [&](std::size_t i) { return std::span<const GatherCopy>(descriptors + spans[i].first, spans[i].second - spans[i].first); };
+    gather_copies(span_of(0), stream_);
+    check(cudaEventRecord(state_ready_, stream_), "record");
+    check(cudaStreamWaitEvent(copy, state_ready_, 0), "wait");
+    // To the host by one paced copy kernel (host_gather.h: neither an unpaced kernel nor the copy engine overlaps a
+    // forward on this link without delaying it about the copy's own time).
+    for (std::size_t i = 1; i < spans.size(); ++i) {
+        gather_copies_paced(span_of(i), GatherPace{}, copy);
+        if (launch_visit[i] < visits) { check(cudaEventRecord(ring_copied_[launch_visit[i]], copy), "record"); }
+    }
+    check(cudaEventRecord(copy_done_, copy), "record");
+    copy_pending_     = true;
+    copy_first_       = first;
+    snapshot.position = position_;
+}
+
+void TextProgram::settle_copy() {
+    if (copy_pending_ && cudaEventQuery(copy_done_) == cudaSuccess) { copy_pending_ = false; }
+}
+
+void TextProgram::wait_copy() {
+    if (!copy_pending_) { return; }
+    if (cudaStreamWaitEvent(stream_, copy_done_, 0) != cudaSuccess) { throw std::runtime_error("inkling2: cannot wait for the snapshot copy"); }
+    copy_pending_ = false;
+}
+
 void TextProgram::restore(const Snapshot& snapshot) {
     if (snapshot.position < 0 || snapshot.position > limits_.max_context) { throw std::invalid_argument("inkling2: an empty snapshot"); }
-    const auto* in = static_cast<const std::byte*>(snapshot.memory.p);
+    wait_copy(); // never a half-copied snapshot, nor rings the copy still reads
+    const auto* in = static_cast<const std::byte*>(snapshot.memory.data());
     CopyBatch copies(stream_);
     const std::int64_t first = std::max<std::int64_t>(0, snapshot.position - (config_.sliding_window - 1));
     for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
@@ -487,6 +612,9 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     const LayerWeights& w = model_.weights().layers.at(p);
     VisitState& st        = state_[v];
     const bool local      = c.local[p];
+    if (ring_wait_ && local && cudaStreamWaitEvent(stream_, ring_copied_[v], 0) != cudaSuccess) {
+        throw std::runtime_error("inkling2: cannot wait for the snapshot copy");
+    }
     const std::int32_t h = i32(c.hidden_size), cols = cur.ne[1], heads = i32(c.heads), d = i32(c.head_dim),
                        kv = i32(c.kv_heads * c.head_dim), q = heads * d, rel = heads * i32(c.d_rel), k = i32(c.conv_kernel_size);
     const float eps = c.rms_norm_eps;
@@ -802,6 +930,22 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, std::span<cons
         next = e.column + e.values.ne[1];
     }
     const bool tracing = trace != nullptr && *trace;
+    // A save_async copy still reading the rings: a forward that writes a slot it reads (position copy_first_ + the
+    // ring's capacity or later) waits for it, an eager one visit by visit, the decode graph all at once.
+    settle_copy();
+    if (copy_pending_) {
+        std::int64_t capacity = 0;
+        for (std::uint32_t v = 0; v < c.num_layer_visits && capacity == 0; ++v) {
+            if (c.local[c.physical(v)]) { capacity = state_[v].k_cache.ne[1]; }
+        }
+        if (capacity > 0 && position_ + cols - 1 >= copy_first_ + capacity) {
+            if (cols == 1) {
+                wait_copy();
+            } else {
+                ring_wait_ = true;
+            }
+        }
+    }
     // With several slots the one-token forward is a batch of one (the single-sequence graph would hold one slot's
     // state pointers), unless there are taps to copy: forward_batch copies none, so a tapped forward takes the eager
     // path below, which copies them for this slot as a single-sequence forward does.
@@ -836,10 +980,11 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, std::span<cons
     try {
         logits = run(ids, position_, trace);
     } catch (...) {
-        saving_ = false;
+        saving_ = ring_wait_ = false;
         inputs_ = {};
         throw;
     }
+    ring_wait_ = false; // the copy stays pending (the histories after the last sliding visit) until its event completes
     saving_ = false;
     inputs_ = {};
     position_ += cols;
@@ -912,6 +1057,7 @@ Tensor TextProgram::forward_batch(std::span<const std::int32_t> slots, std::span
     if (cols < 1 || cols > std::min(kMaxBatchColumns, limits_.max_chunk) || tokens.size() != slots.size()) {
         throw std::invalid_argument("inkling2: forward_batch takes 1 to 8 (slot, token) pairs, at most max_chunk");
     }
+    wait_copy();
     struct Step {
         std::int64_t positions[kMaxBatchColumns];
         std::int32_t tokens[kMaxBatchColumns];

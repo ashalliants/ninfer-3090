@@ -6,6 +6,7 @@
 #include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/host_memory.h"
 #include "core/startup.h"
 #include "models/inkling2/program/adapters.h"
 #include "models/inkling2/program/dspark_program.h"
@@ -299,13 +300,42 @@ void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink
         }
     }
     if (vision != nullptr) { programs_->vision = std::make_unique<ink::VisionEncoder>(*model_, stream_); }
-    if (options_.context_cache.enabled && slots_ > 1) {
-        programs_->slot_snapshots.resize(static_cast<std::size_t>(slots_));
-        programs_->slot_snapshot_keys.resize(static_cast<std::size_t>(slots_));
-        for (auto& snap : programs_->slot_snapshots) { snap.memory = DeviceBuffer(programs_->text.snapshot_bytes()); }
-    } else if (options_.context_cache.enabled) {
-        programs_->snapshot.memory = DeviceBuffer(programs_->text.snapshot_bytes());
-        if (programs_->drafter) { programs_->draft_snapshot.memory = DeviceBuffer(programs_->drafter->snapshot_bytes()); }
+    // The prefix-reuse snapshots live in pinned host memory (no device memory): one per slot, or one with the
+    // drafter's beside it. Refused up front when the host cannot pin them. The text snapshots' size is the same at
+    // every chunk and context (invalid_argument ends the fit); the drafter's follows its window, so with a drafter the
+    // fit goes on to a narrower one (runtime_error), and the last attempt reports it.
+    if (options_.context_cache.enabled) {
+        const std::size_t text_bytes = programs_->text.snapshot_bytes();
+        const std::size_t draft_bytes = programs_->drafter && slots_ == 1 ? programs_->drafter->snapshot_bytes() : 0;
+        const std::size_t pinned = static_cast<std::size_t>(slots_) * text_bytes + draft_bytes;
+        const HostMemorySnapshot host = host_memory_snapshot();
+        constexpr std::size_t kHostSpare = 1ULL << 30; // left to the OS and the rest of the process
+        const bool locked_out = host.lock_limit.has_value() && *host.lock_limit < pinned;
+        if (host.available_physical < pinned + kHostSpare || locked_out) {
+            const auto refuse = [&](const std::string& why) {
+                const std::size_t text_only = static_cast<std::size_t>(slots_) * text_bytes;
+                if (draft_bytes > 0 && host.available_physical >= text_only + kHostSpare &&
+                    (!host.lock_limit.has_value() || *host.lock_limit >= text_only)) {
+                    throw std::runtime_error(why);
+                }
+                throw std::invalid_argument(why);
+            };
+            refuse("inkling2: the prefix-reuse snapshots need " + std::to_string(pinned >> 20) + " MiB of pinned host memory (" +
+                   std::to_string(slots_) + " x " + std::to_string(text_bytes >> 20) + " MiB" +
+                   (draft_bytes > 0 ? " + the drafter's " + std::to_string(draft_bytes >> 20) + " MiB" : std::string()) + "), and " +
+                   (locked_out ? "RLIMIT_MEMLOCK allows " + std::to_string(*host.lock_limit >> 20) + " MiB"
+                               : std::to_string(host.available_physical >> 20) + " MiB is available (1 GiB kept free)") +
+                   "; lower --max-concurrency or pass --no-prefix-reuse");
+        }
+        snapshot_host_bytes_ = pinned;
+        if (slots_ > 1) {
+            programs_->slot_snapshots.resize(static_cast<std::size_t>(slots_));
+            programs_->slot_snapshot_keys.resize(static_cast<std::size_t>(slots_));
+            for (auto& snap : programs_->slot_snapshots) { snap.memory = PinnedHostBuffer(text_bytes); }
+        } else {
+            programs_->snapshot.memory = PinnedHostBuffer(text_bytes);
+            if (draft_bytes > 0) { programs_->draft_snapshot.memory = PinnedHostBuffer(draft_bytes); }
+        }
     }
     programs_->dense = std::move(dense);
 }
@@ -472,6 +502,10 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         phase.complete();
     }
     check_cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
+    if (const cudaError_t made = cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking); made != cudaSuccess) {
+        release_stream();
+        check_cuda(made, "copy stream");
+    }
     // From here a failure releases the programs and then the stream (the destructor does not run).
     try {
         StartupPhaseScope phase(options_.startup_observer, StartupPhase::ProgramInitialize);
@@ -630,12 +664,19 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     if (options_.dense_q8 != DenseQ8::Off) { load_.weight_formats.push_back("q8_g32_fp16 (re-encoded at load)"); }
     const bool fp32_prefill   = prefill_is_fp32(options_.kv_rings, options_.prefill_math);
     load_.prefill_signature   = fp32_prefill ? "inkling2-fp32" : "inkling2-tc";
+    std::size_t device_free = 0, device_total = 0;
+    check_cuda(cudaMemGetInfo(&device_free, &device_total), "memory info");
     load_.notes.push_back("prefill | chunk " + std::to_string(chunk_) + (options_.prefill_chunk_auto ? " (widest that fits)" : " (--prefill-chunk)") +
                           " | workspace " + std::to_string(programs_->text.workspace().capacity() >> 20) + " MiB" +
                           (programs_->drafter ? std::string(drafter_head_copy_ ? " | drafter head Q8 copy" : " | drafter head: the target's BF16") +
                                                     " | drafter window " + (drafter_window_ == 0 ? std::string("whole context") : std::to_string(drafter_window_))
                                               : std::string()) +
-                          " | " + (fp32_prefill ? "FP32" : "tensor cores (--prefill-math fp32: the exact FP32 prefill)"));
+                          " | " + (fp32_prefill ? "FP32" : "tensor cores (--prefill-math fp32: the exact FP32 prefill)") +
+                          " | device free " + std::to_string(device_free >> 20) + " MiB");
+    if (snapshot_host_bytes_ > 0) {
+        load_.notes.push_back("prefix reuse | " + std::to_string(slots_) + (slots_ > 1 ? " snapshots" : " snapshot") + " in pinned host memory | " +
+                              std::to_string((snapshot_host_bytes_ + (1U << 20) - 1) >> 20) + " MiB");
+    }
     for (const auto& adapter : loras) {
         const auto layers = std::count_if(adapter.layers.begin(), adapter.layers.end(), [](const auto& l) { return l.has_value(); });
         load_.notes.push_back("lora " + adapter.name + " | rank " + std::to_string(adapter.rank) + ", scale " + std::to_string(adapter.scale) +
@@ -685,10 +726,14 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
 }
 
 void Inkling2Core::release_stream() noexcept {
+    // A snapshot copy in flight ends before its source and its pinned host memory are freed.
+    if (copy_stream_ != nullptr) { (void)cudaStreamSynchronize(copy_stream_); }
     programs_.reset();
-    if (stream_ != nullptr) {
-        cudaStreamDestroy(stream_);
-        stream_ = nullptr;
+    for (cudaStream_t* s : {&copy_stream_, &stream_}) {
+        if (*s != nullptr) {
+            cudaStreamDestroy(*s);
+            *s = nullptr;
+        }
     }
 }
 
@@ -984,7 +1029,7 @@ void Inkling2Core::run(Job& job) {
     }
     // The state after the last whole chunk that leaves a position to compute, kept for the next prompt. Every cut is a
     // multiple of chunk_, so a prompt's forwards are the same whether it resumes or not (reuse is chunk-grained).
-    const std::int32_t keep_at = snapshot.memory.p != nullptr ? prefill_snapshot_at(n, chunk_) : 0;
+    const std::int32_t keep_at = snapshot.memory.data() != nullptr ? prefill_snapshot_at(n, chunk_) : 0;
     const auto prefill_start = Clock::now();
     const std::size_t hidden = text_cfg.hidden_size;
     Tensor logits;
@@ -1009,13 +1054,22 @@ void Inkling2Core::run(Job& job) {
         logits = program.forward(std::span(prompt.tokens).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len)), inputs);
         if (speculate) { extend_drafter(*drafter, taps_of(), len); }
         if (s + len == keep_at && keep_at > resume) {
-            program.save(snapshot);
-            // The drafter followed the prompt only when this request speculates.
-            if (speculate) {
-                drafter->save(programs_->draft_snapshot);
-            } else if (drafter != nullptr) {
-                programs_->draft_snapshot.position = -1;
-            }
+            // To the host beside the rest of the prompt and the first decode steps (copy_stream_): the text Program's
+            // forwards wait only where they would write ring slots the copy still reads, visit by visit, and the
+            // drafter's extends for its rings. The copy that the next forward needs first goes first: the text rings
+            // when that forward is wide enough to reach them (a chunk past the rings' spare slots), else the drafter's.
+            const bool rings_first = n - keep_at >= ink::local_ring_chunk(chunk_) + 1;
+            const auto save_drafter = [&] {
+                // The drafter followed the prompt only when this request speculates.
+                if (speculate) {
+                    drafter->save_async(programs_->draft_snapshot, copy_stream_);
+                } else if (drafter != nullptr) {
+                    programs_->draft_snapshot.position = -1;
+                }
+            };
+            if (!rings_first) { save_drafter(); }
+            program.save_async(snapshot, copy_stream_);
+            if (rings_first) { save_drafter(); }
             programs_->snapshot_keys.assign(keys.begin(), keys.begin() + keep_at);
             programs_->snapshot_adapters = adapter_key;
         }

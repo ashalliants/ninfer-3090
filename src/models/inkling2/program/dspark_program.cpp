@@ -4,6 +4,7 @@
 #include "models/inkling2/program/dspark_program.h"
 
 #include "core/copy_batch.h"
+#include "core/host_gather.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/dspark_fp32.h"
 #include "ninfer/ops/fp32_rows.h"
@@ -202,6 +203,7 @@ ops::DenseMatrix DSparkProgram::matrix(const Model::Matrix& m) const {
 
 void DSparkProgram::extend(std::span<const Tensor> taps, std::int32_t n) {
     const DSparkConfig& c = config_;
+    wait_copy(); // its ring writes after a save_async copy that may still read them
     if (taps.size() != c.target_visits.size()) { throw std::invalid_argument("inkling2 dspark: one tap per target visit"); }
     if (n < 1 || n > max_chunk_ || position_ + n > max_context_) { throw std::invalid_argument("inkling2 dspark: bad extend size"); }
     const std::int32_t h = i32(c.hidden_size), kv = i32(std::size_t(c.kv_heads) * c.head_dim), r = i32(c.markov_rank);
@@ -395,6 +397,19 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
     return drafts;
 }
 
+// The byte runs of a windowed ring that hold positions [max(0, position - capacity), position), the only ones
+// dspark_block_attention reads (every slot is position mod capacity): a snapshot copies those, at their own offsets.
+template <class F> void DSparkProgram::ring_rows(const Tensor& ring, F&& f) const {
+    const std::int64_t capacity = ring.ne[1];
+    const std::int64_t first    = std::max<std::int64_t>(0, position_ - capacity);
+    const auto column           = static_cast<std::size_t>(ring.nb[1]);
+    for (std::int64_t p = first; p < position_;) {
+        const std::int64_t slot = p % capacity, run = std::min(position_ - p, capacity - slot);
+        f(static_cast<std::size_t>(slot) * column, static_cast<std::size_t>(run) * column);
+        p += run;
+    }
+}
+
 std::size_t DSparkProgram::snapshot_bytes() const {
     std::size_t total = joint_in_.bytes();
     for (std::size_t i = 0; i < layers_.size(); ++i) {
@@ -403,16 +418,73 @@ std::size_t DSparkProgram::snapshot_bytes() const {
     return total;
 }
 
-void DSparkProgram::save(Snapshot& snapshot) const {
-    if (snapshot.memory.bytes < snapshot_bytes()) { throw std::invalid_argument("dspark: the snapshot is too small"); }
-    auto* out = static_cast<std::byte*>(snapshot.memory.p);
+DSparkProgram::~DSparkProgram() {
+    // A copy may still run after wait_copy() (a stream wait) cleared copy_pending_: it reads this Program's buffers.
+    if (copy_done_ != nullptr) { (void)cudaEventSynchronize(copy_done_); }
+    for (cudaEvent_t e : {state_ready_, copy_done_}) {
+        if (e != nullptr) { cudaEventDestroy(e); }
+    }
+}
+
+void DSparkProgram::wait_copy() {
+    if (!copy_pending_) { return; }
+    if (cudaEventQuery(copy_done_) != cudaSuccess) { cuda(cudaStreamWaitEvent(stream_, copy_done_, 0), "snapshot copy wait"); }
+    copy_pending_ = false;
+}
+
+void DSparkProgram::save_async(Snapshot& snapshot, cudaStream_t copy) {
+    if (snapshot.memory.size() < snapshot_bytes()) { throw std::invalid_argument("dspark: the snapshot is too small"); }
+    // The staging and the descriptors below are the previous copy's until it has completed.
+    if (copy_done_ != nullptr) { cuda(cudaEventSynchronize(copy_done_), "snapshot copy"); }
+    copy_pending_ = false;
+    if (copy_done_ == nullptr) {
+        cuda(cudaEventCreateWithFlags(&state_ready_, cudaEventDisableTiming), "event");
+        cuda(cudaEventCreateWithFlags(&copy_done_, cudaEventDisableTiming), "event");
+    }
+    // draft() rewrites the anchor context: staged in stream order. Only extend() writes the rings.
+    if (joint_stage_.bytes < joint_in_.bytes()) { joint_stage_ = DeviceBuffer(joint_in_.bytes()); }
+    cuda(cudaMemcpyAsync(joint_stage_.p, joint_in_.data, joint_in_.bytes(), cudaMemcpyDeviceToDevice, stream_), "anchor staging");
+    cuda(cudaEventRecord(state_ready_, stream_), "record");
+    cuda(cudaStreamWaitEvent(copy, state_ready_, 0), "wait");
+    // By one paced copy kernel (as TextProgram::save_async), in pieces of at most 256 KiB, their list in pinned memory
+    // that the kernel reads until it completes.
+    require_identity_mapped(snapshot.memory.data()); // the copy kernel writes it by its host address
+    auto* out = static_cast<std::byte*>(snapshot.memory.data());
+    std::vector<GatherCopy> copies;
+    const auto add = [&](void* to, const void* from, std::size_t bytes) {
+        const std::size_t row = bytes % 2048 == 0 ? 2048 : bytes;
+        copies.push_back({to, from, row, row, row, bytes / row});
+    };
+    add(out, joint_stage_.p, joint_in_.bytes());
+    out += joint_in_.bytes();
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        if (window_[i] == 0) { continue; }
+        for (const Tensor* t : {&layers_[i].k_ring, &layers_[i].v_ring}) {
+            ring_rows(*t, [&](std::size_t at, std::size_t bytes) { add(out + at, static_cast<const std::byte*>(t->data) + at, bytes); });
+            out += t->bytes();
+        }
+    }
+    split_gather_copies(copies, 256U << 10);
+    if (copy_descriptors_.size() < copies.size() * sizeof(GatherCopy)) { copy_descriptors_ = PinnedHostBuffer(copies.size() * sizeof(GatherCopy)); }
+    auto* descriptors = static_cast<GatherCopy*>(copy_descriptors_.data());
+    std::copy(copies.begin(), copies.end(), descriptors);
+    gather_copies_paced(std::span<const GatherCopy>(descriptors, copies.size()), GatherPace{}, copy);
+    cuda(cudaEventRecord(copy_done_, copy), "record");
+    copy_pending_     = true;
+    snapshot.position = position_;
+}
+
+void DSparkProgram::save(Snapshot& snapshot) {
+    if (snapshot.memory.size() < snapshot_bytes()) { throw std::invalid_argument("dspark: the snapshot is too small"); }
+    wait_copy();
+    auto* out = static_cast<std::byte*>(snapshot.memory.data());
     CopyBatch copies(stream_);
     copies.add(out, joint_in_.data, joint_in_.bytes());
     out += joint_in_.bytes();
     for (std::size_t i = 0; i < layers_.size(); ++i) {
         if (window_[i] == 0) { continue; }
         for (const Tensor* t : {&layers_[i].k_ring, &layers_[i].v_ring}) {
-            copies.add(out, t->data, t->bytes());
+            ring_rows(*t, [&](std::size_t at, std::size_t bytes) { copies.add(out + at, static_cast<const std::byte*>(t->data) + at, bytes); });
             out += t->bytes();
         }
     }
@@ -422,19 +494,20 @@ void DSparkProgram::save(Snapshot& snapshot) const {
 
 void DSparkProgram::restore(const Snapshot& snapshot) {
     if (snapshot.position < 0) { throw std::invalid_argument("dspark: an empty snapshot"); }
-    const auto* in = static_cast<const std::byte*>(snapshot.memory.p);
+    wait_copy();
+    position_      = snapshot.position; // ring_rows: the snapshot's positions
+    const auto* in = static_cast<const std::byte*>(snapshot.memory.data());
     CopyBatch copies(stream_);
     copies.add(joint_in_.data, in, joint_in_.bytes());
     in += joint_in_.bytes();
     for (std::size_t i = 0; i < layers_.size(); ++i) {
         if (window_[i] == 0) { continue; }
         for (const Tensor* t : {&layers_[i].k_ring, &layers_[i].v_ring}) {
-            copies.add(t->data, in, t->bytes());
+            ring_rows(*t, [&](std::size_t at, std::size_t bytes) { copies.add(static_cast<std::byte*>(t->data) + at, in + at, bytes); });
             in += t->bytes();
         }
     }
     copies.flush();
-    position_ = snapshot.position;
 }
 
 } // namespace ninfer::models::inkling2

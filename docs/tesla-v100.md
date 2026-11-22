@@ -39,7 +39,7 @@ drafted tokens are accepted, which depends on the text, not on the context lengt
 | **Decode**, one stream, DSpark | **up to 120.7 tok/s** (maths prompt); 93.4-94.4 average over 12 chats |
 | **Decode**, plain | 78.5-78.8 tok/s; 48 tok/s at 100K context |
 | **Decode**, `--max-concurrency 8` | **198.2 tok/s** aggregate (plain) |
-| **Prefill** | **1,930 tok/s** at 8K (131,072 context, chunk 2048); 1,629 at 1K, 1,244 at 100K. At 262,144 with DSpark and vision: 786 at 8K (default chunk 256), 1,869 with `--prefill-chunk 2048` |
+| **Prefill** | **1,930 tok/s** at 8K (131,072 context, chunk 2048); 1,629 at 1K, 1,244 at 100K. At 262,144 with DSpark and vision (chunk 2048 by default): 1,868 at 8K, 1,671 at 1K, 1,219 at 100K |
 | **Load** | 9.2-14.2 s |
 
 ## What you need
