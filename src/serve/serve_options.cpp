@@ -415,7 +415,7 @@ std::string serve_usage_text(const char* argv0) {
            "could be verified (the same output; off by default: every round drafts --draft-tokens); "
            "--mtp-sampled-drafts (--spec mtp) draws a sampled request's drafts under the uniforms its "
            "sampler uses next and keeps them while they equal the target's own draws, so it emits the "
-           "tokens plain sampling emits under the same seed (greedy requests unchanged; off by default: "
+           "tokens plain sampling emits under the same seed (greedy requests unchanged; slower: fewer drafts are accepted; off by default: "
            "argmax drafts and the rejection rule, the same distribution); "
            "--mtp-rows-verify "
            "(needs --mtp-joint-acceptance) batches a genuine draft-and-verify across every eligible row "

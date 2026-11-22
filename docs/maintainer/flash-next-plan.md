@@ -696,6 +696,13 @@ None has been measured on the RTX 3090 yet.
     top-k 20, presence penalty 1.0, fixed seeds) emitted the same text with the option as with
     plain decoding (no `--spec`). `ninfer_qwen4_exp_engine_real_test --mtp-exact 3
     --mtp-sampled-drafts --sampled 0.6 TOKENS` is the test-binary form (not run).
+  - Speed (Tesla V100, same flags as the router's Flash-Next section at 32K context, ABBA, eight
+    prompts, warm pass): off 87.2 / 87.3 tok/s, on 74.5 / 79.1 tok/s. Acceptance fell from 69.8% to
+    64.7% (2.26 to 2.05 tokens per verification round); time per round was unchanged (25.9 against
+    25.8 ms), so the loss is acceptance alone: the rejection rule keeps an argmax draft with chance
+    p(draft), which beats the chance that two coupled draws from the drafter's and the target's
+    distributions agree. Off by default for that reason; its use is seed-reproducible sampled
+    output. Not run on an RTX 3090 (the same acceptance argument applies: expect a loss there too).
 - **N-gram prefetch for the anchor column** (`--ngram-prefetch`, needs `--spec mtp`). Verification's
   `upload_rows` reads W columns of rows (`program/ngram_rows.h`, `ngram_window_rows`) after the front
   half of the verify forward is enqueued; the volume reads are the host's critical path when the rows
