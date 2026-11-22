@@ -365,6 +365,7 @@ struct ForwardCheckpoint::Impl {
     DeviceBuffer state;
     EngramHasher::History engram_history;
     std::int32_t position = 0;
+    const void* owner     = nullptr; // the Forward that captured it
 };
 
 ForwardCheckpoint::ForwardCheckpoint() noexcept                               = default;
@@ -385,11 +386,12 @@ void Forward::capture(ForwardCheckpoint& into) {
     s.state.capture(c.state.p, s.stream);
     c.engram_history = s.engram_history;
     c.position       = s.position;
+    c.owner          = &s;
 }
 
 void Forward::restore(const ForwardCheckpoint& from) {
     Impl& s = *impl_;
-    if (!from.impl_ || from.impl_->state.bytes != s.state.checkpoint_bytes() || from.impl_->position < 1) {
+    if (!from.impl_ || from.impl_->state.bytes != s.state.checkpoint_bytes() || from.impl_->position < 1 || from.impl_->owner != &s) {
         throw std::invalid_argument("dsv4 forward: restore of an empty or foreign checkpoint");
     }
     s.state.restore(from.impl_->state.p, s.stream);

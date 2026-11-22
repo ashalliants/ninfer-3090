@@ -236,6 +236,7 @@ void Program::require_sequence(SequenceHandle sequence) const {
 }
 
 void Program::release_lane() noexcept {
+    if (lane_.base && !lane_.base->reuse) { drop_held(); } // an opt-out request leaves nothing for a later one
     lane_ = Lane{};
     ++epoch_; // handles to the released request go stale
     binding_ = false;

@@ -190,6 +190,11 @@ int main() {
         check(scratch.reused_prompt_tokens == 0 && scratch.computed_prefill_tokens == scratch.prompt.prompt_tokens, "a request that opts out prefills everything");
         check(scratch.generated_token_ids == turn2.generated_token_ids, "the second turn answers as the same turn from scratch does");
         check(turn2.computed_prefill_tokens < scratch.computed_prefill_tokens, "reuse prefilled fewer tokens");
+
+        // A request that opted out leaves nothing behind: the next one that allows reuse starts from scratch.
+        const GenerationResult after_opt_out = engine.generate(engine.prepare(conversation(second)), request(2, true, true));
+        show("turn 2 after an opt-out request (reuse on)", after_opt_out);
+        check(after_opt_out.reused_prompt_tokens == 0, "an opt-out request's state is not reused");
     }
     std::printf(failures == 0 ? "PASS\n" : "FAILED\n");
     return failures == 0 ? 0 : 1;
