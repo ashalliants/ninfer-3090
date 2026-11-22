@@ -240,10 +240,14 @@ int main() {
             std::vector<ninfer::Tensor> taps;
             for (std::size_t i = 0; i < dc.target_visits.size(); ++i) { taps.push_back(target.tap(i)); }
             drafter.extend(taps, static_cast<std::int32_t>(prompt.size()));
-            ink::TextProgram::Snapshot target_snapshot{ninfer::DeviceBuffer(target.snapshot_bytes())};
-            ink::DSparkProgram::Snapshot drafter_snapshot{ninfer::DeviceBuffer(drafter.snapshot_bytes())};
-            target.save(target_snapshot);
-            drafter.save(drafter_snapshot);
+            // In pinned host memory, copied on their own stream (save_async) while the draft and the forwards below run:
+            // those that write what the copy reads wait for it.
+            ink::TextProgram::Snapshot target_snapshot{ninfer::PinnedHostBuffer(target.snapshot_bytes())};
+            ink::DSparkProgram::Snapshot drafter_snapshot{ninfer::PinnedHostBuffer(drafter.snapshot_bytes())};
+            cudaStream_t copy_stream = nullptr;
+            if (cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking) != cudaSuccess) { throw std::runtime_error("copy stream"); }
+            drafter.save_async(drafter_snapshot, copy_stream);
+            target.save_async(target_snapshot, copy_stream);
             const auto drafts_before = drafter.draft(anchor, block - 1);
             const std::int32_t one[] = {anchor};
             const auto next_before   = greedy(target.forward(one), vocab, ids, stream).back();
@@ -258,6 +262,8 @@ int main() {
             const auto drafts_after = drafter.draft(anchor, block - 1);
             const auto next_after   = greedy(target.forward(one), vocab, ids, stream).back();
             const bool same = drafts_after == drafts_before && next_after == next_before && target.position() == static_cast<std::int64_t>(prompt.size()) + 1;
+            cudaStreamSynchronize(copy_stream);
+            cudaStreamDestroy(copy_stream);
             std::printf("snapshot restore: %s\n", same ? "the same drafts and next token" : "DIFFERENT");
             if (!same) { ++failures; }
         }

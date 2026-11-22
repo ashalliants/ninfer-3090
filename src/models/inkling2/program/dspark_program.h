@@ -39,6 +39,7 @@ public:
     // The workspace extend() (of up to max_chunk positions) and draft() take.
     [[nodiscard]] static std::size_t workspace_bytes(const Model& model, std::int32_t max_chunk);
     [[nodiscard]] std::int32_t max_chunk() const noexcept { return max_chunk_; }
+    ~DSparkProgram();
     DSparkProgram(const DSparkProgram&)            = delete;
     DSparkProgram& operator=(const DSparkProgram&) = delete;
 
@@ -47,12 +48,16 @@ public:
     // The drafter's state at position() (prefix reuse, as TextProgram::Snapshot): its rings (the sliding layers', and the
     // global layers' under a global_window) and the anchor context. Unwindowed global rings are indexed by position and
     // not copied.
+    // In pinned host memory, as TextProgram::Snapshot.
     struct Snapshot {
-        DeviceBuffer memory;        // snapshot_bytes()
+        PinnedHostBuffer memory;    // snapshot_bytes()
         std::int64_t position = -1; // -1: holds nothing
     };
     [[nodiscard]] std::size_t snapshot_bytes() const;
-    void save(Snapshot& snapshot) const;
+    void save(Snapshot& snapshot);
+    // As TextProgram::save_async: the anchor context staged on the device in stream order, then the copy on `copy`
+    // while this Program's stream goes on; extend() (which writes the rings), restore() and the next save wait for it.
+    void save_async(Snapshot& snapshot, cudaStream_t copy);
     void restore(const Snapshot& snapshot);
     // Target positions committed so far; the next anchor sits here.
     [[nodiscard]] std::int64_t position() const noexcept { return position_; }
@@ -96,6 +101,13 @@ private:
     Tensor probs_;      // FP32 [block]: the drafter's probability of each draft (picked drafts)
     Tensor draws_;      // FP64 [block] (as I32 [2 * block]): a sampled round's uniforms
     std::int64_t position_ = 0;
+    // save_async: the anchor context's staging, the copy's events, whether it may still be reading.
+    DeviceBuffer joint_stage_;
+    PinnedHostBuffer copy_descriptors_; // the copy kernel's GatherCopy list (host_gather.h)
+    cudaEvent_t state_ready_ = nullptr, copy_done_ = nullptr;
+    bool copy_pending_ = false;
+    void wait_copy();
+    template <class F> void ring_rows(const Tensor& ring, F&& f) const;
     // The drafter's compact forms (lossy; they change only drafts): P = W_head W_o as Q8, and the head as Q8 (the
     // target's re-encoded head when it has one, else the drafter's own copy in head_memory_).
     ops::MarkovHead markov_{};

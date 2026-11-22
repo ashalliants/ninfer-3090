@@ -122,8 +122,9 @@ calls (`parallel_tool_calls` honoured), reasoning and thinking budgets, stop str
   draws the tokens plain sampling draws under the same seed. Both held on every DSpark request measured below.
 - **Several requests at once:** `--max-concurrency N` (2 to 8) decodes up to N requests together. Each request's
   tokens are its one-at-a-time tokens. At N > 1 requests decode without DSpark, and `--lora`/`--graft` are refused.
-- **Prefix reuse** is on by default. A prompt that starts with the same tokens and images resumes from a kept
-  device snapshot (one per request slot), and the result reports `reused_prompt_tokens`.
+- **Prefix reuse** is on by default. A prompt that starts with the same tokens and images resumes from a snapshot
+  kept in pinned host memory (one per request slot: 236 MiB with DSpark, 163 MiB per slot at `--max-concurrency N`),
+  and the result reports `reused_prompt_tokens`. A chat's second turn at 8K answers in 1.10 s instead of 4.26 s.
 - **Opt-in uncensoring adapters:** `--lora NAME=DIR` loads the
   [OpenUncensored](https://huggingface.co/OpenUncensored/Inkling-2-Mini-Uncensored) LoRA and `--graft NAME=FILE`
   the [satellitedown](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine) per-visit ablation.
@@ -151,9 +152,10 @@ clean run first, then the typical range across repeated or ABBA legs.
 | **Decode, plain** | **78.8 tok/s** | the 12 chats, greedy | 78.2-78.8 |
 | **Batched decode, aggregate** | **198.2 tok/s** | `--max-concurrency 8`, 8 greedy chats of 256 tokens at once, prefill included | 196.8-198.2 at N = 8 (26.4 tok/s each); 170.5 at N = 4, 121.8 at N = 2 |
 | **Prefill** | **1,930 tok/s** | 7,979-token prompt, TTFT 4.1 s, `--max-context 131072` (chunk 2048, picked by the engine) | 1,629 at 1,098 tokens (TTFT 0.67 s), 1,896 at 9,798 (5.2 s), 1,244 at 100,107 (80.5 s); with DSpark and vision on, 1-4% lower (1,900 at 7,979) |
-| **Prefill at 262,144** | **1,869 tok/s** | 7,979-token prompt, TTFT 4.3 s, `--max-context 262144 --spec dspark --vision` with both adapters loaded, `--prefill-chunk 2048` (2026-11-22, branch `perf/inkling2-prefill-fit-256k`) | 1,579 at 1,098 (0.70 s), 1,619 at 34,701 (21.4 s), 1,219 at 100,107 (82.1 s). Without `--prefill-chunk` the engine picks chunk 256 at this context (2048 leaves 64 MiB, under its 256 MiB spare): 699-703, 782-786, 739-743 and 629-632 tok/s |
+| **Prefill at 262,144** | **1,868 tok/s** | 7,979-token prompt, TTFT 4.27 s, `--max-context 262144 --spec dspark --vision` with both adapters loaded, the default chunk 2048 (2026-11-22, branch `perf/inkling2-host-snapshots`) | 1,566-1,671 at 1,098 (0.66-0.70 s), 1,613 at 34,701 (21.5 s), 1,219 at 100,107 (82.1 s). Before the prefix-reuse snapshot moved to host memory the engine picked chunk 256 here: 699-703, 782-786, 739-743 and 629-632 tok/s |
+| **Second turn of a chat** | **TTFT 1.10 s** | 7,977-token prompt, 6,144 positions resumed from the first turn's snapshot, same server | 4.26 s cold; 1.51 s against 21.4 s at 34,699 tokens; the same output as cold |
 | **Decode at long context** | **91.2 tok/s** | DSpark, 128 tokens after a 7,979-token prompt (summarize it) | DSpark 84.9-91.2 at 8K and 88.0-89.8 at 10K; plain 71.5 at 8K and 48.1 at 100K (DSpark 47.4-48.0 there) |
-| **Image prompt** | **TTFT 382 ms** | 230-token prompt (llama.cpp's 640 x 488 `test-1.jpeg`, correctly described), vision encode and prefill, `--vision --spec dspark` | 382-425 ms; then 105 tok/s decode |
+| **Image prompt** | **TTFT 375 ms** | 230-token prompt (llama.cpp's 640 x 488 `test-1.jpeg`, correctly described), vision encode and prefill, `--vision --spec dspark` at 262,144 | 375-398 ms (382-425 at 131,072); then 100-105 tok/s decode |
 | **Load** | **9.2 s** | engine ready, plain server | 9.2-14.2 s over 23 starts; weights read at 1.7-2.5 GiB/s |
 | **Context** | **262,144 tokens** | with DSpark and vision on | |
 

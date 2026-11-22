@@ -276,8 +276,14 @@ int main() {
                 const auto cols = logit_columns(logits, vocab);
                 return static_cast<std::int32_t>(argmax(cols.back().data(), static_cast<std::size_t>(vocab)));
             };
+            // The cold prefill also saves its first chunk's state with save_async on its own stream, and goes on at once:
+            // its next forwards race the copy (they write the ring slots it reads), resumed from below.
+            ink::TextProgram::Snapshot raced;
+            raced.memory = ninfer::PinnedHostBuffer(prog.snapshot_bytes());
+            cudaStream_t copy_stream = nullptr;
+            if (cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking) != cudaSuccess) { throw std::runtime_error("copy stream"); }
             // The prefill from position `from` (0 or a snapshot's), hashing each chunk's logits and taps.
-            const auto prefill = [&](std::int32_t from, std::vector<std::uint64_t>& per_chunk) {
+            const auto prefill = [&](std::int32_t from, std::vector<std::uint64_t>& per_chunk, bool race = false) {
                 ninfer::Tensor logits;
                 for (std::int32_t s = from; s < tokens; s += chunk) {
                     const std::int32_t len = std::min(chunk, tokens - s);
@@ -290,12 +296,13 @@ int main() {
                     std::uint64_t hc = fnv(kSeed, to_host(logits));
                     for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) { hc = fnv(hc, to_host(prog.tap(i))); }
                     per_chunk.push_back(hc);
+                    if (race && s + len == chunk && len < tokens) { prog.save_async(raced, copy_stream); }
                 }
                 return logits;
             };
             std::vector<std::uint64_t> cold;
             prog.reset();
-            ninfer::Tensor logits = prefill(0, cold);
+            ninfer::Tensor logits = prefill(0, cold, true);
             std::uint64_t all = kSeed;
             for (std::size_t i = 0; i < cold.size(); ++i) {
                 std::printf("layout hash chunk %zu: %016llx\n", i, static_cast<unsigned long long>(cold[i]));
@@ -328,8 +335,16 @@ int main() {
             }
             std::printf("layout hash verify and 8 steps: %016llx\n", static_cast<unsigned long long>(verify));
             if (tokens > chunk) {
+                // The raced copy, restored after the cold run's decode and verification wrote over its source.
+                std::vector<std::uint64_t> resumed_raced;
+                prog.restore(raced);
+                (void)prefill(chunk, resumed_raced);
+                bool raced_same = resumed_raced.size() + 1 == cold.size();
+                for (std::size_t i = 0; raced_same && i < resumed_raced.size(); ++i) { raced_same = resumed_raced[i] == cold[i + 1]; }
+                check(raced_same, "layout hash: a prefill resumed from the save_async snapshot (raced by the cold run) differs from the cold one");
+                std::printf("layout hash resume from the raced save_async copy: %s\n", raced_same ? "equal to cold" : "DIFFERS");
                 ink::TextProgram::Snapshot snap;
-                snap.memory = ninfer::DeviceBuffer(prog.snapshot_bytes());
+                snap.memory = ninfer::PinnedHostBuffer(prog.snapshot_bytes());
                 prog.reset();
                 std::vector<ink::InputEmbeddings> inputs{{100, emb.slice(1, 0, std::min(200, chunk - 100))}};
                 (void)prog.forward(std::span(ids).subspan(0, static_cast<std::size_t>(chunk)), chunk > 100 ? inputs : std::vector<ink::InputEmbeddings>{});
@@ -346,6 +361,8 @@ int main() {
                 check(same, "layout hash: a prefill resumed from the first chunk's snapshot differs from the cold one");
                 std::printf("layout hash resume from the first chunk: %s\n", same ? "equal to cold" : "DIFFERS");
             }
+            cudaStreamSynchronize(copy_stream);
+            cudaStreamDestroy(copy_stream);
             std::printf("layout hash (chunk %d, %d tokens, %s, workspace %.1f of %.1f MiB): prefill %016llx decode %016llx verify %016llx\n",
                         chunk, tokens, fp32 ? "FP32" : "FP16 rings, tensor cores", prog.workspace().peak_used() / 1048576.0,
                         prog.workspace().capacity() / 1048576.0, static_cast<unsigned long long>(all), static_cast<unsigned long long>(decode),
