@@ -51,3 +51,8 @@ ninfer_add_op_test(ninfer_inkling2_adapters_test
 ninfer_add_op_test(ninfer_inkling2_engine_batch_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_batch.cpp"
   LIBRARIES ninfer_engine ninfer_core)
+# The opt-in low-bit global KV rings: the specs code only global visits, the defaults none, and the ring bytes at
+# 262,144 the fit plans with (no GPU; skips without the artifact).
+ninfer_add_op_test(ninfer_inkling2_lowbit_kv_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lowbit_kv.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)

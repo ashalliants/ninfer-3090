@@ -40,6 +40,7 @@ drafted tokens are accepted, which depends on the text, not on the context lengt
 | **Decode**, plain | 78.5-78.8 tok/s; 48 tok/s at 100K context |
 | **Decode**, `--max-concurrency 8` | **198.2 tok/s** aggregate (plain) |
 | **Prefill** | **1,930 tok/s** at 8K (131,072 context, chunk 2048); 1,629 at 1K, 1,244 at 100K. At 262,144 with DSpark and vision (chunk 2048 by default): 1,868 at 8K, 1,671 at 1K, 1,219 at 100K |
+| **Low-bit KV** (`--kv-dtype rk4v4`, opt-in, lossy) | plain decode **41.1 tok/s at 200K** (FP16 34.8), 53.2 at 100K (47.8); frees 5,952 MiB at 262,144; KLD 2.8x the FP32 floor (`int8`: 1.06x, 40.7 tok/s) |
 | **Load** | 9.2-14.2 s |
 
 ## What you need

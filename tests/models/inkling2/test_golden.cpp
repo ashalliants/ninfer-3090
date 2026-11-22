@@ -26,6 +26,7 @@
 #include "models/inkling2/program/text_program.h"
 #include "ninfer/ops/tensor_core_fp32.h"
 
+#include <thread>
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
@@ -544,6 +545,86 @@ int main() {
             }
             return 0;
         }
+        if (const char* kvq_ids = std::getenv("NINFER_INKLING2_KVQ_KLD"); kvq_ids != nullptr) {
+            // The low-bit KV trial: KLD(FP16 rings || variant), teacher-forced over the text in chunks of
+            // NINFER_INKLING2_KVQ_CHUNK (256), FP32 math. NINFER_INKLING2_KVQ_VARIANTS: ';'-separated parse_kv_quant specs, or
+            // "fp32" (FP32 rings: the noise floor), all run in lockstep with the reference.
+            const auto text_ids = read_ids(kvq_ids);
+            const std::int32_t chunk = std::getenv("NINFER_INKLING2_KVQ_CHUNK") ? std::atoi(std::getenv("NINFER_INKLING2_KVQ_CHUNK")) : 256;
+            std::int32_t n = static_cast<std::int32_t>(text_ids.size());
+            if (const char* t = std::getenv("NINFER_INKLING2_KVQ_TOKENS"); t != nullptr) { n = std::min(n, std::atoi(t)); }
+            const std::string all_specs = std::getenv("NINFER_INKLING2_KVQ_VARIANTS") ? std::getenv("NINFER_INKLING2_KVQ_VARIANTS") : "k4v4";
+            std::vector<std::string> specs;
+            for (std::size_t from = 0; from <= all_specs.size();) {
+                std::size_t to = all_specs.find(';', from);
+                if (to == std::string::npos) { to = all_specs.size(); }
+                if (to > from) { specs.push_back(all_specs.substr(from, to - from)); }
+                from = to + 1;
+            }
+            ink::ProgramLimits base{n + chunk, chunk};
+            base.decode_graph = false;
+            base.kv_fp16 = true;
+            ink::TextProgram ref(*model, base, stream);
+            std::vector<std::unique_ptr<ink::TextProgram>> variants;
+            for (const auto& spec : specs) {
+                ink::ProgramLimits l = base;
+                if (spec == "fp32") {
+                    l.kv_fp16 = false;
+                } else {
+                    ink::parse_kv_quant(model->config(), spec, l);
+                }
+                variants.push_back(std::make_unique<ink::TextProgram>(*model, l, stream));
+            }
+            const unsigned workers = std::max(1U, std::min(16U, std::thread::hardware_concurrency()));
+            std::vector<std::vector<double>> klds(specs.size());
+            std::vector<std::vector<int>> agrees(specs.size());
+            const auto t0 = std::chrono::steady_clock::now();
+            for (std::int32_t s = 0; s < n;) {
+                const std::int32_t len = std::min(chunk, n - s);
+                const auto ids = std::span(text_ids).subspan(static_cast<std::size_t>(s), static_cast<std::size_t>(len));
+                const auto a = to_host(ref.forward(ids));
+                const std::size_t rows = a.size() / static_cast<std::size_t>(len);
+                for (std::size_t vi = 0; vi < variants.size(); ++vi) {
+                    const auto b = to_host(variants[vi]->forward(ids));
+                    std::vector<double> part(static_cast<std::size_t>(len));
+                    std::vector<int> agree(static_cast<std::size_t>(len));
+                    std::vector<std::thread> pool;
+                    for (unsigned w = 0; w < workers; ++w) {
+                        pool.emplace_back([&, w] {
+                            for (std::int32_t t = static_cast<std::int32_t>(w); t < len; t += static_cast<std::int32_t>(workers)) {
+                                const float* x = a.data() + static_cast<std::size_t>(t) * rows;
+                                const float* y = b.data() + static_cast<std::size_t>(t) * rows;
+                                part[static_cast<std::size_t>(t)] = kld(x, y, vocab);
+                                agree[static_cast<std::size_t>(t)] = argmax(x, vocab) == argmax(y, vocab) ? 1 : 0;
+                            }
+                        });
+                    }
+                    for (auto& th : pool) { th.join(); }
+                    klds[vi].insert(klds[vi].end(), part.begin(), part.end());
+                    agrees[vi].insert(agrees[vi].end(), agree.begin(), agree.end());
+                }
+                s += len;
+                if ((s / chunk) % 20 == 0) {
+                    std::fprintf(stderr, "kvq kld: %d / %d tokens, %.0f s\n", s, n, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                }
+            }
+            const std::int32_t edges[] = {0, 1024, 4096, 16384, n};
+            for (std::size_t vi = 0; vi < specs.size(); ++vi) {
+                for (int e = -1; e < 4; ++e) {
+                    const std::int32_t lo = e < 0 ? 0 : edges[e], hi = e < 0 ? n : std::min(edges[e + 1], n);
+                    if (lo >= hi) { continue; }
+                    std::vector<double> part(klds[vi].begin() + lo, klds[vi].begin() + hi);
+                    double mean = 0;
+                    int agree = 0;
+                    for (std::int32_t i = lo; i < hi; ++i) { mean += klds[vi][static_cast<std::size_t>(i)], agree += agrees[vi][static_cast<std::size_t>(i)]; }
+                    std::sort(part.begin(), part.end());
+                    const auto count = static_cast<int>(part.size());
+                    std::printf("KVQ %-28s [%5d, %5d): KLD mean %.3e median %.3e p99 %.3e max %.3e; top-1 agrees %.2f%%\n", specs[vi].c_str(), lo, hi,
+                                mean / count, part[part.size() / 2], part[part.size() * 99 / 100], part.back(), 100.0 * agree / count);
+                }
+            }
+            return 0;
+        }
         // NINFER_INKLING2_TC_COUNT: the weight values the tensor-core route's FP16 row scaling does not carry exactly.
         if (std::getenv("NINFER_INKLING2_TC_COUNT") != nullptr) {
             const std::int32_t h = static_cast<std::int32_t>(c.hidden_size), heads = static_cast<std::int32_t>(c.heads), d = static_cast<std::int32_t>(c.head_dim);
@@ -602,6 +683,7 @@ int main() {
             if (std::getenv("NINFER_INKLING2_TC") != nullptr) { limits.prefill_tc = tc_parts(); }
             limits.kv_fp16     = std::getenv("NINFER_INKLING2_KV") != nullptr && std::string(std::getenv("NINFER_INKLING2_KV")) == "fp16";
             limits.last_logits = true;
+            if (const char* kvq = std::getenv("NINFER_INKLING2_KVQ"); kvq != nullptr) { ink::parse_kv_quant(model->config(), kvq, limits); }
             ink::TextProgram prog(*model, limits, stream);
             double seconds = 0;
             for (int pass = 0; pass < 2; ++pass) {
@@ -694,8 +776,10 @@ int main() {
             limits.kv_fp16 = std::getenv("NINFER_INKLING2_KV") != nullptr && std::string(std::getenv("NINFER_INKLING2_KV")) == "fp16";
             limits.last_logits = true;
             if (tc) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
+            const char* kvq = std::getenv("NINFER_INKLING2_KVQ");
+            if (kvq != nullptr) { ink::parse_kv_quant(model->config(), kvq, limits); }
             const std::string form = std::string(limits.split_attention ? "split attention" : "single-block attention") +
-                                     (limits.kv_fp16 ? ", FP16 KV" : ", FP32 KV") + (tc ? ", TC prefill" : "") + ", chunks of " +
+                                     (limits.kv_fp16 ? ", FP16 KV" : ", FP32 KV") + (kvq != nullptr ? std::string(", KVQ ") + kvq : std::string()) + (tc ? ", TC prefill" : "") + ", chunks of " +
                                      std::to_string(kChunk);
             ink::TextProgram bench(*model, limits, stream);
             for (const std::int32_t context : {1024, 16384, only > 0 ? only : n - kSteps - 1}) {

@@ -565,6 +565,159 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
     compare(label, std::vector<float>(got.begin() + static_cast<std::ptrdiff_t>(check_from) * qw, got.end()), want, 2e-6);
 }
 
+// Opt-in low-bit global rings (ops::kLowbitKeys4 ...; kb, vb the key and value bits): head_norms_fp32 appends the clipped
+// keys and unit-rms values coded into U8 rings and rotates the queries; the host decodes the rings (FP64 Hadamard),
+// checks the codes against an FP64 encoder and the round-trip error, then relative_bias_sink_attention over the rings
+// against the FP64 oracle on the unrotated queries and the decoded keys and values.
+void test_lowbit_rings(int n, int chunk, const std::string& label, bool device_start, bool split, bool tiled, int check_from, double tol,
+                       int kb = 4, int vb = 4) {
+    namespace ops = ninfer::ops;
+    // Its own random inputs: the tests after it draw the same numbers as without it.
+    struct KeepSeed {
+        std::uint32_t saved = seed_state;
+        ~KeepSeed() { seed_state = saved; }
+    } keep_seed;
+    seed_state = 0x5eed4b17U + static_cast<std::uint32_t>(n * 131 + chunk * 7 + kb * 3 + vb);
+    const int heads = 24, kvh = 8, d = 128, rel = 16, qw = heads * d, kvw = kvh * d, extent = 1024;
+    const float clip = 16.0F * std::sqrt(2.0F);
+    auto q = randoms(qw * n, -0.3F, 0.3F), r = randoms(heads * rel * n), sink = randoms(heads * n, -2, 2), table = randoms(extent * rel, -0.5, 0.5);
+    auto k = randoms(kvw * n, -2.5F, 2.5F), v = randoms(kvw * n);
+    for (int i = 0; i < kvw * n; i += 97) { k[i] *= 6.0F; } // a few outliers, and some heads past the clip
+    const int capacity = n;
+    const std::int64_t krow = kvh * ops::lowbit_key_bytes(kb), vrow = kvh * ops::lowbit_value_bytes(vb);
+    const int kcode = kb * 16, vcode = vb * 16; // code bytes per head
+    ninfer::DeviceBuffer kring(static_cast<std::size_t>(krow) * capacity), vring(static_cast<std::size_t>(vrow) * capacity), doff(8);
+    Tensor tk(kring.p, DType::U8, {static_cast<std::int32_t>(krow), capacity}), tv(vring.p, DType::U8, {static_cast<std::int32_t>(vrow), capacity});
+    Buf dq(q), dr(r), ds(sink), dk(k), dv(v), dt(table), out(static_cast<std::size_t>(qw * n));
+    const ops::RelativeBiasAttentionShape shape{heads, kvh, d, rel, 0};
+    const std::size_t split_bytes = split ? ops::relative_bias_attention_split_bytes(shape, chunk, capacity) : 0;
+    Buf ws(std::max<std::size_t>(split_bytes / 4, 1));
+    const Tensor split_ws = ws.tensor({static_cast<std::int32_t>(std::max<std::size_t>(split_bytes / 4, 1))});
+    ninfer::DeviceBuffer counters(std::size_t(ops::kSplitMaxColumns) * heads * 4);
+    counters.fill(0);
+    for (int s = 0; s < n; s += chunk) {
+        const int len = std::min(chunk, n - s);
+        const std::int64_t position = s;
+        if (device_start) { check(cudaMemcpy(doff.p, &position, 8, cudaMemcpyHostToDevice) == cudaSuccess, "offset upload"); }
+        const std::int64_t* off = device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr;
+        Tensor qt = dq.tensor({qw, n}).slice(1, s, len), kt = dk.tensor({kvw, n}).slice(1, s, len), vt = dv.tensor({kvw, n}).slice(1, s, len);
+        ops::KvAppend ka{&tk, device_start ? 0 : s, off}, va{&tv, device_start ? 0 : s, off};
+        ka.quant = kb == 4 ? ops::kLowbitKeys4 : ops::kLowbitKeys8, va.quant = vb == 4 ? ops::kLowbitValues4 : ops::kLowbitValues8;
+        ops::HeadNormJob jobs[3];
+        jobs[0].x = &qt, jobs[0].head_dim = d, jobs[0].threshold = 1e30F, jobs[0].rotate = true;
+        jobs[1].x = &kt, jobs[1].head_dim = d, jobs[1].threshold = clip, jobs[1].append = &ka;
+        jobs[2].x = &vt, jobs[2].head_dim = d, jobs[2].unit_rms = true, jobs[2].eps = 1e-6F, jobs[2].append = &va;
+        ops::head_norms_fp32(jobs, nullptr);
+        Tensor to = out.tensor({qw, n}).slice(1, s, len);
+        ops::relative_bias_sink_attention(shape, qt, dr.tensor({heads * rel, n}).slice(1, s, len), ds.tensor({heads, n}).slice(1, s, len), nullptr,
+                                          nullptr, dt.tensor({rel, extent}), tk, tv, device_start ? 0 : s, off, nullptr, to, nullptr,
+                                          split_bytes > 0 ? &split_ws : nullptr, split_bytes > 0 ? static_cast<std::int32_t*>(counters.p) : nullptr,
+                                          tiled);
+    }
+    check(cudaDeviceSynchronize() == cudaSuccess, label + ": launch");
+    // The normalized keys and values (in place), the rings, and an FP64 decode of them.
+    const auto kn = dk.get(static_cast<std::size_t>(kvw) * n), vn = dv.get(static_cast<std::size_t>(kvw) * n);
+    std::vector<unsigned char> kbytes(static_cast<std::size_t>(krow) * capacity), vbytes(static_cast<std::size_t>(vrow) * capacity);
+    check(cudaMemcpy(kbytes.data(), kring.p, kbytes.size(), cudaMemcpyDeviceToHost) == cudaSuccess &&
+              cudaMemcpy(vbytes.data(), vring.p, vbytes.size(), cudaMemcpyDeviceToHost) == cudaSuccess,
+          "ring download");
+    const auto hadamard = [](double* x) { // normalized Sylvester Hadamard-128, in place
+        for (int s = 1; s < 128; s <<= 1) {
+            for (int i = 0; i < 128; ++i) {
+                if ((i & s) == 0) { const double a = x[i], b = x[i + s]; x[i] = a + b, x[i + s] = a - b; }
+            }
+        }
+        for (int i = 0; i < 128; ++i) { x[i] /= std::sqrt(128.0); }
+    };
+    const auto half = [](const unsigned char* p) {
+        std::uint16_t h;
+        std::memcpy(&h, p, 2);
+        const int e = (h >> 10) & 31, m = h & 1023;
+        const double mag = e == 0 ? std::ldexp(m, -24) : std::ldexp(1024 + m, e - 25);
+        return (h & 0x8000) != 0 ? -mag : mag;
+    };
+    const double codes[8] = {6, 18, 31, 44, 58, 75, 96, 127};
+    const double bounds[7] = {0.25825, 0.52245, 0.79960, 1.09930, 1.43715, 1.84355, 2.40080};
+    Vec kd(static_cast<std::size_t>(kvw) * n), vd(kd.size());
+    double kerr = 0, knorm = 0, verr = 0, vnorm = 0;
+    std::int64_t agree = 0, total = 0;
+    for (int p = 0; p < n; ++p) {
+        for (int g = 0; g < kvh; ++g) {
+            const unsigned char* krp = kbytes.data() + static_cast<std::size_t>(p) * krow;
+            const unsigned char* vrp = vbytes.data() + static_cast<std::size_t>(p) * vrow;
+            double y[128], x[128];
+            for (int i = 0; i < 128; ++i) { x[i] = kn[(static_cast<std::size_t>(p) * kvh + g) * d + i]; }
+            std::copy(x, x + 128, y);
+            hadamard(y);
+            double dec[128];
+            for (int grp = 0; grp < 2; ++grp) {
+                double ss = 0;
+                for (int i = 64 * grp; i < 64 * grp + 64; ++i) { ss += y[i] * y[i]; }
+                const double rms = std::sqrt(ss / 64);
+                const double sc = half(krp + kvh * kcode + g * 4 + grp * 2);
+                double amax = 0;
+                for (int i = 64 * grp; i < 64 * grp + 64; ++i) { amax = std::max(amax, std::fabs(y[i])); }
+                for (int i = 64 * grp; i < 64 * grp + 64; ++i) {
+                    if (kb == 4) {
+                        const int nib = (krp[g * kcode + i / 2] >> (4 * (i & 1))) & 15;
+                        dec[i] = ((nib & 8) != 0 ? -1 : 1) * codes[nib & 7] * sc;
+                        int mag = 0;
+                        for (const double b : bounds) { mag += std::fabs(y[i]) / rms >= b ? 1 : 0; }
+                        agree += ((y[i] < 0 ? 8 : 0) | mag) == nib ? 1 : 0;
+                    } else {
+                        const int code = static_cast<std::int8_t>(krp[g * kcode + i]);
+                        dec[i] = code * sc;
+                        agree += std::abs(code - static_cast<int>(std::nearbyint(y[i] / sc))) <= 0 || std::fabs(std::fabs(y[i] / sc) - 127) < 1 ? 1 : 0;
+                        (void)amax;
+                    }
+                    ++total;
+                }
+            }
+            hadamard(dec);
+            for (int i = 0; i < 128; ++i) {
+                kd[(static_cast<std::size_t>(p) * kvh + g) * d + i] = dec[i];
+                kerr += (dec[i] - x[i]) * (dec[i] - x[i]), knorm += x[i] * x[i];
+                const double vx = vn[(static_cast<std::size_t>(p) * kvh + g) * d + i];
+                double vdec;
+                if (vb == 4) {
+                    const int nib = (vrp[g * vcode + i / 2] >> (4 * (i & 1))) & 15;
+                    vdec = (nib >= 8 ? nib - 16 : nib) * half(vrp + kvh * vcode + g * 8 + (i / 32) * 2);
+                } else {
+                    vdec = static_cast<std::int8_t>(vrp[g * vcode + i]) * half(vrp + kvh * vcode + g * 4 + (i / 64) * 2);
+                }
+                vd[(static_cast<std::size_t>(p) * kvh + g) * d + i] = vdec;
+                verr += (vdec - vx) * (vdec - vx), vnorm += vx * vx;
+            }
+        }
+    }
+    std::printf("%-44s key codes as the FP64 encoder %.4f%%; round trip rel RMS K %.4f V %.4f\n", label.c_str(), 100.0 * agree / total,
+                std::sqrt(kerr / knorm), std::sqrt(verr / vnorm));
+    check(agree >= total - total / 500, label + ": key codes differ from the FP64 encoder past boundary ties");
+    check(std::sqrt(kerr / knorm) < (kb == 4 ? 0.12 : 0.012) && std::sqrt(verr / vnorm) < (vb == 4 ? 0.12 : 0.012), label + ": round-trip error too large");
+    Vec want;
+    for (int p = check_from; p < n; ++p) {
+        std::vector<bool> visible(n);
+        Vec bias(static_cast<std::size_t>(heads) * n, 0.0);
+        for (int j = 0; j < n; ++j) {
+            visible[j] = j <= p;
+            for (int hh = 0; hh < heads; ++hh) {
+                const Vec rr(r.begin() + (p * heads + hh) * rel, r.begin() + (p * heads + hh + 1) * rel);
+                bias[hh * n + j] = ref::relative_bias(rr.data(), widen(table), rel, p - j);
+            }
+        }
+        const Vec o = ref::attention(Vec(q.begin() + p * qw, q.begin() + (p + 1) * qw), kd, vd, bias, Vec(sink.begin() + p * heads, sink.begin() + (p + 1) * heads),
+                                     visible, heads, kvh, d);
+        want.insert(want.end(), o.begin(), o.end());
+    }
+    const auto got = out.get(static_cast<std::size_t>(qw) * n);
+    compare(label, std::vector<float>(got.begin() + static_cast<std::ptrdiff_t>(check_from) * qw, got.end()), want, tol);
+    if (split_bytes > 0) {
+        std::vector<std::int32_t> left(std::size_t(ops::kSplitMaxColumns) * heads);
+        counters.copy_to_host(left.data(), left.size() * 4);
+        check(std::all_of(left.begin(), left.end(), [](std::int32_t c) { return c == 0; }), label + ": the split counters are not left zero");
+    }
+}
+
 // head_norms_fp32 with a KvAppend: x the bits of the plain call, and the ring slots (start + t) mod capacity
 // (wrapping) hold those columns.
 void test_head_norm_append() {
@@ -1780,6 +1933,16 @@ int main() {
         test_attention(4, 4, 40, 19, "attention local window 4 tiled, partial tiles", false, 0, false, true);
         test_attention(0, 64, 200, 1, "attention global, 200 keys with the split workspace: the single block (last 8)", true, 192, true);
         test_head_norm_append();
+        test_lowbit_rings(40, 40, "lowbit rings: 40 keys in one call (single block)", false, false, false, 0, 2e-5);
+        test_lowbit_rings(1300, 4, "lowbit rings: split, chunks of 4 (last 4)", false, true, false, 1296, 2e-5);
+        test_lowbit_rings(1300, 1, "lowbit rings: split, decode, device start (last 4)", true, true, false, 1296, 2e-5);
+        test_lowbit_rings(1100, 100, "lowbit rings: tensor cores, chunks of 100 (last 40)", false, false, true, 1060, 4e-3);
+        for (const auto [kb, vb] : {std::pair{8, 8}, std::pair{8, 4}, std::pair{4, 8}}) {
+            const std::string form = " k" + std::to_string(kb) + "v" + std::to_string(vb);
+            test_lowbit_rings(1300, 1, "lowbit rings" + form + ": split, decode, device start", true, true, false, 1296, 2e-5, kb, vb);
+            test_lowbit_rings(40, 40, "lowbit rings" + form + ": single block", false, false, false, 0, 2e-5, kb, vb);
+            test_lowbit_rings(1100, 100, "lowbit rings" + form + ": tensor cores (last 40)", false, false, true, 1060, 4e-3, kb, vb);
+        }
         test_kv_fp16();
         test_column_sequences();
         test_projection_inputs();

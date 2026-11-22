@@ -158,6 +158,7 @@ clean run first, then the typical range across repeated or ABBA legs.
 | **Image prompt** | **TTFT 375 ms** | 230-token prompt (llama.cpp's 640 x 488 `test-1.jpeg`, correctly described), vision encode and prefill, `--vision --spec dspark` at 262,144 | 375-398 ms (382-425 at 131,072); then 100-105 tok/s decode |
 | **Load** | **9.2 s** | engine ready, plain server | 9.2-14.2 s over 23 starts; weights read at 1.7-2.5 GiB/s |
 | **Context** | **262,144 tokens** | with DSpark and vision on | |
+| **Decode at 200K, low-bit KV** (opt-in, lossy) | **41.1 tok/s** | plain program decode at 204,800 context, `--kv-dtype rk4v4` (2026-11-22, branch `exp/inkling2-lowbit-kv`, A B C C B A against FP16 and `int8`) | FP16 34.8; `int8` 40.7. At 100K: 53.2 (`int8` 52.9) against 47.8. Prefill 5-8% slower past 100K |
 
 DSpark per prompt type (greedy, 300 tokens, two prompts each, ABBA against plain in one session; the output equals
 plain decode on every request):
@@ -210,6 +211,14 @@ Checked against CPU llama.cpp built from Unsloth's Inkling-2 pull request (`unsl
 - **Batched decode:** each request's tokens and logits are bit-identical to its one-at-a-time run (tested at 2, 4
   and 8 in flight).
 
+
+**Low-bit KV rings (opt-in, lossy).** `--kv-dtype int8 | rk8v4 | rk4v4` codes the 8 global KV rings in 8 or 4 bits
+(the sliding rings and the default stay FP16). Teacher-forced KLD from the FP16 rings over 30,840 tokens: `int8`
+3.66e-3 (p99 3.22e-2, top-1 97.62%), at the FP32-vs-FP16 noise floor of 3.46e-3; `rk8v4` 6.82e-3; `rk4v4` 9.71e-3
+(p99 7.92e-2, top-1 95.85%). Greedy text diverges from FP16 within a few hundred tokens, but the maths and code
+answers hold and needles at 100K and 200K are found. At 262,144 with DSpark and vision they free 3,968 (`int8`) to
+5,952 MiB (`rk4v4`), so DSpark keeps its Q8 head and whole-context window: 12 chats 92.8-93.4 tok/s against 89.4.
+One request at a time. See the [spec](https://github.com/ashalliants/ninfer-3090/blob/master/docs/maintainer/inkling2-model.md#low-bit-global-kv-rings-opt-in).
 ## License and credits
 
 Apache 2.0, as the base model. Model by [Thinking Machines](https://thinkingmachines.ai/); GGUF
