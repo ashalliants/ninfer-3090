@@ -708,9 +708,11 @@ constexpr int kFusedMaxEntries = 16; // NVFP4 calls up to here (T 1-2 at top 8) 
 
 // ---- One launch for an NVFP4 call's per-entry gate_up and down: entries * gate groups gate items, then the down
 // items, both entry-major so the first entries' down items can start first. Each item does its per-entry kernel's work
-// with the same arithmetic. A block takes the next item by ticket (an atomic in launch order), so every gate item is
-// held by a running block before any down item is taken: a down item can wait for its entry's gate items without
-// deadlock. It issues its weight loads first, then waits on its entry's ready count, so the down weights stream while
+// with the same arithmetic. The item is the block's ticket, not its index: a block that has started takes the next
+// ticket (an atomic, in whatever order blocks reach it), and tickets below entries * gate_groups are the gate items.
+// So when any block holds down ticket t, tickets 0 .. t - 1, every gate item among them, are held by blocks that have
+// already started; gate items never wait, so each finishes whatever else is resident, and a down item can wait for its
+// entry's gate items without deadlock. No order of block scheduling is assumed. It issues its weight loads first, then waits on its entry's ready count, so the down weights stream while
 // the gate items finish. sync[0] is the ticket and sync[1 + entry] the entry's finished gate items, zeroed by the
 // caller.
 template <int PG, int PD>
