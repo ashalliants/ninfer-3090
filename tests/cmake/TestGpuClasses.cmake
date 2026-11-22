@@ -39,6 +39,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_qwen3_5_inkling2_tokenizer_test
   ninfer_expert_tier_plan_test
   ninfer_dsv4_expert_tiers_test
+  ninfer_dsv4_expert_trace_replay_test
   ninfer_expert_extents_test
   ninfer_flash_next_perf_model_test
   ninfer_gdn_head_map_test

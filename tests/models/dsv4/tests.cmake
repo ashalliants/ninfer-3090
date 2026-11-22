@@ -51,3 +51,16 @@ set_tests_properties(ninfer_dsv4_frontend_real_test PROPERTIES SKIP_RETURN_CODE 
 ninfer_add_test(ninfer_dsv4_expert_tiers_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_tiers.cpp"
   LIBRARIES ninfer_core)
+
+# The expert tier policy replayed against an access sequence (a synthetic one, or NINFER_DSV4_TRACE=FILE written by
+# FileExpertSource's NINFER_DSV4_EXPERT_TRACE): hit rates per eviction policy and tier size. Host only.
+ninfer_add_test(ninfer_dsv4_expert_trace_replay_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_trace_replay.cpp"
+  LIBRARIES ninfer_core)
+
+# Records the routed-expert trace of real prompts for the replay above (needs NINFER_TEST_DSV4_ARTIFACT,
+# NINFER_DSV4_EXPERT_TRACE and NINFER_DSV4_PROMPTS; skips with 77).
+ninfer_add_test(ninfer_dsv4_expert_trace_record
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_trace_record.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_ops ninfer_core)
+set_tests_properties(ninfer_dsv4_expert_trace_record PROPERTIES SKIP_RETURN_CODE 77)

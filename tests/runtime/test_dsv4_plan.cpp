@@ -149,6 +149,14 @@ void memory_fits() {
     check(!refusal([&] { check_dsv4_device_fit(6'200'000'000ULL, 6ULL << 30); }).empty(), "the dense weights do not fit 6 GiB");
 }
 
+// The device tier of the expert records takes the free memory less the headroom, up to the cap.
+void expert_vram_sizing() {
+    check(dsv4_expert_vram_bytes(0) == 0, "no free memory, no device tier");
+    check(dsv4_expert_vram_bytes(kDsv4ExpertVramHeadroomBytes) == 0, "free memory equal to the headroom leaves nothing for the tier");
+    check(dsv4_expert_vram_bytes(kDsv4ExpertVramHeadroomBytes + (5ULL << 30)) == (5ULL << 30), "the tier takes what is free beyond the headroom");
+    check(dsv4_expert_vram_bytes(64ULL << 30) == kDsv4ExpertVramMaxBytes, "the tier is capped");
+}
+
 std::vector<float> row() { return {0.0F, 1.0F, 5.0F, 4.0F, -1.0F, 5.0F}; }
 
 void context_limit() {
@@ -254,6 +262,7 @@ int main() {
     options_defaults();
     options_refusals();
     memory_fits();
+    expert_vram_sizing();
     context_limit();
     greedy_selection();
     sampled_selection();
