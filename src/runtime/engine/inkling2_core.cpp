@@ -160,6 +160,11 @@ std::vector<std::uint64_t> prompt_keys(const ink::PreparedPrompt& prompt) {
     return keys;
 }
 
+// The sampler's one uniform draw per token, in [0, 1): sample() scales it by the kept mass, and DSpark's sampled
+// rounds read the same draws ahead off a copy of the generator. One explicit function, so the two consume the generator
+// identically on every standard library (std::uniform_real_distribution's algorithm is not specified).
+double sampler_uniform(std::mt19937_64& rng) { return std::generate_canonical<double, std::numeric_limits<double>::digits>(rng); }
+
 TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
                const std::unordered_map<TokenId, std::uint32_t>& counts, std::mt19937_64& rng) {
     if (p.presence_penalty != 0.0F || p.frequency_penalty != 0.0F) {
@@ -219,7 +224,7 @@ TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
         }
     }
     const double total = std::accumulate(prob.begin(), prob.begin() + static_cast<std::ptrdiff_t>(keep), 0.0);
-    double u           = std::uniform_real_distribution<double>(0.0, total)(rng);
+    double u           = sampler_uniform(rng) * total;
     for (std::size_t i = 0; i < keep; ++i) {
         if ((u -= prob[i]) < 0.0) { return ids[i]; }
     }
@@ -993,11 +998,11 @@ void Inkling2Core::run(Job& job) {
         if (round) {
             flush_held();
             if (sampled) {
-                // The uniforms the target's sampler draws for the next `drafts` tokens (std::uniform_real_distribution
-                // scales one generate_canonical per draw), read off a copy of its generator.
+                // The uniforms the target's sampler draws for the next `drafts` tokens (sampler_uniform, one a token),
+                // read off a copy of its generator: the live one advances only as tokens are emitted.
                 std::mt19937_64 ahead = rng;
                 uniforms.resize(static_cast<std::size_t>(drafts));
-                for (double& u : uniforms) { u = std::generate_canonical<double, std::numeric_limits<double>::digits>(ahead); }
+                for (double& u : uniforms) { u = sampler_uniform(ahead); }
             }
             drafted = drafter->draft(next, drafts, sampled ? &pick : nullptr, uniforms, draft_min_p > 0.0F ? &draft_probs : nullptr);
             if (draft_min_p > 0.0F) {
