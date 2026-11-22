@@ -68,8 +68,8 @@ int main(int argc, char** argv) {
     ::fstat(fd, &st);
     const std::uint64_t size   = static_cast<std::uint64_t>(st.st_size);
     const std::uint64_t record = (static_cast<std::uint64_t>(record_mb * 1e6) + 4095) / 4096 * 4096;
-    if (size <= record) {
-        std::fprintf(stderr, "the file (%llu bytes) must be larger than one record (%llu bytes)\n", static_cast<unsigned long long>(size), static_cast<unsigned long long>(record));
+    if (size < record + 4096) {
+        std::fprintf(stderr, "the file (%llu bytes) must hold one record and a page more (%llu bytes)\n", static_cast<unsigned long long>(size), static_cast<unsigned long long>(record));
         return 2;
     }
     if (mode == "random") { ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM); }
