@@ -24,6 +24,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -491,18 +492,70 @@ void test_argmax() {
           "argmax_fp32 reports a column with no finite maximum");
 }
 
+// FP64 values on the device.
+struct DeviceBufferD {
+    ninfer::DeviceBuffer b;
+    explicit DeviceBufferD(const std::vector<double>& v) : b(v.size() * 8) {
+        if (cudaMemcpy(b.p, v.data(), v.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess) { throw std::runtime_error("upload"); }
+    }
+    [[nodiscard]] const double* at(std::size_t j) const { return static_cast<const double*>(b.p) + j; }
+};
+
+// The host sampler's draw (Inkling2Core's sample(), without penalties) over the whole vocabulary, in FP64: the
+// candidates by logit descending and id ascending, top_k, min_p, top_p, then the inverse CDF at u * kept mass.
+std::pair<int, double> draw_oracle(const std::vector<float>& l, int valid, const ninfer::ops::DraftPick& p, double u) {
+    std::vector<int> ids(static_cast<std::size_t>(valid));
+    for (int i = 0; i < valid; ++i) { ids[static_cast<std::size_t>(i)] = i; }
+    const auto better = [&](int a, int b) { return l[a] > l[b] || (l[a] == l[b] && a < b); };
+    const auto k = static_cast<std::size_t>(std::clamp(p.top_k, 1, valid));
+    std::partial_sort(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(k), ids.end(), better);
+    ids.resize(k);
+    std::vector<double> w(k);
+    double sum = 0;
+    for (std::size_t i = 0; i < k; ++i) { sum += w[i] = std::exp((double(l[ids[i]]) - l[ids[0]]) / p.temperature); }
+    for (double& x : w) { x /= sum; }
+    std::size_t keep = k;
+    if (p.min_p > 0) {
+        while (keep > 1 && w[keep - 1] < p.min_p * w[0]) { --keep; }
+    }
+    if (p.top_p < 1) {
+        double mass = 0;
+        for (std::size_t i = 0; i < keep; ++i) {
+            if ((mass += w[i]) >= p.top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+    }
+    double total = 0;
+    for (std::size_t i = 0; i < keep; ++i) { total += w[i]; }
+    double x = u * total;
+    for (std::size_t i = 0; i < keep; ++i) {
+        if ((x -= w[i]) < 0) { return {ids[i], w[i] / total}; }
+    }
+    return {ids[keep - 1], w[keep - 1] / total};
+}
 
 void test_draft_pick() {
     const int rows = 201024, valid = 200058;
     // A softcapped column: noise in [-10, 10], 60 tokens in a band near the top and one far ahead of them, and a
-    // larger value in padding (ignored). The draft is argmax_fp32's token, with its softmax probability.
+    // larger value in padding (ignored).
     auto x = randoms(rows, -10, 10);
-    for (int i = 0; i < 60; ++i) { x[3 + 3331 * i] = 14.0F + 0.11F * static_cast<float>((i * 37) % 60); }
+    std::vector<int> band;
+    for (int i = 0; i < 60; ++i) {
+        const int id = 3 + 3331 * i;
+        x[id]        = 14.0F + 0.11F * static_cast<float>((i * 37) % 60);
+        band.push_back(id);
+    }
     x[777] = 22.0F;
     x[valid + 3] = 29.0F;
     Buf dx(x), id(4), prob(4);
+    std::vector<double> us;
+    for (int i = 0; i < 48; ++i) { us.push_back((i + 0.37) / 48.0); }
+    DeviceBufferD du(us);
     Tensor tx = dx.tensor({rows}), ti = id.tensor({1}, DType::I32), tp = prob.tensor({1});
-    ninfer::ops::dspark_draft_pick(tx, valid, ti, tp, nullptr);
+    // Greedy: argmax_fp32's token and its softmax probability.
+    ninfer::ops::dspark_draft_pick(tx, valid, {}, nullptr, ti, tp, nullptr);
     {
         double s = 0;
         for (int i = 0; i < valid; ++i) { s += std::exp(double(x[i]) - 22.0); }
@@ -510,6 +563,26 @@ void test_draft_pick() {
         const float pr = t::from_device<float>(prob.b, 1)[0];
         std::printf("dspark_draft_pick greedy: %d p %.6f (want 777 p %.6f)\n", g, pr, 1.0 / s);
         check(g == 777 && std::abs(pr - 1.0 / s) < 1e-6, "dspark_draft_pick greedy");
+    }
+    const ninfer::ops::DraftPick picks[] = {{1.0F, 20, 1.0F, 0.0F}, {0.7F, 40, 0.9F, 0.0F}, {2.0F, 50, 1.0F, 0.05F}, {6.0F, 30, 0.95F, 0.02F}, {1.0F, 1000, 1.0F, 0.0F}};
+    for (const auto& p : picks) {
+        int same = 0, prob_ok = 0, varied = 0, last = -1;
+        for (std::size_t j = 0; j < us.size(); ++j) {
+            ninfer::ops::dspark_draft_pick(tx, valid, p, du.at(j), ti, tp, nullptr);
+            const int g = t::from_device<std::int32_t>(id.b, 1)[0];
+            const float pr = t::from_device<float>(prob.b, 1)[0];
+            const auto [want, wp] = draw_oracle(x, valid, p, us[j]);
+            if ((g != want || std::abs(pr - wp) >= 1e-5) && same + 3 > static_cast<int>(j)) {
+                std::printf("  u %.4f: got %d p %.6f, want %d p %.6f\n", us[j], g, pr, want, wp);
+            }
+            same += g == want;
+            prob_ok += std::abs(pr - wp) < 1e-5;
+            varied += g != last;
+            last = g;
+        }
+        std::printf("dspark_draft_pick t %.1f top-k %d top-p %.2f min-p %.2f: %d/%zu draws and %d probabilities as the host's, %d changes\n",
+                    p.temperature, p.top_k, p.top_p, p.min_p, same, us.size(), prob_ok, varied);
+        check(same == static_cast<int>(us.size()) && prob_ok == same && varied > 1, "dspark_draft_pick sampled draws the host sampler's tokens");
     }
 }
 

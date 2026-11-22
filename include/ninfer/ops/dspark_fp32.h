@@ -197,14 +197,42 @@ void dspark_markov_logits(const Tensor& base, const Tensor& hb, const MarkovHead
  */
 void argmax_fp32(const Tensor& logits, std::int32_t valid_rows, Tensor& out, cudaStream_t stream, std::int32_t non_finite = 0);
 
+/// How the drafter picks a draft from its logits (dspark_draft_pick): greedy (temperature <= 0), or the draw a sampled
+/// request's target makes with the same processors and the same uniform (Inkling2Core's host sampler), so that a
+/// draft is the token the target samples whenever their distributions agree there.
+struct DraftPick {
+    float temperature  = 0.0F; // <= 0: greedy
+    std::int32_t top_k = 1;    // clamped to at least 1
+    float top_p        = 1.0F; // >= 1: off
+    float min_p        = 0.0F; // <= 0: off
+};
+
+/// Largest candidate set a sampled pick sorts (dspark_draft_pick).
+inline constexpr std::int32_t kDraftPickCandidates = 1024;
+
 /**
- * Op: dspark_draft_pick: the drafter's greedy draft from one column of logits, and its probability.
+ * Op: dspark_draft_pick: one draft from one column of drafter logits, and the drafter's probability of it.
  *
- * logits FP32 [V] contiguous (rows >= valid_rows used); id I32 [1]; prob FP32 [1]. *id = argmax_fp32's token (the
- * lowest v < valid_rows with a maximal finite logit; 0 when none is finite) and *prob = exp(l[id] - m) /
- * sum_v exp(l[v] - m) (m the maximum; NaN rows contribute 0; 0 when no logit is finite), the softmax probability of
- * the draft at temperature 1, with FP64 sums. One block; asynchronous on `stream`.
+ * logits FP32 [V] contiguous (rows >= valid_rows used); id I32 [1]; prob FP32 [1]; canonical FP64 [1] (read only when
+ * sampled), a uniform in [0, 1).
+ *
+ * Greedy: *id = argmax_fp32's token (the lowest v < valid_rows with a maximal finite logit; 0 when none is finite) and
+ * *prob = exp(l[id] - m) / sum_v exp(l[v] - m) (m the maximum; NaN rows contribute 0), the softmax probability of
+ * the draft at temperature 1.
+ *
+ * Sampled (temperature > 0): the candidates are the K = min(max(top_k, 1), kDraftPickCandidates) largest logits (by
+ * an exact radix select; rows tied with the K-th all join, up to kDraftPickCandidates, beyond which an unspecified
+ * subset of the ties) that lie within temperature * 18 of the maximum (weight relative to the best at least e^-18),
+ * sorted by logit descending and id ascending. Over them, as Inkling2Core's host sampler over the whole vocabulary: keep the
+ * first top_k, weigh w_i = exp((l_i - l_0) / temperature) normalized to sum 1, drop the tail below min_p * w_0, keep
+ * the shortest prefix whose mass reaches top_p, and draw by inverse CDF with u = canonical * (kept mass). *prob is the
+ * draft's weight over the kept mass. FP64 weights.
+ *
+ * So with top_k <= kDraftPickCandidates and no weights under e^-18 among the top_k, the draw is exactly the host
+ * sampler's over the same logits (up to FP64 rounding at an interval's edge); otherwise an approximation of it, which
+ * only changes which token is drafted, never what a verify accepts. One block; asynchronous on `stream`.
  */
-void dspark_draft_pick(const Tensor& logits, std::int32_t valid_rows, Tensor& id, Tensor& prob, cudaStream_t stream);
+void dspark_draft_pick(const Tensor& logits, std::int32_t valid_rows, const DraftPick& pick, const double* canonical, Tensor& id,
+                       Tensor& prob, cudaStream_t stream);
 
 } // namespace ninfer::ops
