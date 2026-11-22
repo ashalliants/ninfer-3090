@@ -285,7 +285,11 @@ std::string Forward::profile_report() const {
 
 std::size_t Forward::device_bytes() const noexcept {
     const Impl& i = *impl_;
-    return i.state.device_bytes() + i.residual_buffer.bytes + i.mixes_buffer.bytes + i.logits_buffer.bytes + i.workspace.capacity();
+    // The decode graphs are instantiated on the first warm decode step; 27 MiB were measured for 43 layers on the
+    // real artifact (test_forward prints it), so each layer is allowed 1 MiB.
+    const std::size_t graph_allowance = i.graphs ? std::size_t(i.layer_graphs.size()) << 20 : 0;
+    return i.state.device_bytes() + i.residual_buffer.bytes + i.mixes_buffer.bytes + i.logits_buffer.bytes + i.workspace.capacity() +
+           i.tail_collapsed.bytes + i.tail_normed.bytes + graph_allowance;
 }
 
 const Tensor& Forward::residual() const {

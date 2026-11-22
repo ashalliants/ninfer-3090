@@ -153,6 +153,8 @@ int main() {
     forward.run(prompt, 0);
     std::vector<std::int32_t> generated;
     std::int32_t position = static_cast<std::int32_t>(prompt.size());
+    std::size_t free_before = 0, total_before = 0;
+    cudaMemGetInfo(&free_before, &total_before);
     std::int32_t next     = forward.argmax();
     experts.reset_stats();
     t0 = std::chrono::steady_clock::now();
@@ -186,6 +188,11 @@ int main() {
     if (std::getenv("NINFER_DSV4_TOKENS") == nullptr && generated.size() >= 2) {
         check(generated[0] == 11111, "the default prompt continues with ' Paris'");
         if (!forward.engram_applied()) { check(generated[1] == 16, "the uninjected default prompt continues with ' Paris' and '.'"); }
+    }
+    {
+        std::size_t free_after = 0, total = 0;
+        cudaMemGetInfo(&free_after, &total);
+        std::printf("device memory taken since before the first decode step (the decode graphs): %.1f MiB\n", (double(free_before) - double(free_after)) / 1048576.0);
     }
     std::printf("\ndecode: %d tokens in %.2f s (%.2f s/token)\n", new_tokens, decode_seconds, decode_seconds / std::max(new_tokens, 1));
     print_tiers("decode after the prefill", experts.stats(), decode_seconds, new_tokens);
