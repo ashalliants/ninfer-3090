@@ -61,13 +61,19 @@ bool load_trace(const char* path, Trace& trace) {
         trace.experts = head[2];
         for (;;) {
             std::uint16_t h[2];
-            if (std::fread(h, 2, 2, f) != 2) { break; }
+            const std::size_t got = std::fread(h, 2, 2, f);
+            if (got == 0 && std::feof(f) != 0) { break; } // a clean end between calls
             Call c;
+            if (got != 2 || h[0] >= trace.layers) { ok = false; break; }
             c.layer = h[0];
             c.experts.resize(h[1]);
-            if (std::fread(c.experts.data(), 2, h[1], f) != h[1]) { break; }
+            if (std::fread(c.experts.data(), 2, h[1], f) != h[1] || std::any_of(c.experts.begin(), c.experts.end(), [&](std::uint16_t e) { return e >= trace.experts; })) {
+                ok = false; // a truncated or corrupt call: do not report hit rates for a prefix
+                break;
+            }
             trace.calls.push_back(std::move(c));
         }
+        ok = ok && std::ferror(f) == 0;
     }
     std::fclose(f);
     return ok && !trace.calls.empty();

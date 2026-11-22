@@ -94,7 +94,7 @@ public:
         if (k.ram >= 0) {
             Ram& r      = ram_[static_cast<std::size_t>(k.ram)];
             r.last_used = call_;
-            r.priority  = floor_ + k.freq;
+            r.base      = floor_;
         }
         if (k.frame >= 0) { frame_[static_cast<std::size_t>(k.frame)].last_used = call_; }
     }
@@ -116,13 +116,13 @@ public:
         if (victim < 0) { return kNone; }
         Ram& r = ram_[static_cast<std::size_t>(victim)];
         if (r.key >= 0) {
-            if (r.priority > floor_) { floor_ = r.priority; } // the aging of Lfuda: later records start above what just left
+            if (priority(r) > floor_) { floor_ = priority(r); } // the aging of Lfuda: later records start above what just left
             key_[static_cast<std::size_t>(r.key)].ram = kNone;
         }
         r.key       = static_cast<std::int64_t>(key);
         r.last_used = call_;
         r.hold      = 0;
-        r.priority  = floor_ + key_[key].freq;
+        r.base      = floor_;
         key_[key].ram = victim;
         return victim;
     }
@@ -203,7 +203,7 @@ private:
     };
     struct Ram {
         std::int64_t key = -1;
-        std::uint64_t last_used = 0, hold = 0, priority = 0;
+        std::uint64_t last_used = 0, hold = 0, base = 0; // base: the aging floor when the record was last used
     };
     struct Frame {
         std::int64_t key = -1;
@@ -215,6 +215,9 @@ private:
         o.age_period = age_period;
         return o;
     }
+
+    // Lfuda's priority: the floor at the record's last use plus its use count now (so halved counts lower it).
+    [[nodiscard]] std::uint64_t priority(const Ram& r) const { return r.base + key_[static_cast<std::size_t>(r.key)].freq; }
 
     // Whether the occupied slot `a` should be evicted before `b`.
     [[nodiscard]] bool ram_before(const Ram& a, const Ram& b) const {
@@ -232,7 +235,7 @@ private:
             if ((qa >= 2) != (qb >= 2)) { return qa < 2; }
             break;
         case RamEviction::Lfuda:
-            if (a.priority != b.priority) { return a.priority < b.priority; }
+            if (priority(a) != priority(b)) { return priority(a) < priority(b); }
             break;
         }
         return a.last_used < b.last_used;

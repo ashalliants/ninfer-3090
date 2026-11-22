@@ -54,6 +54,10 @@ int main(int argc, char** argv) {
     const unsigned seed    = argc > 6 ? static_cast<unsigned>(std::atoi(argv[6])) : 1;
     const std::uint64_t chunk = argc > 7 ? static_cast<std::uint64_t>(std::atoll(argv[7])) * 1024 : 0;
     const int batch        = argc > 8 ? std::atoi(argv[8]) : 16;
+    if (records <= 0 || batch <= 0 || record_mb <= 0 || (chunk != 0 && chunk < 4096)) {
+        std::fprintf(stderr, "records, batch and record_mb must be positive and chunk_kb 0 or at least 4\n");
+        return 2;
+    }
     const bool direct      = mode == "direct";
     const int fd           = ::open(path, O_RDONLY | (direct ? O_DIRECT : 0));
     if (fd < 0) {
@@ -64,6 +68,10 @@ int main(int argc, char** argv) {
     ::fstat(fd, &st);
     const std::uint64_t size   = static_cast<std::uint64_t>(st.st_size);
     const std::uint64_t record = (static_cast<std::uint64_t>(record_mb * 1e6) + 4095) / 4096 * 4096;
+    if (size <= record) {
+        std::fprintf(stderr, "the file (%llu bytes) must be larger than one record (%llu bytes)\n", static_cast<unsigned long long>(size), static_cast<unsigned long long>(record));
+        return 2;
+    }
     if (mode == "random") { ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM); }
     const std::uint8_t* map = nullptr;
     if (mode == "mmap") {
