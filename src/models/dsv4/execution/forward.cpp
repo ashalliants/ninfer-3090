@@ -153,7 +153,8 @@ struct Forward::Impl {
         const char* v = std::getenv("NINFER_DSV4_GRAPHS");
         return v == nullptr || std::string(v) != "0";
     }();
-    cudaStream_t capture_stream = nullptr;
+    OwnedStream capture_stream_owner;
+    cudaStream_t capture_stream = nullptr; // capture_stream_owner's handle
     // The shared expert of a decode step runs beside the routed experts inside the tail graph: its kernels stream
     // weights while the routed experts' are bound by integer decode work, so the two overlap on the GPU. It runs on
     // aux_stream, forked from and joined to the captured stream by these events.
@@ -183,7 +184,6 @@ struct Forward::Impl {
                 if (e != nullptr) { cudaGraphExecDestroy(e); }
             }
         }
-        if (capture_stream != nullptr) { cudaStreamDestroy(capture_stream); }
     }
 
     // Runs `body(stream)`: directly, or (`use`) as the graph `exec`, captured from `body(capture_stream)` the
@@ -296,7 +296,8 @@ struct Forward::Impl {
         tail_collapsed = DeviceBuffer(std::size_t(H) * T * 2);
         tail_normed    = DeviceBuffer(std::size_t(H) * 2);
         layer_graphs.resize(config.num_hidden_layers);
-        cuda_ok(cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking), "capture stream");
+        capture_stream_owner.create("capture stream");
+        capture_stream = capture_stream_owner.handle;
         aux_stream.create("shared expert stream");
         fork_event.create("fork event");
         join_event.create("join event");
