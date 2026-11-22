@@ -15,6 +15,7 @@
 #include "models/inkling2/program/text_program.h"
 #include "models/inkling2/program/vision_program.h"
 
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -514,6 +515,26 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         limits.last_logits = true; // prefill reads only the last column (decode below)
         limits.split_attention = options_.split_attention;
         limits.kv_fp16         = options_.kv_rings != KvRings::FP32; // FP16 by default
+        // Opt-in, lossy: --kv-dtype int8 | rk8v4 | rk4v4 codes the global visits' rings (K and V bits 8/8, 8/4, 4/4).
+        {
+            const int kb = options_.kv_cache == KvCacheStorage::RotatedLloyd4KeyInt4Value ? 4
+                         : options_.kv_cache == KvCacheStorage::Int8Group64 || options_.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ? 8 : 0;
+            const int vb = options_.kv_cache == KvCacheStorage::Int8Group64 ? 8 : 4;
+            if (kb != 0) {
+                if (slots_ > 1) { throw std::invalid_argument("--kv-dtype int8|rk8v4|rk4v4 (Inkling-2's low-bit global rings) takes --max-concurrency 1"); }
+                const ink::TextConfig& tc = model_->config();
+                limits.kv_lowbit_k.assign(tc.num_layer_visits, 0);
+                limits.kv_lowbit_v.assign(tc.num_layer_visits, 0);
+                for (std::uint32_t v = 0; v < tc.num_layer_visits; ++v) {
+                    if (!tc.local[tc.physical(v)]) { limits.kv_lowbit_k[v] = static_cast<std::uint8_t>(kb), limits.kv_lowbit_v[v] = static_cast<std::uint8_t>(vb); }
+                }
+            }
+        }
+        // Measuring knob (the low-bit KV trial, docs/maintainer/inkling2-model.md): a parse_kv_quant spec, simulated or real.
+        if (const char* kvq = std::getenv("NINFER_INKLING2_KVQ"); kvq != nullptr && *kvq != '\0') {
+            ink::parse_kv_quant(model_->config(), kvq, limits);
+            load_.notes.push_back(std::string("experimental | NINFER_INKLING2_KVQ ") + kvq + " (lossy, measuring only)");
+        }
         if (!prefill_is_fp32(options_.kv_rings, options_.prefill_math)) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
         limits.slots = slots_;
         // Batched decode runs every request plain: with several slots there is no drafter.
@@ -672,6 +693,10 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                                                     " | drafter window " + (drafter_window_ == 0 ? std::string("whole context") : std::to_string(drafter_window_))
                                               : std::string()) +
                           " | " + (fp32_prefill ? "FP32" : "tensor cores (--prefill-math fp32: the exact FP32 prefill)") +
+                          (options_.kv_cache == KvCacheStorage::Int8Group64 ? " | global KV rings int8 (K8 V8, lossy, opt-in)"
+                           : options_.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ? " | global KV rings rk8v4 (K8 V4, lossy, opt-in)"
+                           : options_.kv_cache == KvCacheStorage::RotatedLloyd4KeyInt4Value ? " | global KV rings rk4v4 (K4 V4, lossy, opt-in)"
+                           : "") +
                           " | device free " + std::to_string(device_free >> 20) + " MiB");
     if (snapshot_host_bytes_ > 0) {
         load_.notes.push_back("prefix reuse | " + std::to_string(slots_) + (slots_ > 1 ? " snapshots" : " snapshot") + " in pinned host memory | " +

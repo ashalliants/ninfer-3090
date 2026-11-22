@@ -49,6 +49,13 @@ struct ProgramLimits {
     // Lossy (the Engine's default): the KV rings hold FP16 (round to nearest) rather than FP32, half the bytes per
     // position, so about twice the context fits. The attention widens them to FP32 as it reads them.
     bool kv_fp16 = false;
+    // Experimental, lossy (FP16 rings only): a simulated low-bit KV coding per layer visit (ops::KvAppend::quant codes,
+    // one per visit; empty: none): each append codes and decodes the values into the FP16 ring. parse_kv_quant()
+    // fills these from a spec.
+    std::vector<std::int32_t> kv_quant_k, kv_quant_v;
+    // Opt-in, lossy: low-bit global KV rings (ops::kLowbitKeys4 ... : keys rotated and coded in 4 or 8 bits, values in
+    // 4 or 8), the bits per layer visit (empty or 0: FP16; only global visits take them). Needs kv_fp16 and one slot.
+    std::vector<std::uint8_t> kv_lowbit_k, kv_lowbit_v;
     // A forward of more than max(1, max_rollback) tokens (a prefill chunk) returns its last column's logits only,
     // FP32 [vocab_size, 1], the same bits as that column of all of them; saves vocab_size * 4 bytes per chunk column
     // of workspace. false: every column's.
@@ -73,6 +80,18 @@ struct ProgramLimits {
         [[nodiscard]] static TensorCoreParts all() { return {true, true, true}; }
     } prefill_tc;
 };
+
+// Experimental: forms "k<K>v<V>[:g=i,j,..][:local][:real]" joined by '+', applied left to right, each setting the
+// visits it names (k16v16 sets them back to FP16). K one of 16 8 4 (rotated INT8, rotated Lloyd-Max 4-bit; 8n, 4n
+// unrotated), V one of 16 8 4 (INT8 per 64, int4 per 32), 4l (rotated Lloyd-Max), 4r (rotated int4), 8r; g the global
+// visits (0..7 in visit order, default all), local also the sliding ones; real (K and V each 4, 8 or both 16, global
+// visits only) stores the rings coded (kv_lowbit_k / kv_lowbit_v) instead of simulating them. Simulated and real forms
+// do not mix. Throws on a bad spec.
+void parse_kv_quant(const TextConfig& config, const std::string& spec, ProgramLimits& limits);
+// One slot's K and V ring bytes over the layer visits at these limits (global rings max_context positions each, as
+// FP32, FP16 or the low-bit codes kv_lowbit_k/_v name; sliding rings their window plus a chunk), padded as
+// TextProgram carves them.
+[[nodiscard]] std::size_t kv_ring_bytes(const TextConfig& config, const ProgramLimits& limits);
 
 inline constexpr std::int32_t kTensorCoreMinColumns = 64;
 // A local (sliding) visit attends a wider chunk in pieces of this many columns, each appending its keys first, so its

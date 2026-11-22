@@ -613,6 +613,11 @@ Gen3 x4 eGPU):
   picked before the prefix-reuse snapshot moved to host memory. A 230-token image prompt answers its first token
   in 375-398 ms.
 - **Context:** the full 262,144 tokens with DSpark and vision on. Decode at 100K context runs at 48 tok/s.
+- **Low-bit KV (opt-in, lossy):** `--kv-dtype rk4v4` (or `int8`, `rk8v4`) codes the 8 global KV rings in 4 or 8 bits:
+  plain decode **41.1 tok/s at 200K** context against 34.8 (+18%), 53.2 against 47.8 at 100K; it frees 5,952 MiB at
+  262,144 (`int8`: 3,968), so DSpark keeps its Q8 head and whole-context window beside vision (12 chats 93.4 against
+  89.4 tok/s). KLD from FP16 is 2.8x the FP32 noise floor for `rk4v4` and 1.06x for `int8`; needles at 100K and 200K
+  are found. One request at a time; prefill past 100K is 5-8% slower. Off by default.
 - **Several requests:** `--max-concurrency` up to 8, **198.2 tok/s** aggregate at 8 (121.8 at 2, 170.5 at 4),
   each request's tokens the same as alone. Requests at N > 1 decode without DSpark.
 - **Adapters:** two opt-in uncensoring adapters (`--lora`, `--graft`, selected per request) take the refusals

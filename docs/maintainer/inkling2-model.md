@@ -837,7 +837,8 @@ the longest ring. That is about 25 MB of workspace at 65,536 context.
 `fp32`; an explicit `--prefill-math tc` beside it runs the tensor cores and is not exact). With FP16 rings the
 head norms' append rounds each normalized K and V value to nearest FP16, and the attention widens the values back to
 FP32 as it reads them. Scores, softmax and sums stay FP32. A position costs 32 KiB across the 8 global visits
-instead of 64 KiB, so about twice the context fits. Inkling-2 refuses every other `--kv-dtype` form.
+instead of 64 KiB, so about twice the context fits. Besides `fp16` and `fp32`, Inkling-2 takes only the opt-in
+low-bit global rings `int8`, `rk8v4` and `rk4v4` ([Low-bit global KV rings](#low-bit-global-kv-rings-opt-in)) and refuses every other form.
 
 The values suit FP16: the head norms bound them (K is clipped per head, V has unit norm). Over the 30,840-token
 prompt below (1.5e9 values each of K and V), max |K| is 21.7 and max |V| 11.3, none overflows, and 60,305 K and
@@ -866,6 +867,91 @@ experts.
 | [1024, 4096) | 3.65e-3 | 1.41e-3 | 3.24e-2 | 3.98e-1 | 97.07% |
 | [4096, 16384) | 3.47e-3 | 1.27e-3 | 3.14e-2 | 4.50e-1 | 97.78% |
 | [16384, 30840) | 3.49e-3 | 1.33e-3 | 3.14e-2 | 1.91e-1 | 97.36% |
+
+## Low-bit global KV rings (opt-in)
+
+**Lossy, opt-in, off by default.** `--kv-dtype int8 | rk8v4 | rk4v4` stores the 8 global visits' K and V rings in 8
+or 4 bits; the 40 sliding rings stay FP16 and the FP16 default is untouched (same bytes: golden, layout hashes and
+DSpark tests as before). At the full 262,144 with `--spec dspark --vision` the freed memory lets the engine keep the
+drafter's **Q8 head copy and its whole-context window** (FP16 there falls back to the target's BF16 head and a
+16,384-position window), and long-context decode runs faster:
+
+| `--kv-dtype` | K / V | Global rings at 262,144 | Frees | KLD mean / p99 vs FP16 | Top-1 | Decode 100K / 200K (plain) |
+|---|---|---:|---:|---|---:|---|
+| `fp16` (default) | FP16 / FP16 | 8192 MiB | | (FP32 floor: 3.46e-3 / 3.06e-2) | (97.50%) | 47.80 / 34.81 tok/s |
+| `int8` | rotated INT8 / INT8 | 4224 MiB | 3968 MiB | 3.66e-3 / 3.22e-2 (1.06x floor) | 97.62% | 52.92 / 40.72 (+10.7% / +17.0%) |
+| `rk8v4` | rotated INT8 / int4 | 3264 MiB | 4928 MiB | 6.82e-3 / 5.68e-2 (2.0x) | 96.62% | |
+| `rk4v4` | rotated Lloyd-Max 4-bit / int4 | 2240 MiB | 5952 MiB | 9.71e-3 / 7.92e-2 (2.8x) | 95.85% | **53.24 / 41.05 (+11.4% / +17.9%)** |
+
+`int8` sits at the noise floor of an FP32 reordering (the same KLD as FP16 against FP32); `rk4v4` frees the most and
+decodes fastest at about 3x the floor. Only one sequence at a time: `--max-concurrency` above 1 is refused with them.
+
+**Layout.** A global ring is a U8 tensor `[kv_heads * row_bytes, capacity]`; a position's row holds every head's codes,
+then every head's FP16 scales. K (L2-clipped per head, no RoPE) is rotated by a normalized 128-point Hadamard and coded
+per 64 dimensions: Lloyd-Max 4-bit with a least-squares scale (68 bytes a head) or INT8 absmax/127 (132 bytes). V
+(unit RMS) is not rotated: int4 absmax/7 per 32 (72 bytes) or INT8 per 64 (132 bytes). The q clip job rotates the
+queries by the same Hadamard, so scores need no inverse. The head-norm append codes each new position
+(`ops::kLowbitKeys4/8`, `ops::kLowbitValues4/8`); decode and verification read the codes in
+`attention_lowbit_group_kernel` (split blocks of 256 keys; a block takes the 3 query heads of a GQA group so each key
+and value is loaded and expanded once; scores, softmax and sums FP32), and the tensor-core prefill expands them to FP16
+as it stages a tile. The relative bias and sinks are as in FP16.
+
+**Accuracy.** KLD(FP16 rings || low-bit) teacher-forced over the 30,840-token docs-and-C++ prompt in chunks of 256
+(`NINFER_INKLING2_KVQ_KLD`, FP32 math, both programs in lockstep); flat over [0,1K), [1K,4K), [4K,16K), [16K,31K).
+Greedy output is not token-identical to FP16 (0 of 12 300-token chats match, `int8` included: at this floor a
+near-tied expert choice flips within a few hundred tokens), but answers hold: the maths prompt gives the same 14:43, the code prompt the same
+algorithm and complexity, and the needle at 100K and 200K (depths 0.2, 0.8; 0.3, 0.7) is found 4 of 4 with each.
+
+Variants measured with the simulator (`NINFER_INKLING2_KVQ=<spec>`, forms such as `k4v8:g=4,5` joined by `+`, which
+code and decode each append into the FP16 rings; `:real` stores them coded instead; its
+`k4v4` 1.01e-2 matches the real rings' 9.71e-3) and not shipped:
+
+| Variant | KLD mean | p99 | Top-1 |
+|---|---:|---:|---:|
+| K FP16, V int4 | 6.85e-3 | 5.71e-2 | 96.66% |
+| K 4-bit, V FP16 | 8.83e-3 | 7.23e-2 | 96.05% |
+| K 4-bit, V INT8 | 8.87e-3 | 7.25e-2 | 95.81% |
+| K 4-bit, V Lloyd 4-bit | 9.65e-3 | 7.43e-2 | 95.79% |
+| `rk4v4` on the 2 most tolerant visits (g6, g7) | 1.25e-3 | 1.08e-2 | 98.78% |
+| on 4 (g4-g7) | 2.56e-3 | 1.95e-2 | 97.97% |
+| on 6 (g2-g7) | 5.17e-3 | 3.95e-2 | 96.86% |
+| g2-g7 at 4 bits, g0-g1 INT8 | 6.66e-3 | 5.26e-2 | 96.51% |
+| g4-g7 at 4 bits, g0-g3 INT8 (real rings) | 5.45e-3 | 4.19e-2 | 96.98% |
+| `rk4v4`, last 4,096 positions FP16 | 5.52e-3 | 5.21e-2 | 97.06% |
+| `rk4v4` on the sliding rings too | 2.69e-2 | 2.11e-1 | 92.97% |
+
+The early global visits are the sensitive ones (`rk4v4` alone on g0 ... g7: 6.9e-3, 4.4e-3, 2.7e-3, 1.8e-3, 8.9e-4,
+7.8e-4, 6.0e-4, 6.8e-4). A mix saves memory in proportion to the visits it codes (744 MiB a visit at 4 bits, 496 at
+8), so none beats `int8` (at the floor, 3968 MiB) on accuracy per byte. The FP16 recent window only helps while the
+window is a large part of the context (7.06e-3 over [16K, 31K)), and the sliding rings are far too sensitive. The
+window was simulated by recoding the positions that aged past it after each forward; that is not rollback-safe
+(speculative `keep()`, snapshot `restore()`) and is not in this tree. The trial branch `exp/inkling2-lowbit-kv-trial`
+keeps it (`:w=N`) for reproduction.
+
+**Speed.** `ninfer_inkling2_golden_test` decode bench (`NINFER_INKLING2_DECODE_BENCH`, plain program decode, TC
+prefill chunk 2048), FP16 / `int8` / `rk4v4` as A B C C B A in one hold per context, 2026-11-22, the two legs
+equal to 0.1%:
+
+| Context | Decode FP16 / int8 / rk4v4 (tok/s) | Prefill FP16 / int8 / rk4v4 (tok/s) |
+|---|---|---|
+| 8,192 | 72.43 / 72.94 / 73.05 | 1888 / 1873 / 1870 |
+| 102,400 | 47.80 / 52.92 / 53.24 | 1221 / 1156 / 1152 |
+| 204,800 | 34.81 / 40.72 / 41.05 | 880 / 812 / 809 |
+
+Prefill is 5-8% slower past 100K (the flash kernel expands the codes as it stages each tile). A per-head lowbit
+kernel (one block per query head, `NINFER_LOWBIT_PER_HEAD=1`) gives only +1-4% decode: the gain comes from reading a
+key once for its GQA group.
+
+Through `ninfer-serve` with the production flags (`--vision --spec dspark --draft-tokens 3 --max-context 262144`,
+both adapters loaded), one server per form:
+
+| | FP16 | `int8` | `rk4v4` |
+|---|---|---|---|
+| Fit at 262,144 | chunk 2048, BF16 head, window 16,384, 302 MiB free | chunk 2048, **Q8 head, whole window**, 2840 MiB free | chunk 2048, **Q8 head, whole window**, 4824 MiB free |
+| 12 chats, DSpark (mean tok/s) | 89.35 | 92.83 | **93.35** |
+| Maths / code, DSpark (tok/s) | 112.6 / 112.1 | 119.7 / 118.2 | 119.6 / 112.9 |
+| Decode after 8K / 100K / 216K prompt, DSpark | 80.8 / 46.7 / 32.4 | 88.4 / 49.9 / 38.8 | 90.1 / 49.9 / 39.3 |
+| Prefill 8K / 100K / 216K (tok/s) | 1859 / 1207 / 846 | 1845 / 1144 / 781 | 1846 / 1141 / 779 |
 
 ## Tensor-core prefill
 

@@ -334,7 +334,12 @@ public:
             throw std::invalid_argument("--no-split-attention selects Inkling-2's attention kernel; this model has its own");
         }
         if (runtime::artifact_is_inkling2(options.artifact_path) && (options.kv_cache != KvCacheStorage::BFloat16 || options.kv_cache_explicit)) {
-            throw std::invalid_argument("--kv-dtype: Inkling-2 takes fp16 (default) or fp32");
+            // Opt-in, lossy: the global visits' rings in a low-bit coding (int8, rk8v4, rk4v4), the sliding ones FP16.
+            const bool lowbit = options.kv_cache == KvCacheStorage::Int8Group64 || options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+                                options.kv_cache == KvCacheStorage::RotatedLloyd4KeyInt4Value;
+            if (!lowbit || options.kv_rings == KvRings::FP32) {
+                throw std::invalid_argument("--kv-dtype: Inkling-2 takes fp16 (default), fp32, or the opt-in lossy global rings int8, rk8v4 or rk4v4");
+            }
         }
         if (options.prefill_math != PrefillMath::Default && !runtime::artifact_is_inkling2(options.artifact_path)) {
             throw std::invalid_argument("--prefill-math selects Inkling-2's prefill arithmetic; this model has its own prefill options");
