@@ -1202,6 +1202,10 @@ Exactness: each request's tokens and logits are bit-identical to its solo run.
   described below, both bit-exact with T = 1), depth mix, loop controllers, norms, routing and the head.
 - Experts of a call with several columns (`moe_situ_experts`, CUDA cores):
   - One column runs per entry: a block takes one entry's rows.
+  - NVFP4 calls of up to 16 entries (T = 1 decode, B = 2) run gate_up and down in one launch. Blocks take items by
+    an atomic ticket, every gate item before any down item. A down block issues its weight loads, waits for its
+    entry's gate blocks on a counter, then reads the activations. The arithmetic is the two kernels', so the bits
+    are unchanged. This removes the gap between the two launches (B = 1 serve +0.7%).
   - Calls of fewer than 64 entries (up to 7 columns at top 8, so batched decode up to B = 7 and DSpark verify) also
     run per entry. Entries of one expert run at the same time, so its second read mostly hits the L2, and the
     per-entry kernels' occupancy (64 registers, four blocks an SM) beats the expert-major kernels at these widths.
