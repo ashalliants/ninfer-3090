@@ -822,6 +822,23 @@ int main() {
                               to_fp16.kv_rings == KvRings::FP16 && to_fp16.kv_cache == ninfer::KvCacheStorage::BFloat16 && !to_fp16.kv_cache_explicit,
                           "--kv-dtype: the last form does not win, or an explicit bf16 is not marked");
     }
+    // --prefill-math tc|fp32 is Inkling-2's prefill arithmetic; --prefill-chunk marks the chunk as given.
+    {
+        using ninfer::PrefillMath;
+        failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--prefill-math", "fp32"})).prefill_math == PrefillMath::FP32 &&
+                              make_engine_options(parse({"ninfer-serve", "model.ninfer", "--prefill-math", "tc"})).prefill_math ==
+                                  PrefillMath::TensorCores &&
+                              make_engine_options(parse({"ninfer-serve", "model.ninfer"})).prefill_math == PrefillMath::Default,
+                          "--prefill-math did not reach the Engine options");
+        failures += check(!make_engine_options(parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "512"})).prefill_chunk_auto &&
+                              make_engine_options(parse({"ninfer-serve", "model.ninfer"})).prefill_chunk_auto,
+                          "the auto chunk is on only when --prefill-chunk is omitted");
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-math", "fp16"});
+        } catch (const std::exception&) { refused = true; }
+        failures += check(refused, "--prefill-math accepted an unknown form");
+    }
     // --spec dspark drafts 3 per round unless --draft-tokens says otherwise (1..7).
     const ninfer::EngineOptions dspark = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark"}));
     failures += check(dspark.speculative.backend == ninfer::SpeculativeBackend::DSpark && dspark.speculative.draft_tokens == 3,

@@ -39,6 +39,9 @@ enum class DenseQ8 : std::uint8_t { Off, Head, All };
 
 // Inkling-2's KV rings (--kv-dtype fp16|fp32): Default is FP16; FP32 reproduces the exact FP32 program.
 enum class KvRings : std::uint8_t { Default, FP16, FP32 };
+// Inkling-2's prefill arithmetic (--prefill-math tc|fp32): Default is TensorCores, or FP32 with KvRings::FP32 (so
+// --kv-dtype fp32 alone stays the exact FP32 program); FP32 is the exact FP32 program.
+enum class PrefillMath : std::uint8_t { Default, TensorCores, FP32 };
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -814,6 +817,10 @@ struct EngineOptions {
     bool admission_affinity            = false;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Opt-in: Inkling-2 ignores prefill_chunk and picks the widest of 2048, 1024, 512 and 256 whose programs fit
+    // beside max_context. Off, every route runs the prefill_chunk set here; the CLI and serve turn it on when
+    // --prefill-chunk is omitted.
+    bool prefill_chunk_auto            = false;
     // Zero (off), or a multiple of prefill_chunk: a long prefill leaves a private LongAnchor
     // checkpoint every this many tokens, so a request that loses its pause snapshot replays from
     // the nearest anchor instead of from the root. Needs the context cache; each owner keeps its
@@ -880,6 +887,12 @@ struct EngineOptions {
     // kv_cache was chosen explicitly (--kv-dtype bf16|int8|...), BF16 included: Inkling-2, which has no BF16 rings,
     // refuses it rather than reading the default BF16 as "unset".
     bool kv_cache_explicit                 = false;
+    // Inkling-2 only (other models refuse anything but Default): its prefill forwards of 64 or more columns. Default
+    // (except with kv_rings FP32, where it means FP32) and TensorCores (--prefill-math tc) run the projections, the
+    // experts and the attention on the FP16 tensor cores with FP32 accumulation (lossy, at the noise floor of an FP32
+    // reordering; about five times the speed); FP32 (--prefill-math fp32) keeps the exact FP32 program. An explicit
+    // TensorCores with kv_rings FP32 is allowed and is not exact. Decode and DSpark's verify are FP32 either way.
+    PrefillMath prefill_math               = PrefillMath::Default;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.
@@ -2311,6 +2324,8 @@ struct LoadSummary {
     // Conditions of this load the operator should know about (a model running with reduced quality,
     // say). The application's startup renderer logs each one as a warning once the engine is ready.
     std::vector<std::string> warnings;
+    // Choices made at load the operator may want to see (Inkling-2's prefill chunk, say), logged as information.
+    std::vector<std::string> notes;
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;

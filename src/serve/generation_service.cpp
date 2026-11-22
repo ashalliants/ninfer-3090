@@ -345,6 +345,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.split_attention         = options.split_attention;
     engine_options.kv_rings                = options.kv_rings;
     engine_options.kv_cache_explicit       = options.kv_cache_explicit;
+    engine_options.prefill_math            = options.prefill_math;
+    engine_options.prefill_chunk_auto      = !options.prefill_chunk_explicit; // --prefill-chunk omitted
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
     engine_options.loras                    = options.loras;

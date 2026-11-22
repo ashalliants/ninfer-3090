@@ -4,6 +4,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 
 #include <algorithm>
 #include <cmath>
@@ -378,6 +379,359 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(AttentionArgs a) {
     store_out(static_cast<Out*>(a.out) + t * a.os + at, y);
 }
 
+// ---- Wide calls (prefill): one block per (kTileQueries columns, head) folds key tiles of kTileKeys staged in shared
+// memory into every column's online softmax, so each key and value is read once per tile of columns. FP32 or FP16
+// rings (Fp16: widened as they are staged); FP32 arithmetic in another order than attention_kernel (not its bits).
+constexpr int kTileQueries = 16, kTileKeys = 32, kTileStride = kHeadDim + 1;
+constexpr int kTileThreads = 256;
+
+template <typename Out, bool Fp16>
+__global__ void __launch_bounds__(kTileThreads) attention_tiled_kernel(AttentionArgs a, int cols) {
+    __shared__ float qs[kTileQueries][kTileStride];
+    __shared__ float ks[kTileKeys][kTileStride];
+    __shared__ __align__(16) float vs[kTileKeys][kHeadDim]; // read as float4
+    __shared__ float ps[kTileQueries][kTileKeys + 1];
+    __shared__ float rs[kTileQueries][kMaxRel];
+    __shared__ float row_m[kTileQueries], row_l[kTileQueries], row_scale[kTileQueries];
+    const int t0 = blockIdx.x * kTileQueries, h = blockIdx.y, g = h / a.group, tid = threadIdx.x;
+    const int nq = min(kTileQueries, cols - t0);
+    for (int i = tid; i < kTileQueries * kHeadDim; i += kTileThreads) {
+        const int q = i / kHeadDim, d = i % kHeadDim;
+        qs[q][d] = q < nq ? a.q[(t0 + q) * a.qs + static_cast<std::int64_t>(h) * kHeadDim + d] : 0.0F;
+    }
+    for (int i = tid; i < kTileQueries * kMaxRel; i += kTileThreads) {
+        const int q = i / kMaxRel, c = i % kMaxRel;
+        rs[q][c] = q < nq && c < a.d_rel ? a.r[(t0 + q) * a.rs + static_cast<std::int64_t>(h) * a.d_rel + c] : 0.0F;
+    }
+    if (tid < kTileQueries) {
+        row_m[tid] = tid < nq ? a.sink[(t0 + tid) * a.ss + h] : 0.0F;
+        row_l[tid] = 1.0F;
+    }
+    const std::int64_t base = a.start + (a.start_offset != nullptr ? *a.start_offset : 0);
+    const std::int64_t pos_first = base + t0, pos_last = base + t0 + nq - 1;
+    const std::int64_t lo = a.window > 0 ? (pos_first - a.window + 1 > 0 ? pos_first - a.window + 1 : 0) : 0;
+    const float inv_sqrt_d = rsqrtf(static_cast<float>(kHeadDim));
+    // Scores: thread (q = tid / 16, j = tid % 16) takes keys j and j + 16 of the tile.
+    const int sq = tid >> 4, sj = tid & 15;
+    // Values: thread (q = tid / 16, dims 8 (tid % 16) .. + 8).
+    const int vq = tid >> 4, vd = (tid & 15) * 8;
+    static_assert(kTileQueries * 16 == kTileThreads && kTileKeys == 32, "the thread maps");
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { acc[i] = 0.0F; }
+    __syncthreads();
+    for (std::int64_t k0 = lo; k0 <= pos_last; k0 += kTileKeys) {
+        const int nk = static_cast<int>(pos_last - k0 + 1 < kTileKeys ? pos_last - k0 + 1 : kTileKeys);
+        for (int i = tid; i < kTileKeys * kHeadDim; i += kTileThreads) {
+            const int j = i / kHeadDim, d = i % kHeadDim;
+            float kv = 0.0F, vv = 0.0F;
+            if (j < nk) {
+                const std::int64_t slot = (k0 + j) % a.capacity;
+                const std::int64_t at = slot * a.kv_width + static_cast<std::int64_t>(g) * kHeadDim + d;
+                if constexpr (Fp16) {
+                    kv = __half2float(static_cast<const __half*>(a.k)[at]), vv = __half2float(static_cast<const __half*>(a.v)[at]);
+                } else {
+                    kv = static_cast<const float*>(a.k)[at], vv = static_cast<const float*>(a.v)[at];
+                }
+            }
+            ks[j][d] = kv;
+            vs[j][d] = vv;
+        }
+        __syncthreads();
+        {
+            float dot[2] = {0.0F, 0.0F};
+            for (int d = 0; d < kHeadDim; ++d) {
+                const float qv = qs[sq][d];
+#pragma unroll
+                for (int u = 0; u < 2; ++u) { dot[u] = fmaf(qv, ks[sj + 16 * u][d], dot[u]); }
+            }
+            const std::int64_t pos = base + t0 + sq;
+#pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                const int j = sj + 16 * u;
+                const std::int64_t key = k0 + j, dist = pos - key;
+                float score = -INFINITY;
+                if (sq < nq && j < nk && dist >= 0 && (a.window == 0 || dist < a.window)) {
+                    float bias = 0.0F;
+                    if (dist < a.extent) {
+                        for (int c = 0; c < a.d_rel; ++c) { bias = fmaf(rs[sq][c], a.table[dist * a.d_rel + c], bias); }
+                    }
+                    score = dot[u] * inv_sqrt_d + bias;
+                }
+                ps[sq][j] = score;
+            }
+        }
+        __syncthreads();
+        // Online softmax per column: warp w takes columns 2w, 2w + 1, lane = key.
+        {
+            const int warp = tid >> 5, lane = tid & 31;
+            for (int q = warp * 2; q < warp * 2 + 2; ++q) {
+                const float sv = ps[q][lane];
+                float top = sv;
+                for (int o = 16; o > 0; o >>= 1) { top = fmaxf(top, __shfl_xor_sync(0xFFFFFFFFU, top, o)); }
+                top = fmaxf(top, row_m[q]);
+                const float e = expf(sv - top);
+                float sum = e;
+                for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xFFFFFFFFU, sum, o); }
+                ps[q][lane] = e;
+                __syncwarp();
+                if (lane == 0) {
+                    const float rescale = expf(row_m[q] - top);
+                    row_scale[q] = rescale;
+                    row_l[q] = fmaf(row_l[q], rescale, sum);
+                    row_m[q] = top;
+                }
+            }
+        }
+        __syncthreads();
+        {
+            const float rescale = row_scale[vq];
+            float part[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { part[i] = 0.0F; }
+            for (int j = 0; j < nk; ++j) {
+                const float pj = ps[vq][j];
+                const float4* v4 = reinterpret_cast<const float4*>(&vs[j][vd]);
+#pragma unroll
+                for (int m = 0; m < 2; ++m) {
+                    const float4 v = v4[m];
+                    part[4 * m]     = fmaf(pj, v.x, part[4 * m]);
+                    part[4 * m + 1] = fmaf(pj, v.y, part[4 * m + 1]);
+                    part[4 * m + 2] = fmaf(pj, v.z, part[4 * m + 2]);
+                    part[4 * m + 3] = fmaf(pj, v.w, part[4 * m + 3]);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { acc[i] = fmaf(acc[i], rescale, part[i]); }
+        }
+        __syncthreads();
+    }
+    if (vq < nq) {
+        const int t = t0 + vq;
+        const float l = row_l[vq];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const std::int64_t at = static_cast<std::int64_t>(h) * kHeadDim + vd + i;
+            const float x = acc[i] / l;
+            const float y = a.gate != nullptr ? x / (1.0F + expf(-a.gate[t * a.gs + at])) : x;
+            store_out(static_cast<Out*>(a.out) + t * a.os + at, y);
+        }
+    }
+}
+
+
+// ---- Wide calls over FP16 rings on the tensor cores: one block per (kFlashQueries columns, KV head) takes the
+// group's G heads together (rows head-major, kFlashQueries columns each), so each staged key and value serves every
+// head of the group; warp w owns rows 16 w .. + 16 and thread lane their row lane / 2 (keys (lane & 1) 16 .. + 16 of
+// each tile). One pass with the online softmax: Q and the softmax weights in FP16, K and V as stored, FP32
+// accumulation (WMMA 16x16x16); the accumulators are rescaled in registers through the fragment's row map (an
+// accumulator fragment loaded from a matrix of row numbers). The relative bias r . table[dist] is a WMMA product too,
+// over FP16 hi + lo parts of r and the table (hi hi + hi lo + lo hi: about FP32's absolute accuracy); the masks and
+// the softmax in FP32.
+constexpr int kFlashQueries = 32, kFlashKeys = 32, kFlashLd = kHeadDim + 8, kFlashSLd = kFlashKeys + 4, kFlashPLd = kFlashKeys + 8;
+constexpr int kFlashRelLd = 16 + 8, kFlashDists = kFlashQueries + kFlashKeys, kFlashBLd = 48 + 4;
+
+template <int G>
+struct FlashLayout {
+    static constexpr int kRows = G * kFlashQueries, kWarps = kRows / 16;
+    static constexpr int kK = 0, kV = kK + kFlashKeys * kFlashLd * 2, kS = kV + kFlashKeys * kFlashLd * 2;
+    static constexpr int kP = kS + kRows * kFlashSLd * 4, kB = kP + kRows * kFlashPLd * 2;
+    static constexpr int kTab = kB + kWarps * 16 * kFlashBLd * 4; // hi then lo, [kFlashDists][kFlashRelLd] each
+    static constexpr int kAlpha = kTab + 2 * kFlashDists * kFlashRelLd * 2;
+    static constexpr int kBytes = kAlpha + kRows * 4;
+    static constexpr int kQ = 0, kR = kRows * kFlashLd * 2; // staging at the start, over K, V, S and P
+    static_assert(kR + 2 * kRows * kFlashRelLd * 2 <= kB, "Q and r stage before the bias buffers");
+    static_assert(kV % 32 == 0 && kS % 32 == 0 && kP % 32 == 0 && kB % 32 == 0 && kTab % 32 == 0 && kR % 32 == 0, "fragment alignment");
+};
+
+template <typename Out, int G>
+__global__ void __launch_bounds__(G * kFlashQueries * 2) attention_flash_kernel(AttentionArgs a, int cols) {
+    namespace wm = nvcuda::wmma;
+    using L = FlashLayout<G>;
+    constexpr int kThreadsF = L::kRows * 2;
+    extern __shared__ __align__(128) unsigned char smem[];
+    __half (*Ks)[kFlashLd] = reinterpret_cast<__half (*)[kFlashLd]>(smem + L::kK);
+    __half (*Vs)[kFlashLd] = reinterpret_cast<__half (*)[kFlashLd]>(smem + L::kV);
+    float (*Ss)[kFlashSLd] = reinterpret_cast<float (*)[kFlashSLd]>(smem + L::kS);
+    __half (*Ps)[kFlashPLd] = reinterpret_cast<__half (*)[kFlashPLd]>(smem + L::kP);
+    __half (*Qs)[kFlashLd] = reinterpret_cast<__half (*)[kFlashLd]>(smem + L::kQ);
+    __half (*Rhi)[kFlashRelLd] = reinterpret_cast<__half (*)[kFlashRelLd]>(smem + L::kR);
+    __half (*Rlo)[kFlashRelLd] = Rhi + L::kRows;
+    __half (*Thi)[kFlashRelLd] = reinterpret_cast<__half (*)[kFlashRelLd]>(smem + L::kTab);
+    __half (*Tlo)[kFlashRelLd] = Thi + kFlashDists;
+    float* alpha_s = reinterpret_cast<float*>(smem + L::kAlpha);
+    const int t0 = blockIdx.x * kFlashQueries, g = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    float (*Bw)[kFlashBLd] = reinterpret_cast<float (*)[kFlashBLd]>(smem + L::kB) + 16 * warp;
+    const int nq = min(kFlashQueries, cols - t0);
+    const int row = tid >> 1, wrow = lane >> 1, khalf = (lane & 1) * 16, qi = row % kFlashQueries, h = g * G + row / kFlashQueries;
+    const bool live = qi < nq;
+    const std::int64_t t = t0 + qi;
+    for (int i = tid; i < L::kRows * kHeadDim; i += kThreadsF) {
+        const int rr = i / kHeadDim, d = i % kHeadDim, q = rr % kFlashQueries, hh = g * G + rr / kFlashQueries;
+        Qs[rr][d] = __float2half_rn(q < nq ? a.q[(t0 + q) * a.qs + static_cast<std::int64_t>(hh) * kHeadDim + d] : 0.0F);
+    }
+    for (int i = tid; i < L::kRows * 16; i += kThreadsF) {
+        const int rr = i / 16, c = i % 16, q = rr % kFlashQueries, hh = g * G + rr / kFlashQueries;
+        const float v = q < nq && c < a.d_rel ? a.r[(t0 + q) * a.rs + static_cast<std::int64_t>(hh) * a.d_rel + c] : 0.0F;
+        const __half hi = __float2half_rn(v);
+        Rhi[rr][c] = hi;
+        Rlo[rr][c] = __float2half_rn(v - __half2float(hi));
+    }
+    const float sink = live ? a.sink[t * a.ss + h] : 0.0F;
+    __syncthreads();
+    wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> qf[kHeadDim / 16], rhf, rlf;
+#pragma unroll
+    for (int k = 0; k < kHeadDim / 16; ++k) { wm::load_matrix_sync(qf[k], &Qs[16 * warp][16 * k], kFlashLd); }
+    wm::load_matrix_sync(rhf, &Rhi[16 * warp][0], kFlashRelLd);
+    wm::load_matrix_sync(rlf, &Rlo[16 * warp][0], kFlashRelLd);
+    __syncthreads();
+    // The accumulator fragment's row of each element: load a matrix of row numbers.
+    wm::fragment<wm::accumulator, 16, 16, 16, float> rowmap;
+    for (int i = lane; i < 16 * 16; i += 32) { Ss[16 * warp + i / 16][i % 16] = static_cast<float>(i / 16); }
+    __syncwarp();
+    wm::load_matrix_sync(rowmap, &Ss[16 * warp][0], kFlashSLd, wm::mem_row_major);
+    __syncwarp();
+    const std::int64_t base = a.start + (a.start_offset != nullptr ? *a.start_offset : 0);
+    const std::int64_t pos_first = base + t0, pos_last = base + t0 + nq - 1, pos = base + t;
+    const std::int64_t lo = a.window > 0 ? (pos_first - a.window + 1 > 0 ? pos_first - a.window + 1 : 0) : 0;
+    const float inv_sqrt_d = rsqrtf(static_cast<float>(kHeadDim));
+    const std::int64_t gofs = static_cast<std::int64_t>(g) * kHeadDim;
+    wm::fragment<wm::accumulator, 16, 16, 16, float> of[kHeadDim / 16];
+#pragma unroll
+    for (int n = 0; n < kHeadDim / 16; ++n) { wm::fill_fragment(of[n], 0.0F); }
+    float m = sink, l = 0.0F;
+    for (std::int64_t k0 = lo; k0 <= pos_last; k0 += kFlashKeys) {
+        const int nk = static_cast<int>(pos_last - k0 + 1 < kFlashKeys ? pos_last - k0 + 1 : kFlashKeys);
+        // The block's distances pos_first - (k0 + 31) + i, i < kFlashDists; the bias only where some is below extent.
+        const std::int64_t dmin = pos_first - (k0 + kFlashKeys - 1);
+        const bool biased = pos_first - (k0 + nk - 1) < a.extent;
+        for (int i = tid; i < kFlashKeys * 32; i += kThreadsF) { // 16 uint4 per row of K, then of V
+            const int which = i / (kFlashKeys * 16), j = (i / 16) % kFlashKeys, c = (i % 16) * 8;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (j < nk) {
+                const std::int64_t at = ((k0 + j) % a.capacity) * a.kv_width + gofs + c;
+                v = *reinterpret_cast<const uint4*>(static_cast<const __half*>(which == 0 ? a.k : a.v) + at);
+            }
+            *reinterpret_cast<uint4*>(which == 0 ? &Ks[j][c] : &Vs[j][c]) = v;
+        }
+        if (biased) {
+            for (int i = tid; i < kFlashDists * 16; i += kThreadsF) {
+                const int dd = i / 16, c = i % 16;
+                const std::int64_t dist = dmin + dd;
+                const float v = dist >= 0 && dist < a.extent && c < a.d_rel ? a.table[dist * a.d_rel + c] : 0.0F;
+                const __half hi = __float2half_rn(v);
+                Thi[dd][c] = hi;
+                Tlo[dd][c] = __float2half_rn(v - __half2float(hi));
+            }
+        }
+        __syncthreads();
+        // Scores of the warp's rows into Ss, and their bias over distances dmin + 16 (warp & 1) + (0 .. 48) into Bw.
+#pragma unroll
+        for (int n = 0; n < kFlashKeys / 16; ++n) {
+            wm::fragment<wm::accumulator, 16, 16, 16, float> sf;
+            wm::fill_fragment(sf, 0.0F);
+#pragma unroll
+            for (int k = 0; k < kHeadDim / 16; ++k) {
+                wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::col_major> kf;
+                wm::load_matrix_sync(kf, &Ks[16 * n][16 * k], kFlashLd);
+                wm::mma_sync(sf, qf[k], kf, sf);
+            }
+            wm::store_matrix_sync(&Ss[16 * warp][16 * n], sf, kFlashSLd, wm::mem_row_major);
+        }
+        if (biased) {
+#pragma unroll
+            for (int n = 0; n < 3; ++n) {
+                wm::fragment<wm::accumulator, 16, 16, 16, float> bf;
+                wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::col_major> th, tl;
+                const int d0 = 16 * (warp & 1) + 16 * n;
+                wm::load_matrix_sync(th, &Thi[d0][0], kFlashRelLd);
+                wm::load_matrix_sync(tl, &Tlo[d0][0], kFlashRelLd);
+                wm::fill_fragment(bf, 0.0F);
+                wm::mma_sync(bf, rlf, th, bf);
+                wm::mma_sync(bf, rhf, tl, bf);
+                wm::mma_sync(bf, rhf, th, bf);
+                wm::store_matrix_sync(&Bw[0][16 * n], bf, kFlashBLd, wm::mem_row_major);
+            }
+        }
+        __syncwarp();
+        // The row's scores (distance pos - k0 - j = dmin + 16 (warp & 1) + wrow - j + 31), tile maximum, rescale.
+        float sc[16];
+        float top = -INFINITY;
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            const int j = khalf + u;
+            const std::int64_t dist = pos - (k0 + j);
+            float v = -INFINITY;
+            if (live && j < nk && dist >= 0 && (a.window == 0 || dist < a.window)) {
+                v = Ss[16 * warp + wrow][j] * inv_sqrt_d + (biased ? Bw[wrow][wrow - j + kFlashKeys - 1] : 0.0F);
+            }
+            sc[u] = v;
+            top = fmaxf(top, v);
+        }
+        top = fmaxf(top, __shfl_xor_sync(0xFFFFFFFFU, top, 1));
+        const float m_new = fmaxf(m, top), alpha = expf(m - m_new);
+        m = m_new;
+        float sum = 0.0F;
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            const __half p = __float2half_rn(expf(sc[u] - m));
+            sum += __half2float(p);
+            Ps[16 * warp + wrow][khalf + u] = p;
+        }
+        l = fmaf(l, alpha, sum);
+        if ((lane & 1) == 0) { alpha_s[16 * warp + wrow] = alpha; }
+        __syncwarp();
+        float scale[8];
+#pragma unroll
+        for (int i = 0; i < rowmap.num_elements; ++i) { scale[i] = alpha_s[16 * warp + static_cast<int>(rowmap.x[i])]; }
+#pragma unroll
+        for (int n = 0; n < kHeadDim / 16; ++n) {
+#pragma unroll
+            for (int i = 0; i < of[n].num_elements; ++i) { of[n].x[i] *= scale[i]; }
+        }
+#pragma unroll
+        for (int k = 0; k < kFlashKeys / 16; ++k) {
+            wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> pf;
+            wm::load_matrix_sync(pf, &Ps[16 * warp][16 * k], kFlashPLd);
+#pragma unroll
+            for (int n = 0; n < kHeadDim / 16; ++n) {
+                wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::row_major> vf;
+                wm::load_matrix_sync(vf, &Vs[16 * k][16 * n], kFlashLd);
+                wm::mma_sync(of[n], pf, vf, of[n]);
+            }
+        }
+        __syncthreads();
+    }
+    l += __shfl_xor_sync(0xFFFFFFFFU, l, 1);
+    l += expf(sink - m);
+    // Out through the warp's rows of Ss, 32 dimensions at a time.
+#pragma unroll
+    for (int c0 = 0; c0 < kHeadDim; c0 += kFlashKeys) {
+#pragma unroll
+        for (int n = 0; n < kFlashKeys / 16; ++n) { wm::store_matrix_sync(&Ss[16 * warp][16 * n], of[c0 / 16 + n], kFlashSLd, wm::mem_row_major); }
+        __syncwarp();
+        if (live) {
+            for (int j = khalf; j < khalf + 16; ++j) {
+                const std::int64_t at = static_cast<std::int64_t>(h) * kHeadDim + c0 + j;
+                const float x = Ss[16 * warp + wrow][j] / l;
+                const float y = a.gate != nullptr ? x / (1.0F + expf(-a.gate[t * a.gs + at])) : x;
+                store_out(static_cast<Out*>(a.out) + t * a.os + at, y);
+            }
+        }
+        __syncwarp();
+    }
+}
+
+template <typename Out>
+void launch_flash(const AttentionArgs& a, int cols, int kv_heads, cudaStream_t stream) {
+    constexpr int kBytes = FlashLayout<3>::kBytes;
+    static const bool configured = [] {
+        return cudaFuncSetAttribute(attention_flash_kernel<Out, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes) == cudaSuccess;
+    }();
+    if (!configured) { throw std::runtime_error("relative_bias_sink_attention: the tensor-core kernel's shared memory"); }
+    attention_flash_kernel<Out, 3><<<dim3((cols + kFlashQueries - 1) / kFlashQueries, kv_heads), 3 * kFlashQueries * 2, kBytes, stream>>>(a, cols);
+}
+
 } // namespace
 
 void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream) {
@@ -466,7 +820,7 @@ std::size_t relative_bias_attention_split_bytes(const RelativeBiasAttentionShape
 void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Tensor& q, const Tensor& r, const Tensor& sink,
                                   const Tensor* k_new, const Tensor* v_new, const Tensor& table, Tensor& k_cache, Tensor& v_cache,
                                   std::int64_t start, const std::int64_t* start_offset, const Tensor* gate, Tensor& out,
-                                  cudaStream_t stream, const Tensor* split_workspace, std::int32_t* split_counters) {
+                                  cudaStream_t stream, const Tensor* split_workspace, std::int32_t* split_counters, bool tiled) {
     const char* op = "relative_bias_sink_attention";
     require(s.head_dim == kHeadDim, op, "head_dim must be 128");
     require(s.d_rel > 0 && s.d_rel <= kMaxRel, op, "d_rel must be 1..32");
@@ -502,6 +856,9 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     // Both paths read the caches (the pre-appended one, k_new = v_new = null, only reads them), so both need storage.
     require(k_cache.data != nullptr && v_cache.data != nullptr, op, "k_cache and v_cache need storage");
     require(reinterpret_cast<std::uintptr_t>(k_cache.data) % 16 == 0, op, "k_cache must be 16-byte aligned (vector key loads)");
+    // The flash route also loads values as uint4; a v_cache that is not 16-byte aligned takes the tiled route, which
+    // reads them one at a time.
+    const bool v_aligned = reinterpret_cast<std::uintptr_t>(v_cache.data) % 16 == 0;
     const std::int64_t capacity = k_cache.ne[1];
     require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
     require((k_new == nullptr) == (v_new == nullptr), op, "k_new and v_new come together");
@@ -554,6 +911,25 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
             } else {
                 attention_kernel<float, false, true><<<parts, kThreads, 0, stream>>>(a);
             }
+        }
+    } else if (tiled && cols > kSplitMaxColumns && fp16 && v_aligned && a.group == 3 && s.d_rel <= 16) {
+        if (out.dtype == DType::BF16) {
+            launch_flash<__nv_bfloat16>(a, cols, s.kv_heads, stream);
+        } else {
+            launch_flash<float>(a, cols, s.kv_heads, stream);
+        }
+    } else if (tiled && cols > kSplitMaxColumns) {
+        const dim3 tiles((cols + kTileQueries - 1) / kTileQueries, s.heads);
+        if (out.dtype == DType::BF16) {
+            if (fp16) {
+                attention_tiled_kernel<__nv_bfloat16, true><<<tiles, kTileThreads, 0, stream>>>(a, cols);
+            } else {
+                attention_tiled_kernel<__nv_bfloat16, false><<<tiles, kTileThreads, 0, stream>>>(a, cols);
+            }
+        } else if (fp16) {
+            attention_tiled_kernel<float, true><<<tiles, kTileThreads, 0, stream>>>(a, cols);
+        } else {
+            attention_tiled_kernel<float, false><<<tiles, kTileThreads, 0, stream>>>(a, cols);
         }
     } else if (out.dtype == DType::BF16) {
         if (fp16) {

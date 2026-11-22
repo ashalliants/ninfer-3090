@@ -20,6 +20,11 @@ ninfer_add_test(ninfer_dsv4_engine_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_dsv4_plan.cpp"
   LIBRARIES ninfer_runtime_support)
 
+# Inkling-2's prefill partition: a resumed prompt runs a cold one's forward calls (header only).
+ninfer_add_test(ninfer_inkling2_prefill_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_inkling2_prefill_plan.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_prefill_yield_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefill_yield.cpp"
   LIBRARIES ninfer_runtime_support)

@@ -260,7 +260,7 @@ The DSpark drafter runs greedy speculative decoding (see "DSpark drafter").
 | Piece | Where | What it does now |
 |---|---|---|
 | Config, binding | `config.{h,cpp}`, `model.h`, `load.cpp` | `inkling2_text` config, every parameter by name, all device resident (22.9 GB, 8.6 s on the V100) |
-| Program | `program/text_program.{h,cpp}` | `TextProgram::forward(tokens)`: the visit order, loop restarts and messages of "Forward, in order", any chunk size up to `max_chunk` (256), positions up to `max_context` (8192); optional per-visit trace hook with llama.cpp's names; optional taps (`tap_visits`) and `keep(n)`, which cuts a forward of up to `max_rollback` tokens back to its first n |
+| Program | `program/text_program.{h,cpp}` | `TextProgram::forward(tokens)`: the visit order, loop restarts and messages of "Forward, in order", any chunk size up to `max_chunk` (the engine's prefill chunk), positions up to `max_context` (8192); optional per-visit trace hook with llama.cpp's names; optional taps (`tap_visits`) and `keep(n)`, which cuts a forward of up to `max_rollback` tokens back to its first n |
 | Drafter | `program/dspark_program.{h,cpp}`, `ops/dspark_fp32.h` | `DSparkProgram::extend(taps, n)` writes the context K/V of committed positions; `draft(anchor)` runs the block and the Markov chain (W_head W_o precomputed at start and stored as Q8; see "Compact drafter") |
 | Dense projections | `ops/projection_fp32.h` | BF16 activations x BF16 weights, FP32 out; the head too |
 | Element-wise and norms | `ops/fp32_rows.h` | FP32 RMSNorm (weighted or unit), add, sigmoid gate, tanh softcap, BF16 embedding gather |
@@ -497,7 +497,8 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   - resets the `TextProgram`;
   - encodes its images, copying each encoding out, since a chunk can need the end of one image and the
     start of the next;
-  - prefills in chunks of 256;
+  - prefills in chunks of the startup's width ([Tensor-core prefill](#tensor-core-prefill)), one ending where
+    prefix reuse keeps its snapshot;
   - decodes with the decode graph.
 - Sampling runs on the host from the last column's FP32 logits (`unpadded_vocab_size`). It applies, in
   order: presence and frequency penalties, temperature, top-k (at most 20, as everywhere in the Engine),
@@ -506,12 +507,14 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
 - `max_pending_requests` bounds the queue, and `pending_timeout` refuses a request that waited too long.
 - There is no batching, context store or suspend.
 - Prefix reuse (on unless `context_cache.enabled` is off or a request sets `allow_prefix_reuse` false): after the
-  last whole 256-token chunk of each prompt that leaves a position to compute, the core copies the state a forward
+  last whole multiple of the prefill chunk that leaves a position to compute, the core copies the state a forward
   from there needs (`TextProgram::save`: every sliding visit's last 1023 K/V columns and every visit's convolution
   histories, 335 MB; the global caches are indexed by position and stay valid). A next prompt whose first positions
   are the same (token ids, and images by a hash of their pixels) restores it and prefills only the rest, in the same
-  chunks a prefill from 0 runs, so the output is unchanged. With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`); a sampled request does not run the drafter, so a greedy one resumes only from a snapshot a greedy one left. Images wholly in the reused prefix are not encoded. The
-  result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when shorter than 257 tokens).
+  chunks a prefill from 0 runs: every forward cut falls on a multiple of the chunk (`inkling2_prefill_plan.h`), so the
+  resumed forwards are the cold ones call for call and, as the tensor-core routes dispatch on a call's width, bit for
+  bit. Reuse is therefore chunk-grained (2048 positions at the default chunk 2048; `--prefill-chunk 256` for finer reuse). With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save`); a sampled request does not run the drafter, so a greedy one resumes only from a snapshot a greedy one left. Images wholly in the reused prefix are not encoded. The
+  result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when no longer than one chunk).
 - `--spec dspark` (default 3 drafts) speculates on greedy requests (`Inkling2Core::run`):
   - A round drafts n tokens after the anchor, forwards `[anchor, drafts]`, and consumes each column
     whose input is the token the previous column chose; the first that differs ends the round, and
@@ -622,7 +625,8 @@ the longest ring. That is about 25 MB of workspace at 65,536 context.
 ## FP16 KV rings
 
 **Lossy, on by default.** The target's and the drafter's KV rings hold FP16 (`EngineOptions::kv_rings`,
-`ProgramLimits::kv_fp16`); `--kv-dtype fp32` keeps the exact FP32 program, for reproduction. With FP16 rings the
+`ProgramLimits::kv_fp16`); `--kv-dtype fp32` keeps the exact FP32 program, for reproduction (it also resolves an unset `--prefill-math` to
+`fp32`; an explicit `--prefill-math tc` beside it runs the tensor cores and is not exact). With FP16 rings the
 head norms' append rounds each normalized K and V value to nearest FP16, and the attention widens the values back to
 FP32 as it reads them. Scores, softmax and sums stay FP32. A position costs 32 KiB across the 8 global visits
 instead of 64 KiB, so about twice the context fits. Inkling-2 refuses every other `--kv-dtype` form.
@@ -654,6 +658,72 @@ experts.
 | [1024, 4096) | 3.65e-3 | 1.41e-3 | 3.24e-2 | 3.98e-1 | 97.07% |
 | [4096, 16384) | 3.47e-3 | 1.27e-3 | 3.14e-2 | 4.50e-1 | 97.78% |
 | [16384, 30840) | 3.49e-3 | 1.33e-3 | 3.14e-2 | 1.91e-1 | 97.36% |
+
+## Tensor-core prefill
+
+**Lossy, on by default.** Prefill forwards of 64 or more columns run on the FP16 tensor cores with FP32
+accumulation (`EngineOptions::prefill_math`, `ProgramLimits::prefill_tc`). `--prefill-math fp32` keeps the exact
+FP32 prefill. Decode and DSpark's verify (at most 17 columns) are the FP32 program either way.
+
+- Dense projections: `projection_tc_fp32`. Each BF16 weight row is converted to FP16 under a power of two per row
+  (its absmax in [2^14, 2^15)), and each activation column under its own. cuBLAS `GemmEx` multiplies them with FP32
+  accumulation, and the two scales are divided out. A BF16 value converts exactly unless its scaled magnitude falls
+  under FP16's normal range: 1 of the 4.7e9 dense values does (`NINFER_INKLING2_TC_COUNT`).
+- Experts: `moe_situ_experts_tc`. The entries are grouped by expert, and one kernel per matrix runs every expert. A
+  CTA takes 128 rows of one expert by up to 64 of its entries. It decodes the NVFP4 blocks into shared memory and
+  multiplies on WMMA 16x16x16.
+  - Every NVFP4 value is exact in FP16 unscaled: at most 6 significant bits, with magnitudes in [2^-10, 2688].
+    That makes 0 of 2.0e10 inexact.
+  - Inputs are FP16 under a power of two per entry.
+  - The gate/up kernel applies SiTU and stores the activation in FP16 under one power of two for the call; the down
+    kernel scatters each entry's column.
+  - Layers 20-23's BF16 banks take per-expert cuBLAS calls.
+- Attention: one pass of flash attention over the FP16 rings. A block takes 32 columns by the 3 heads of a KV group,
+  so each staged key and value serves all three heads.
+  - Q and the softmax weights are FP16, K and V as stored, and the sums FP32 on WMMA.
+  - The online softmax rescales the accumulators in registers through the fragment's row map.
+  - The relative bias is a WMMA product too, over FP16 hi + lo parts of r and the table, which keeps about FP32's
+    absolute accuracy.
+
+Bit-identical changes made along the way also speed up the FP32 prefill (`test_wide_bits` checks them against one
+call per column):
+
+- the router scores take 4 columns by 16 experts per block;
+- the loop controllers form z once per column, then one thread per output;
+- the short convolutions split the columns into segments;
+- a forward holds only the visit outputs still referred to (the blocks, the loop's prelude and bank, the current
+  one) in a pool of slots, and releases each visit's own temporaries when it returns, instead of keeping every
+  visit's (six hidden-wide FP32 columns each, 2.65 MB of workspace per chunk token over the 48 visits). Only the
+  addresses change: the golden test stays byte-identical.
+
+Quality is measured with `NINFER_INKLING2_TC_KLD` on the FP16 rings: tensor cores in chunks of 1024 against the
+FP32 prefill in chunks of 256. Each row covers the logits after the prompt and those of the 64 teacher-forced decode
+steps that follow. The control changes only the order of the FP32 attention's sums (the tiled FP32 kernel in place of
+the flash one, through a measuring switch since removed; over FP32 rings `NINFER_INKLING2_TC_PARTS=attention` still
+takes that kernel), so it is the reordering noise floor. `NINFER_INKLING2_TC_PARTS` (any of dense, experts, attention)
+selects the parts for the other rows.
+
+| Route | 2K: KLD mean / max | 2K: argmax | 16K: KLD mean / max | 16K: argmax |
+|---|---|---|---|---|
+| All three | 2.63e-3 / 1.58e-2 | 65/65 | 1.92e-3 / 3.42e-2 | 64/65 |
+| Control: FP32, reordered | 3.06e-3 / 2.39e-2 | 65/65 | 1.96e-3 / 4.05e-2 | 64/65 |
+| Dense only | 2.46e-3 / 1.57e-2 | 64/65 | 1.21e-3 / 3.22e-2 | 65/65 |
+| Experts only | 2.96e-3 / 2.30e-2 | 64/65 | 1.46e-3 / 2.00e-2 | 64/65 |
+| Attention only | 2.58e-3 / 1.56e-2 | 64/65 | 1.64e-3 / 3.27e-2 | 65/65 |
+
+Speed on the V100 (2026-11-21), FP16 rings, `NINFER_INKLING2_PREFILL_BENCH`:
+
+| Context | FP32, chunk 256 | TC, chunk 256 | TC, 512 | TC, 1024 | TC, 2048 |
+|---|---|---|---|---|---|
+| 2,048 | 416 | 864 | 1,285 | 1,731 | 2,096 |
+| 10,240 | 382 | 831 | 1,227 | 1,633 | 1,968 |
+| 16,384 | - | - | - | 1,575 | 1,895 |
+
+(tok/s.) ninfer-all's tensor-core prefill on the same card is about 2,124 tok/s at 2K and 1,589 at 10K.
+
+The engine picks the widest chunk of 2048, 1024, 512 and 256 whose programs (with the drafter and the vision tower
+when they are on) fit beside `--max-context`, leaving 256 MiB free. It logs the choice at startup. `--prefill-chunk
+N` sets the chunk instead.
 
 ## GGUF mapping (Unsloth `unsloth/Inkling-2-Mini-GGUF`)
 

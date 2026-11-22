@@ -10,12 +10,14 @@
 #include "ninfer/ops/projection_fp32.h"
 #include "ninfer/ops/relative_bias_attention.h"
 #include "ninfer/ops/short_conv.h"
+#include "ninfer/ops/tensor_core_fp32.h"
 
 #include "core/copy_batch.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -34,12 +36,44 @@ void sync(cudaStream_t stream) {
     if (cudaStreamSynchronize(stream) != cudaSuccess) { throw std::runtime_error("inkling2: stream synchronization failed"); }
 }
 
+// The most visit outputs a forward holds at once (the current one, the blocks, the loop's prelude and bank, and the
+// output being written): run()'s bookkeeping over ids, the embedding not counted.
+std::int32_t max_live_outputs(const TextConfig& c) {
+    std::vector<int> blocks, prelude_blocks, bank;
+    int cur = 0, prelude_cur = -1, bank_last = -1;
+    std::size_t peak = 0;
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        const std::uint32_t p = c.physical(v), pass = c.pass(v);
+        if (c.is_core(p) && p == c.loop_core_start) {
+            if (pass == 0) {
+                prelude_blocks = blocks, prelude_cur = cur;
+            } else {
+                bank.assign(blocks.begin() + static_cast<std::ptrdiff_t>(prelude_blocks.size()) + 1, blocks.end());
+                bank_last = cur, blocks = prelude_blocks, cur = prelude_cur;
+            }
+        }
+        std::vector<int> live(blocks);
+        live.insert(live.end(), prelude_blocks.begin(), prelude_blocks.end());
+        live.insert(live.end(), bank.begin(), bank.end());
+        live.insert(live.end(), {cur, prelude_cur, bank_last});
+        std::sort(live.begin(), live.end());
+        live.erase(std::unique(live.begin(), live.end()), live.end());
+        const auto pooled = std::count_if(live.begin(), live.end(), [](int id) { return id > 0; });
+        peak = std::max(peak, static_cast<std::size_t>(pooled) + 1);
+        if (p % c.attn_res_block_size == 0) { blocks.push_back(cur); }
+        cur = static_cast<int>(v) + 1;
+    }
+    return static_cast<std::int32_t>(peak);
+}
+
 // Every allocation one token costs in a forward call (persistent across visits and per visit), with slack.
 std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_t max_context, bool split_attention,
-                            std::int32_t logit_columns) {
+                            std::int32_t logit_columns, const ProgramLimits::TensorCoreParts& tc, QType expert_format,
+                            const DenseWeightsQ8* dense) {
     const std::size_t h = c.hidden_size, q = std::size_t(c.heads) * c.head_dim, kv = std::size_t(c.kv_heads) * c.head_dim;
-    const std::size_t per_visit_kept = 6 * h * 4; // ffn_inp, the output and a core visit's four loop messages
-    const std::size_t per_visit_temp = 12 * h * 4 + 3 * h * 2 + (2 * q + std::size_t(c.heads) * (c.d_rel + 1)) * 4 +
+    const std::size_t kept = static_cast<std::size_t>(max_live_outputs(c)) * h * 4; // the pooled visit outputs
+    // A visit's own (ffn_inp and the four loop messages among them) are released when it returns.
+    const std::size_t per_visit_temp = 17 * h * 4 + 3 * h * 2 + (2 * q + std::size_t(c.heads) * (c.d_rel + 1)) * 4 +
                                        4 * (kv + 64) * 4 + 2 * q * 4 + q * 2 + 4 * h * 2 + 4 * h * 4 + 64 * 4 * 2 +
                                        std::size_t(c.experts_per_token) * (c.moe_intermediate + h) * 4 + 4 * c.experts_per_token * 4 +
                                        ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), 1) +
@@ -47,7 +81,7 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_
                                        ops::loop_controller_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), 1,
                                                                             ops::kLoopControllerMaxJobs);
     const std::size_t output = 4 * h * 4;
-    const std::size_t per_token = c.num_layer_visits * per_visit_kept + per_visit_temp + output;
+    const std::size_t per_token = kept + per_visit_temp + output;
     const std::size_t logits = std::size_t(c.vocab_size) * 4 * static_cast<std::size_t>(logit_columns);
     // Each allocation pads to 256 bytes; a visit makes about 60.
     // The attention's split parts of a call of up to kSplitMaxColumns columns over the ring that shows the most keys
@@ -56,7 +90,30 @@ std::size_t workspace_bytes(const TextConfig& c, std::int32_t chunk, std::int32_
     const std::int64_t keys = std::max<std::int64_t>(max_context, c.sliding_window);
     const std::size_t split =
         split_attention ? ops::relative_bias_attention_split_bytes(global, std::min(chunk, ops::kSplitMaxColumns), keys) : 0;
-    return per_token * static_cast<std::size_t>(chunk) + logits + split + (c.num_layer_visits * 2 + 64) * kAlign * 4 + (64U << 20);
+    // The tensor-core route's staging: the widest dense weight and the chunk in FP16, or the experts' entries. The
+    // head goes through project() too: when its call is wide enough for the tensor cores (every column's logits kept,
+    // last_logits off), its vocab_size rows are the widest weight. A re-encoded weight runs over its Q8 copy instead
+    // (project() takes it first): either --dense-q8 form re-encodes the head, and Q8All every dense projection, so
+    // nothing dense is staged.
+    ops::SituExpertBank bank;
+    bank.format = expert_format, bank.hidden = i32(h), bank.intermediate = i32(c.moe_intermediate), bank.experts = i32(c.experts);
+    const bool head_tc  = logit_columns >= kTensorCoreMinColumns && dense == nullptr;
+    const bool dense_tc = tc.dense && (dense == nullptr || dense->form() != DenseForm::Q8All);
+    const std::size_t widest = std::max({q, h, head_tc ? static_cast<std::size_t>(c.vocab_size) : std::size_t{0}});
+    const std::size_t staging =
+        std::max(dense_tc ? ops::projection_tc_workspace_bytes(i32(std::max(q, h)), i32(widest), chunk) : 0,
+                 tc.experts ? ops::moe_situ_experts_tc_workspace_bytes(bank, std::int64_t(c.experts_per_token) * chunk) : 0);
+    return per_token * static_cast<std::size_t>(chunk) + logits + split + staging + (c.num_layer_visits * 2 + 64) * kAlign * 4 +
+           (64U << 20);
+}
+
+// BF16 when any layer's experts are BF16 banks (their tensor-core route stages more), else the records' format.
+QType widest_expert_format(const Model& model) {
+    QType format = model.expert_bank(0).format;
+    for (std::size_t p = 0; p < model.weights().layers.size(); ++p) {
+        if (model.expert_bank(static_cast<std::uint32_t>(p)).format == QType::BF16) { format = QType::BF16; }
+    }
+    return format;
 }
 
 // The limits, validated before anything is sized from them.
@@ -75,7 +132,8 @@ ProgramLimits checked(ProgramLimits limits) {
 TextProgram::TextProgram(const Model& model, ProgramLimits limits, cudaStream_t stream)
     : model_(model), config_(model.config()), limits_(limits), stream_(stream),
       workspace_(workspace_bytes(model.config(), checked(limits).max_chunk, limits.max_context, limits.split_attention,
-                                 limits.last_logits ? std::max(1, limits.max_rollback) : limits.max_chunk)) {
+                                 limits.last_logits ? std::max(1, limits.max_rollback) : limits.max_chunk, limits.prefill_tc,
+                                 widest_expert_format(model), limits.dense)) {
     const TextConfig& c = config_;
     const std::size_t kv = std::size_t(c.kv_heads) * c.head_dim, taps = c.conv_kernel_size - 1;
     const std::size_t local_cap = c.sliding_window - 1 + static_cast<std::size_t>(limits.max_chunk);
@@ -278,6 +336,10 @@ Tensor TextProgram::project_inputs(std::span<const Tensor* const> inputs, std::s
         total += rows[i];
     }
     Tensor out = workspace_.alloc(DType::FP32, {total, cols});
+    if (limits_.prefill_tc.dense && cols >= kTensorCoreMinColumns) {
+        ops::projection_tc_fp32(inputs, std::span<const Tensor* const>(pointers.data(), weights.size()), out, workspace_, stream_);
+        return out;
+    }
     ops::projection_fp32_inputs(inputs, std::span<const Tensor* const>(pointers.data(), weights.size()), out, stream_);
     return out;
 }
@@ -293,7 +355,8 @@ Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, 
         total += rows[i];
     }
     Tensor out = workspace_.alloc(DType::FP32, {total, cols});
-    // A call runs over the re-encoding when every one of its weights has one (all or none, as the forms are made).
+    // A call runs over the re-encoding when every one of its weights has one (all or none, as the forms are made),
+    // at every width: --dense-q8 takes precedence over the tensor cores, so prefill and decode read the same weights.
     if (limits_.dense != nullptr && limits_.dense->find(views[0].data) != nullptr) {
         std::array<ops::Q8Weight, ops::kProjectionMaxWeights> q8;
         for (std::size_t i = 0; i < weights.size(); ++i) {
@@ -302,6 +365,9 @@ Tensor TextProgram::project(const Tensor& x, std::span<const WeightId> weights, 
             q8[i] = *found;
         }
         ops::projection_q8_fp32(x, std::span<const ops::Q8Weight>(q8.data(), weights.size()), out, stream_);
+    } else if (limits_.prefill_tc.dense && cols >= kTensorCoreMinColumns) {
+        const Tensor* input[] = {&x};
+        ops::projection_tc_fp32(input, std::span<const Tensor* const>(pointers.data(), weights.size()), out, workspace_, stream_);
     } else {
         ops::projection_fp32(x, std::span<const Tensor* const>(pointers.data(), weights.size()), out, stream_);
     }
@@ -322,7 +388,7 @@ void TextProgram::control(std::span<const ControllerWeights* const> w, std::span
     ops::loop_controller_fp32(std::span<const ops::LoopControllerJob>(jobs.data(), w.size()), config_.rms_norm_eps, workspace_, stream_);
 }
 
-Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, const Tensor* messages, std::int64_t start,
+Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, const Tensor* messages, Tensor next, std::int64_t start,
                           const Trace* trace) {
     const TextConfig& c   = config_;
     const std::uint32_t p = c.physical(v);
@@ -333,10 +399,9 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
                        kv = i32(c.kv_heads * c.head_dim), q = heads * d, rel = heads * i32(c.d_rel), k = i32(c.conv_kernel_size);
     const float eps = c.rms_norm_eps;
 
-    // The visit's outputs outlive it (blocks and the loop bookkeeping keep them); everything else is scoped.
-    Tensor ffn_inp = workspace_.alloc(DType::FP32, {h, cols});
-    Tensor next    = workspace_.alloc(DType::FP32, {h, cols});
+    // The output is the caller's (blocks and the loop bookkeeping keep it); everything else is scoped.
     const auto scope = workspace_.scope();
+    Tensor ffn_inp = workspace_.alloc(DType::FP32, {h, cols});
 
     // 3b-3d: attention inputs by depth attention, loop messages, input norms.
     Tensor xq = cur, xk = cur, xv = cur;
@@ -470,7 +535,8 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     const Tensor split = split_bytes > 0 ? workspace_.alloc(DType::FP32, {i32(split_bytes / 4)}) : Tensor{};
     ops::relative_bias_sink_attention(shape, q_t, r_t, sink, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
                                       gated, stream_, split_bytes > 0 ? &split : nullptr,
-                                      split_bytes > 0 ? static_cast<std::int32_t*>(split_counters_.p) : nullptr);
+                                      split_bytes > 0 ? static_cast<std::int32_t*>(split_counters_.p) : nullptr,
+                                      limits_.prefill_tc.attention && cols >= kTensorCoreMinColumns);
     const WeightId ow[] = {w.output};
     const std::int32_t orows[] = {h};
     Tensor a_in = project(gated, ow, orows);
@@ -522,7 +588,11 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     // The experts' outputs are combined by the output convolution's launch (the same FMAs as the experts' own
     // combine); the combined y is written out only when the convolution inputs are being saved.
     Tensor entries = workspace_.alloc(DType::FP32, {h, top_k * cols});
-    ops::moe_situ_experts(model_.expert_bank(p), zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_);
+    if (limits_.prefill_tc.experts && cols >= kTensorCoreMinColumns) {
+        ops::moe_situ_experts_tc(model_.expert_bank(p), zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_);
+    } else {
+        ops::moe_situ_experts(model_.expert_bank(p), zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_);
+    }
     {
         Tensor y = saving_ ? workspace_.alloc(DType::FP32, {h, cols}) : Tensor();
         const ops::ConvCombine combine{&entries, &weights, saving_ ? &y : nullptr};
@@ -672,9 +742,31 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
         }
     }
 
-    // 3: the visits, with the loop bookkeeping of 3a.
+    // 3: the visits, with the loop bookkeeping of 3a. Their outputs take slots of a pool sized by max_live_outputs,
+    // a slot freed once no block, loop state or the current output refers to it (the same values: only addresses).
     std::vector<Tensor> blocks, prelude_blocks, bank;
     Tensor prelude_cur, bank_last;
+    std::vector<Tensor> pool(static_cast<std::size_t>(max_live_outputs(c)));
+    for (Tensor& slot : pool) { slot = workspace_.alloc(DType::FP32, {h, cols}); }
+    std::vector<bool> taken(pool.size(), false);
+    const auto take_slot = [&]() -> Tensor {
+        const auto refers = [&](const void* data) {
+            const auto in = [&](const std::vector<Tensor>& list) {
+                return std::any_of(list.begin(), list.end(), [&](const Tensor& t) { return t.data == data; });
+            };
+            return cur.data == data || prelude_cur.data == data || bank_last.data == data || in(blocks) || in(prelude_blocks) || in(bank);
+        };
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            if (taken[i] && !refers(pool[i].data)) { taken[i] = false; }
+        }
+        for (std::size_t i = 0; i < pool.size(); ++i) {
+            if (!taken[i]) {
+                taken[i] = true;
+                return pool[i];
+            }
+        }
+        throw std::logic_error("inkling2: the visit output pool is exhausted");
+    };
     const Tensor loop_q = model_.tensor(model_.weights().loop_res_query, {h, i32(2 * c.core_layers())});
     const Tensor loop_kv = model_.tensor(model_.weights().loop_kv_res_query, {h, i32(2 * c.core_layers())});
     for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
@@ -691,6 +783,8 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
                 cur       = prelude_cur;
             }
         }
+        Tensor next = take_slot();
+        const auto visit_scope = workspace_.scope(); // the loop messages and the visit's temporaries
         std::array<Tensor, 4> messages; // attn, k, v, mlp
         const bool has_messages = core && pass > 0;
         if (has_messages) {
@@ -705,7 +799,7 @@ Tensor TextProgram::run(const Tensor& ids, std::int64_t start, const Trace* trac
             ops::depth_attention_mix(sources, loop_kv.slice(1, 2 * j, 2), c.rms_norm_eps, workspace_, k_v, stream_);
         }
         copy_tap(v, cur);
-        cur = visit(v, cur, blocks, has_messages ? messages.data() : nullptr, start, trace);
+        cur = visit(v, cur, blocks, has_messages ? messages.data() : nullptr, next, start, trace);
     }
 
     // 4: output.

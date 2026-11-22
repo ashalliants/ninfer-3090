@@ -22,6 +22,11 @@
 #include <optional>
 #include <thread>
 
+namespace ninfer::models::inkling2 {
+struct ProgramLimits;
+class DenseWeightsQ8;
+} // namespace ninfer::models::inkling2
+
 namespace ninfer::runtime {
 
 class Inkling2Core {
@@ -83,7 +88,10 @@ private:
     std::unique_ptr<models::inkling2::Frontend> frontend_;
     cudaStream_t stream_ = nullptr;
     struct Programs;
+    void build_programs(models::inkling2::ProgramLimits limits, std::unique_ptr<models::inkling2::DenseWeightsQ8>& dense,
+                        const models::inkling2::VisionConfig* vision, bool dspark);
     std::unique_ptr<Programs> programs_;
+    std::int32_t chunk_ = 256; // prompt tokens per forward, chosen at startup
 
     mutable std::mutex mutex_;
     std::condition_variable wake_;

@@ -67,6 +67,23 @@ public:
     std::string content, reasoning;
 };
 
+// The prefill chunk the Engine picked, from its load note ("prefill | chunk N ...").
+std::uint32_t chunk_of(const ninfer::Engine& engine) {
+    for (const std::string& note : engine.load_summary().notes) {
+        if (note.rfind("prefill | chunk ", 0) == 0) { return static_cast<std::uint32_t>(std::stoul(note.substr(16))); }
+    }
+    throw std::runtime_error("no prefill chunk note");
+}
+
+// A prompt of facts at least `tokens` long as the Engine counts it.
+std::string facts_until(const ninfer::Engine& engine, std::uint32_t tokens) {
+    std::string context = "Here is a list of facts.";
+    for (int i = 0; engine.prepare(user_turn({text(context)})).summary().prompt_tokens < tokens; ++i) {
+        context += " Fact " + std::to_string(i) + ": the number " + std::to_string(i * 7) + " is noted.";
+    }
+    return context;
+}
+
 std::string ids_text(const std::vector<ninfer::TokenId>& ids) {
     std::string s;
     for (const auto id : ids) { s += std::to_string(id) + " "; }
@@ -86,6 +103,7 @@ int main() {
         options.artifact_path = artifact_path;
         options.max_context   = 4096;
         options.enable_vision = true;
+        options.prefill_chunk_auto = true; // the widest chunk that fits, as the CLI and serve run without --prefill-chunk
         options.max_concurrency = 4; // Inkling-2 runs one: the Engine reports what it runs
         {
             ninfer::EngineOptions unbounded   = options;
@@ -135,12 +153,50 @@ int main() {
             } catch (const std::invalid_argument&) {}
         }
         {
-            // Prefix reuse off: no snapshot, so no extra device state is reported.
+            // Prefix reuse off: no snapshot, so no extra device state is reported. With FP32 rings and --prefill-math
+            // unset, the prefill is the exact FP32 one too.
             ninfer::EngineOptions uncached = options;
             uncached.context_cache.enabled = false;
+            uncached.kv_rings              = ninfer::KvRings::FP32;
             ninfer::Engine engine(uncached);
             check(!engine.options().context_cache.enabled && engine.options().context_cache.device_state_slots == 0U,
                   "no extra device state without prefix reuse");
+            check(engine.load_summary().prefill_signature == "inkling2-fp32",
+                  "--kv-dtype fp32 alone runs the exact FP32 prefill: " + engine.load_summary().prefill_signature);
+        }
+        {
+            // Prefix reuse at --prefill-chunk 512 under the tensor-core default: every cut and snapshot is a multiple of
+            // the chunk, so a resumed prompt runs a cold one's forward calls from the resume point on. A 512-token
+            // prompt leaves no snapshot (a 256 one would resume [256,768) where a cold prefill runs [0,512)
+            // [512,768)); a 513-token one leaves 512, from which a 1024-token prompt sharing the prefix resumes.
+            ninfer::EngineOptions chunked   = options;
+            chunked.enable_vision           = false;
+            chunked.prefill_chunk           = 512;
+            chunked.prefill_chunk_auto      = false; // a direct caller's chunk runs as set
+            ninfer::Engine engine(chunked);
+            check(chunk_of(engine) == 512, "--prefill-chunk 512 is the chunk that runs");
+            const std::vector<ninfer::TokenId> base = engine.tokenize_text(facts_until(engine, 1100));
+            check(base.size() >= 1024, "the facts tokenize to 1024 tokens or more");
+            const auto prompt_of = [&](std::uint32_t tokens) {
+                return std::vector<ninfer::TokenId>(base.begin(), base.begin() + std::min<std::size_t>(tokens, base.size()));
+            };
+            const auto run = [&](std::uint32_t tokens, bool reuse) {
+                auto o                         = greedy(24);
+                o.execution.allow_prefix_reuse = reuse;
+                return engine.generate(engine.prepare_tokens(prompt_of(tokens)), o);
+            };
+            const auto cold = run(1024, false);
+            (void)run(512, true);
+            const auto after_512 = run(1024, true);
+            check(after_512.reused_prompt_tokens == 0, "a 512-token prompt at chunk 512 leaves no snapshot: " +
+                                                           std::to_string(after_512.reused_prompt_tokens) + " reused");
+            (void)run(513, true);
+            const auto resumed = run(1024, true);
+            check(resumed.reused_prompt_tokens == 512 && resumed.computed_prefill_tokens == 512,
+                  "a 1024-token prompt resumes from the 513-token prompt's snapshot at 512: " +
+                      std::to_string(resumed.reused_prompt_tokens) + " reused");
+            check(after_512.generated_token_ids == cold.generated_token_ids && resumed.generated_token_ids == cold.generated_token_ids,
+                  "at chunk 512 a resumed prompt decodes what a cold one does");
         }
         const auto t0         = Clock::now();
         ninfer::Engine engine(options);
@@ -372,12 +428,16 @@ int main() {
             std::printf("  ids: %s\n  reasoning: %s\n", ids_text(r.generated_token_ids).c_str(), r.reasoning.c_str());
             // An image prompt past one chunk resumes with the image in the reused prefix, which is then not encoded.
             std::string longer = "Describe this image in one paragraph, then list every object in it.";
-            for (int i = 0; i < 12; ++i) { longer += " Mention colours, shapes, text and layout, and be precise."; }
+            // Past one whole chunk: reuse is chunk-grained.
+            while (engine.tokenize_text(longer).size() + r.prompt.prompt_tokens <= chunk_of(engine) + 32) { // the image's 234 and more
+                longer += " Mention colours, shapes, text and layout, and be precise.";
+            }
             auto no_reuse                         = greedy(16);
             no_reuse.execution.allow_prefix_reuse = false;
             const auto cold  = engine.generate(engine.prepare(user_turn({image, text(longer)})), no_reuse);
             const auto again = engine.generate(engine.prepare(user_turn({image, text(longer)})), greedy(16));
-            check(cold.prompt.prompt_tokens > 256 && again.reused_prompt_tokens >= 256 && again.timings.vision_seconds == 0.0 &&
+            check(cold.prompt.prompt_tokens > chunk_of(engine) && again.reused_prompt_tokens >= chunk_of(engine) &&
+                      again.reused_prompt_tokens % chunk_of(engine) == 0 && again.timings.vision_seconds == 0.0 &&
                       again.generated_token_ids == cold.generated_token_ids,
                   "an image prompt resumes from its snapshot: " + std::to_string(again.reused_prompt_tokens) + " reused, vision " +
                       std::to_string(again.timings.vision_seconds) + " s, same output " +
@@ -386,8 +446,8 @@ int main() {
         // Prefix reuse: a prompt that repeats the last one's first whole chunks resumes from their snapshot and
         // decodes what a prefill from 0 does; a request that forbids reuse, or an unrelated prompt, does not.
         {
-            std::string context = "Here is a list of facts.";
-            for (int i = 0; i < 60; ++i) { context += " Fact " + std::to_string(i) + ": the number " + std::to_string(i * 7) + " is noted."; }
+            const std::uint32_t chunk = chunk_of(engine); // reuse is chunk-grained: the prompt passes one whole chunk
+            const std::string context = facts_until(engine, chunk + 160);
             const auto ask = [&](const std::string& tail, bool reuse) {
                 auto o                              = greedy(24);
                 o.execution.allow_prefix_reuse = reuse;
@@ -396,8 +456,8 @@ int main() {
             (void)engine.generate(engine.prepare(question()), greedy(4)); // any snapshot is another prompt's
             const auto cold  = ask(" What is fact 3?", false); // takes none, leaves one
             const auto again = ask(" What is fact 3?", true);
-            check(cold.reused_prompt_tokens == 0 && cold.prompt.prompt_tokens > 512, "a request that forbids reuse reuses nothing");
-            check(again.reused_prompt_tokens > 0 && again.reused_prompt_tokens % 256 == 0 &&
+            check(cold.reused_prompt_tokens == 0 && cold.prompt.prompt_tokens > chunk, "a request that forbids reuse reuses nothing");
+            check(again.reused_prompt_tokens > 0 && again.reused_prompt_tokens % chunk == 0 &&
                       again.reused_prompt_tokens < again.prompt.prompt_tokens &&
                       again.computed_prefill_tokens == again.prompt.prompt_tokens - again.reused_prompt_tokens,
                   "the same prompt resumes from its snapshot: " + std::to_string(again.reused_prompt_tokens));
