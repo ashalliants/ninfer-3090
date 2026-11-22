@@ -168,6 +168,9 @@ ProgramLimits checked(ProgramLimits limits) {
         throw std::invalid_argument("inkling2: max_rollback must be in 0..max_chunk");
     }
     if (limits.slots < 1) { throw std::invalid_argument("inkling2: a Program holds at least one slot"); }
+    if (!limits.kv_quant_k.empty() && (!limits.kv_fp16 || (limits.kv_quant_recent > 0 && limits.slots > 1))) {
+        throw std::invalid_argument("inkling2: simulated low-bit KV needs FP16 rings (and one slot with a recent window)");
+    }
     return limits;
 }
 
@@ -302,6 +305,7 @@ void TextProgram::reset() {
         }
     }
     position_  = 0;
+    aged_      = 0;
     last_cols_ = 0;
 }
 
@@ -786,7 +790,8 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
             jobs[1].log_scale = local ? nullptr : &tau;
             // The k and v norms also append the normalized columns to the visit's ring (the attention then does not); with
             // pieces, each piece's just before its attention (below).
-            const ops::KvAppend k_append{&st.k_cache, start, start_offset_}, v_append{&st.v_cache, start, start_offset_};
+            ops::KvAppend k_append{&st.k_cache, start, start_offset_}, v_append{&st.v_cache, start, start_offset_};
+            if (!limits_.kv_quant_k.empty() && limits_.kv_quant_recent == 0) { k_append.quant = limits_.kv_quant_k[v], v_append.quant = limits_.kv_quant_v[v]; }
             jobs[2].x = &kconv, jobs[2].head_dim = d, jobs[2].threshold = c.qk_clip, jobs[2].append = &k_append;
             jobs[3].x = &vconv, jobs[3].head_dim = d, jobs[3].unit_rms = true, jobs[3].eps = eps, jobs[3].append = &v_append;
             ops::head_norms_fp32(std::span<const ops::HeadNormJob>(jobs, pieces.size() == 1 ? 4 : 2), stream_, columns_);
@@ -808,7 +813,8 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
             for (const auto& piece : pieces) {
                 Tensor kp = piece_of(kconv, piece), vp = piece_of(vconv, piece);
                 const std::int64_t at = start + piece.first;
-                const ops::KvAppend k_append{&st.k_cache, at, nullptr}, v_append{&st.v_cache, at, nullptr};
+                ops::KvAppend k_append{&st.k_cache, at, nullptr}, v_append{&st.v_cache, at, nullptr};
+                if (!limits_.kv_quant_k.empty() && limits_.kv_quant_recent == 0) { k_append.quant = limits_.kv_quant_k[v], v_append.quant = limits_.kv_quant_v[v]; }
                 ops::HeadNormJob jobs[2];
                 jobs[0].x = &kp, jobs[0].head_dim = d, jobs[0].threshold = c.qk_clip, jobs[0].append = &k_append;
                 jobs[1].x = &vp, jobs[1].head_dim = d, jobs[1].unit_rms = true, jobs[1].eps = eps, jobs[1].append = &v_append;
@@ -988,9 +994,77 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, std::span<cons
     saving_ = false;
     inputs_ = {};
     position_ += cols;
+    age_rings();
     last_cols_   = cols;
     last_tapped_ = taps_on_;
     return logits;
+}
+
+void TextProgram::age_rings() {
+    if (limits_.kv_quant_k.empty() || limits_.kv_quant_recent <= 0) { return; }
+    const std::int64_t to = position_ - limits_.kv_quant_recent;
+    if (to <= aged_) { return; }
+    for (std::uint32_t v = 0; v < config_.num_layer_visits; ++v) {
+        VisitState& s = state_[v];
+        const std::int64_t first = std::max(aged_, to - s.k_cache.ne[1]);
+        if (limits_.kv_quant_k[v] != 0) { ops::kv_ring_fake_quant(s.k_cache, limits_.kv_quant_k[v], first, to - first, stream_); }
+        if (limits_.kv_quant_v[v] != 0) { ops::kv_ring_fake_quant(s.v_cache, limits_.kv_quant_v[v], first, to - first, stream_); }
+    }
+    aged_ = to;
+}
+
+void parse_kv_quant(const TextConfig& c, const std::string& spec, ProgramLimits& limits) {
+    const auto fail = [&] { throw std::invalid_argument("inkling2: bad low-bit KV spec '" + spec + "'"); };
+    std::vector<std::string> parts;
+    for (std::size_t from = 0;;) {
+        const std::size_t to = spec.find(':', from);
+        parts.push_back(spec.substr(from, to == std::string::npos ? std::string::npos : to - from));
+        if (to == std::string::npos) { break; }
+        from = to + 1;
+    }
+    const std::string& form = parts[0];
+    const std::size_t vat = form.find('v');
+    if (form.empty() || form[0] != 'k' || vat == std::string::npos) { fail(); }
+    const std::string kf = form.substr(1, vat - 1), vf = form.substr(vat + 1);
+    int kq = -1, vq = -1;
+    if (kf == "16") { kq = 0; } else if (kf == "8") { kq = 0x12; } else if (kf == "4") { kq = 0x11; } else if (kf == "8n") { kq = 0x02; } else if (kf == "4n") { kq = 0x01; }
+    if (vf == "16") { vq = 0; } else if (vf == "8") { vq = 0x02; } else if (vf == "4") { vq = 0x03; } else if (vf == "4l") { vq = 0x11; } else if (vf == "4r") { vq = 0x13; } else if (vf == "8r") { vq = 0x12; }
+    if (kq < 0 || vq < 0) { fail(); }
+    std::vector<std::uint32_t> globals;
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        if (!c.local[c.physical(v)]) { globals.push_back(v); }
+    }
+    std::vector<bool> on(c.num_layer_visits, false);
+    bool chose = false, local = false;
+    for (std::size_t i = 1; i < parts.size(); ++i) {
+        const std::string& o = parts[i];
+        if (o == "local") {
+            local = true;
+        } else if (o.rfind("g=", 0) == 0) {
+            chose = true;
+            std::size_t from = 2;
+            while (from < o.size()) {
+                std::size_t to = o.find(',', from);
+                if (to == std::string::npos) { to = o.size(); }
+                const int g = std::stoi(o.substr(from, to - from));
+                if (g < 0 || g >= static_cast<int>(globals.size())) { fail(); }
+                on[globals[static_cast<std::size_t>(g)]] = true;
+                from = to + 1;
+            }
+        } else if (o.rfind("w=", 0) == 0) {
+            limits.kv_quant_recent = std::stoi(o.substr(2));
+        } else {
+            fail();
+        }
+    }
+    if (!chose) {
+        for (const auto v : globals) { on[v] = true; }
+    }
+    limits.kv_quant_k.assign(c.num_layer_visits, 0);
+    limits.kv_quant_v.assign(c.num_layer_visits, 0);
+    for (std::uint32_t v = 0; v < c.num_layer_visits; ++v) {
+        if (on[v] || (local && c.local[c.physical(v)])) { limits.kv_quant_k[v] = kq, limits.kv_quant_v[v] = vq; }
+    }
 }
 
 Tensor TextProgram::forward_graph(std::int32_t token) {
@@ -1047,6 +1121,7 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
     }
     if (cudaGraphLaunch(exec, stream_) != cudaSuccess) { throw std::runtime_error("inkling2: decode graph launch failed"); }
     position_ += 1;
+    age_rings();
     last_cols_   = 1;
     last_tapped_ = taps_on_;
     return graph_logits;

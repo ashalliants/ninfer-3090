@@ -15,6 +15,8 @@
 #include "models/inkling2/program/text_program.h"
 #include "models/inkling2/program/vision_program.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -514,6 +516,11 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         limits.last_logits = true; // prefill reads only the last column (decode below)
         limits.split_attention = options_.split_attention;
         limits.kv_fp16         = options_.kv_rings != KvRings::FP32; // FP16 by default
+        // Experimental measuring knob (the low-bit KV trial): a simulated low-bit coding of the FP16 rings.
+        if (const char* kvq = std::getenv("NINFER_INKLING2_KVQ"); kvq != nullptr && *kvq != '\0') {
+            ink::parse_kv_quant(model_->config(), kvq, limits);
+            std::fprintf(stderr, "inkling2: EXPERIMENTAL simulated low-bit KV '%s'\n", kvq);
+        }
         if (!prefill_is_fp32(options_.kv_rings, options_.prefill_math)) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
         limits.slots = slots_;
         // Batched decode runs every request plain: with several slots there is no drafter.

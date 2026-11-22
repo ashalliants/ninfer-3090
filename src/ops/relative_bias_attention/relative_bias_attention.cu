@@ -111,6 +111,7 @@ struct HeadArgs {
     int head_begin[kHeadNormMaxJobs]; // first global head of each job
     void* cache[kHeadNormMaxJobs];    // or null: the KV ring the normalized column is also written to
     bool cache_fp16[kHeadNormMaxJobs]; // the ring holds FP16 (round to nearest) rather than FP32
+    int quant[kHeadNormMaxJobs];       // experimental: KvAppend::quant (FP16 rings, head_dim 128)
     std::int64_t cache_start[kHeadNormMaxJobs], capacity[kHeadNormMaxJobs], cache_rows[kHeadNormMaxJobs];
     const std::int64_t* cache_offset[kHeadNormMaxJobs];
     int count, total;
@@ -153,6 +154,68 @@ __device__ void unit_rms_head(float* v, int head_dim, float eps, int lane) {
     }
 }
 
+// ---- Experimental low-bit KV (simulated): the value a 4- or 8-bit ring would hand back, stored in the FP16 ring ----
+// quant = rotate << 4 | kind (KvAppend::quant). rotate: a normalized Hadamard-128 first (the inverse after). kind 1: the
+// rk4v4 key codec's 16-level Lloyd-Max indices per 64 dimensions against the group RMS, least-squares FP16 scale;
+// 2: INT8 per 64 dimensions, FP16 scale absmax / 127; 3: signed int4 per 32 dimensions, FP16 scale absmax / 7 (rk8v4's
+// value plane). A warp holds one head of 128, lane l dimensions l + 32 i.
+__device__ __forceinline__ float warp_max_abs(float v) {
+    v = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) { v = fmaxf(v, __shfl_xor_sync(0xffffffffU, v, o)); }
+    return v;
+}
+__device__ __forceinline__ void hadamard128(float (&x)[4], int lane) {
+#pragma unroll
+    for (int s = 1; s < 32; s <<= 1) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float o = __shfl_xor_sync(0xffffffffU, x[i], s);
+            x[i] = (lane & s) != 0 ? o - x[i] : x[i] + o;
+        }
+    }
+    const float a = x[0] + x[1], b = x[0] - x[1], c = x[2] + x[3], d = x[2] - x[3];
+    constexpr float kNorm = 0.08838834764831845F; // 1 / sqrt(128)
+    x[0] = (a + c) * kNorm, x[1] = (b + d) * kNorm, x[2] = (a - c) * kNorm, x[3] = (b - d) * kNorm;
+}
+__device__ __forceinline__ int lloyd4_magnitude(float z) {
+    const float a = fabsf(z);
+    return (a >= 0.25825F) + (a >= 0.52245F) + (a >= 0.79960F) + (a >= 1.09930F) + (a >= 1.43715F) + (a >= 1.84355F) + (a >= 2.40080F);
+}
+__device__ __forceinline__ float lloyd4_code(int m) {
+    constexpr float codes[8] = {6, 18, 31, 44, 58, 75, 96, 127};
+    return codes[m];
+}
+__device__ void fake_quant_head(float (&x)[4], int quant, int lane) {
+    const bool rotate = (quant >> 4) != 0;
+    const int kind = quant & 15;
+    if (rotate) { hadamard128(x, lane); }
+    if (kind == 1) {
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            float x0 = x[2 * g], x1 = x[2 * g + 1];
+            const float rms = sqrtf(warp_sum(x0 * x0 + x1 * x1) / 64.0F);
+            const float inv = rms > 0.0F ? 1.0F / rms : 0.0F;
+            const float c0 = copysignf(lloyd4_code(lloyd4_magnitude(x0 * inv)), x0), c1 = copysignf(lloyd4_code(lloyd4_magnitude(x1 * inv)), x1);
+            const float xc = warp_sum(x0 * c0 + x1 * c1), cc = warp_sum(c0 * c0 + c1 * c1);
+            const float s = __half2float(__float2half_rn(rms > 0.0F ? xc / cc : 0.0F));
+            x[2 * g] = c0 * s, x[2 * g + 1] = c1 * s;
+        }
+    } else if (kind == 2) {
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const float s = __half2float(__float2half_rn(warp_max_abs(fmaxf(fabsf(x[2 * g]), fabsf(x[2 * g + 1]))) / 127.0F));
+            for (int e = 2 * g; e < 2 * g + 2; ++e) { x[e] = s > 0.0F ? fminf(127.0F, fmaxf(-127.0F, rintf(x[e] / s))) * s : 0.0F; }
+        }
+    } else if (kind == 3) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float s = __half2float(__float2half_rn(warp_max_abs(x[i]) / 7.0F));
+            x[i] = s > 0.0F ? fminf(7.0F, fmaxf(-7.0F, rintf(x[i] / s))) * s : 0.0F;
+        }
+    }
+    if (rotate) { hadamard128(x, lane); } // normalized Sylvester Hadamard: its own inverse
+}
+
 // Global head g (of every job's heads in order) of column t.
 __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int lane) {
     // The job by compile-time compares (a runtime index into the parameters would copy them to local memory).
@@ -167,6 +230,7 @@ __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int l
     int head_dim = a.head_dim[0], kind = a.kind[0], begin = a.head_begin[0];
     void* cache = a.cache[0];
     bool fp16 = a.cache_fp16[0];
+    int quant = a.quant[0];
     std::int64_t cache_start = a.cache_start[0], capacity = a.capacity[0], cache_rows = a.cache_rows[0];
     const std::int64_t* cache_offset = a.cache_offset[0];
 #pragma unroll
@@ -175,7 +239,7 @@ __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int l
             x = a.x[i], xs = a.xs[i], start = a.start[i], floor = a.floor[i], scale = a.scale[i], offset = a.start_offset[i];
             threshold = a.threshold[i], alpha = a.alpha[i], eps = a.eps[i], head_dim = a.head_dim[i], kind = a.kind[i];
             begin = a.head_begin[i];
-            cache = a.cache[i], fp16 = a.cache_fp16[i], cache_start = a.cache_start[i], capacity = a.capacity[i], cache_offset = a.cache_offset[i];
+            cache = a.cache[i], fp16 = a.cache_fp16[i], quant = a.quant[i], cache_start = a.cache_start[i], capacity = a.capacity[i], cache_offset = a.cache_offset[i];
             cache_rows = a.cache_rows[i];
         }
     }
@@ -196,7 +260,15 @@ __device__ __forceinline__ void head_norm(const HeadArgs& a, int t, int g, int l
             a.col_pos != nullptr ? a.col_pos[t] : cache_start + (cache_offset != nullptr ? *cache_offset : 0) + t;
         const std::int64_t at = (position % capacity) * cache_rows + static_cast<std::int64_t>(h) * head_dim;
         if (a.col_slot != nullptr) { cache = static_cast<char*>(cache) + a.col_slot[t] * a.slot_stride; }
-        if (fp16) {
+        if (fp16 && quant != 0) {
+            float y[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { y[i] = v[lane + 32 * i]; }
+            fake_quant_head(y, quant, lane);
+            __half* copy = static_cast<__half*>(cache) + at;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { copy[lane + 32 * i] = __float2half_rn(y[i]); }
+        } else if (fp16) {
             __half* copy = static_cast<__half*>(cache) + at;
             for (int d = lane; d < head_dim; d += 32) { copy[d] = __float2half_rn(v[d]); }
         } else {
@@ -930,6 +1002,8 @@ void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream, con
             a.cache_offset[j] = ap.start_offset;
             a.capacity[j]     = ap.cache->ne[1];
             a.cache_rows[j]   = x.ne[0];
+            a.quant[j]        = ap.quant;
+            require(ap.quant == 0 || (a.cache_fp16[j] && head_dim == 128), op, "a simulated low-bit append needs an FP16 ring and heads of 128");
         }
         if (job.unit_rms) {
             require(job.eps > 0.0F, op, "eps must be positive");
@@ -956,6 +1030,31 @@ void head_norms_fp32(std::span<const HeadNormJob> jobs, cudaStream_t stream, con
     require(heads_total <= std::numeric_limits<int>::max(), op, "too many heads");
     a.total = static_cast<int>(heads_total);
     head_norms_kernel<<<dim3(cols, static_cast<unsigned>(std::min<std::int64_t>(heads_total, kMaxGridY))), 32, 0, stream>>>(a);
+    check_launch(op);
+}
+
+namespace {
+// grid (count, heads): positions first .. first + count - 1 of an FP16 ring, quantized in place (fake_quant_head).
+__global__ void ring_fake_quant_kernel(__half* ring, std::int64_t rows, std::int64_t capacity, std::int64_t first, int quant) {
+    const int lane = threadIdx.x;
+    __half* p = ring + ((first + blockIdx.x) % capacity) * rows + static_cast<std::int64_t>(blockIdx.y) * 128;
+    float y[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { y[i] = __half2float(p[lane + 32 * i]); }
+    fake_quant_head(y, quant, lane);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { p[lane + 32 * i] = __float2half_rn(y[i]); }
+}
+} // namespace
+
+void kv_ring_fake_quant(Tensor& ring, int quant, std::int64_t first, std::int64_t count, cudaStream_t stream) {
+    const char* op = "kv_ring_fake_quant";
+    require(ring.dtype == DType::FP16 && ring.is_contiguous() && ring.ne[0] % 128 == 0 && quant != 0 && first >= 0, op,
+            "an FP16 ring of heads of 128 and a quantization");
+    if (count <= 0) { return; }
+    require(count <= ring.ne[1], op, "at most the ring's capacity");
+    ring_fake_quant_kernel<<<dim3(static_cast<unsigned>(count), static_cast<unsigned>(ring.ne[0] / 128)), 32, 0, stream>>>(
+        static_cast<__half*>(ring.data), ring.ne[0], ring.ne[1], first, quant);
     check_launch(op);
 }
 

@@ -49,6 +49,11 @@ struct ProgramLimits {
     // Lossy (the Engine's default): the KV rings hold FP16 (round to nearest) rather than FP32, half the bytes per
     // position, so about twice the context fits. The attention widens them to FP32 as it reads them.
     bool kv_fp16 = false;
+    // Experimental, lossy (FP16 rings only): a simulated low-bit KV coding per layer visit (ops::KvAppend::quant codes,
+    // one per visit; empty: none). With kv_quant_recent > 0 the last kv_quant_recent positions stay FP16 and each forward
+    // codes the ones that age past them. parse_kv_quant() fills these from a spec.
+    std::vector<std::int32_t> kv_quant_k, kv_quant_v;
+    std::int32_t kv_quant_recent = 0;
     // A forward of more than max(1, max_rollback) tokens (a prefill chunk) returns its last column's logits only,
     // FP32 [vocab_size, 1], the same bits as that column of all of them; saves vocab_size * 4 bytes per chunk column
     // of workspace. false: every column's.
@@ -73,6 +78,11 @@ struct ProgramLimits {
         [[nodiscard]] static TensorCoreParts all() { return {true, true, true}; }
     } prefill_tc;
 };
+
+// Experimental: "k<K>v<V>[:g=i,j,..][:local][:w=N]", K one of 16 8 4 (rotated INT8, rotated Lloyd-Max 4-bit; 8n, 4n
+// unrotated), V one of 16 8 4 (INT8 per 64, int4 per 32), 4l (rotated Lloyd-Max), 4r (rotated int4), 8r; g the global
+// visits (0..7 in visit order, default all), local also the sliding ones, w the FP16 recent window. Throws on a bad spec.
+void parse_kv_quant(const TextConfig& config, const std::string& spec, ProgramLimits& limits);
 
 inline constexpr std::int32_t kTensorCoreMinColumns = 64;
 // A local (sliding) visit attends a wider chunk in pieces of this many columns, each appending its keys first, so its
@@ -207,6 +217,9 @@ private:
     // save_async's copy: settle_copy() drops it once complete; wait_copy() orders this Program's stream after all of it.
     void settle_copy();
     void wait_copy();
+    // kv_quant_recent: codes the positions that aged past the window since the last call.
+    void age_rings();
+    std::int64_t aged_ = 0;
 
     const Model& model_;
     const TextConfig& config_;

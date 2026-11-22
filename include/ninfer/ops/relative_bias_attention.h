@@ -52,7 +52,13 @@ struct KvAppend {
     Tensor* cache                    = nullptr;
     std::int64_t start               = 0;
     const std::int64_t* start_offset = nullptr;
+    // Experimental, lossy (FP16 rings, heads of 128): the value a low-bit ring would return instead of the FP16 one.
+    // rotate << 4 | kind: rotate a normalized Hadamard-128 around the coding; kind 1 Lloyd-Max 4-bit per 64 (rk4v4's key
+    // codec), 2 INT8 per 64, 3 signed int4 per 32 (rk8v4's values). 0: none.
+    int quant = 0;
 };
+/// The same coding applied in place to positions first .. first + count - 1 of an FP16 ring (an aging recent window).
+void kv_ring_fake_quant(Tensor& ring, int quant, std::int64_t first, std::int64_t count, cudaStream_t stream);
 
 /// One head_l2_clip_fp32 (unit_rms false) or head_unit_rms_fp32 (unit_rms true) of a batch.
 struct HeadNormJob {
