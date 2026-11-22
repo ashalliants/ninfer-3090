@@ -766,10 +766,10 @@ golden test is byte-identical (781 dumped tensors, 0 differ). Prefill chunks (mo
 block. `--no-split-attention` reproduces the earlier builds exactly.
 
 Inside a block (single or split) the kernel is bound by instruction issue and load latency, not bytes: a
-256-key block moves 128 KB. Since 2026-11-22 a block has 8 warps. Each warp issues the loads of four score steps
+256-key block moves 128 KB of FP16 keys and values (256 KB from FP32 rings). Since 2026-11-22 a block has 8 warps. Each warp issues the loads of four score steps
 before their arithmetic. The value fold runs as four chains: key j below n & ~3 goes to chain j % 4, and the
 remaining keys go to chain 0, each chain in key order. Warp w runs chain w % 4 over its lanes' dimensions, with
-one 4-byte load of two values per key and the next 16 keys' loads in flight. The chains meet in shared memory as
+one load of two values per key (4 bytes from an FP16 ring, 8 from FP32) and the next 16 keys' loads in flight. The chains meet in shared memory as
 (0 + 1) + (2 + 3). Only threads below 128 sum the softmax's exponentials, with the old stride, and the other warps
 add +0. So every FMA, sum and shuffle tree is the 128-thread kernel's, and the bits are unchanged: the golden dumps
 (FP32 and FP16 rings) and the decode and 4-column logits at contexts 300 to 8,192 are byte-identical. The kernel

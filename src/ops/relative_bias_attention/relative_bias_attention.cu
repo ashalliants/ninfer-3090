@@ -1026,6 +1026,23 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     const std::int64_t capacity = k_cache.ne[1];
     require(s.window > 0 ? capacity >= s.window - 1 + cols : capacity >= start + cols, op, "the KV ring cannot hold the visible keys");
     require((k_new == nullptr) == (v_new == nullptr), op, "k_new and v_new come together");
+    if (columns != nullptr) {
+        require(columns->positions != nullptr && columns->slots != nullptr && cols <= kSplitMaxColumns && k_new == nullptr && !tiled, op,
+                "columns need positions and slots, at most kSplitMaxColumns columns, pre-appended rings and no tiled route");
+        // Both rings move by slot_stride: the key loads (float4 or uint2) and the value loads stay aligned.
+        require(columns->slot_stride % 16 == 0, op, "columns->slot_stride must be a multiple of 16 bytes (vector key and value loads)");
+        a.col_pos = columns->positions, a.col_slot = columns->slots, a.slot_stride = columns->slot_stride;
+    }
+    // attention_kernel (every route but the wide tiled one): 32-bit ring and table offsets, and kLaneDims values a lane
+    // in one load. Checked before the append, so a refused call leaves the caches as they were.
+    if (!(tiled && cols > kSplitMaxColumns)) {
+        const std::size_t word = (fp16 ? 2 : 4) * kLaneDims;
+        require(capacity * kv_width <= std::numeric_limits<std::int32_t>::max() &&
+                    static_cast<std::int64_t>(table.ne[1]) * s.d_rel <= std::numeric_limits<std::int32_t>::max(),
+                op, "a ring of capacity * kv_heads * d and a table of extent * d_rel must each fit 32-bit offsets");
+        require(reinterpret_cast<std::uintptr_t>(v_cache.data) % word == 0 && a.slot_stride % static_cast<std::int64_t>(word) == 0, op,
+                "v_cache (and its slot stride) must be aligned to kLaneDims values (vector value loads)");
+    }
     if (k_new != nullptr) {
         const std::int64_t ks = column_stride(*k_new, kv_width, cols, op, "k_new"), vs = column_stride(*v_new, kv_width, cols, op, "v_new");
         append_kernel<<<dim3(cols, (kv_width + 255) / 256, 2), 256, 0, stream>>>(
@@ -1049,11 +1066,6 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     a.start_offset = start_offset;
     a.capacity = capacity;
     a.kv_width = kv_width;
-    if (columns != nullptr) {
-        require(columns->positions != nullptr && columns->slots != nullptr && cols <= kSplitMaxColumns && k_new == nullptr && !tiled, op,
-                "columns need positions and slots, at most kSplitMaxColumns columns, pre-appended rings and no tiled route");
-        a.col_pos = columns->positions, a.col_slot = columns->slots, a.slot_stride = columns->slot_stride;
-    }
     const dim3 grid(cols, s.heads);
     // A few columns over a long ring split their keys across blocks. The grid covers the most keys a column of this
     // call can see: with a host start, its last column's (at most start + T); with a device start, the ring's.
@@ -1061,14 +1073,6 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
     if (start_offset == nullptr && columns == nullptr) { keys = std::min<std::int64_t>(keys, start + cols); }
     const int splits = static_cast<int>((keys + kSplitKeys - 1) / kSplitKeys);
     require((split_workspace == nullptr) == (split_counters == nullptr), op, "split_workspace and split_counters come together");
-    if (!(tiled && cols > kSplitMaxColumns)) { // attention_kernel: kLaneDims values a lane in one load
-        const std::size_t word = (fp16 ? 2 : 4) * kLaneDims;
-        require(capacity * kv_width <= std::numeric_limits<std::int32_t>::max() &&
-                    static_cast<std::int64_t>(table.ne[1]) * s.d_rel <= std::numeric_limits<std::int32_t>::max(),
-                op, "a ring of capacity * kv_heads * d and a table of extent * d_rel must each fit 32-bit offsets");
-        require(reinterpret_cast<std::uintptr_t>(v_cache.data) % word == 0 && a.slot_stride % static_cast<std::int64_t>(word) == 0, op,
-                "v_cache (and its slot stride) must be aligned to kLaneDims values (vector value loads)");
-    }
     if (split_workspace != nullptr && cols <= kSplitMaxColumns && keys > kSplitMinKeys) {
         require(split_workspace->dtype == DType::FP32 && split_workspace->is_contiguous() &&
                     split_workspace->bytes() >= relative_bias_attention_split_bytes(s, cols, capacity),
