@@ -195,12 +195,20 @@ void ffn_shared(const FfnParams& p, const FfnWeights& w, FfnCall& call, DeviceAr
     project(call.act, w.shared_down, call.shared);
 }
 
-void ffn_experts(const FfnParams& p, FfnCall& call, const ops::MoeExpertSource& source, FfnInput in, cudaStream_t stream) {
+void ffn_routed(const FfnParams& p, FfnCall& call, const ops::MoeExpertSource& source, cudaStream_t stream) {
     const std::int32_t jobs = max_jobs(p, call.columns);
     ops::moe_experts_narrow(shape_of(p), call.x, call.dispatch, source, p.top_k, jobs, call.expert_ws.data, call.routed, stream);
+}
+
+void ffn_combine(FfnCall& call, FfnInput in, cudaStream_t stream) {
     ops::weighted_slot_sum(call.routed, call.weights, call.shared, call.y, stream);
     // Back into the streams.
     ops::hc_expand_mix(call.y, in.mixes.post, in.mixes.comb, in.residual, stream);
+}
+
+void ffn_experts(const FfnParams& p, FfnCall& call, const ops::MoeExpertSource& source, FfnInput in, cudaStream_t stream) {
+    ffn_routed(p, call, source, stream);
+    ffn_combine(call, in, stream);
 }
 
 void ffn_forward(const FfnParams& p, const FfnWeights& w, std::uint32_t layer, ExpertSource& experts, FfnInput in, DeviceArena& arena,

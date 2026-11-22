@@ -94,15 +94,19 @@ struct Forward::Impl {
     struct LayerGraphs {
         cudaGraphExec_t front = nullptr; // attention mixes, collapse, norm (only where the previous layer's tail did not run it)
         cudaGraphExec_t route = nullptr; // attention expand, FFN mixes, collapse, norm, router, dispatch
-        cudaGraphExec_t shared = nullptr; // the shared expert
         cudaGraphExec_t attn_front = nullptr, attn_back = nullptr; // the attention layer's two stretches (AttentionRunner)
-        cudaGraphExec_t tail  = nullptr; // routed experts, weighted sum, expand, then the next layer's front (or the head)
+        cudaGraphExec_t tail  = nullptr; // the shared expert beside the routed experts, weighted sum, expand, then the next layer's front (or the head)
     };
     bool graphs = [] {
         const char* v = std::getenv("NINFER_DSV4_GRAPHS");
         return v == nullptr || std::string(v) != "0";
     }();
     cudaStream_t capture_stream = nullptr;
+    // The shared expert of a decode step runs beside the routed experts inside the tail graph: its kernels stream
+    // weights while the routed experts' are bound by integer decode work, so the two overlap on the GPU. It runs on
+    // aux_stream, forked from and joined to the captured stream by these events.
+    cudaStream_t aux_stream = nullptr;
+    cudaEvent_t fork_event = nullptr, join_event = nullptr;
     std::vector<LayerGraphs> layer_graphs;
     bool warmed = false; // one eager one-column step has run
     DeviceBuffer tail_collapsed, tail_normed;
@@ -123,11 +127,14 @@ struct Forward::Impl {
 
     ~Impl() {
         for (LayerGraphs& g : layer_graphs) {
-            for (cudaGraphExec_t e : {g.front, g.route, g.shared, g.tail, g.attn_front, g.attn_back}) {
+            for (cudaGraphExec_t e : {g.front, g.route, g.tail, g.attn_front, g.attn_back}) {
                 if (e != nullptr) { cudaGraphExecDestroy(e); }
             }
         }
         if (capture_stream != nullptr) { cudaStreamDestroy(capture_stream); }
+        if (aux_stream != nullptr) { cudaStreamDestroy(aux_stream); }
+        if (fork_event != nullptr) { cudaEventDestroy(fork_event); }
+        if (join_event != nullptr) { cudaEventDestroy(join_event); }
     }
 
     // Runs `body(stream)`: directly, or (`use`) as the graph `exec`, captured from `body(capture_stream)` the
@@ -241,6 +248,9 @@ struct Forward::Impl {
         tail_normed    = DeviceBuffer(std::size_t(H) * 2);
         layer_graphs.resize(config.num_hidden_layers);
         cuda_ok(cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking), "capture stream");
+        cuda_ok(cudaStreamCreateWithFlags(&aux_stream, cudaStreamNonBlocking), "shared expert stream");
+        cuda_ok(cudaEventCreateWithFlags(&fork_event, cudaEventDisableTiming), "fork event");
+        cuda_ok(cudaEventCreateWithFlags(&join_event, cudaEventDisableTiming), "join event");
     }
 
     // Mixes of T columns carved from one of the three sets.
@@ -273,7 +283,7 @@ std::string Forward::profile_report() const {
     std::string out;
     if (!s.profile || s.stage_calls == 0) { return out; }
     static const char* names[6] = {"embedding", "attention mixes+collapse+norm", "attention layer", "attn expand + ffn route",
-                                   "shared launch + ids wait + expert read (host)", "experts + next front (GPU)"};
+                                   "ids wait + expert read (host; shared expert when not in the graph)", "experts + next front (GPU)"};
     for (int i = 0; i < 6; ++i) {
         char line[160];
         std::snprintf(line, sizeof line, "dsv4 profile: %-30s %9.3f ms per decoded token\n", names[i],
@@ -417,7 +427,10 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
         s.end(3);
         s.begin();
         s.experts.begin(l, ids, entries, stream);
-        s.segment(g.shared, use_graphs, [&](cudaStream_t st) { ffn_shared(fp, s.ffn[l], call, s.workspace, st); });
+        // A graph step runs the shared expert inside the tail graph, beside the routed experts; its Op scratch then lies
+        // at the arena's current top while they run, where nothing else is allocated until the graph has ended.
+        const bool overlap_shared = use_graphs && s.graphs;
+        if (!overlap_shared) { ffn_shared(fp, s.ffn[l], call, s.workspace, stream); }
         const ops::MoeExpertSource source = s.experts.prepare(l, ids, entries, stream);
         s.end(4);
         s.begin();
@@ -425,7 +438,15 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
         const bool next_front = !last && !s.engram_layers[l + 1];
         const Tensor mixes_pre = mixes.pre;
         s.segment(g.tail, use_graphs, [&](cudaStream_t st) {
-            ffn_experts(fp, call, source, input, st);
+            if (overlap_shared) {
+                cuda_ok(cudaEventRecord(s.fork_event, st), "fork event");
+                cuda_ok(cudaStreamWaitEvent(s.aux_stream, s.fork_event, 0), "fork wait");
+                ffn_shared(fp, s.ffn[l], call, s.workspace, s.aux_stream);
+                cuda_ok(cudaEventRecord(s.join_event, s.aux_stream), "join event");
+            }
+            ffn_routed(fp, call, source, st);
+            if (overlap_shared) { cuda_ok(cudaStreamWaitEvent(st, s.join_event, 0), "join wait"); }
+            ffn_combine(call, input, st);
             if (next_front) {
                 attn_front(l + 1, mixes_pre, collapsed, x, st);
             } else if (last) {

@@ -97,7 +97,13 @@ void ffn_route(const FfnParams& params, const FfnWeights& weights, FfnCall& call
 // Phase 2: the shared expert (capturable). Its Op scratch is carved from `arena` and released inside.
 void ffn_shared(const FfnParams& params, const FfnWeights& weights, FfnCall& call, DeviceArena& arena, cudaStream_t stream);
 // Phase 3: the routed experts from `source`, the weighted sum and the expansion back into the streams (capturable).
+// It is ffn_routed, then ffn_combine; a caller that runs the shared expert beside the routed experts (on another stream,
+// ffn_shared's output being needed only by the combine) calls the two itself and joins that stream between them.
 void ffn_experts(const FfnParams& params, FfnCall& call, const ops::MoeExpertSource& source, FfnInput input, cudaStream_t stream);
+// Phase 3a: the routed experts' outputs (call.routed).
+void ffn_routed(const FfnParams& params, FfnCall& call, const ops::MoeExpertSource& source, cudaStream_t stream);
+// Phase 3b: the weighted sum with the shared expert's output (call.shared) and the expansion back into the streams.
+void ffn_combine(FfnCall& call, FfnInput input, cudaStream_t stream);
 
 // Runs the sublayer on `stream`. Scratch is carved from `workspace` inside a scope and released on return.
 void ffn_forward(const FfnParams& params, const FfnWeights& weights, std::uint32_t layer, ExpertSource& experts,

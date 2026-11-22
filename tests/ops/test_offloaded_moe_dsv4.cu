@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <numeric>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -38,6 +39,7 @@ constexpr int kH = om::kDsv4Shape.hidden, kI = om::kDsv4Shape.intermediate;
 constexpr double kLimit = 10.0; // the SwiGLU clamp of every layer of the published builds
 
 bool g_small = false;
+bool g_bench = false;
 
 void cuda_ok(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -233,7 +235,7 @@ std::vector<std::uint16_t> run(const Bank& bank, const Placement& p, const Route
     d_frames.copy_from_host(frames.data(), frames.size() * 4);
     std::unique_ptr<DeviceBuffer> staging;
     if (p.staging_slots > 0) { staging = std::make_unique<DeviceBuffer>(bank.stride * p.staging_slots); }
-    DeviceBuffer workspace(ops::moe_experts_narrow_workspace_bytes(om::kDsv4Shape, max_jobs, k * columns, columns, p.precast));
+    DeviceBuffer workspace(ops::moe_experts_narrow_workspace_bytes(om::kDsv4Shape, max_jobs, k * columns, columns));
     cuda_ok(cudaMemset(workspace.p, 0xA5, workspace.bytes), "poison the workspace");
     DeviceBuffer outputs(static_cast<std::size_t>(k) * columns * kH * 2);
     cuda_ok(cudaMemset(outputs.p, 0xFF, outputs.bytes), "poison the outputs");
@@ -294,6 +296,9 @@ void check_bank(const Bank& bank, int kTopK, const std::vector<int>& column_coun
             const auto unclamped = oracle(format, bank.records[expert].data(), x.data() + static_cast<std::size_t>(column) * kH, false);
             if (!accept(measure(got, unclamped))) { ++clamped_entries; }
         }
+        std::uint64_t hash = 1469598103934665603ULL; // FNV-1a of the outputs: equal across builds of the route
+        for (const std::uint16_t v : results[0]) { hash = (hash ^ v) * 1099511628211ULL; }
+        std::printf("%-16s T=%-2d output hash %016llx; ", record_name(format), columns, static_cast<unsigned long long>(hash));
         std::printf("%-16s T=%-2d %zu placements bit-identical; %zu entries vs FP64 (clamped): normwise %.2e, worst %.2e; "
                     "the clamp changes %d of them\n",
                     record_name(format), columns, results.size(), sample.size(), worst_norm, worst_elem, clamped_entries);
@@ -341,6 +346,78 @@ void test_real_records(const char* dir) {
         check_bank(bank, std::min(2, count), {1, 3, 8}, 1.0F, false, rng);
         check_bank(bank, std::min(2, count), {1, 3}, 6.0F, true, rng);
     }
+}
+
+
+// --bench: milliseconds per call of moe_experts_narrow on a resident bank (the warm decode and prefill placement:
+// frames, the stage kernel resolving them, the precast input), over several routings so no call finds the last
+// one's records in L2. `bytes` is what the call has to read at least: each routed expert's record once.
+void bench_format(QType format, std::mt19937& rng) {
+    const int kExperts = 64, kSets = 6, kTopK = 6;
+    // One random record repeated: the kernels' timing does not depend on the values, and generating 64 distinct 9 MB
+    // records on the host would dominate the run.
+    Bank bank{format, kExperts, 0, {}, nullptr, nullptr};
+    const auto record = random_dsv4_record(format, rng);
+    bank.stride       = (om::record_geometry(format, om::kDsv4Shape).bytes + 255) / 256 * 256;
+    std::vector<std::uint8_t> flat(static_cast<std::size_t>(kExperts) * bank.stride, 0);
+    for (int e = 0; e < kExperts; ++e) { std::memcpy(flat.data() + static_cast<std::size_t>(e) * bank.stride, record.data(), record.size()); }
+    bank.pinned = std::make_unique<Pinned>(flat.size());
+    std::memcpy(bank.pinned->host, flat.data(), flat.size());
+    bank.frames = std::make_unique<DeviceBuffer>(flat.size());
+    bank.frames->copy_from_host(flat.data(), flat.size());
+    std::vector<std::int32_t> frames(kExperts);
+    for (int e = 0; e < kExperts; ++e) { frames[e] = e; }
+    DeviceBuffer d_frames(frames.size() * 4);
+    d_frames.copy_from_host(frames.data(), frames.size() * 4);
+    DeviceBuffer staging(bank.stride * 64);
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+    for (const int columns : {1, 2, 4, 8, 16, 32, 64}) {
+        std::vector<std::unique_ptr<Routed>> sets;
+        for (int i = 0; i < kSets; ++i) { sets.push_back(std::make_unique<Routed>(kExperts, kTopK, columns, rng)); }
+        const auto x = random_dsv4_x(columns, rng, 1.0F);
+        DeviceBuffer x_dev(x.size() * 2);
+        x_dev.copy_from_host(x.data(), x.size() * 2);
+        const int max_jobs = std::min(kExperts, kTopK * columns);
+        DeviceBuffer workspace(ops::moe_experts_narrow_workspace_bytes(om::kDsv4Shape, max_jobs, kTopK * columns, columns));
+        DeviceBuffer outputs(static_cast<std::size_t>(kTopK) * columns * kH * 2);
+        ops::MoeExpertSource source;
+        source.format         = bank.format;
+        source.frame_base     = static_cast<const std::uint8_t*>(bank.frames->p);
+        source.frames         = static_cast<const std::int32_t*>(d_frames.p);
+        source.host_records   = bank.pinned->device;
+        source.record_stride  = bank.stride;
+        source.staging_base   = static_cast<std::uint8_t*>(staging.p);
+        source.staging_slots  = 64;
+        source.precast_input  = true;
+        const Tensor xt(x_dev.p, DType::BF16, {kH, columns});
+        Tensor out(outputs.p, DType::BF16, {kH, kTopK * columns});
+        double distinct = 0;
+        for (const auto& r : sets) {
+            std::vector<int> seen(kExperts, 0);
+            for (const int id : r->host_ids) { seen[id] = 1; }
+            distinct += std::accumulate(seen.begin(), seen.end(), 0);
+        }
+        distinct /= kSets;
+        const int reps = columns <= 8 ? 60 : 12;
+        for (int rep = 0; rep < 3; ++rep) { ops::moe_experts_narrow(om::kDsv4Shape, xt, sets[rep % kSets]->view, source, kTopK, max_jobs, workspace.p, out, nullptr); }
+        cuda_ok(cudaDeviceSynchronize(), "bench warmup");
+        cudaEventRecord(t0);
+        for (int rep = 0; rep < reps; ++rep) {
+            ops::moe_experts_narrow(om::kDsv4Shape, xt, sets[rep % kSets]->view, source, kTopK, max_jobs, workspace.p, out, nullptr);
+        }
+        cudaEventRecord(t1);
+        cuda_ok(cudaEventSynchronize(t1), "bench");
+        float ms = 0;
+        cudaEventElapsedTime(&ms, t0, t1);
+        const double per = ms / reps;
+        const double gb  = distinct * static_cast<double>(om::record_geometry(format, om::kDsv4Shape).bytes) / 1e9;
+        std::printf("bench %-16s T=%-3d %5.1f experts  %8.3f ms  (%.1f MB of records: %.0f GB/s)\n", record_name(format), columns, distinct, per,
+                    gb * 1e3, gb / (per * 1e-3));
+    }
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
 }
 
 template <class F>
@@ -420,6 +497,7 @@ void test_refusals(std::mt19937& rng) {
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--small") { g_small = true; }
+        if (std::string(argv[i]) == "--bench") { g_bench = true; }
     }
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
@@ -427,6 +505,10 @@ int main(int argc, char** argv) {
         return 77;
     }
     std::mt19937 rng(5120);
+    if (g_bench) {
+        for (const QType format : {QType::GGML_REC_IQ2_XXS_IQ2_XXS, QType::GGML_REC_IQ1_M_IQ1_M, QType::GGML_REC_IQ2_XS_IQ2_XS}) { bench_format(format, rng); }
+        return 0;
+    }
     test_refusals(rng);
     const std::vector<QType> formats = g_small ? std::vector<QType>{kFormats[0], kFormats[2], kFormats[7]}
                                                : std::vector<QType>(std::begin(kFormats), std::end(kFormats));

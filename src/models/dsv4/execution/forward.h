@@ -18,10 +18,12 @@
 // Decode graphs: a one-token call (after one eager one-token call has initialised the Ops) runs each layer as
 // CUDA graphs captured on first use, around the steps that cannot be captured: the attention's position
 // arguments (its position-dependent kernels, the compressor's pooling and the indexer stay eager), and the host's
-// read of the routed expert ids, the one host synchronization of a layer (the shared expert's graph runs while
-// the host reads the records the ids name). Per layer: [attention front] -> eager position steps -> [attention
-// back] -> [attention expand + FFN route] -> ids to the host -> [shared expert] -> host: records -> [experts +
-// expand + the next layer's attention front, or the head]. The graphs run the same Ops on the same tensors as the eager path.
+// read of the routed expert ids, the one host synchronization of a layer. Per layer: [attention front] -> eager
+// position steps -> [attention back] -> [attention expand + FFN route] -> ids to the host -> host: records ->
+// [shared expert beside the routed experts (a forked stream inside the graph: the routed experts are bound by integer
+// decode work, the shared expert by memory, so they overlap) + weighted sum + expand + the next layer's attention
+// front, or the head]. The graphs run the same Ops on the same tensors as the eager path; the eager path runs the
+// shared expert before the host's read, so it overlaps the reads of a cold step.
 // NINFER_DSV4_GRAPHS=0 turns them off; NINFER_DSV4_PROFILE=1 times the stages.
 //
 // Engram: with `ForwardOptions::engram_dir` set (the folder tools/convert/dsv4_engram_volume.py writes), every
