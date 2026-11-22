@@ -93,3 +93,6 @@ ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DI
 # The opt-in cuBLAS prefill route against the integer-activation route it would replace.
 ninfer_add_op_bench(ninfer_w4_cublas_prefill_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/w4_cublas_prefill_bench.cu")
+
+# DeepSeek-V4's prefill attention core and indexer scoring at the model geometry.
+ninfer_add_op_bench(ninfer_dsv4_attention_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/dsv4_attention_bench.cu")

@@ -3,6 +3,9 @@
 
 #include "ninfer/ops/position_selection.h"
 
+#include "ops/common/smem_limit.h"
+#include "ops/position_selection/weighted_relu_dot_scores_mma.cuh"
+
 #include <cuda_bf16.h>
 
 #include <algorithm>
@@ -111,6 +114,54 @@ void launch(const Tensor& q, const Tensor& k, const Tensor& weights, const Tenso
         weight_scale, static_cast<float*>(scores.data));
 }
 
+// Chunks of at least this many columns take the tensor-core kernel (16, 32 or 64 heads of a head
+// dimension of 64 to 256 whose A fragments fit the registers, an Ampere or newer device): below it the
+// eight columns of a block are mostly idle and the CUDA-core kernel's position tiles do better.
+constexpr int kMmaMinColumns = 8;
+
+template <int MT, int D>
+void launch_mma(const Tensor& q, const Tensor& k, const Tensor& weights, const Tensor& valid, float weight_scale,
+                Tensor& scores, int sms, cudaStream_t stream) {
+    using Shape = scores_mma::Shape<MT, D>;
+    const int columns  = q.ne[2], n = k.ne[1];
+    const int blocks_x = (columns + scores_mma::kWarps - 1) / scores_mma::kWarps;
+    const int tiles    = (n + scores_mma::kKeys - 1) / scores_mma::kKeys;
+    const int wanted   = std::clamp((4 * sms + blocks_x - 1) / blocks_x, 1, tiles); // about four blocks per SM
+    const int per      = (tiles + wanted - 1) / wanted;
+    const dim3 grid(static_cast<unsigned>(blocks_x), static_cast<unsigned>((tiles + per - 1) / per));
+    scores_mma::scores_mma_kernel<MT, D><<<grid, scores_mma::kThreads, Shape::bytes, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(weights.data), static_cast<const std::int32_t*>(valid.data), columns, n,
+        per, weight_scale, static_cast<float*>(scores.data));
+}
+
+// True when the tensor-core kernel served the call.
+bool try_mma(const Tensor& q, const Tensor& k, const Tensor& weights, const Tensor& valid, float weight_scale,
+             Tensor& scores, cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    return false; // Volta emulates the BF16 MMA: the CUDA-core kernel is faster there
+#else
+    const int dim = q.ne[0], heads = q.ne[1], columns = q.ne[2];
+    if (columns < kMmaMinColumns || heads < 16 || (dim != 64 && dim != 128 && dim != 256) || heads / 16 * dim > 256) { return false; }
+    int device = 0, major = 0, sms = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess || major < 8 ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        return false;
+    }
+    const int mt = heads / 16;
+#define NINFER_SCORES_MMA(MT, D)                                                      \
+    if (mt == MT && dim == D) {                                                       \
+        launch_mma<MT, D>(q, k, weights, valid, weight_scale, scores, sms, stream);   \
+        return true;                                                                  \
+    }
+    NINFER_SCORES_MMA(1, 64) NINFER_SCORES_MMA(1, 128) NINFER_SCORES_MMA(1, 256)
+    NINFER_SCORES_MMA(2, 64) NINFER_SCORES_MMA(2, 128) NINFER_SCORES_MMA(4, 64)
+#undef NINFER_SCORES_MMA
+    return false;
+#endif
+}
+
 } // namespace
 
 void weighted_relu_dot_scores(const Tensor& q, const Tensor& k, const Tensor& weights, const Tensor& valid,
@@ -128,6 +179,13 @@ void weighted_relu_dot_scores(const Tensor& q, const Tensor& k, const Tensor& we
             "shapes disagree");
     require(std::isfinite(weight_scale), "weight_scale must be finite");
     for (const Tensor* in : {&q, &k, &weights, &valid}) { require(!overlaps(scores, *in), "scores overlaps an input"); }
+    if (try_mma(q, k, weights, valid, weight_scale, scores, stream)) {
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            throw std::runtime_error(std::string("weighted_relu_dot_scores: ") + cudaGetErrorString(error));
+        }
+        return;
+    }
     switch (heads) {
     case 8:  launch<8>(q, k, weights, valid, weight_scale, scores, stream); break;
     case 16: launch<16>(q, k, weights, valid, weight_scale, scores, stream); break;
