@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -86,8 +87,27 @@ struct Forward::Impl {
         const char* v = std::getenv("NINFER_DSV4_PROFILE");
         return v != nullptr && v[0] != '\0' && std::string(v) != "0";
     }();
-    bool recording = false; // only decode steps from position 16 on (the warm ones) are recorded
-    double stage_seconds[6] = {};
+    // Decode graphs (NINFER_DSV4_GRAPHS=0 turns them off). A one-column step runs each layer as a few CUDA graphs
+    // around the steps that cannot be captured: the attention layer (its kernels take the position as an
+    // argument) and the host's read of the routed ids. Graphs are captured on the first use, after one eager
+    // one-column step has initialised the Ops, and live as long as the Forward.
+    struct LayerGraphs {
+        cudaGraphExec_t front = nullptr; // attention mixes, collapse, norm (only where the previous layer's tail did not run it)
+        cudaGraphExec_t route = nullptr; // attention expand, FFN mixes, collapse, norm, router, dispatch
+        cudaGraphExec_t shared = nullptr; // the shared expert
+        cudaGraphExec_t attn_front = nullptr, attn_back = nullptr; // the attention layer's two stretches (AttentionRunner)
+        cudaGraphExec_t tail  = nullptr; // routed experts, weighted sum, expand, then the next layer's front (or the head)
+    };
+    bool graphs = [] {
+        const char* v = std::getenv("NINFER_DSV4_GRAPHS");
+        return v == nullptr || std::string(v) != "0";
+    }();
+    cudaStream_t capture_stream = nullptr;
+    std::vector<LayerGraphs> layer_graphs;
+    bool warmed = false; // one eager one-column step has run
+    DeviceBuffer tail_collapsed, tail_normed;
+    bool recording = false; // only one-column steps (decode) are recorded
+    double stage_seconds[8] = {};
     std::int64_t stage_calls = 0;
     std::chrono::steady_clock::time_point mark;
     void begin() {
@@ -99,6 +119,49 @@ struct Forward::Impl {
         if (!recording) { return; }
         cudaStreamSynchronize(stream);
         stage_seconds[stage] += std::chrono::duration<double>(std::chrono::steady_clock::now() - mark).count();
+    }
+
+    ~Impl() {
+        for (LayerGraphs& g : layer_graphs) {
+            for (cudaGraphExec_t e : {g.front, g.route, g.shared, g.tail, g.attn_front, g.attn_back}) {
+                if (e != nullptr) { cudaGraphExecDestroy(e); }
+            }
+        }
+        if (capture_stream != nullptr) { cudaStreamDestroy(capture_stream); }
+    }
+
+    // Runs `body(stream)`: directly, or (`use`) as the graph `exec`, captured from `body(capture_stream)` the
+    // first time. A capture that fails throws (a decode must not silently change how it runs).
+    template <class Body>
+    void segment(cudaGraphExec_t& exec, bool use, Body&& body) {
+        if (!use || !graphs) {
+            body(stream);
+            return;
+        }
+        if (exec == nullptr) {
+            cudaGraph_t graph = nullptr;
+            cudaError_t status = cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeRelaxed);
+            if (status == cudaSuccess) {
+                try {
+                    body(capture_stream);
+                } catch (...) {
+                    cudaGraph_t partial = nullptr;
+                    cudaStreamEndCapture(capture_stream, &partial);
+                    if (partial != nullptr) { cudaGraphDestroy(partial); }
+                    throw;
+                }
+                status = cudaStreamEndCapture(capture_stream, &graph);
+            }
+            if (status == cudaSuccess) { status = cudaGraphInstantiate(&exec, graph, 0); }
+            if (graph != nullptr) { cudaGraphDestroy(graph); }
+            if (status != cudaSuccess) {
+                cudaGetLastError();
+                exec = nullptr;
+                throw std::runtime_error(std::string("dsv4 forward: CUDA graph capture failed: ") + cudaGetErrorString(status) +
+                                         " (NINFER_DSV4_GRAPHS=0 decodes without graphs)");
+            }
+        }
+        cuda_ok(cudaGraphLaunch(exec, stream), "graph launch");
     }
 
     static std::size_t workspace_bytes(const Model& model, const ForwardOptions& options, std::size_t engram_bytes) {
@@ -174,6 +237,10 @@ struct Forward::Impl {
         logits_buffer = DeviceBuffer(std::size_t(config.vocab_size) * 4);
         logits        = Tensor(logits_buffer.p, DType::FP32, {static_cast<std::int32_t>(config.vocab_size), 1});
         tokens_buffer = DeviceBuffer(std::size_t(T) * 4);
+        tail_collapsed = DeviceBuffer(std::size_t(H) * T * 2);
+        tail_normed    = DeviceBuffer(std::size_t(H) * 2);
+        layer_graphs.resize(config.num_hidden_layers);
+        cuda_ok(cudaStreamCreateWithFlags(&capture_stream, cudaStreamNonBlocking), "capture stream");
     }
 
     // Mixes of T columns carved from one of the three sets.
@@ -196,11 +263,17 @@ Forward::~Forward() = default;
 
 bool Forward::engram_applied() const noexcept { return impl_->engram != nullptr; }
 
+void Forward::reset_profile() noexcept {
+    for (double& v : impl_->stage_seconds) { v = 0; }
+    impl_->stage_calls = 0;
+}
+
 std::string Forward::profile_report() const {
     const Impl& s = *impl_;
     std::string out;
     if (!s.profile || s.stage_calls == 0) { return out; }
-    static const char* names[6] = {"embedding", "attention mixes+collapse+norm", "attention layer", "attention expand", "ffn sublayer", "head"};
+    static const char* names[6] = {"embedding", "attention mixes+collapse+norm", "attention layer", "attn expand + ffn route",
+                                   "shared launch + ids wait + expert read (host)", "experts + next front (GPU)"};
     for (int i = 0; i < 6; ++i) {
         char line[160];
         std::snprintf(line, sizeof line, "dsv4 profile: %-30s %9.3f ms per decoded token\n", names[i],
@@ -212,7 +285,11 @@ std::string Forward::profile_report() const {
 
 std::size_t Forward::device_bytes() const noexcept {
     const Impl& i = *impl_;
-    return i.state.device_bytes() + i.residual_buffer.bytes + i.mixes_buffer.bytes + i.logits_buffer.bytes + i.workspace.capacity();
+    // The decode graphs are instantiated on the first warm decode step; 27 MiB were measured for 43 layers on the
+    // real artifact (test_forward prints it), so each layer is allowed 1 MiB.
+    const std::size_t graph_allowance = i.graphs ? std::size_t(i.layer_graphs.size()) << 20 : 0;
+    return i.state.device_bytes() + i.residual_buffer.bytes + i.mixes_buffer.bytes + i.logits_buffer.bytes + i.workspace.capacity() +
+           i.tail_collapsed.bytes + i.tail_normed.bytes + graph_allowance;
 }
 
 const Tensor& Forward::residual() const {
@@ -250,7 +327,7 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
         s.engram->stage(std::span<const Engram::Run>(&run, 1));
     }
     // Embedding into one stream, then copied into the others.
-    s.recording = s.profile && T == 1 && start >= 16;
+    s.recording = s.profile && T == 1 && start >= 1;
     s.begin();
     cuda_ok(cudaMemcpyAsync(s.tokens_buffer.p, tokens.data(), std::size_t(T) * 4, cudaMemcpyHostToDevice, stream), "token upload");
     Tensor ids(s.tokens_buffer.p, DType::I32, {T});
@@ -269,63 +346,102 @@ const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t st
     }
 
     s.end(0);
-    s.begin();
-    HcMixes attn_mixes = s.mixes(0, T);
+    HcMixes attn_mixes   = s.mixes(0, T);
     HcMixes ffn_mixes[2] = {s.mixes(1, T), s.mixes(2, T)};
-    const Tensor* pre    = &s.identity_pre;
-    Tensor pre_view      = s.columns(s.identity_pre, T);
-    pre                  = &pre_view;
+    Tensor pre           = s.columns(s.identity_pre, T);
+    const bool use_graphs = s.graphs && T == 1 && s.warmed;
+    const std::uint32_t L = c.num_hidden_layers;
 
-    for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
-        const BlockWeights& b = s.model.weights().layers[l];
+    // The attention sublayer's front: this layer's mixes, the collapse of the streams and the norm.
+    const auto attn_front = [&](std::uint32_t l, const Tensor& pre_in, Tensor& collapsed, Tensor& x, cudaStream_t st) {
+        const BlockWeights& b   = s.model.weights().layers[l];
+        const Tensor attn_fn    = weight_tensor(s.model.weight(b.attn_hc.fn).view, {S * H, (2 + S) * S});
+        const Tensor attn_scale = weight_tensor(s.model.weight(b.attn_hc.scale).view, {3});
+        const Tensor attn_base  = weight_tensor(s.model.weight(b.attn_hc.base).view, {(2 + S) * S});
+        ops::hc_sinkhorn_mixes(residual, attn_fn, attn_scale, attn_base, c.rms_norm_eps, c.hc_epsilon,
+                               static_cast<std::int32_t>(c.hc_iterations), attn_mixes.pre, attn_mixes.post, attn_mixes.comb, st);
+        ops::hc_collapse(residual, pre_in, collapsed, st);
+        ops::rmsnorm(collapsed, s.attention[l].views.attn_norm, c.rms_norm_eps, false, x, st);
+    };
+
+    for (std::uint32_t l = 0; l < L; ++l) {
+        Impl::LayerGraphs& g = s.layer_graphs[l];
+        // Buffers that live across the layer's segments; the same arena state gives the same addresses every
+        // step, which is what the captured graphs rely on.
+        auto layer_scope = s.workspace.scope();
+        Tensor collapsed = s.workspace.alloc(DType::BF16, {H, T});
+        Tensor x         = s.workspace.alloc(DType::BF16, {H, T});
+        Tensor out       = s.workspace.alloc(DType::BF16, {H, T});
+        const bool front_here = l == 0 || s.engram_layers[l].has_value(); // else the previous layer's tail ran it
         if (s.engram_layers[l]) {
             // The residual streams receive the layer's gated n-gram value before its block.
             EngramLayer& e = *s.engram_layers[l];
             auto scope     = s.workspace.scope();
             (void)s.engram->apply(s.engram_index[l], e.kv, e.gate, residual, e.policy, s.workspace, stream);
         }
-        // Attention sublayer.
+        s.begin();
+        if (front_here) {
+            const Tensor pre_in = pre;
+            s.segment(g.front, use_graphs, [&](cudaStream_t st) { attn_front(l, pre_in, collapsed, x, st); });
+        }
+        s.end(1);
+        s.begin();
         {
             auto scope = s.workspace.scope();
-            const Tensor attn_fn    = weight_tensor(s.model.weight(b.attn_hc.fn).view, {S * H, (2 + S) * S});
-            const Tensor attn_scale = weight_tensor(s.model.weight(b.attn_hc.scale).view, {3});
-            const Tensor attn_base  = weight_tensor(s.model.weight(b.attn_hc.base).view, {(2 + S) * S});
-            ops::hc_sinkhorn_mixes(residual, attn_fn, attn_scale, attn_base, c.rms_norm_eps, c.hc_epsilon,
-                                   static_cast<std::int32_t>(c.hc_iterations), attn_mixes.pre, attn_mixes.post, attn_mixes.comb, stream);
-            Tensor collapsed = s.workspace.alloc(DType::BF16, {H, T});
-            Tensor x         = s.workspace.alloc(DType::BF16, {H, T});
-            Tensor out       = s.workspace.alloc(DType::BF16, {H, T});
-            ops::hc_collapse(residual, *pre, collapsed, stream);
-            ops::rmsnorm(collapsed, s.attention[l].views.attn_norm, c.rms_norm_eps, false, x, stream);
-            s.end(1);
-            s.begin();
-            attention_layer(c, l, s.attention[l].views, s.state, x, start, out, s.workspace, stream);
-            s.end(2);
-            s.begin();
-            ops::hc_expand_mix(out, attn_mixes.post, attn_mixes.comb, residual, stream);
+            struct Runner final : AttentionRunner {
+                Impl& impl;
+                Impl::LayerGraphs& graphs;
+                Runner(Impl& i, Impl::LayerGraphs& g) : impl(i), graphs(g) {}
+                void run(int slot, const std::function<void(cudaStream_t)>& body) override {
+                    impl.segment(slot == 0 ? graphs.attn_front : graphs.attn_back, true, body);
+                }
+            } runner(s, g);
+            attention_layer(c, l, s.attention[l].views, s.state, x, start, out, s.workspace, stream, use_graphs ? &runner : nullptr);
         }
+        s.end(2);
+        s.begin();
         // FFN sublayer; its mixes alternate between two buffers so the next block can collapse with them.
+        HcMixes& mixes  = ffn_mixes[l & 1];
+        FfnInput input{residual, &attn_mixes.pre, mixes};
+        const FfnParams fp = ffn_params(c, l);
+        const std::int32_t entries = fp.top_k * T;
+        FfnCall call = ffn_carve(fp, T, s.workspace);
+        s.segment(g.route, use_graphs, [&](cudaStream_t st) {
+            ops::hc_expand_mix(out, attn_mixes.post, attn_mixes.comb, residual, st);
+            ffn_route(fp, s.ffn[l], call, input, st);
+        });
+        // The ids start their way to the host now, and the shared expert (which does not depend on them) is
+        // enqueued before the source waits for them, so a source that reads records from a file overlaps those
+        // reads with the shared expert's work.
+        const auto* ids = static_cast<const std::int32_t*>(call.ids.data);
         s.end(3);
         s.begin();
-        HcMixes& mixes = ffn_mixes[l & 1];
-        FfnInput input{residual, &attn_mixes.pre, mixes};
-        ffn_forward(ffn_params(c, l), s.ffn[l], l, s.experts, input, s.workspace, stream);
+        s.experts.begin(l, ids, entries, stream);
+        s.segment(g.shared, use_graphs, [&](cudaStream_t st) { ffn_shared(fp, s.ffn[l], call, s.workspace, st); });
+        const ops::MoeExpertSource source = s.experts.prepare(l, ids, entries, stream);
         s.end(4);
-        pre = &mixes.pre;
         s.begin();
+        const bool last = l + 1 == L;
+        const bool next_front = !last && !s.engram_layers[l + 1];
+        const Tensor mixes_pre = mixes.pre;
+        s.segment(g.tail, use_graphs, [&](cudaStream_t st) {
+            ffn_experts(fp, call, source, input, st);
+            if (next_front) {
+                attn_front(l + 1, mixes_pre, collapsed, x, st);
+            } else if (last) {
+                // Final collapse with the last FFN's pre, then the last position only through norm and head.
+                Tensor all(s.tail_collapsed.p, DType::BF16, {H, T});
+                ops::hc_collapse(residual, mixes_pre, all, st);
+                Tensor last_col(static_cast<std::byte*>(all.data) + std::size_t(T - 1) * H * 2, DType::BF16, {H, 1});
+                Tensor normed(s.tail_normed.p, DType::BF16, {H, 1});
+                ops::rmsnorm(last_col, s.output_norm, c.rms_norm_eps, false, normed, st);
+                ops::projection_fp32(normed, s.head, s.logits, st);
+            }
+        });
+        pre = mixes.pre;
+        s.end(5);
     }
-
-    // Final collapse with the last FFN's pre, then the last position only through norm and head.
-    {
-        auto scope = s.workspace.scope();
-        Tensor collapsed = s.workspace.alloc(DType::BF16, {H, T});
-        ops::hc_collapse(residual, *pre, collapsed, stream);
-        Tensor last(static_cast<std::byte*>(collapsed.data) + std::size_t(T - 1) * H * 2, DType::BF16, {H, 1});
-        Tensor normed = s.workspace.alloc(DType::BF16, {H, 1});
-        ops::rmsnorm(last, s.output_norm, c.rms_norm_eps, false, normed, stream);
-        ops::projection_fp32(normed, s.head, s.logits, stream);
-    }
-    s.end(5);
+    if (T == 1) { s.warmed = true; }
     if (s.recording) { ++s.stage_calls; }
     s.position     = start + T;
     s.last_columns = T;

@@ -47,6 +47,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -99,6 +100,19 @@ struct AttentionLimits {
 // rope_inv_freqs).
 [[nodiscard]] std::vector<float> rope_inv_freqs(const TextConfig& config, std::uint32_t layer);
 
+// Lets a caller run the position-independent stretches of a one-token attention call as CUDA graphs. A call with
+// a runner (one column, a layer whose compression ratio is not 1) hands each such stretch to run(), which
+// calls body(stream) directly or replays a graph it captured from body(capture_stream) earlier. Slot 0 is the
+// stretch before the position-dependent steps (queries, keys, the compressor's projections), slot 1 the one after
+// them (the attention itself, the output projection, the shifts of the carried rows). The stretches read their
+// tensors from fixed addresses: the caller must give the call the same workspace state every time (the same
+// arena top), and may release the workspace only between calls.
+class AttentionRunner {
+public:
+    virtual ~AttentionRunner() = default;
+    virtual void run(int slot, const std::function<void(cudaStream_t)>& body) = 0;
+};
+
 class AttentionState {
 public:
     AttentionState(const TextConfig& config, AttentionLimits limits);
@@ -123,7 +137,7 @@ public:
 private:
     friend void attention_layer(const TextConfig&, std::uint32_t, const AttentionLayerViews&,
                                 AttentionState&, const Tensor&, std::int32_t, Tensor&,
-                                WorkspaceArena&, cudaStream_t);
+                                WorkspaceArena&, cudaStream_t, AttentionRunner*);
     AttentionLimits limits_;
     std::unique_ptr<Impl> impl_;
 };
@@ -140,6 +154,7 @@ private:
 // residual).
 void attention_layer(const TextConfig& config, std::uint32_t layer,
                      const AttentionLayerViews& weights, AttentionState& state, const Tensor& x,
-                     std::int32_t start, Tensor& out, WorkspaceArena& work, cudaStream_t stream);
+                     std::int32_t start, Tensor& out, WorkspaceArena& work, cudaStream_t stream,
+                     AttentionRunner* runner = nullptr);
 
 } // namespace ninfer::models::dsv4

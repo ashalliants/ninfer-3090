@@ -153,6 +153,8 @@ int main() {
     forward.run(prompt, 0);
     std::vector<std::int32_t> generated;
     std::int32_t position = static_cast<std::int32_t>(prompt.size());
+    std::size_t free_before = 0, total_before = 0;
+    cudaMemGetInfo(&free_before, &total_before);
     std::int32_t next     = forward.argmax();
     experts.reset_stats();
     t0 = std::chrono::steady_clock::now();
@@ -187,6 +189,11 @@ int main() {
         check(generated[0] == 11111, "the default prompt continues with ' Paris'");
         if (!forward.engram_applied()) { check(generated[1] == 16, "the uninjected default prompt continues with ' Paris' and '.'"); }
     }
+    {
+        std::size_t free_after = 0, total = 0;
+        cudaMemGetInfo(&free_after, &total);
+        std::printf("device memory taken since before the first decode step (the decode graphs): %.1f MiB\n", (double(free_before) - double(free_after)) / 1048576.0);
+    }
     std::printf("\ndecode: %d tokens in %.2f s (%.2f s/token)\n", new_tokens, decode_seconds, decode_seconds / std::max(new_tokens, 1));
     print_tiers("decode after the prefill", experts.stats(), decode_seconds, new_tokens);
     const std::vector<std::int32_t> first_pass = generated;
@@ -197,7 +204,8 @@ int main() {
 
     // The same prompt and continuation again with the caches warm: identical tokens, and the speed a
     // repeated workload sees.
-    for (int pass = 0; pass < 3; ++pass) {
+    for (int pass = 0; pass < 5; ++pass) {
+        if (pass == 4) { forward.reset_profile(); } // the report below covers the last, fully warm pass
         experts.reset_stats();
         forward.run(prompt, 0);
         cudaStreamSynchronize(stream);
@@ -210,8 +218,9 @@ int main() {
             forward.run(std::span<const std::int32_t>(&tok, 1), pos++);
             tok = forward.argmax();
         }
-        print_tiers(pass == 0 ? "warm decode, pass 1 (same text again)" : pass == 1 ? "warm decode, pass 2" : "warm decode, pass 3", experts.stats(), seconds_since(start), new_tokens);
+        print_tiers(pass == 0 ? "warm decode, pass 1 (same text again)" : pass == 1 ? "warm decode, pass 2" : pass == 2 ? "warm decode, pass 3" : pass == 3 ? "warm decode, pass 4" : "warm decode, pass 5", experts.stats(), seconds_since(start), new_tokens);
         check(again == first_pass, "the second decode of the same text gives the same ids");
+        if (pass == 4) { std::printf("%s", forward.profile_report().c_str()); }
         next     = tok;
         position = pos;
     }
@@ -230,7 +239,6 @@ int main() {
         const auto& w = experts.stats();
         print_tiers("probe, same token repeated (routing drifts)", w, warm, warm_steps);
     }
-    std::printf("%s", forward.profile_report().c_str());
     if (failures == 0) { std::printf("PASS\n"); }
     return failures == 0 ? 0 : 1;
 }
