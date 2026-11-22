@@ -507,6 +507,35 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
             check(no_cache, std::string("relative_bias_sink_attention reads a pre-appended ") + (k_missing ? "k_cache" : "v_cache") +
                                 " without storage");
         }
+        // A v_cache 4 bytes off an 8-byte boundary (one FP32 value, not two) is refused for the attention kernel's vector
+        // value loads, before the append: the caches stay as they were.
+        {
+            const std::size_t ring = static_cast<std::size_t>(kvw) * tkc2.ne[1] * 4;
+            ninfer::DeviceBuffer kc3(ring), vc3(ring + 8);
+            char* const v_base = static_cast<char*>(vc3.p) + 4;
+            check(cudaMemcpy(kc3.p, kc2.b.p, ring, cudaMemcpyDeviceToDevice) == cudaSuccess &&
+                      cudaMemcpy(v_base, vc2.b.p, ring, cudaMemcpyDeviceToDevice) == cudaSuccess,
+                  "misaligned ring copy");
+            Tensor tk3(kc3.p, DType::FP32, {kvw, tkc2.ne[1]}), tv3(v_base, DType::FP32, {kvw, tkc2.ne[1]});
+            const int one = 1;
+            const Tensor k1 = dk.tensor({kvw, n}).slice(1, 0, one), v1 = dv.tensor({kvw, n}).slice(1, 0, one);
+            Tensor out1 = out.tensor({qw, n}).slice(1, 0, one);
+            bool misaligned = false;
+            try {
+                ninfer::ops::relative_bias_sink_attention({heads, kvh, d, rel, window}, dq.tensor({qw, n}).slice(1, 0, one),
+                                                          dr.tensor({heads * rel, n}).slice(1, 0, one), ds.tensor({heads, n}).slice(1, 0, one),
+                                                          &k1, &v1, dt.tensor({rel, extent}), tk3, tv3, 0, nullptr, nullptr, out1, nullptr);
+            } catch (const std::invalid_argument&) { misaligned = true; }
+            check(misaligned, "relative_bias_sink_attention takes a v_cache 4 bytes off 8 for FP32 vector value loads");
+            check(cudaDeviceSynchronize() == cudaSuccess, "refused call");
+            std::vector<char> k_before(ring), k_after(ring), v_before(ring), v_after(ring);
+            check(cudaMemcpy(k_before.data(), kc2.b.p, ring, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                      cudaMemcpy(k_after.data(), kc3.p, ring, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                      cudaMemcpy(v_before.data(), vc2.b.p, ring, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                      cudaMemcpy(v_after.data(), v_base, ring, cudaMemcpyDeviceToHost) == cudaSuccess,
+                  "ring download");
+            check(k_before == k_after && v_before == v_after, "a refused relative_bias_sink_attention appended to its caches");
+        }
     }
     {
         Tensor tw(want_gated.p, DType::BF16, {qw, n});
@@ -693,6 +722,19 @@ void test_column_sequences() {
                   cudaMemcpy(oa.data(), outa.p, oa.size() * 2, cudaMemcpyDeviceToHost) == cudaSuccess,
               "attention download");
         check(ob == oa, "relative_bias_sink_attention with columns (window " + std::to_string(window) + ") differs from one-column calls");
+        {
+            // A slot stride 8 bytes off 16 would misalign the vector key loads of slots past 0: refused.
+            const o::ColumnSequences odd{cs.positions, cs.slots, cs.slot_stride + 8};
+            Tensor out(outb.p, DType::BF16, {qw, kB}), kr = ring_at(rb, 0, false), vr = ring_at(rb, 0, true);
+            const Tensor g = dg.tensor({qw, kB});
+            bool refused = false;
+            try {
+                o::relative_bias_sink_attention(shape, qb.tensor({qw, kB}), dr.tensor({heads * rel, kB}), ds.tensor({heads, kB}), nullptr,
+                                                nullptr, dt.tensor({rel, extent}), kr, vr, 0, nullptr, &g, out, nullptr, &tws,
+                                                static_cast<std::int32_t*>(counters.p), false, &odd);
+            } catch (const std::invalid_argument&) { refused = true; }
+            check(refused, "relative_bias_sink_attention takes columns at a slot stride 8 bytes off 16");
+        }
         std::vector<std::int32_t> left(std::size_t(o::kSplitMaxColumns) * heads);
         counters.copy_to_host(left.data(), left.size() * 4);
         check(std::all_of(left.begin(), left.end(), [](std::int32_t c) { return c == 0; }), "column attention: the split counters are not left zero");

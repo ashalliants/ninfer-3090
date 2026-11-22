@@ -102,7 +102,11 @@ struct RelativeBiasAttentionShape {
  *   [heads * d, T] or null; out FP32 [heads * d, T], or BF16 with a gate.
  *
  * Supported domain:
- *   d = 128; d_rel at most 32; heads a multiple of kv_heads; columns at any stride; k_cache 16-byte aligned. The ring must hold every
+ *   d = 128; d_rel at most 32; heads a multiple of kv_heads; columns of q, r, sink, gate and out at any stride;
+ *   k_cache 16-byte aligned. Except on the wide tiled route (tiled with T > kSplitMaxColumns, which reads values one
+ *   at a time): v_cache aligned to two values (4 bytes FP16, 8 bytes FP32), and capacity * kv_heads * d and
+ *   extent * d_rel each below 2^31 (refused otherwise, before any launch, so the caches are not appended to). The
+ *   ring must hold every
  *   key a column of this call can see: capacity >= window - 1 + T with a window, capacity >= start + T without.
  *   Positions before `start` must have been appended by earlier calls (the caller's sequence order). With a
  *   `start_offset` (a device int64, nullable) the start is start + *start_offset, read when the kernels run; the
@@ -135,7 +139,8 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& shape, const
                                   bool tiled = false, const ColumnSequences* columns = nullptr);
 // columns (batched decode, at most kSplitMaxColumns columns, k_new and v_new null, not tiled): column t sits at
 // positions[t] (start and start_offset are not read) and reads the rings at their addresses plus slots[t] * slot_stride
-// bytes; each ring must hold what its column can see (the caller's bound). With a split workspace each column splits
+// bytes, slot_stride a multiple of 16 (the key and value loads stay aligned); each ring must hold what its column can
+// see (the caller's bound). With a split workspace each column splits
 // exactly when a one-column call at its position would (when it sees more than kSplitMinKeys keys: min(position + 1,
 // window, capacity) > kSplitMinKeys) and otherwise runs the single block, so every column has the bits of its own
 // one-column call. The split workspace is sized for the ring: relative_bias_attention_split_bytes(shape, T, capacity).
