@@ -458,6 +458,7 @@ GenerationService::GenerationService(
     engine_options.fault_listener         = std::move(fault_listener);
     engine_options.numeric_tripwire.listener = std::move(tripwire_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    validate_route_defaults(options_, engine_->load_summary().architecture);
     // A context fit may have lowered the context; every request limit follows what was resolved.
     options_.max_context = engine_->options().max_context;
     options_.kv_capacity = engine_->options().kv_capacity;

@@ -7,6 +7,7 @@
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/startup.h"
+#include "models/inkling2/program/adapters.h"
 #include "models/inkling2/program/dspark_program.h"
 #include "ninfer/ops/dspark_fp32.h"
 #include "ninfer/ops/sampling.h"
@@ -248,6 +249,7 @@ struct Inkling2Core::Programs {
     // (prompt_keys) of the positions before it.
     ink::TextProgram::Snapshot snapshot;
     std::vector<std::uint64_t> snapshot_keys;
+    std::uint64_t snapshot_adapters = 0; // the adapters the snapshot's prompt ran with (adapter_key)
     ink::DSparkProgram::Snapshot draft_snapshot; // the drafter's, with --spec dspark
     // dense_q8 is a view: the caller keeps the owner until build_programs succeeds, so a failed attempt never takes it.
     Programs(const ink::Model& model, const ink::DenseWeightsQ8* dense_q8, ink::ProgramLimits limits, cudaStream_t stream)
@@ -388,6 +390,36 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     if (options_.enable_vision && !reader.directory().components.contains("vision")) {
         throw std::invalid_argument("--vision: this Inkling-2 artifact has no vision tower (convert it with --mmproj)");
     }
+    // The adapters are read (and any unsupported one refused) before the weights load; uploaded after it.
+    if (options_.loras.size() > 8) { throw std::invalid_argument("Inkling-2 loads at most eight LoRA adapters"); }
+    // A request selects an adapter by name, so each one needs a name of its own: an empty or repeated one would be
+    // uploaded yet never selectable. Checked here too, since EngineOptions reaches this without the CLI parser.
+    const auto check_names = [](const auto& sources, const char* what) {
+        for (std::size_t i = 0; i < sources.size(); ++i) {
+            if (sources[i].name.empty()) { throw std::invalid_argument(std::string("a ") + what + " needs a name"); }
+            for (std::size_t j = 0; j < i; ++j) {
+                if (sources[j].name == sources[i].name) {
+                    throw std::invalid_argument(std::string("two ") + what + "s are named '" + sources[i].name + "'");
+                }
+            }
+        }
+    };
+    check_names(options_.loras, "LoRA adapter");
+    check_names(options_.grafts, "graft");
+    // '+' joins graft names in a selection (Frontend::build refuses a selected one containing it): a graft named with
+    // it could never be selected. The CLI and serve parsers refuse it too.
+    for (const GraftSource& source : options_.grafts) {
+        if (source.name.find('+') != std::string::npos) {
+            throw std::invalid_argument("graft name '" + source.name + "' contains '+', which joins graft names in a selection");
+        }
+    }
+    std::vector<ink::LoraAdapter> loras;
+    std::vector<ink::VisitAblation> grafts;
+    {
+        const ink::TextConfig text = ink::parse_config(reader.directory());
+        for (const LoraSource& source : options_.loras) { loras.push_back(ink::load_lora_adapter(source, text)); }
+        for (const GraftSource& source : options_.grafts) { grafts.push_back(ink::load_visit_ablation(source, text)); }
+    }
     inspect.complete();
     // Only the components the server uses are uploaded: the tower with --vision, the drafter with --spec dspark.
     // (load_model reports the weights' materialize phase itself.)
@@ -397,9 +429,19 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                               .vision_overlay = options_.enable_vision && options_.vision_residency == VisionResidency::Overlay},
                              &options_.startup_observer);
     const ink::VisionConfig* vision = options_.enable_vision ? model_->vision_config() : nullptr;
+    for (const auto& adapter : loras) {
+        loras_.push_back(std::make_unique<ink::DeviceLora>(adapter));
+        lora_digests_.push_back(adapter.digest);
+    }
+    for (const auto& graft : grafts) {
+        grafts_.push_back(std::make_unique<ink::DeviceAblation>(graft));
+        graft_digests_.push_back(graft.digest);
+    }
     {
         StartupPhaseScope phase(options_.startup_observer, StartupPhase::FrontendInitialize);
         ink::FrontendOptions frontend_options{.max_context = options_.max_context, .vision = vision};
+        for (const LoraSource& source : options_.loras) { frontend_options.lora_names.push_back(source.name); }
+        for (const GraftSource& source : options_.grafts) { frontend_options.graft_names.push_back(source.name); }
         frontend_ = std::make_unique<ink::Frontend>(model_->resources(), frontend_options);
         phase.complete();
     }
@@ -501,6 +543,15 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                                                     " | drafter window " + (drafter_window_ == 0 ? std::string("whole context") : std::to_string(drafter_window_))
                                               : std::string()) +
                           " | " + (fp32_prefill ? "FP32" : "tensor cores (--prefill-math fp32: the exact FP32 prefill)"));
+    for (const auto& adapter : loras) {
+        const auto layers = std::count_if(adapter.layers.begin(), adapter.layers.end(), [](const auto& l) { return l.has_value(); });
+        load_.notes.push_back("lora " + adapter.name + " | rank " + std::to_string(adapter.rank) + ", scale " + std::to_string(adapter.scale) +
+                              " | attn.wo_ud of " + std::to_string(layers) + " layers, FP32 unmerged | opt-in (\"lora\": \"" + adapter.name + "\")");
+    }
+    for (const auto& graft : grafts) {
+        load_.notes.push_back("graft " + graft.name + " | per-visit ablation of the post-attention and post-MLP writes over " +
+                              std::to_string(graft.visits) + " visits | opt-in (\"graft\": \"" + graft.name + "\")");
+    }
     load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());
     load_.upload_seconds       = stats.upload_seconds;
@@ -730,12 +781,24 @@ void Inkling2Core::run(Job& job) {
     // least one position remains to compute the first token's logits from.
     auto& snapshot          = programs_->snapshot;
     const auto keys         = prompt_keys(prompt);
+    // The adapters the prompt selected (adapters.h), and the key of that pair: a snapshot computed with other adapters
+    // (or none) is never resumed, as the dense models key their cached prefixes on the LoRA digest. 0 is the base model.
+    const ink::AdapterSelection adapters{prompt.lora >= 0 ? loras_.at(static_cast<std::size_t>(prompt.lora)).get() : nullptr,
+                                         prompt.graft >= 0 ? grafts_.at(static_cast<std::size_t>(prompt.graft)).get() : nullptr};
+    const std::uint64_t adapter_key = [&]() -> std::uint64_t {
+        if (adapters.lora == nullptr && adapters.ablation == nullptr) { return 0; }
+        const std::uint64_t l = prompt.lora >= 0 ? lora_digests_[static_cast<std::size_t>(prompt.lora)] : 0;
+        const std::uint64_t g = prompt.graft >= 0 ? graft_digests_[static_cast<std::size_t>(prompt.graft)] : 0;
+        const std::uint64_t key = (l * 0x9E3779B97F4A7C15ULL) ^ (g + 0x632BE59BD9B4E019ULL + (l << 6U) + (l >> 2U));
+        return key == 0 ? 1 : key;
+    }();
     // Requests speculate (DSpark), greedy and sampled alike: the drafter follows the prompt only for them, so they resume
     // only from a snapshot that kept the drafter's state too.
     const bool speculate = programs_->drafter != nullptr;
     const std::int32_t resume = [&] {
         if (!options_.context_cache.enabled || !job.options.execution.allow_prefix_reuse || snapshot.position <= 0 ||
-            snapshot.position >= n || (speculate && programs_->draft_snapshot.position != snapshot.position)) {
+            snapshot.position >= n || (speculate && programs_->draft_snapshot.position != snapshot.position) ||
+            programs_->snapshot_adapters != adapter_key) {
             return 0;
         }
         const auto length = static_cast<std::size_t>(snapshot.position);
@@ -787,6 +850,9 @@ void Inkling2Core::run(Job& job) {
     // Prefill in chunks from position 0, or from the reused snapshot's position (a whole number of chunks, so the
     // forwards are the ones a prefill from 0 runs from there, bit for bit: see inkling2_prefill_plan.h).
     auto& program  = programs_->text;
+    // The drafter runs no adapter: it only proposes, and the target (adapted) verifies every draft, so the output is
+    // what plain decoding with the adapters gives; the drafts' acceptance may differ.
+    program.set_adapters(adapters);
     // Only a request that drafts reads the taps: a sampled one runs its forwards without the copies.
     program.set_taps(speculate);
     auto* drafter  = programs_->drafter.get();
@@ -838,6 +904,7 @@ void Inkling2Core::run(Job& job) {
                 programs_->draft_snapshot.position = -1;
             }
             programs_->snapshot_keys.assign(keys.begin(), keys.begin() + keep_at);
+            programs_->snapshot_adapters = adapter_key;
         }
         {
             std::lock_guard lock(stats_mutex_);

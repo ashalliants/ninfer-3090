@@ -9,6 +9,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "models/inkling2/model.h"
+#include "models/inkling2/program/adapters.h"
 #include "models/inkling2/program/dense_q8.h"
 #include "ninfer/ops/column_sequences.h"
 #include "ninfer/ops/projection_fp32.h"
@@ -125,6 +126,10 @@ public:
     [[nodiscard]] Tensor tap(std::size_t i) const;
     // Whether forwards copy the taps (on by default): a request that never drafts turns them off and saves the copies.
     void set_taps(bool on) noexcept { taps_on_ = on; }
+    // The adapters the next forwards run with (adapters.h; none by default, the base model). The objects must outlive
+    // their use. A change drops the captured decode graphs (the next decode step captures its own), so the forwards
+    // of the base model launch exactly the kernels they launch without any adapter loaded.
+    void set_adapters(AdapterSelection adapters);
 
     // The state a forward from a position needs, copied (prefix reuse): every sliding visit's K/V for the last
     // sliding_window - 1 positions and every visit's convolution histories. The global visits' caches are indexed by
@@ -216,6 +221,7 @@ private:
     const ops::ColumnSequences* columns_ = nullptr;
     cudaGraphExec_t batch_graph_[kMaxBatchColumns] = {};
     Tensor batch_logits_[kMaxBatchColumns];
+    AdapterSelection adapters_;
 };
 
 } // namespace ninfer::models::inkling2

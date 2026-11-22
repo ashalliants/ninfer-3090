@@ -228,4 +228,10 @@ std::string serve_usage_text(const char* argv0);
 // empty selection has none; an empty name between separators is returned as such.
 [[nodiscard]] std::vector<std::string> graft_selection_names(const std::string& selection);
 
+// The defaults a loaded model's route can serve, checked at startup once the Engine reports its architecture.
+// Inkling-2 applies one graft per request (its frontend refuses a '+' selection), so a '+'-joined
+// --default-graft there would fail every request that omits "graft": refused instead. Other
+// routes keep '+' combinations.
+void validate_route_defaults(const ServeOptions& options, const std::string& architecture);
+
 } // namespace ninfer::serve

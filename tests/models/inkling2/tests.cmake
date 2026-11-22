@@ -40,3 +40,9 @@ ninfer_add_op_test(ninfer_inkling2_batch_test
 ninfer_add_op_test(ninfer_inkling2_engine_dspark_sampled_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dspark_sampled.cpp"
   LIBRARIES ninfer_engine ninfer_core)
+# The opt-in adapters (program/adapters.h) on the real artifact and the published files: loading and refusals, the
+# Ops against FP64, the LoRA's effective wo_ud rows, the ablation's hook points in the program, the decode graph with
+# adapters, and (NINFER_INKLING2_KLD_TEXT) a KLD report. Skips without the artifact and both adapter files.
+ninfer_add_op_test(ninfer_inkling2_adapters_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_adapters.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_artifact ninfer_media_decode ninfer_ops ninfer_core)

@@ -712,10 +712,10 @@ private:
 
     void construct_inkling2() {
         runtime::validate_engine_options(options); // the bounds every model's route shares
-        if (options.context_store.enabled() || !options.loras.empty() || !options.grafts.empty() ||
-            options.devices.size() > 1 || options.suspend.enabled) {
-            throw std::invalid_argument(
-                "Inkling-2 runs on one device with no context store, model suspend, LoRA adapters or grafts");
+        // LoRA adapters and grafts are the Inkling-2 forms models/inkling2/program/adapters.h reads (a wo_ud LoRA, a
+        // per-visit ablation); Inkling2Core refuses any other with the reason.
+        if (options.context_store.enabled() || options.devices.size() > 1 || options.suspend.enabled) {
+            throw std::invalid_argument("Inkling-2 runs on one device with no context store or model suspend");
         }
         // The context cache is one device snapshot of the last prompt (Inkling2Core, "Prefix reuse"; the host-tier
         // options were refused before normalization): one extra state when it is on, none when it is off.

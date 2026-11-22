@@ -21,10 +21,13 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <vector>
 
 namespace ninfer::models::inkling2 {
 struct ProgramLimits;
 class DenseWeightsQ8;
+struct DeviceLora;
+struct DeviceAblation;
 } // namespace ninfer::models::inkling2
 
 namespace ninfer::runtime {
@@ -91,6 +94,11 @@ private:
     void build_programs(models::inkling2::ProgramLimits limits, std::unique_ptr<models::inkling2::DenseWeightsQ8>& dense,
                         const models::inkling2::VisionConfig* vision, bool dspark);
     std::unique_ptr<Programs> programs_;
+    // The opt-in adapters (models/inkling2/program/adapters.h): options_.loras and options_.grafts in order, which a
+    // prompt's lora and graft index, and their digests (prefix reuse keys a snapshot on the pair a prompt ran with).
+    std::vector<std::unique_ptr<models::inkling2::DeviceLora>> loras_;
+    std::vector<std::unique_ptr<models::inkling2::DeviceAblation>> grafts_;
+    std::vector<std::uint64_t> lora_digests_, graft_digests_;
     std::int32_t chunk_ = 256; // prompt tokens per forward, chosen at startup
     bool drafter_head_copy_ = true; // the drafter's Q8 copy of the head, unless memory is short
     std::uint32_t drafter_window_ = 0; // the drafter's global window (0: the whole context), chosen at startup

@@ -212,6 +212,13 @@ std::vector<std::string> graft_selection_names(const std::string& selection) {
     }
 }
 
+void validate_route_defaults(const ServeOptions& options, const std::string& architecture) {
+    if (architecture == "inkling2" && graft_selection_names(options.default_graft).size() > 1) {
+        throw std::invalid_argument("--default-graft '" + options.default_graft +
+                                    "': Inkling-2 applies one graft per request, not a '+' combination");
+    }
+}
+
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " (--models-dir DIR | --models-preset FILE) [--models-max N] [--no-models-autoload] "

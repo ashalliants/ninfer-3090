@@ -59,12 +59,18 @@ struct PreparedPrompt {
     PromptSummary summary;
     PromptPreparationStats stats;
     bool thinking = true; // the request's sampling mode
+    // The adapters the request selected (program/adapters.h): indexes into FrontendOptions::lora_names and
+    // graft_names, or -1 for none (the base model).
+    std::int32_t lora = -1, graft = -1;
 };
 
 struct FrontendOptions {
     std::uint32_t max_context = 8192;
     // The tower's config when the artifact has one; images are refused otherwise.
     const VisionConfig* vision = nullptr;
+    // The loaded adapters' names (the Engine's --lora and --graft entries, in order), which a request's
+    // PromptOptions::lora and ::graft select from.
+    std::vector<std::string> lora_names, graft_names;
 };
 
 class Frontend {

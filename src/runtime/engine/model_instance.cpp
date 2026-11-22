@@ -11,6 +11,7 @@
 #include "models/qwen3_5/lossy_options.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_cache.h"
+#include "runtime/engine/inkling2_core.h"
 #include "runtime/engine/validate_options.h"
 
 #include <algorithm>
@@ -394,9 +395,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     // Each direct graft is installed as a pinned context-cache checkpoint that holds one StateImage
     // for the Engine's life, so the Device state pool grows by one per graft.
     // A Qwen3.8-Flash-Next --graft names a refusal-steering vector (a GGUF file with no sidecar and no
-    // KV to install), so it holds no state image.
+    // KV to install), and an Inkling-2 one a per-visit ablation (models/inkling2/program/adapters.h), so
+    // neither holds a state image.
     const auto direct_grafts =
-        artifact_is_qwen4_exp(options.artifact_path)
+        artifact_is_qwen4_exp(options.artifact_path) || artifact_is_inkling2(options.artifact_path)
             ? 0U
             : static_cast<std::uint32_t>(models::qwen3_5::direct_graft_slots(options.grafts).size());
     if (direct_grafts != 0 && !cache.enabled) {
