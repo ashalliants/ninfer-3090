@@ -49,6 +49,29 @@
 
 namespace ninfer::models::dsv4 {
 
+// The state of a sequence at one position, small (a few MiB): see AttentionState::capture. It belongs to the Forward
+// that captured it and is valid for as long as the sequence's tokens before its position are unchanged and no call
+// has run from an earlier position (the caller tracks that; Forward only checks the position it restores to).
+class ForwardCheckpoint {
+public:
+    ForwardCheckpoint() noexcept;
+    ~ForwardCheckpoint();
+    ForwardCheckpoint(ForwardCheckpoint&&) noexcept;
+    ForwardCheckpoint& operator=(ForwardCheckpoint&&) noexcept;
+    ForwardCheckpoint(const ForwardCheckpoint&)            = delete;
+    ForwardCheckpoint& operator=(const ForwardCheckpoint&) = delete;
+
+    // The number of tokens of the sequence the state covers (0 when nothing was captured).
+    [[nodiscard]] std::int32_t position() const noexcept;
+    [[nodiscard]] std::size_t device_bytes() const noexcept;
+
+    struct Impl;
+
+private:
+    std::unique_ptr<Impl> impl_;
+    friend class Forward;
+};
+
 struct ForwardOptions {
     AttentionLimits limits; // max_context and max_chunk
     std::filesystem::path engram_dir; // empty: no Engram injection
@@ -65,6 +88,15 @@ public:
     // Runs `tokens` at positions start .. start + size - 1 and returns the last position's FP32 logits
     // [vocab, 1] (valid until the next call). start must equal the number of tokens already run, or be 0.
     const Tensor& run(std::span<const std::int32_t> tokens, std::int32_t start);
+
+    // The number of tokens of the current sequence the state holds: the `start` the next call continues from.
+    [[nodiscard]] std::int32_t position() const noexcept;
+    // Saves the state at position() into `into` (stream-ordered; reuses its storage once allocated). Throws when
+    // the device has no room for the copy.
+    void capture(ForwardCheckpoint& into);
+    // Returns the sequence to the captured position: the next call continues from `from.position()`. The caller
+    // guarantees the tokens before that position are the ones that were run when it was captured.
+    void restore(const ForwardCheckpoint& from);
 
     // The residual streams after the last block of the last call, BF16 [hc * hidden, T] (for tests).
     [[nodiscard]] const Tensor& residual() const;

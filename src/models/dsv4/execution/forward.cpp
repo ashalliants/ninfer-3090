@@ -361,6 +361,44 @@ const Tensor& Forward::residual() const {
     return s.residual_last;
 }
 
+struct ForwardCheckpoint::Impl {
+    DeviceBuffer state;
+    EngramHasher::History engram_history;
+    std::int32_t position = 0;
+    const void* owner     = nullptr; // the Forward that captured it
+};
+
+ForwardCheckpoint::ForwardCheckpoint() noexcept                               = default;
+ForwardCheckpoint::~ForwardCheckpoint()                                       = default;
+ForwardCheckpoint::ForwardCheckpoint(ForwardCheckpoint&&) noexcept            = default;
+ForwardCheckpoint& ForwardCheckpoint::operator=(ForwardCheckpoint&&) noexcept = default;
+std::int32_t ForwardCheckpoint::position() const noexcept { return impl_ ? impl_->position : 0; }
+std::size_t ForwardCheckpoint::device_bytes() const noexcept { return impl_ ? impl_->state.bytes : 0; }
+
+std::int32_t Forward::position() const noexcept { return impl_->position; }
+
+void Forward::capture(ForwardCheckpoint& into) {
+    Impl& s = *impl_;
+    if (!into.impl_) { into.impl_ = std::make_unique<ForwardCheckpoint::Impl>(); }
+    ForwardCheckpoint::Impl& c = *into.impl_;
+    const std::size_t bytes    = s.state.checkpoint_bytes();
+    if (c.state.bytes != bytes) { c.state = DeviceBuffer(bytes); }
+    s.state.capture(c.state.p, s.stream);
+    c.engram_history = s.engram_history;
+    c.position       = s.position;
+    c.owner          = &s;
+}
+
+void Forward::restore(const ForwardCheckpoint& from) {
+    Impl& s = *impl_;
+    if (!from.impl_ || from.impl_->state.bytes != s.state.checkpoint_bytes() || from.impl_->position < 1 || from.impl_->owner != &s) {
+        throw std::invalid_argument("dsv4 forward: restore of an empty or foreign checkpoint");
+    }
+    s.state.restore(from.impl_->state.p, s.stream);
+    s.engram_history = from.impl_->engram_history;
+    s.position       = from.impl_->position;
+}
+
 const Tensor& Forward::run(std::span<const std::int32_t> tokens, std::int32_t start) {
     Impl& s              = *impl_;
     const TextConfig& c  = s.config;

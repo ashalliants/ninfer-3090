@@ -247,6 +247,79 @@ int main() {
         const auto& w = experts.stats();
         print_tiers("probe, same token repeated (routing drifts)", w, warm, warm_steps);
     }
+
+    // Checkpoints (prefix reuse): the state of an earlier position, captured and restored, equals having run to
+    // that position. A 200-token sequence is run to a position past the first compressed row of the longest
+    // ratio and off every compressor's group boundary, with the checkpoint taken there; a different continuation
+    // then overwrites the state after it; the restore and the rest of the sequence must give the logits (and the
+    // greedy tokens after them) of the same chunks run from scratch.
+    {
+        const std::size_t n = static_cast<std::size_t>(env_number("NINFER_DSV4_CKPT_TOKENS", 200)), k = 137;
+        std::vector<std::int32_t> pool(prompt.begin(), prompt.end());
+        for (const std::int32_t id : {1500, 2210, 3071, 4096, 5120, 6144, 7777, 8888, 9999, 12345, 20001, 30303}) { pool.push_back(id); }
+        std::vector<std::int32_t> seq(n), other(70);
+        std::uint32_t lcg = 12345;
+        for (auto& t : seq) { lcg = lcg * 1664525U + 1013904223U; t = pool[(lcg >> 16) % pool.size()]; }
+        for (auto& t : other) { lcg = lcg * 1664525U + 1013904223U; t = pool[(lcg >> 16) % pool.size()]; }
+        const std::size_t chunk = forward_options.limits.max_chunk;
+        // Runs tokens[from, to) in chunks; returns the last chunk's logits (the last position's).
+        const auto run_range = [&](const std::vector<std::int32_t>& tokens, std::size_t from, std::size_t to) {
+            const ninfer::Tensor* last = nullptr;
+            for (std::size_t at = from; at < to;) {
+                const std::size_t width = std::min(chunk, to - at);
+                last = &forward.run(std::span<const std::int32_t>(tokens).subspan(at, width), static_cast<std::int32_t>(at));
+                at += width;
+            }
+            cudaStreamSynchronize(stream);
+            return download(*last);
+        };
+        const auto greedy = [&](int count) {
+            std::vector<std::int32_t> ids;
+            std::int32_t pos = forward.position(), tok = forward.argmax();
+            for (int i = 0; i < count; ++i) {
+                ids.push_back(tok);
+                forward.run(std::span<const std::int32_t>(&tok, 1), pos++);
+                tok = forward.argmax();
+            }
+            return ids;
+        };
+        const auto difference = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double num = 0, den = 0, peak = 0;
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                num += (a[i] - b[i]) * (a[i] - b[i]);
+                den += a[i] * a[i];
+                peak = std::max(peak, std::fabs(double(a[i]) - double(b[i])));
+            }
+            return std::pair<double, double>(std::sqrt(num / std::max(den, 1e-30)), peak);
+        };
+        // From scratch, the chunks split at the checkpoint position.
+        run_range(seq, 0, k);
+        const std::vector<float> scratch = run_range(seq, k, n);
+        const std::vector<std::int32_t> scratch_ids = greedy(4);
+
+        // Capture at k, overwrite what follows with a different continuation, restore, finish the sequence.
+        run_range(seq, 0, k);
+        ninfer::models::dsv4::ForwardCheckpoint checkpoint;
+        forward.capture(checkpoint);
+        std::vector<std::int32_t> diverged(seq.begin(), seq.begin() + static_cast<std::ptrdiff_t>(k));
+        diverged.insert(diverged.end(), other.begin(), other.end());
+        run_range(diverged, k, diverged.size());
+        check(forward.position() == static_cast<std::int32_t>(diverged.size()), "the diverging continuation advanced the state");
+        forward.restore(checkpoint);
+        check(forward.position() == static_cast<std::int32_t>(k), "restore returns the sequence to the captured position");
+        const std::vector<float> restored = run_range(seq, k, n);
+        const std::vector<std::int32_t> restored_ids = greedy(4);
+        const auto [rel, peak] = difference(scratch, restored);
+        std::printf("checkpoint of %zu positions: %.2f MiB on the device; restored vs scratch logits: relative L2 %.3g, max abs %.3g\n", k,
+                    static_cast<double>(checkpoint.device_bytes()) / 1048576.0, rel, peak);
+        check(rel == 0.0, "the restored state gives the very logits of a run from scratch");
+        check(restored_ids == scratch_ids, "greedy tokens after a restore equal those of a run from scratch");
+
+        // A second restore of the same checkpoint (a retry of the same prompt) works the same.
+        forward.restore(checkpoint);
+        const std::vector<float> again = run_range(seq, k, n);
+        check(difference(scratch, again).second == 0.0, "a checkpoint restores more than once");
+    }
     if (failures == 0) { std::printf("PASS\n"); }
     return failures == 0 ? 0 : 1;
 }
