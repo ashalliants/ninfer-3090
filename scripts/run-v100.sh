@@ -143,6 +143,13 @@ case "$model_key" in
     # MTP drafts one step at a time and stops once no further draft could be verified (the same
     # output): a round mostly needs one or two of the three drafts, and a step is ~1.2 ms here.
     export NINFER_MTP_STAGED_DRAFTS="${NINFER_MTP_STAGED_DRAFTS:-on}"
+    # Up to seven MTP drafts a round instead of three (the same output), with the reduced draft head
+    # (--mtp-draft-vocab auto, the default here: <model>.draft-vocab from scripts/download-model.sh):
+    # code +3.5%, thinking +3%, story and Chinese level, French -14% (docs/tesla-v100.md). Measured on
+    # the IQ2_XS build only; NINFER_DRAFT_TOKENS=3 restores three.
+    if [[ "$model_key" == 'qwen38-flash-next' ]]; then
+      export NINFER_DRAFT_TOKENS="${NINFER_DRAFT_TOKENS:-7}"
+    fi
     # A verification round's misses go partly to CPU threads beside the GPU instead of over the link
     # (the same output): a prompt's first pass, 48-63 -> 68-80 tok/s on this card.
     export NINFER_CPU_VERIFY_MISSES="${NINFER_CPU_VERIFY_MISSES:-on}"

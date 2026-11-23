@@ -306,6 +306,7 @@ void validate_flash_next_options_unused(const EngineOptions& options) {
     note(set.prefill_cpu_all_columns != 0, "--prefill-cpu-all-columns");
     note(set.ngram_ram_bytes != 0, "--ngram-ram-mib");
     note(set.mtp_staged_drafts, "--mtp-staged-drafts");
+    note(set.mtp_draft_vocab != unset.mtp_draft_vocab, "--mtp-draft-vocab");
     note(set.gdn_async_commit, "--gdn-async-commit");
     note(set.hc_int8, "--hc-int8");
     note(set.hc_fused_read, "--hc-fused-read");

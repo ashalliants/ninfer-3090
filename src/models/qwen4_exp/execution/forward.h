@@ -323,6 +323,12 @@ struct SteeringTable {
     std::vector<std::uint8_t> active; // per layer: some set steers it
 };
 
+// The reduced MTP draft head (--mtp-draft-vocab): copies rows ids[0..rows) of the GGML-blocked
+// output head `head` into `dst` (rows times the head's row bytes, on the device; ids on the device
+// too) and returns a Weight over the copy, whose row r is head row ids[r] byte for byte. Throws if
+// the head is not GGML blocks with an even row size.
+Weight gather_head_rows(const Weight& head, const std::int32_t* ids, std::int32_t rows, void* dst, cudaStream_t stream);
+
 // Opt-in execution choices of a Forward. Off (the default) runs every Op on the device's stream in
 // the order the forward has always run them; each option leaves the outputs bitwise unchanged
 // unless its comment says otherwise.
@@ -343,6 +349,12 @@ struct ForwardOptions {
     std::int32_t hot_embedding_rows = 0;
     Weight hot_embedding;
     Weight cold_embedding;
+    // Non-null: the MTP drafter scores only draft_head (draft_head.n rows of the output head, as
+    // GGML blocks in device memory) and maps its argmax row r to the token draft_head_ids[r]
+    // (--mtp-draft-vocab). Its draft probability is the softmax over those rows. Verification
+    // is untouched, so the output is the same. Null: the full head.
+    Weight draft_head;
+    const std::int32_t* draft_head_ids = nullptr;
     // Each GDN layer's recurrence reads its config_.gdn.key_heads q/k heads in place through the
     // tiled head map (value head h reads key head h % key_heads, ops::GdnHeadMap::Tiled) instead of
     // copying them to one head per value head first. The same values reach the same arithmetic:
@@ -629,6 +641,8 @@ private:
     bool hc_fused_read_ = false; // ForwardOptions::hc_fused_read
     const SteeringTable* steering_ = nullptr; // ForwardOptions::steering
     bool ggml_decode_mma_ = false; // ForwardOptions::ggml_decode_mma
+    Weight draft_head_;                            // ForwardOptions::draft_head
+    const std::int32_t* draft_head_ids_ = nullptr; // ForwardOptions::draft_head_ids (null: the full head)
     Tensor mtp_frames_; // I32 [E]: every drafter expert resident at its own index
     DeviceBuffer mtp_frames_backing_;
     Tensor residual_; // the call's residual stream, in the workspace from run_front to run_back

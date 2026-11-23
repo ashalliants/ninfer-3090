@@ -105,10 +105,12 @@ sha256sum --check SHA256SUMS
   spread between prompts almost disappeared (table below). Decode barely moved (+0.8%).
 - **OS:** Windows. The `run.bat qwen38-flash-next` launcher is the supported way to serve it.
 - **Tesla V100 32 GB (Linux, built from source):** the same file serves its full 262,144-token
-  context on a V100 through `scripts/run-v100.sh`. Decode with MTP3 (2026-11-23, master `61b3e032c`,
-  200 W, 300 greedy tokens, warm cache): **119.1 tok/s** on code, 97.1 on a thinking prompt, 88.7
-  French, 80.1 story, 78.6 Chinese (best of five runs; the ranges are in the
-  [V100 guide](https://github.com/ashalliants/ninfer-3090/blob/master/docs/tesla-v100.md#qwen38-flash-next)).
+  context on a V100 through `scripts/run-v100.sh`. Decode with up to seven MTP drafts and the reduced
+  draft vocabulary (2026-11-23, 200 W, 300 greedy tokens, warm cache): **123.3 tok/s** on code, 100.3
+  on a thinking prompt, 80.5 story, 78.8 Chinese, and **71.8 French, down from 88.7** with three drafts
+  and the full head: the list covers French poorly. `--mtp-draft-vocab off` turns it off. The output
+  is the same either way; the conditions and ranges are in the
+  [V100 guide](https://github.com/ashalliants/ninfer-3090/blob/master/docs/tesla-v100.md#qwen38-flash-next).
 
 ## Measurements
 
@@ -285,6 +287,12 @@ DASLab GGUF repository and its IQ2_XS files declare `apache-2.0`; its mmproj dec
 `qwen-community-1.0`; Strata's `mtp-q2_0.gguf` carries no license metadata and holds tensors taken
 from Qwen's checkpoint. A quantization does not change the license of the weights it encodes, so
 this artifact follows the base model's license.
+
+The optional MTP draft vocabulary (`<model>.draft-vocab`, used on a Tesla V100) is not part of this
+repository: `scripts/download-model.sh` fetches it at install time from jesdga's
+[Qwen3.8-Flash-Next-Basalt](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) pack, where it is
+published under the Qwen Community License 1.0, and it stays under that license. Credit to jesdga for
+the list and to chris83-dev's Lapilli (MIT) for its V100 use.
 
 ---
 

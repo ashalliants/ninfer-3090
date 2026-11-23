@@ -267,7 +267,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--ngram-ram-mib N|auto] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
-           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--mtp-staged-drafts] [--mtp-rows-verify] [--ngram-prefetch] "
+           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--mtp-staged-drafts] [--mtp-draft-vocab PATH|auto|off] [--mtp-rows-verify] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
            "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F [--prefill-cpu-all-columns N] [--prefill-cpu-max-columns N]] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
@@ -420,6 +420,9 @@ std::string serve_usage_text(const char* argv0) {
            "(off by default: an acceptance estimate picks the count before drafting); --mtp-staged-drafts "
            "(needs --mtp-joint-acceptance) drafts one step at a time and stops once no further draft "
            "could be verified (the same output; off by default: every round drafts --draft-tokens); "
+           "--mtp-draft-vocab PATH|auto|off (--spec mtp) makes the drafter score only the token ids listed "
+           "in PATH (int32), so a draft step reads a smaller head (the same output; auto, the default, reads "
+           "<artifact>.draft-vocab when it exists, on a Tesla V100 only; off: the full head); "
            "--mtp-rows-verify "
            "(needs --mtp-joint-acceptance) batches a genuine draft-and-verify across every eligible row "
            "when two or more lanes decode together, instead of always falling back to a plain round "
@@ -1185,6 +1188,11 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.flash_next.mtp_joint_acceptance = true;
         } else if (arg == "--mtp-staged-drafts") {
             options.flash_next.mtp_staged_drafts = true;
+        } else if (arg == "--mtp-draft-vocab") {
+            options.flash_next.mtp_draft_vocab = require_value("--mtp-draft-vocab");
+            if (options.flash_next.mtp_draft_vocab.empty()) {
+                throw std::invalid_argument("--mtp-draft-vocab needs PATH, auto or off");
+            }
         } else if (arg == "--mtp-rows-verify") {
             options.flash_next.mtp_rows_verify = true;
         } else if (arg == "--ngram-prefetch") {

@@ -21,6 +21,8 @@
 // pinned one), zero when off; ngram_rows_in_graph's rule.
 // --partial-ram-residency: the residency term grows by the host slot table (8 bytes per expert),
 // zero when off; --vision and a KV base are refused naming the flag.
+// --mtp-draft-vocab: the gathered draft head is a named term (rows, then an I32 id each), zero
+// without a vocabulary or MTP; load_draft_vocab filters, sorts, dedupes and pads the ids.
 
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/expert_residency.h"
@@ -32,6 +34,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -222,6 +227,45 @@ int main() {
         check(plan.fixed_bytes() == 1000, "a plan without the side stream has no extra term");
         plan.shared_expert_workspace = planned;
         check(plan.fixed_bytes() == 1000 + planned, "fixed_bytes counts the side-stream workspace");
+
+        // --mtp-draft-vocab: the gathered head rows (rounded up to 256 bytes), then an I32 id per row;
+        // nothing without a vocabulary or without MTP, and fixed_bytes counts it.
+        {
+            q4::ProgramOptions dv;
+            dv.max_context = 32768;
+            check(q4::plan_mtp_draft_head(dv) == 0, "no draft vocabulary plans no draft head");
+            dv.mtp_draft_vocab          = std::make_shared<const std::vector<std::int32_t>>(std::vector<std::int32_t>{1, 5, 9, 9});
+            dv.mtp_draft_head_row_bytes = 1360; // IQ4_XS at K = 2560
+            check(q4::plan_mtp_draft_head(dv) == 0, "a draft vocabulary without MTP plans nothing");
+            dv.mtp_draft_tokens = 3;
+            check(q4::mtp_draft_head_ids_offset(dv) == 5632, "the ids follow the rows, 256-byte aligned (4 x 1360 -> 5632)");
+            check(q4::plan_mtp_draft_head(dv) == 5632 + 16, "the head term is the rows and one I32 id per row");
+            q4::ProgramDevicePlan with;
+            with.mtp_draft_head = q4::plan_mtp_draft_head(dv);
+            check(with.fixed_bytes() == 5648, "fixed_bytes counts the draft head");
+        }
+        // The vocabulary file: int32 ids, out-of-range ids and repeats dropped, sorted, padded to even.
+        {
+            const auto path = std::filesystem::temp_directory_path() / "ninfer_draft_vocab_test.bin";
+            const auto write = [&](const std::vector<std::int32_t>& v) {
+                std::ofstream out(path, std::ios::binary | std::ios::trunc);
+                out.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(4 * v.size()));
+            };
+            write({7, 3, 3, -1, 100, 5});
+            const auto ids = q4::load_draft_vocab(path, 100);
+            check((ids == std::vector<std::int32_t>{3, 5, 7, 7}), "ids are filtered, sorted, distinct and padded to even");
+            write({4, 2});
+            check((q4::load_draft_vocab(path, 100) == std::vector<std::int32_t>{2, 4}), "an even list is kept as is");
+            write({100, 200, 1});
+            bool threw = false;
+            try { (void)q4::load_draft_vocab(path, 100); } catch (const std::exception&) { threw = true; }
+            check(threw, "fewer than two usable ids are refused");
+            { std::ofstream out(path, std::ios::binary | std::ios::trunc); out.write("abc", 3); }
+            threw = false;
+            try { (void)q4::load_draft_vocab(path, 100); } catch (const std::exception&) { threw = true; }
+            check(threw, "a file that is not whole int32 ids is refused");
+            std::filesystem::remove(path);
+        }
 
         // --mtp-constrained: K + 1 masks of ceil(V / 32) words for a verification of K drafts.
         constexpr std::uint32_t kVocab = 248077; // 7753 words, the last one partial

@@ -363,6 +363,9 @@ struct ProgramDevicePlan {
     // (plan_ngram_flag_wait(...).device; 0 when off). The flag and the error word are pinned host
     // memory (.pinned), charged to the RAM ledger.
     std::uint64_t ngram_flag_wait = 0;
+    // The reduced draft head (ProgramOptions::mtp_draft_vocab; plan_mtp_draft_head; 0 when off): the
+    // gathered head rows, then the I32 token id of each row.
+    std::uint64_t mtp_draft_head = 0;
     std::uint64_t expert_record_stride = 0; // one expert frame
     std::uint32_t max_frames           = 0; // the most frames the expert cache uses
     std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate (counts both halves of the split decode)
@@ -370,7 +373,7 @@ struct ProgramDevicePlan {
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
         return kv + workspace + staging + state + io + residency + speculation + shared_expert_workspace +
                mtp_constrained_masks + mtp_draft_probs + hot_embedding + cpu_misses + hc_int8_bytes +
-               steering + ngram_flag_wait;
+               steering + ngram_flag_wait + mtp_draft_head;
     }
 };
 
@@ -436,6 +439,13 @@ struct ProgramOptions {
     // graph) and stops once the joint product of the drafts so far is below the threshold. The
     // drafts it makes are the full chain's first ones, bit for bit, and the window is the same.
     bool mtp_staged_drafts = false;
+    // FlashNextOptions::mtp_draft_vocab, as read (load_draft_vocab): the token ids the drafter may
+    // propose, ascending and distinct, padded to an even count with the last id repeated (the GGML
+    // head route takes rows in pairs). The Program gathers those rows of the output head, each
+    // mtp_draft_head_row_bytes, into its own device copy; the drafter scores only them and maps its
+    // argmax back to the token id. Empty: the full head.
+    std::shared_ptr<const std::vector<std::int32_t>> mtp_draft_vocab;
+    std::uint64_t mtp_draft_head_row_bytes = 0;
     // FlashNextOptions::mtp_rows_verify: a round with more than one eligible row speculates
     // genuinely in a single batched draft-and-verify (docs/maintainer/mtp-multi-row-lanes-design.md)
     // instead of always falling back to a plain round. Requires mtp_joint_acceptance. Off by
@@ -589,6 +599,19 @@ struct NgramFlagPlan {
 // rows, the final mixer without, and with MTP the drafter's two block mixers and final mixer: 97,
 // or 100 with MTP, on Flash-Next); 0 without hc_int8.
 [[nodiscard]] std::uint64_t plan_hc_int8(const ProgramOptions& options, const TextConfig& config);
+
+// ProgramDevicePlan::mtp_draft_head of these options: the gathered rows (rounded up to 256 bytes)
+// and an I32 id per row; 0 without a draft vocabulary or a drafter.
+[[nodiscard]] std::uint64_t plan_mtp_draft_head(const ProgramOptions& options);
+// The head row offset of the ids in that block (the rows' bytes rounded up to 256).
+[[nodiscard]] std::uint64_t mtp_draft_head_ids_offset(const ProgramOptions& options);
+
+// Reads a draft vocabulary file (FlashNextOptions::mtp_draft_vocab): little-endian int32 token
+// ids. Ids outside [0, public_tokens) and repeats are dropped, the rest sorted ascending (a tie
+// between equal scores then goes to the lower id, as in the full head) and padded to an even count
+// by repeating the last id. Throws when the file is unreadable, not a whole number of ids, or
+// leaves fewer than two ids.
+[[nodiscard]] std::vector<std::int32_t> load_draft_vocab(const std::filesystem::path& path, std::int32_t public_tokens);
 
 // ProgramDevicePlan::steering of these options: FP32 [vectors][layers][hidden]; 0 without a vector.
 [[nodiscard]] std::uint64_t plan_steering(const ProgramOptions& options, const TextConfig& config);

@@ -301,6 +301,16 @@ plus the refusal-vector graft and `--presence-penalty 1.0`; 300 greedy tokens, w
 five runs): story / code / Chinese / French / thinking 80.1 / 119.1 / 78.6 / 88.7 / 97.1 tok/s at
 1.94 / 3.31 / 1.90 / 2.18 / 2.62 tokens per round. Conditions and ranges: [tesla-v100.md](../tesla-v100.md#qwen38-flash-next).
 
+Then `run-v100.sh` moved to seven drafts with the reduced draft head (`--mtp-draft-vocab`, the Basalt
+list fetched at install): 80.5 / 123.3 / 78.8 / 71.8 / 100.3 at 1.92 / 3.93 / 1.88 / 1.78 / 3.05 tokens per
+round, the same text. The head is a `gather_columns` copy of the listed IQ4_XS rows (one BF16 view of
+the row bytes) made at load; the drafter's projection and argmax run over it and
+`proposal_remap_token_ids` maps the winners back. It is off on sm_86 (`auto` checks the compute
+capability). Lapilli's lead on code and thinking was not its MTP weights or algorithm: its
+self-distilled MTP dense, converted and run here, was slower (code 115 against 119), and the experts
+are byte-identical; its UD-IQ2_XS target (IQ4_NL down projections in 26 layers) generates different
+text, which the drafter predicts better.
+
 Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
 - In steady decode the link costs almost nothing: the expert cache hits 99.6-100% and
   `stage_kernel` is ~5 us a call. The link matters for prefill and for refilling the cache.

@@ -39,9 +39,13 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "ninfer/ops/argmax.h"
+#include "ninfer/ops/cast.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/ple.h"
+#include "ninfer/ops/projection_fp32.h"
 #include "ninfer/ops/qsa.h"
+#include "ninfer/ops/speculative_round.h"
 #include "ops/ggml_blocks_decode.h"
 #include "ops/offloaded_moe_fixtures.h"
 
@@ -724,6 +728,80 @@ void test_drafter(Harness& h, DeviceContext& device, const ex::Parameters& param
 
 } // namespace
 
+// ------------------------------------------------------------------ 2b. the reduced draft head
+// --mtp-draft-vocab: gather_head_rows copies listed rows of the real IQ4_XS output head; projecting
+// onto the copy must give, for every listed token, the full head's FP32 logit bit for bit, and the
+// draft (BF16 argmax over the copy, remapped by proposal_remap_token_ids) must be the full head's
+// BF16 argmax restricted to the list (the lowest such token id on a tie, as argmax breaks ties).
+void test_draft_head(const ex::Parameters& parameters, DeviceContext& device) {
+    const Weight& head      = parameters.output_head;
+    const auto V            = static_cast<std::size_t>(head.n);
+    const auto H            = static_cast<std::size_t>(head.k);
+    const auto domain       = static_cast<std::int32_t>(parameters.model.resources().public_token_count);
+    constexpr std::int32_t T = 3;
+    // A scattered, sorted list over the whole public range (first and last ids included), even length.
+    std::vector<std::int32_t> ids;
+    for (std::int32_t v = 0; v < domain; v += (v % 5 == 0 ? 3 : 11)) { ids.push_back(v); }
+    if (ids.back() != domain - 1) { ids.push_back(domain - 1); }
+    if (ids.size() % 2 != 0) { ids.push_back(ids.back()); }
+    const auto rows = static_cast<std::int32_t>(ids.size());
+    const GgmlBlock block = ggml_block(head.qtype);
+    const std::size_t row_bytes = H / block.values * block.bytes;
+
+    DeviceBuffer ids_d(4 * ids.size()), copy(row_bytes * ids.size()), x_d(2 * H * T), full_d(4 * V * T),
+        part_d(4 * ids.size() * T), narrow_d(2 * ids.size() * T), draft_d(4 * T);
+    CUDA_CHECK(cudaMemcpy(ids_d.p, ids.data(), 4 * ids.size(), cudaMemcpyHostToDevice));
+    std::vector<std::uint16_t> x(H * T);
+    std::uint32_t seed = 0x9e3779b9u;
+    for (auto& w : x) {
+        seed = seed * 1664525u + 1013904223u;
+        const float f = (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f) * 4.0f;
+        w = static_cast<std::uint16_t>(std::bit_cast<std::uint32_t>(f) >> 16);
+    }
+    CUDA_CHECK(cudaMemcpy(x_d.p, x.data(), 2 * x.size(), cudaMemcpyHostToDevice));
+    const cudaStream_t s = device.stream;
+    const Weight reduced = ex::gather_head_rows(head, static_cast<const std::int32_t*>(ids_d.p), rows, copy.p, s);
+    const Tensor xt(x_d.p, DType::BF16, {static_cast<std::int32_t>(H), T});
+    Tensor full(full_d.p, DType::FP32, {static_cast<std::int32_t>(V), T});
+    Tensor part(part_d.p, DType::FP32, {rows, T});
+    ops::projection_fp32(xt, head, full, s);
+    ops::projection_fp32(xt, reduced, part, s);
+    Tensor narrow(narrow_d.p, DType::BF16, {rows, T});
+    Tensor draft(draft_d.p, DType::I32, {T});
+    ops::cast_fp32_to_bf16(part, narrow, s);
+    ops::argmax(narrow, draft, rows, s);
+    ops::proposal_remap_token_ids(draft, static_cast<const std::int32_t*>(ids_d.p), rows, s);
+    CUDA_CHECK(cudaStreamSynchronize(s));
+
+    const auto rows_src = download<std::byte>(head.qdata, row_bytes * V);
+    const auto rows_cpy = download<std::byte>(copy.p, row_bytes * ids.size());
+    bool same_rows = true;
+    for (std::size_t r = 0; r < ids.size() && same_rows; ++r) {
+        same_rows = std::memcmp(rows_cpy.data() + r * row_bytes, rows_src.data() + ids[r] * row_bytes, row_bytes) == 0;
+    }
+    expect(same_rows, "draft head: every gathered row is the output head's row of its token, byte for byte");
+    const auto fl = download<float>(full_d.p, V * T);
+    const auto pl = download<float>(part_d.p, ids.size() * T);
+    const auto dr = download<std::int32_t>(draft_d.p, T);
+    bool same_logits = true, same_draft = true;
+    for (std::int32_t t = 0; t < T; ++t) {
+        float best = -INFINITY;
+        std::int32_t want = -1;
+        for (std::int32_t r = 0; r < rows; ++r) {
+            const float f = fl[static_cast<std::size_t>(t) * V + ids[r]];
+            same_logits   = same_logits && std::bit_cast<std::uint32_t>(f) ==
+                                             std::bit_cast<std::uint32_t>(pl[static_cast<std::size_t>(t) * rows + r]);
+            const float b = std::bit_cast<float>((std::bit_cast<std::uint32_t>(f) + 0x7fffu +
+                                                  ((std::bit_cast<std::uint32_t>(f) >> 16) & 1u)) & 0xffff0000u);
+            if (b > best) { best = b; want = ids[r]; }
+        }
+        std::printf("draft head: column %d drafts %d (list argmax %d)\n", t, dr[t], want);
+        same_draft = same_draft && dr[t] == want;
+    }
+    expect(same_logits, "draft head: each listed token's logit is the full head's, bit for bit");
+    expect(same_draft, "draft head: the remapped draft is the full head's BF16 argmax over the list");
+}
+
 // ------------------------------------------------------------------ 3. the shared expert stream
 // The prompt and one full drafter step after it (as test_drafter runs them), for comparing two
 // Forwards: the prompt's last logits, and the step's MoE output, head logits, output residual and
@@ -866,6 +944,7 @@ int main(int argc, char** argv) {
             Harness h(parameters, device, context, prompt);
             test_drafter(h, device, parameters, volume, tokens, prompt);
         }
+        test_draft_head(parameters, device);
         test_shared_expert_stream(parameters, device, volume, tokens, prompt, context);
         std::printf(g_failures == 0 ? "qwen4_exp mtp checks passed\n" : "FAIL: %d qwen4_exp mtp check(s)\n", g_failures);
         return g_failures == 0 ? 0 : 1;
