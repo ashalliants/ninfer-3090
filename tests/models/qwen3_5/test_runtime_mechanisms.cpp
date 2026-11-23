@@ -175,6 +175,43 @@ void test_decoder_layout() {
     expect(k8v4.kv_payload_bytes() ==
                k8v4.text_kv.payload_bytes() + k8v4.mtp_kv->payload_bytes(),
            "K8V4 Text/MTP KV payload accounting");
+
+    // A per-layer cache: layer 0 rk4v4, layer 1 int8. Each layer's planes are its own format's,
+    // the text payload is the two uniform payloads' mean, and the MTP cache keeps kv_storage.
+    q36::DecoderStateSpec mixed_spec = decoder_spec(ninfer::KvCacheStorage::Int8Group64, true);
+    mixed_spec.text_layer_storage = {ninfer::KvCacheStorage::RotatedLloyd4KeyInt4Value,
+                                     ninfer::KvCacheStorage::Int8Group64};
+    ninfer::LayoutBuilder mixed_builder;
+    const q36::DecoderStateLayout mixed = q36::plan_decoder_state(mixed_builder, mixed_spec);
+    (void)mixed_builder.finish(256);
+    const auto& planes = mixed.text_kv.pages.planes;
+    expect(planes.size() == 8 && mixed.text_kv.layer_storage == mixed_spec.text_layer_storage &&
+               planes[0].geometry == rk4v4.text_kv.pages.planes[0].geometry &&
+               planes[1].geometry == rk4v4.text_kv.pages.planes[1].geometry &&
+               planes[4].geometry == int8.text_kv.pages.planes[4].geometry &&
+               planes[5].geometry == int8.text_kv.pages.planes[5].geometry,
+           "a per-layer Text KV lays out each layer in its own format");
+    expect(2 * mixed.text_kv.payload_bytes() ==
+               rk4v4.text_kv.payload_bytes() + int8.text_kv.payload_bytes(),
+           "a per-layer Text KV holds each layer's own bytes");
+    expect(mixed.mtp_kv && mixed.mtp_kv->layer_storage.empty() &&
+               mixed.mtp_kv->payload_bytes() == int8.mtp_kv->payload_bytes(),
+           "a per-layer cache keeps the MTP layer at kv_storage");
+    const auto refuses = [](q36::DecoderStateSpec spec) {
+        ninfer::LayoutBuilder builder;
+        try {
+            (void)q36::plan_decoder_state(builder, spec);
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    q36::DecoderStateSpec short_spec = mixed_spec;
+    short_spec.text_layer_storage.pop_back();
+    q36::DecoderStateSpec fp8_mix = mixed_spec;
+    fp8_mix.text_layer_storage[0] = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    q36::DecoderStateSpec bf16_base = mixed_spec;
+    bf16_base.kv_storage = ninfer::KvCacheStorage::BFloat16;
+    expect(refuses(short_spec) && refuses(fp8_mix) && refuses(bf16_base),
+           "a per-layer cache refuses a short list or a format outside the INT8 family");
 }
 
 void test_round_layout() {

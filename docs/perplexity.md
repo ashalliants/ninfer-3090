@@ -21,6 +21,8 @@ English reference text, English long-form text, Chinese reference text, and NInf
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
 KV representations are `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `nvfp4`, and `k8v4`.
+A Qwen3.5-family model also takes a per-layer INT8-family spec such as `--kv-dtype rk4v4x12,int8x4`
+(runs of `FORMATxCOUNT` over the full-attention layers); the report names it as given, in canonical runs.
 
 All seven have been measured on this corpus; the results, alongside each format's size and decode
 speed, are in [`docs/config-calculator.html`](config-calculator.html).

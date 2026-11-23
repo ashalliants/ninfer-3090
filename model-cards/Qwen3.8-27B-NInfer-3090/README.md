@@ -206,6 +206,12 @@ no longer fits the default profiles.
 - `image_chart` (`NIFER VISION 731；3；左侧`, the expected answer);
 - `image_natural` (mailbox 24, sun on the right) with `--vision --vision-residency overlay`.
 
+**Per-layer KV mixes** (opt-in, not yet measured on a 3090). `--kv-dtype rk4v4x12,int8x4` keeps
+`rk4v4` in the first twelve full-attention layers and `int8` in the last four, which on a Tesla V100
+halved `rk4v4`'s perplexity penalty (+1.69 against +3.56 millinats from `int8`) for 22% more KV per
+token, and decoded 3% faster than `rk4v4` there. On a 24 GB card that trades context for accuracy;
+see [the README](https://github.com/ashalliants/ninfer-3090#per-layer-mixes---kv-dtype-rk4v4x12int8x4-opt-in).
+
 ## Run it
 
 Build [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090), then:

@@ -130,6 +130,8 @@ struct SequencePlanningInputs {
     // EngineOptions::draft_context_rows: the drafters' context-row capacity (0: off).
     std::uint32_t draft_context_rows        = 0;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
+    // EngineOptions::kv_layers: the text cache's per-layer storages (empty: kv_storage).
+    std::vector<KvCacheStorage> kv_layers;
     ProposalHead proposal_head              = ProposalHead::Full;
     models::LoadOptions features;
     NumericTripwireOptions numeric_tripwire;
@@ -166,6 +168,8 @@ struct SequencePlanImpl {
     // EngineOptions::draft_context_rows: the drafters' context-row capacity (0: off).
     std::uint32_t draft_context_rows        = 0;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
+    // EngineOptions::kv_layers: the text cache's per-layer storages (empty: kv_storage).
+    std::vector<KvCacheStorage> kv_layers;
     ProposalHead proposal_head              = ProposalHead::Full;
     models::LoadOptions features;
     NumericTripwireOptions numeric_tripwire;

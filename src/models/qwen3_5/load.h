@@ -52,6 +52,8 @@ private:
 struct StageSizing {
     // Stored K/V format of the Paged KV cache.
     KvCacheStorage kv_storage = KvCacheStorage::BFloat16;
+    // A per-layer cache's storage of each full-attention layer, in order (empty: kv_storage).
+    std::vector<KvCacheStorage> kv_layers;
     // Recurrent-state slots each Linear Attention layer holds: concurrent requests plus the device
     // state slots the context cache keeps.
     std::uint32_t state_slots = 1;

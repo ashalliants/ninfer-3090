@@ -180,6 +180,13 @@ int main() {
                               to_int8.kv_cache_explicit && to_fp16.kv_rings == ninfer::KvRings::FP16 &&
                               to_fp16.kv_cache == ninfer::KvCacheStorage::BFloat16 && !to_fp16.kv_cache_explicit,
                           "CLI --kv-dtype: the last form does not win, or an explicit bf16 is not marked");
+        const auto mixed = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "rk8v4x12,int8x4"});
+        std::vector<ninfer::KvCacheStorage> expected(12, ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64);
+        expected.insert(expected.end(), 4, ninfer::KvCacheStorage::Int8Group64);
+        const auto reset = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "rk8v4x12,int8x4", "--kv-dtype", "int8"});
+        failures += check(mixed.kv_cache == ninfer::KvCacheStorage::Int8Group64 && mixed.kv_layers == expected &&
+                              mixed.kv_cache_explicit && reset.kv_layers.empty(),
+                          "CLI --kv-dtype rk8v4x12,int8x4 did not select the per-layer cache, or a later form kept it");
     }
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--prefill-math", "fp32"}).prefill_math == ninfer::PrefillMath::FP32 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--prefill-math", "tc"}).prefill_math ==

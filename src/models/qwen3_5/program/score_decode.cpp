@@ -89,6 +89,7 @@ std::vector<float> ProgramImpl::causal_score_decode(const PreparedPromptData& pr
                                                    dimension(attention_config.num_attention_heads),
                                                    dimension(attention_config.num_key_value_heads)},
                           .storage              = kv_storage,
+                          .target_storages      = target_kv_storages(kv_layers),
                           .multiprocessor_count = device.multiprocessor_count()});
 
     std::optional<StateImageHandle> state;

@@ -521,7 +521,9 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     const ninfer::ContextCostSummary context_cost = service.load_summary().context_cost;
 
     logger_->info("capacity | KV {} tokens, {}, {} | pages {}/{} | runtime {} | free {}",
-                  product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache),
+                  product::format_pretty_count(memory.kv_capacity),
+                  memory.kv_layers.empty() ? std::string(kv_cache_name(memory.kv_cache))
+                                           : "per-layer " + ninfer::format_kv_layer_spec(memory.kv_layers),
                   kv_capacity_mode_name(memory.kv_capacity_mode),
                   product::format_pretty_count(memory.kv_capacity_page_groups),
                   product::format_pretty_count(memory.kv_capacity_max_page_groups),

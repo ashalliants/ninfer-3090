@@ -68,6 +68,85 @@ enum class KvCacheStorage : std::uint8_t {
     RotatedLloyd4KeyInt4Value,
 };
 
+// A per-layer KV cache (--kv-dtype rk4v4x8,int8x8): the storage of each full-attention layer of the
+// text model, in model order, as runs of FORMATxCOUNT. Only the INT8 family (int8, rk8v4, rk4v4)
+// mixes: its formats share one plane set and one kernel family. The MTP layer's cache stays int8.
+// A spec whose layers all agree is that plain format (parse_kv_layer_spec returns one entry).
+// Opt-in and lossy like its members; see docs/serving.md.
+inline constexpr std::size_t kMaximumKvLayerSpecLayers = 1024;
+
+[[nodiscard]] inline const char* kv_layer_format_name(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::Int8Group64: return "int8";
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64: return "rk8v4";
+    case KvCacheStorage::RotatedLloyd4KeyInt4Value: return "rk4v4";
+    default: throw std::invalid_argument("a per-layer KV spec mixes only int8, rk8v4 and rk4v4");
+    }
+}
+
+// True when text is a per-layer spec (it names a count), so callers can tell it from a plain dtype.
+[[nodiscard]] inline bool is_kv_layer_spec(std::string_view text) {
+    return text.find('x') != std::string_view::npos;
+}
+
+// The layers a per-layer spec names, one storage each, or a single entry when every layer agrees.
+// Throws std::invalid_argument on anything else.
+[[nodiscard]] inline std::vector<KvCacheStorage> parse_kv_layer_spec(std::string_view text) {
+    const auto bad = [&](const char* why) {
+        return std::invalid_argument("invalid per-layer --kv-dtype '" + std::string(text) + "': " + why +
+                                     " (expected runs FORMATxCOUNT of int8, rk8v4 or rk4v4, e.g. rk4v4x8,int8x8)");
+    };
+    std::vector<KvCacheStorage> layers;
+    std::string_view rest = text;
+    while (true) {
+        const std::size_t comma = rest.find(',');
+        const std::string_view run = rest.substr(0, comma);
+        const std::size_t x = run.rfind('x');
+        if (x == std::string_view::npos || x == 0 || x + 1 == run.size()) { throw bad("a run is not FORMATxCOUNT"); }
+        const std::string_view name = run.substr(0, x), count_text = run.substr(x + 1);
+        KvCacheStorage storage;
+        if (name == "int8") {
+            storage = KvCacheStorage::Int8Group64;
+        } else if (name == "rk8v4") {
+            storage = KvCacheStorage::RotatedInt8KeyInt4ValueGroup64;
+        } else if (name == "rk4v4") {
+            storage = KvCacheStorage::RotatedLloyd4KeyInt4Value;
+        } else {
+            throw bad("only int8, rk8v4 and rk4v4 mix");
+        }
+        std::size_t count = 0;
+        for (const char c : count_text) {
+            if (c < '0' || c > '9') { throw bad("a count is not a number"); }
+            count = count * 10U + static_cast<std::size_t>(c - '0');
+            if (count > kMaximumKvLayerSpecLayers) { throw bad("too many layers"); }
+        }
+        if (count == 0) { throw bad("a count is zero"); }
+        if (layers.size() + count > kMaximumKvLayerSpecLayers) { throw bad("too many layers"); }
+        layers.insert(layers.end(), count, storage);
+        if (comma == std::string_view::npos) { break; }
+        rest = rest.substr(comma + 1);
+    }
+    for (const KvCacheStorage storage : layers) {
+        if (storage != layers.front()) { return layers; }
+    }
+    return {layers.front()};
+}
+
+// The canonical spec of a per-layer list: maximal runs, e.g. "rk4v4x8,int8x8".
+[[nodiscard]] inline std::string format_kv_layer_spec(const std::vector<KvCacheStorage>& layers) {
+    std::string out;
+    for (std::size_t i = 0; i < layers.size();) {
+        std::size_t j = i;
+        while (j < layers.size() && layers[j] == layers[i]) { ++j; }
+        if (!out.empty()) { out += ','; }
+        out += kv_layer_format_name(layers[i]);
+        out += 'x';
+        out += std::to_string(j - i);
+        i = j;
+    }
+    return out;
+}
+
 enum class EnginePurpose : std::uint8_t {
     Generation,
     CausalScoring,
@@ -855,6 +934,11 @@ struct EngineOptions {
     // and releases an older one unless something has reused it. Off by default.
     bool progress_anchors_shared = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // A per-layer KV cache (--kv-dtype rk4v4x8,int8x8; see parse_kv_layer_spec): one INT8-family
+    // storage per full-attention layer, in model order, with kv_cache Int8Group64 (the MTP layer's).
+    // Empty: every layer stores kv_cache. Qwen3.5-family models only; it must name every
+    // full-attention layer and mix at least two formats.
+    std::vector<KvCacheStorage> kv_layers;
     SpeculativeOptions speculative;
     // Relaxed drafting (opt-in; CHANGES THE OUTPUT DISTRIBUTION). Under sampling, a draft whose
     // final target probability (after penalties, mask, top-k, min-p, top-p and temperature) is at
@@ -1963,6 +2047,8 @@ struct MemorySummary {
     std::uint32_t kv_capacity_page_groups     = 0;
     std::uint32_t kv_capacity_max_page_groups = 0;
     KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
+    // EngineOptions::kv_layers: empty unless the cache stores a per-layer mix.
+    std::vector<KvCacheStorage> kv_layers;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;

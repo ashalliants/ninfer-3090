@@ -165,6 +165,7 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
     std::vector<LayerCost> layers;
     layers.reserve(weights.layers.size());
     std::uint64_t layer_bytes_total = 0;
+    std::size_t full_attention_index = 0;
     for (std::size_t layer = 0; layer < weights.layers.size(); ++layer) {
         LayerCost cost;
         for (const WeightId id : loading::layer_weights(weights.layers[layer])) {
@@ -172,8 +173,13 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
         }
         if (text.layer_types[layer] == MixerKind::FullAttention && text.attention) {
             // One page group of this layer: every plane of a page, for every KV head, as stored.
+            const std::size_t index = full_attention_index++;
+            if (!sizing.kv_layers.empty() && index >= sizing.kv_layers.size()) {
+                throw std::invalid_argument("a per-layer KV spec names fewer layers than this model's full-attention layers");
+            }
             const PagedKVStorageLayout storage = paged_kv_storage_layout(
-                sizing.kv_storage, static_cast<std::int32_t>(text.attention->head_dim));
+                sizing.kv_layers.empty() ? sizing.kv_storage : sizing.kv_layers[index],
+                static_cast<std::int32_t>(text.attention->head_dim));
             cost.kv_bytes_per_page_group = static_cast<std::uint64_t>(kPagedKVPageSize) *
                                            text.attention->num_key_value_heads *
                                            storage.physical_bytes_per_token_head();

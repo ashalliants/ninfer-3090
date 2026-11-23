@@ -764,6 +764,31 @@ int main() {
     const ServeOptions k8v4 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "k8v4"});
     failures += check(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value,
                       "--kv-dtype k8v4 did not select asymmetric K8V4 KV");
+    {
+        // A per-layer INT8-family spec: runs FORMATxCOUNT in layer order, canonicalised by
+        // format_kv_layer_spec, with the MTP cache at int8; a uniform spec is the plain format.
+        using ninfer::KvCacheStorage;
+        const ServeOptions mixed = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "rk4v4x8,int8x4,int8x4"});
+        std::vector<KvCacheStorage> expected(8, KvCacheStorage::RotatedLloyd4KeyInt4Value);
+        expected.insert(expected.end(), 8, KvCacheStorage::Int8Group64);
+        failures += check(mixed.kv_cache == KvCacheStorage::Int8Group64 && mixed.kv_layers == expected &&
+                              mixed.kv_cache_explicit && make_engine_options(mixed).kv_layers == expected &&
+                              ninfer::format_kv_layer_spec(mixed.kv_layers) == "rk4v4x8,int8x8",
+                          "--kv-dtype rk4v4x8,int8x4,int8x4 did not select the per-layer cache");
+        const ServeOptions uniform = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "rk8v4x16"});
+        failures += check(uniform.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 && uniform.kv_layers.empty(),
+                          "--kv-dtype rk8v4x16 is not plain rk8v4");
+        const ServeOptions last = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "rk4v4x8,int8x8", "--kv-dtype", "rk8v4"});
+        failures += check(last.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 && last.kv_layers.empty(),
+                          "a later plain --kv-dtype did not replace a per-layer spec");
+        for (const char* bad : {"fp8x16", "int8x0", "int8x", "x4", "int8x4,", "int8x4,,rk4v4x4", "int8x4y", "int8x2000",
+                                "nvfp4x8,int8x8", "rk4v4x8;int8x8",
+                                "int8x18446744073709551632"}) {
+            failures += check(refusal({"ninfer-serve", "model.ninfer", "--kv-dtype", bad}).find("per-layer --kv-dtype") !=
+                                  std::string::npos,
+                              "a malformed per-layer --kv-dtype was accepted");
+        }
+    }
     const std::string kv_help = serve_usage_text("ninfer-serve");
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
                           kv_help.find("k8v4") != std::string::npos,

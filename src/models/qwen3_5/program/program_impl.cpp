@@ -222,7 +222,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       relaxed_tokens(plan.relaxed_drafting
                          ? frontend::relaxed_drafting_tokens(*parameters_in.model.resources().tokenizer)
                          : frontend::RelaxedDraftingTokens{}),
-      kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
+      kv_storage(plan.kv_storage), kv_layers(plan.kv_layers), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -851,6 +851,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.max_context     = capacity;
     out.kv_capacity     = kv_capacity;
     out.kv_cache        = kv_storage;
+    out.kv_layers       = kv_layers;
     const auto& weights = parameters.model.storage_stats();
     out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
                                      weights.device_capacity_bytes};

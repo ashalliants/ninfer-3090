@@ -884,7 +884,8 @@ std::string format_server_start_json(
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
              {"prefill_chunk", engine_options.prefill_chunk},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
-             {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+             {"kv_cache", engine_options.kv_layers.empty() ? std::string(kv_cache_name(engine_options.kv_cache))
+                                                           : ninfer::format_kv_layer_spec(engine_options.kv_layers)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"lm_head_q4", engine_options.lm_head_q4},

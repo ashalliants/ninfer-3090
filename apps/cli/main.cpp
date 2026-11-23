@@ -206,7 +206,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                                        std::to_string(memory.kv_capacity_max_page_groups));
     print_metric("gpu weights used", format_arena_used(memory.weights));
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
-    print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
+    print_metric("kv cache dtype", memory.kv_layers.empty()
+                                       ? format_kv_cache(memory.kv_cache)
+                                       : "per-layer " + ninfer::format_kv_layer_spec(memory.kv_layers));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
@@ -339,6 +341,7 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
+        engine_options.kv_layers                = cli.kv_layers;
         engine_options.dense_q8                 = cli.dense_q8;
         engine_options.experts_mxfp8            = cli.experts_mxfp8;
         engine_options.split_attention          = cli.split_attention;

@@ -258,7 +258,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-store-s3-upload-delay-seconds N]]] "
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16|fp32 (Inkling-2: fp16|fp32, or lossy opt-in global rings int8|rk8v4|rk4v4)] [--dense-q8 head|all (lossy)] [--mxfp8-experts auto|on|off] [--no-split-attention] [--prefill-math tc|fp32] "
+           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|<per-layer INT8-family runs, e.g. rk4v4x12,int8x4>|fp16|fp32 (Inkling-2: fp16|fp32, or lossy opt-in global rings int8|rk8v4|rk4v4)] [--dense-q8 head|all (lossy)] [--mxfp8-experts auto|on|off] [--no-split-attention] [--prefill-math tc|fp32] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N] [--draft-min-p P] [--dspark-adaptive on|off]] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
@@ -1045,9 +1045,17 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             if (std::string_view(form) == "fp16" || std::string_view(form) == "fp32") { // Inkling-2's KV rings
                 options.kv_rings          = std::string_view(form) == "fp16" ? KvRings::FP16 : KvRings::FP32;
                 options.kv_cache          = KvCacheStorage::BFloat16;
+                options.kv_layers.clear();
                 options.kv_cache_explicit = false;
+            } else if (is_kv_layer_spec(form)) { // a per-layer mix of the INT8 family
+                std::vector<KvCacheStorage> layers = parse_kv_layer_spec(form);
+                options.kv_cache          = layers.size() == 1 ? layers.front() : KvCacheStorage::Int8Group64;
+                options.kv_layers         = layers.size() == 1 ? std::vector<KvCacheStorage>{} : std::move(layers);
+                options.kv_rings          = KvRings::Default;
+                options.kv_cache_explicit = true;
             } else {
                 options.kv_cache          = parse_kv_dtype(form);
+                options.kv_layers.clear();
                 options.kv_rings          = KvRings::Default;
                 options.kv_cache_explicit = true;
             }

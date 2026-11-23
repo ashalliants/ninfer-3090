@@ -209,6 +209,69 @@ int row_sink_sees_every_target(ninfer::Engine& engine, const std::vector<ninfer:
     return failures;
 }
 
+// A per-layer INT8-family cache (EngineOptions::kv_layers). A list of the wrong length is refused
+// and names the model's full-attention layer count; a mix (the last quarter int8, the rest rk4v4)
+// reaches the cache and the memory summary, scores finite log-probabilities, and its decode phase
+// (whose served graph profiles break on every storage's verify route) agrees with its prefill. A
+// list whose layers all agree is that plain format, bit for bit.
+int per_layer_cache(ninfer::EngineOptions options, const std::vector<ninfer::TokenId>& tokens,
+                    std::uint32_t first_target) {
+    using ninfer::KvCacheStorage;
+    options.kv_cache  = KvCacheStorage::Int8Group64;
+    options.kv_layers = {KvCacheStorage::RotatedLloyd4KeyInt4Value, KvCacheStorage::Int8Group64};
+    std::size_t layers = 0;
+    try {
+        ninfer::Engine refused(options);
+        std::cerr << "a per-layer KV list of the wrong length was accepted\n";
+        return 1;
+    } catch (const std::exception& error) {
+        const std::string message = error.what();
+        const std::size_t at      = message.find("this model has ");
+        if (at == std::string::npos) {
+            std::cerr << "a wrong-length per-layer KV list failed with: " << message << '\n';
+            return 1;
+        }
+        layers = std::stoul(message.substr(at + 15));
+    }
+    if (layers < 4) {
+        std::cerr << "a per-layer KV test needs at least four full-attention layers\n";
+        return 1;
+    }
+    options.kv_layers.assign(layers, KvCacheStorage::RotatedLloyd4KeyInt4Value);
+    std::fill(options.kv_layers.end() - static_cast<std::ptrdiff_t>(layers / 4), options.kv_layers.end(),
+              KvCacheStorage::Int8Group64);
+    int failures = 0;
+    {
+        ninfer::Engine mixed(options);
+        if (mixed.options().kv_layers != options.kv_layers || mixed.memory_summary().kv_layers != options.kv_layers ||
+            mixed.memory_summary().kv_cache != KvCacheStorage::Int8Group64) {
+            std::cerr << "the per-layer KV list did not reach the Engine\n";
+            return 1;
+        }
+        const std::vector<float> scores = mixed.score_tokens(tokens, first_target);
+        for (const float value : scores) {
+            if (!std::isfinite(value) || value > 0.0F) {
+                std::cerr << "a per-layer KV cache scored an invalid log probability\n";
+                return 1;
+            }
+        }
+        failures += decode_phase_matches_prefill(mixed, tokens, first_target);
+    }
+    std::vector<float> plain;
+    {
+        options.kv_layers.clear();
+        ninfer::Engine engine(options);
+        plain = engine.score_tokens(tokens, first_target);
+    }
+    options.kv_layers.assign(layers, KvCacheStorage::Int8Group64);
+    ninfer::Engine uniform(options);
+    if (!uniform.options().kv_layers.empty() || uniform.score_tokens(tokens, first_target) != plain) {
+        std::cerr << "a per-layer KV list of one format is not that plain format\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int run() {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
@@ -311,6 +374,8 @@ int run() {
         sink.tokens = &half;
         return engine.score_tokens(half, kFirstTarget, ScoringOptions{}, &sink);
     });
+    if (failures != 0) { return 1; }
+    failures += per_layer_cache(options, half, kFirstTarget);
     if (failures != 0) { return 1; }
     std::cout << "OK causal_score_real\n";
     return 0;

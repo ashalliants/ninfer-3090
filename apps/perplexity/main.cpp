@@ -59,6 +59,8 @@ struct Options {
 #else
     ninfer::KvCacheStorage kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
 #endif
+    // A per-layer INT8-family mix (--kv-dtype rk4v4x8,int8x8); empty: every layer stores kv.
+    std::vector<ninfer::KvCacheStorage> kv_layers;
     bool quick                          = false;
     bool lm_head_q4                     = false;
     bool lm_head_q6                     = false;
@@ -78,7 +80,8 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>\n"
            "        | --kld-base <llama.kld> [--chunks N] [--decode-window T])\n"
            "       [--context N] [--stride N] [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4] [--output <directory>]\n"
+           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|<per-layer runs, e.g. rk4v4x8,int8x8>]\n"
+           "       [--output <directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] [--gdn-state-fp16]\n"
            "       [--mlp-a8-decode] [--no-prefill-a8]\n"
            "       (--kld-base scores each chunk of a llama.cpp KL-divergence base: the first\n"
@@ -152,7 +155,12 @@ Options parse_options(int argc, char** argv) {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
-            if (dtype == "bf16") {
+            out.kv_layers.clear();
+            if (ninfer::is_kv_layer_spec(dtype)) {
+                std::vector<ninfer::KvCacheStorage> layers = ninfer::parse_kv_layer_spec(dtype);
+                out.kv = layers.size() == 1 ? layers.front() : ninfer::KvCacheStorage::Int8Group64;
+                if (layers.size() > 1) { out.kv_layers = std::move(layers); }
+            } else if (dtype == "bf16") {
                 out.kv = ninfer::KvCacheStorage::BFloat16;
             } else if (dtype == "int8") {
                 out.kv = ninfer::KvCacheStorage::Int8Group64;
@@ -233,6 +241,11 @@ std::string kv_name(ninfer::KvCacheStorage value) {
     throw std::logic_error("unknown KV dtype");
 }
 
+// The report's KV label: the dtype, or the per-layer spec of a mixed cache.
+std::string kv_label(const Options& options) {
+    return options.kv_layers.empty() ? kv_name(options.kv) : ninfer::format_kv_layer_spec(options.kv_layers);
+}
+
 std::string safe_component(std::string_view value) {
     std::string out;
     out.reserve(value.size());
@@ -267,7 +280,7 @@ std::filesystem::path prepare_output_directory(const Options& options,
                                                std::string_view source, std::string_view mode) {
     std::filesystem::path output = options.output.value_or(
         std::filesystem::path("profiles/perplexity") / safe_component(load.model_name) /
-        safe_component(load.prefill_signature) / kv_name(options.kv) / safe_component(source) /
+        safe_component(load.prefill_signature) / kv_label(options) / safe_component(source) /
         safe_component(mode) / timestamp());
     if (std::filesystem::exists(output)) {
         if (!std::filesystem::is_directory(output) ||
@@ -306,6 +319,7 @@ ninfer::EngineOptions scoring_engine_options(const Options& options,
     engine_options.device           = options.device;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
+    engine_options.kv_layers        = options.kv_layers;
     engine_options.lm_head_q4       = options.lm_head_q4;
     engine_options.lm_head_q6       = options.lm_head_q6;
     engine_options.embedding_q4     = options.embedding_q4;
@@ -514,7 +528,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
-          {"kv_dtype", kv_name(options.kv)}}},
+          {"kv_dtype", kv_label(options)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
           {"read_and_tokenize_seconds", preflight_seconds},
@@ -532,7 +546,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 
     std::cout << "Perplexity result\n"
               << "artifact: " << load.model_name << '\n'
-              << "kv: " << kv_name(options.kv) << ", corpus: " << corpus.corpus_id << " / "
+              << "kv: " << kv_label(options) << ", corpus: " << corpus.corpus_id << " / "
               << corpus.mode << ", context/stride: " << options.context << '/' << options.stride
               << "\n\n";
     std::cout << std::left << std::setw(24) << "domain" << std::right << std::setw(16) << "tokens"
@@ -702,7 +716,7 @@ int run_kld(const Options& options, const std::shared_ptr<spdlog::logger>& logge
           {"decode_window", window},
           {"prompt_tokens", first_target},
           {"device", options.device},
-          {"kv_dtype", kv_name(options.kv)}}},
+          {"kv_dtype", kv_label(options)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
           {"score_seconds", scoring_seconds},
@@ -713,7 +727,7 @@ int run_kld(const Options& options, const std::shared_ptr<spdlog::logger>& logge
 
     std::cout << "KL-divergence gate result\n"
               << "artifact: " << load.model_name << '\n'
-              << "kv: " << kv_name(options.kv) << ", base: " << base.path.filename().string()
+              << "kv: " << kv_label(options) << ", base: " << base.path.filename().string()
               << ", chunks: " << chunk_count << '/' << base.n_chunk << ", n_ctx: " << base.n_ctx
               << ", decode window T=" << window << "\n\n"
               << std::fixed << std::setprecision(6) << "rows:           " << summary.rows << '\n'

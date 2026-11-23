@@ -71,6 +71,8 @@ struct ServeOptions {
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose.
     std::vector<std::uint32_t> stage_layers;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    // A per-layer KV cache (--kv-dtype rk4v4x8,int8x8): EngineOptions::kv_layers.
+    std::vector<KvCacheStorage> kv_layers;
     DenseQ8 dense_q8                       = DenseQ8::Off; // --dense-q8 head|all (Inkling-2)
     ExpertsMxfp8 experts_mxfp8             = ExpertsMxfp8::Auto; // --mxfp8-experts auto|on|off (Inkling-2)
     bool split_attention                   = true;         // --no-split-attention: false (Inkling-2)
