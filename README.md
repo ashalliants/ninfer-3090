@@ -279,14 +279,14 @@ the full 262,144 tokens with two lanes sharing the pool:
 | `NINFER_SPEC=mtp` | 2 | 262,144 | rk4v4 | 23.4 of 24.5 GiB used |
 | `int8` | 1 | 65,536 | int8 | 2.85 GiB left unused |
 
-**Accuracy vs speed: the profiles keep plain `rk4v4` on purpose.** It is the fastest and smallest
-KV format, which is what buys the full context here, but it is also the 27B's lossiest (+3.56 mnat
-NLL against `int8`). If you would rather trade some context for accuracy, add a
-[per-layer mix](#per-layer-mixes---kv-dtype-rk4v4x12int8x4-opt-in) yourself:
+**Accuracy vs context: the profiles keep plain `rk4v4` on purpose.** It is the smallest KV format,
+which is what lets them reach the full context (at a 32K cache `rk8v4` decodes faster; see below),
+but it is also the 27B's lossiest (+3.56 mnat NLL against `int8`). If you would rather trade some
+context for accuracy, add a [per-layer mix](#per-layer-mixes---kv-dtype-rk4v4x12int8x4-opt-in) yourself:
 
 | `--kv-dtype` | ΔNLL vs `int8` | KV bytes/token | Trade on a 24 GB card (not yet measured on a 3090) |
 |---|---:|---:|---|
-| **`rk4v4`** (profile default) | +3.56 | 17,920 | fastest, most context |
+| **`rk4v4`** (profile default) | +3.56 | 17,920 | smallest, most context |
 | `rk4v4x12,int8x4` | +1.69 | 21,888 | half the loss; 22% more KV per token plus an INT8 attention workspace (2.26 GiB more than `rk4v4` at 262,144 on the V100), so the fitted context comes down |
 | `rk4v4x4,int8x12` | −0.13 | 29,824 | `int8`-level accuracy; 66% more KV per token, so expect a clearly shorter context |
 
