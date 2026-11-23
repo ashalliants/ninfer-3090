@@ -227,6 +227,40 @@ int main() {
             const auto r = engine.generate(engine.prepare(user_turn(all[0].prompt)), all[0].options);
             check(r.generated_token_ids == alone[0].generated_token_ids, "the fitted Engine decodes the solo output");
         }
+        if (std::getenv("NINFER_INKLING2_BATCH_FIT") == nullptr || std::string(std::getenv("NINFER_INKLING2_BATCH_FIT")) != "0") {
+            // One slot with --fit-context, DSpark (its whole-context window) and the vision tower resident: the full
+            // 262,144 does not fit on a 24 or 32 GB card this way (the V100's largest is 238,592), so the search runs, with
+            // the drafter sized at each candidate. The fit is a multiple of 1024 and the Engine decodes the solo output.
+            const auto one_slot = [&](std::uint32_t floor) {
+                auto options                                = base_options(artifact);
+                options.max_context                         = 262144;
+                options.kv_capacity                         = ninfer::KvCapacityPolicy::explicit_capacity(262144);
+                options.fit_context_floor                   = floor;
+                options.enable_vision                       = true;
+                options.speculative.backend                 = ninfer::SpeculativeBackend::DSpark;
+                options.speculative.draft_tokens            = 3;
+                options.speculative.dspark_window           = 0;
+                options.speculative.dspark_window_explicit  = true;
+                return options;
+            };
+            {
+                bool refused = false;
+                try {
+                    ninfer::Engine engine(one_slot(262144));
+                } catch (const std::exception& e) { refused = std::string(e.what()).find("floor") != std::string::npos; }
+                check(refused, "one slot refuses a context floor that does not fit");
+            }
+            ninfer::Engine engine(one_slot(16384));
+            const auto fitted = engine.options().max_context;
+            std::string notes;
+            for (const auto& n : engine.load_summary().notes) { notes += n + "\n"; }
+            std::printf("one slot, DSpark and vision, asked 262144: %u positions\n%s", fitted, notes.c_str());
+            check(fitted < 262144 && fitted >= 16384 && fitted % 1024 == 0 && notes.find("fitted to the device") != std::string::npos &&
+                      notes.find("drafter window whole context") != std::string::npos,
+                  "one slot fits a multiple of 1024 with the drafter's whole-context window and reports it");
+            const auto r = engine.generate(engine.prepare(user_turn(all[0].prompt)), all[0].options);
+            check(r.generated_token_ids == alone[0].generated_token_ids, "the fitted DSpark Engine decodes the solo output");
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

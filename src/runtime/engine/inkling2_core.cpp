@@ -292,7 +292,7 @@ void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink
             throw std::invalid_argument("--dspark-window: 0 (the whole context) or at least the drafter's sliding window (" +
                                         std::to_string(model_->dspark_config()->sliding_window) + ")");
         }
-        programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), draft_chunk, stream_,
+        programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, limits.max_context, draft_chunk, stream_,
                                                                   dense ? &dense->head() : nullptr, limits.kv_fp16,
                                                                   static_cast<std::int32_t>(window), drafter_head_copy_, programs_->text.lent());
         const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
@@ -653,15 +653,17 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                 }
             }
             const std::string who = slots_ > 1 ? "--max-concurrency " + std::to_string(slots_) + ": " : std::string();
+            // One slot: --fit-context's contract, a multiple of kFitContextStepTokens (1024). Several slots: kFitStep.
+            const std::uint32_t step = slots_ > 1 ? static_cast<std::uint32_t>(kFitStep) : kFitContextStepTokens;
             if (!built) {
                 // fit_context_floor bounds the search from below: a context under it is refused, not started.
-                const std::uint32_t floor_steps = (options_.fit_context_floor + kFitStep - 1) / kFitStep;
-                // In kFitStep units: lo fits (0: none known), hi does not, or is past max_context. hi rounds up, so with a
+                const std::uint32_t floor_steps = (options_.fit_context_floor + step - 1) / step;
+                // In `step` units: lo fits (0: none known), hi does not, or is past max_context. hi rounds up, so with a
                 // max_context off the step the largest multiple under it is still a candidate (only max_context itself
                 // was tried above).
-                std::uint32_t lo = 0, hi = (options_.max_context + kFitStep - 1) / kFitStep;
+                std::uint32_t lo = 0, hi = (options_.max_context + step - 1) / step;
                 if (floor_steps > 0) {
-                    if (floor_steps >= hi || !fits(chunks.back(), floor_steps * kFitStep)) {
+                    if (floor_steps >= hi || !fits(chunks.back(), floor_steps * step)) {
                         throw std::runtime_error("inkling2: " + who + "the context floor of " + std::to_string(options_.fit_context_floor) +
                                                  " positions" + (slots_ > 1 ? " per slot" : "") + " does not fit on the device");
                     }
@@ -671,7 +673,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                 }
                 while (hi > lo + 1) {
                     const std::uint32_t mid = lo + (hi - lo) / 2;
-                    if (fits(chunks.back(), mid * kFitStep)) {
+                    if (fits(chunks.back(), mid * step)) {
                         dense = std::move(programs_->dense);
                         programs_.reset();
                         lo = mid;
@@ -679,11 +681,11 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                         hi = mid;
                     }
                 }
-                if (lo == 0 || !fits(chunks.back(), lo * kFitStep)) {
-                    throw std::runtime_error("inkling2: " + who + "not even " + std::to_string(kFitStep) + " positions" +
+                if (lo == 0 || !fits(chunks.back(), lo * step)) {
+                    throw std::runtime_error("inkling2: " + who + "not even " + std::to_string(step) + " positions" +
                                              (slots_ > 1 ? " per slot" : "") + " fit on the device");
                 }
-                options_.max_context = lo * kFitStep;
+                options_.max_context = lo * step;
             }
             frontend_->set_max_context(options_.max_context);
             if (slots_ > 1) {
@@ -753,6 +755,10 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     for (const auto& graft : grafts) {
         load_.notes.push_back("graft " + graft.name + " | per-visit ablation of the post-attention and post-MLP writes over " +
                               std::to_string(graft.visits) + " visits | opt-in (\"graft\": \"" + graft.name + "\")");
+    }
+    if (slots_ == 1 && options_.max_context < requested_context_) {
+        load_.notes.push_back("context | " + std::to_string(options_.max_context) + " positions (fitted to the device; asked " +
+                              std::to_string(requested_context_) + ")");
     }
     if (slots_ > 1) {
         load_.notes.push_back("batched decode | " + std::to_string(slots_) + " slots of " + std::to_string(options_.max_context) +
