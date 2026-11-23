@@ -38,6 +38,17 @@ tower, in one file. It is not a Transformers checkpoint, Safetensors distributio
 needs NInfer's executables. It runs on one **Tesla V100 32 GB** (`sm_70`, Linux, built from source) or one
 **RTX 3090** (24 GB, `sm_86`). It takes text and images; the model has no video input.
 
+## Why this build
+
+- **Exact.** Converted from Unsloth's UD-Q8_K_XL (their KLD reference quant) without re-quantizing anything, and
+  DSpark speculation never changes the answer: greedy output equals plain greedy decode, and sampled requests draw
+  the same tokens plain sampling draws under the same seed. Unsloth's DSpark notes for llama.cpp say its greedy
+  output with the drafter "is not guaranteed to be bit identical to a run without it".
+- **Fast on a V100.** 78.8 tok/s plain, 93-94 tok/s with DSpark over 12 chats (120.7 on maths), 1,930 tok/s prefill
+  at 8K (1,868 with DSpark and images at the full 262,144-token context). The other published V100 port (Csavoldi's, onto Lapilli)
+  reports 69 tok/s without a drafter and 850 tok/s prompt reading, on a different machine and prompts
+  ([report](https://github.com/chris83-dev/lapilli-v100/blob/f9b7dd093a9ff018bc68f177f81a1d27d3ffec91/docs/community/inkling2-mini.md)).
+
 ## Get NInfer
 
 This artifact runs only on **[NInfer-3090](https://github.com/ashalliants/ninfer-3090)**, a
