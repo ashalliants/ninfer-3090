@@ -310,7 +310,7 @@ scripts/setup-ccache.sh           # Linux/WSL: configures an installed ccache (a
   Files that include the shared vcpkg headers (FFmpeg) resolve those paths differently per tree and
   may still miss.
 - **WSL has its own cache** (`~/.cache/ccache`; Linux objects cannot be shared with Windows ones).
-  WSL builds are `git archive` snapshots under `~` (`~/ninfer-rel-*`) with no `.git`, so CMake passes no
+  WSL release builds are `git archive` snapshots under `~` (`~/.cache/ninfer-release/X.Y.Z/src`) with no `.git`, so CMake passes no
   base there and ccache's own `base_dir` applies, which `scripts/setup-ccache.sh` sets to `$HOME`.
   Install and configure once: `wsl.exe -u root -e apt-get install -y ccache`, then
   `bash scripts/setup-ccache.sh` as the normal WSL user (it installs too when run with sudo or root).
@@ -348,6 +348,28 @@ Corrections to the previous revision of this section, all verified false:
    in `build-ninja/vcpkg_installed/x64-windows`. No `-DFFMPEG_DIR` is needed.
 4. "Configure must pass `-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler`." Not for this build;
    the cache carries `-Xcompiler=/Zc:__cplusplus` and nothing else, because it uses v143.
+
+### Scratch files and build trees stay out of the home folder
+
+The maintainer's home folder is shared with other work. Agent sessions on WSL used to leave their
+build trees and one-off files loose in `~`: in one week that came to about 70 GB, with ~20
+`~/build-*` trees, 150 throwaway `*.py`/`*.sh`/`*.log` files, commit-message files and unpacked
+release archives. None of it was cleaned up, because nobody knew which session owned what.
+Put each kind of file here instead:
+
+- **Build trees** go inside the checkout or worktree whose source they compile: `<tree>/build-linux`,
+  `<tree>/build-v100` and so on. `build-*/` is gitignored, the tree is removed together with its
+  worktree, and ccache still shares, because worktrees live under the main checkout (its `base_dir`).
+  A tree in `~` outlives its worktree and nobody can tell what it was built from.
+  `scripts/v100_build.sh` defaults to `$HOME/build-v100` for users on a V100 box, so pass
+  `BUILD_DIR=<tree>/build-v100` (`scripts/run-v100.sh` also looks for `build-v100/` inside the checkout).
+- **One-off scripts, logs, patches, commit and PR message files** go in `<tree>/tmp/` (gitignored) or the
+  session's scratchpad, never loose in `~` or the repository root. Delete them before the session
+  ends; anything worth keeping belongs in the repo (a test, a tool under `tools/`, a doc).
+- **Release work on WSL** (the `git archive` export, unpacked archives for smoke tests, `ldd` lists)
+  goes under `~/.cache/ninfer-release/X.Y.Z/`, one folder per release. That folder is deleted once the
+  release is published. The parent `~/.cache/ninfer-release/` also holds the Vast instance state,
+  so delete only the version folder, never the parent.
 
 ## Commits
 

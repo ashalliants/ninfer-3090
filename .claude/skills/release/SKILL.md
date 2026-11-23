@@ -12,6 +12,15 @@ and the judgement calls. If the doc and this skill disagree, the doc wins; fix t
 Outward-facing steps (pushing, merging, tagging, creating the release) are listed below with a
 confirmation point. Everything before that is local.
 
+**Where files go (WSL side).** Everything this release writes on WSL lives under one folder,
+`~/.cache/ninfer-release/X.Y.Z/`, never loose in `~`. Use `src/` for the `git archive` export and its
+`build-linux` tree, and `checks/` for unpacked archives, smoke-test folders, `ldd` lists, logs and
+helper scripts. v0.19.0 left `~/ninfer-rel-0.19.0`, `~/ninfer-rel-0.19.0-v100`, `~/v100-unpack`,
+`~/lsmoke` and `~/ldd70.txt`/`~/ldd86.txt` in the home folder, and earlier releases left more. The
+folder is under `$HOME`, so ccache's `base_dir` still applies (see `AGENTS.md`). The parent
+`~/.cache/ninfer-release/` also holds the Vast `instance_id`, so only ever delete the version folder.
+Step 8 deletes it once the release is published.
+
 ## 1. Pick the version
 
 1. `git fetch origin --tags`, then find the latest tag (`git tag --sort=-creatordate | head`) and read
@@ -127,7 +136,7 @@ most of it hits. Check that the tree compiles the release commit's source (workt
 `worktree-build-tree-gotcha`).
 
 **Linux** (WSL), in parallel with the Windows build: export a fresh `git archive` of the release
-commit to `~/ninfer-rel-X.Y.Z`, configure with `-DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=OFF
+commit to `~/.cache/ninfer-release/X.Y.Z/src`, configure with `-DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=OFF
 -DNINFER_BUILD_BENCHMARKS=ON`, build the same three targets. Run it with the Bash tool's
 `run_in_background` on the `wsl.exe -e bash -lc "..."` call, never `& disown`. If ninja dies with
 `posix_spawn: Resource temporarily unavailable`, use the `systemd-run --scope` recipe in the doc. Verify
@@ -208,7 +217,9 @@ Wait for explicit approval, then:
 
 Give the release URL, asset sizes, what was verified and what was not, and any adverse findings
 from the notes (regressions, costs). Update `docs/maintainer/release-process.md` with any new trap
-hit, and clean `dist/` and the `~/ninfer-rel-*` export only after the release is confirmed.
+hit. Once the release is confirmed, clean `dist/` and delete `~/.cache/ninfer-release/X.Y.Z/` (the
+export and every check folder in it). Then check that the release left nothing in `~` (`ls ~` against
+what was there before) and remove anything it did; say in the report what was deleted.
 
 ## Traps hit in v0.15.0 (all cost a retry)
 
@@ -217,7 +228,7 @@ hit, and clean `dist/` and the `~/ninfer-rel-*` export only after the release is
   Add the notes in a second commit afterwards; that does not affect the built binaries. Windows then
   reports `<VERSION>+<commit>` and the `git archive` Linux build reports `<VERSION>`; both are expected.
 - **WSL export:** from Git Bash `~` is the Windows home. Pipe it in instead:
-  `git archive HEAD | wsl.exe -e bash -c 'mkdir -p ~/ninfer-rel-X && tar -x -C ~/ninfer-rel-X'`.
+  `git archive HEAD | wsl.exe -e bash -c 'mkdir -p ~/.cache/ninfer-release/X/src && tar -x -C ~/.cache/ninfer-release/X/src'`.
 - **The `systemd-run --scope` shell has no nvcc on `PATH`.** Start the build script with
   `export PATH=/usr/local/cuda-12.8/bin:$PATH CUDACXX=/usr/local/cuda-12.8/bin/nvcc`, or CMake fails with
   "No CMAKE_CUDA_COMPILER could be found".
