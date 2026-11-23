@@ -18,12 +18,13 @@ ROOT = Path(__file__).resolve().parent.parent
 CARDS = ROOT / "model-cards"
 SOURCE_ASSETS = ROOT / "docs" / "assets"
 HF_ORG = "WarlaxZ"
-OWN_CARD_SUFFIX = "-NInfer-3090"  # the other cards describe upstream's repos, not ours
+# Our own repos end in one of these; the other cards describe upstream's repos, not ours.
+OWN_CARD_SUFFIXES = ("-NInfer-3090", "-NInfer-V100")
 ASSET_REF = re.compile(r"""(?<![\w/.-])(?:\./)?assets/([^\s)"'<>#?]+)""")  # assets/<file> or ./assets/<file> in a README
 
 
 def own_cards():
-    return sorted(p for p in CARDS.iterdir() if p.is_dir() and p.name.endswith(OWN_CARD_SUFFIX))
+    return sorted(p for p in CARDS.iterdir() if p.is_dir() and p.name.endswith(OWN_CARD_SUFFIXES))
 
 
 def check():
