@@ -203,19 +203,22 @@ void check_dflash(std::uint32_t capacity, std::uint32_t draft_window, std::uint3
 // A per-layer text cache (MtpGraphAttention::target_storages): the target verify runs once per
 // storage its layers hold, so every profile must replay one verify launch shape for each of them
 // (and for the MTP layer's own `storage`), and a class must agree on each one's kernel count. The
-// AR steps run on the MTP cache alone, which check() covers through `storage`.
+// AR steps run on the MTP cache alone, which check() covers through `storage`. DFlash2, whose
+// uniform caches keep fixed bands, must break on a mixed cache's verify changes too.
 void check_mixed(std::uint32_t capacity, std::uint32_t draft_window, const MtpGraphAttention& attention,
-                 bool dflash) {
+                 bool dflash, ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::DFlash) {
     namespace detail = ninfer::models::qwen3_5::detail;
     const auto profiles =
-        dflash ? detail::dflash_graph_profiles(ninfer::SpeculativeBackend::DFlash, capacity, draft_window, 1, attention)
+        dflash ? detail::dflash_graph_profiles(backend, capacity, draft_window, 1, attention)
                : detail::mtp_graph_profiles(capacity, draft_window, attention);
     std::vector<KvCacheStorage> storages = attention.target_storages;
     if (!dflash) { storages.push_back(attention.storage); }
     const auto label = [&] {
         std::string kinds;
         for (const KvCacheStorage storage : storages) { kinds += std::to_string(static_cast<int>(storage)) + ' '; }
-        return std::string(dflash ? "mixed dflash" : "mixed mtp") + " capacity=" + std::to_string(capacity) +
+        return std::string(!dflash ? "mixed mtp"
+                           : backend == ninfer::SpeculativeBackend::DFlash2 ? "mixed dflash2" : "mixed dflash") +
+               " capacity=" + std::to_string(capacity) +
                " k=" + std::to_string(draft_window) + " heads=" + std::to_string(attention.geometry.query_heads) +
                " kv=" + kinds;
     };
@@ -384,7 +387,10 @@ int main() {
                 for (const std::uint32_t capacity : {16384U, 262144U}) {
                     for (std::uint32_t draft_window = 1; draft_window <= kSweptDraftWindows; ++draft_window) {
                         check_mixed(capacity, draft_window, attention, false);
-                        if (draft_window <= 15) { check_mixed(capacity, draft_window, attention, true); }
+                        if (draft_window <= 15) {
+                            check_mixed(capacity, draft_window, attention, true);
+                            check_mixed(capacity, draft_window, attention, true, ninfer::SpeculativeBackend::DFlash2);
+                        }
                     }
                 }
             }

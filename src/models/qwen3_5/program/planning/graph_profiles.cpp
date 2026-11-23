@@ -248,7 +248,23 @@ std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend back
         throw std::invalid_argument("invalid masked draft graph dimensions");
     }
     if (backend == SpeculativeBackend::DFlash2) {
-        auto profiles = graph_profiles_through(capacity - 1, {96, 511, 2047, 8191, 32767});
+        std::vector<std::uint32_t> ends{96, 511, 2047, 8191, 32767};
+        if (!attention.target_storages.empty()) {
+            // A per-layer cache also breaks wherever any of its storages' target-verify launch
+            // shape changes, so no profile replays one storage's route across its own change.
+            // A uniform cache keeps the fixed bands above.
+            std::vector<std::uint32_t> changes;
+            collect_shape_changes(
+                0U, capacity - 1,
+                [&](std::uint32_t frontier) {
+                    return dflash_verify_shape(capacity, draft_window, batch_size, frontier, attention);
+                },
+                changes);
+            for (const std::uint32_t change : changes) { ends.push_back(change - 1U); }
+            std::sort(ends.begin(), ends.end());
+            ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+        }
+        auto profiles = graph_profiles_through(capacity - 1, ends);
         for (std::size_t i = 0; i < profiles.size(); ++i) {
             profiles[i].topology_class = static_cast<std::uint32_t>(i);
         }
