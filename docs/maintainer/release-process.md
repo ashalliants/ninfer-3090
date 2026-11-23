@@ -30,6 +30,22 @@ or very nearly shipped a broken archive.
    `gh release create vX.Y.Z-rtx3090 <zip> <tar.gz> <both SHA256SUMS files> -R ashalliants/ninfer-3090
    --notes-file docs/release-notes/RELEASE_NOTES_X.Y.Z.md --title "..." --latest`.
 
+### The Tesla V100 archive (from v0.19.0)
+
+The V100 is a first-class card, so every release also ships `ninfer-v100-linux-x64-<VERSION>.tar.gz` and
+`SHA256SUMS-vX.Y.Z-linux-v100.txt` (Linux only; V100s are datacentre cards). A build holds one architecture,
+so it is a third build, from the same commit as the other two:
+
+- Configure a separate tree with `-DCMAKE_CUDA_ARCHITECTURES=70` (this is what `scripts/v100_build.sh` does),
+  CUDA 12.8 (the newest toolkit that still targets Volta), the same three targets, `-DNINFER_BUILD_BENCHMARKS=ON`.
+  Compiling needs no V100, so the 3090 PC builds it under WSL beside the `sm_86` tree.
+- Package: `NINFER_PACKAGE_TARGET=v100 NINFER_BUILD_ROOT=<that tree> scripts/package-release.sh`. It refuses a
+  tree whose server holds no `sm_70` code (`cuobjdump`), ships `run-v100.sh` and `docs/release-archive-v100.md`
+  as the README, and writes the archive under the `ninfer-v100-linux-x64` name.
+- Verify the same way as the Linux archive (inner and outer checksums, `ldd`, `./ninfer-serve --help`), then
+  run `./run-v100.sh qwen38-27b` on a real V100 and serve one chat completion. The notes say so when that was
+  not done before publishing.
+
 ### A default expert state (model releases)
 
 The binary archives ship no model files. When a model release should warm-start a fresh

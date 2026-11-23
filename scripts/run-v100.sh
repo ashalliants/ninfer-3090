@@ -86,7 +86,8 @@ model_key="${1:-}"
 if [[ -z "${NINFER_SERVER:-}" ]]; then
   # scripts/v100_build.sh's tree: BUILD_DIR, else its default $HOME/build-v100; then build-v100/
   # beside or above the checkout, and a rented box's /workspace.
-  for candidate in ${BUILD_DIR:+"$BUILD_DIR/apps/ninfer-serve"} "$HOME/build-v100/apps/ninfer-serve" \
+  # The release archive keeps ninfer-serve in the same directory as this script.
+  for candidate in "$script_dir/ninfer-serve" ${BUILD_DIR:+"$BUILD_DIR/apps/ninfer-serve"} "$HOME/build-v100/apps/ninfer-serve" \
                    "$root/build-v100/apps/ninfer-serve" "$root/../build-v100/apps/ninfer-serve" \
                    "/workspace/build-v100/apps/ninfer-serve"; do
     if [[ -x "$candidate" ]]; then
