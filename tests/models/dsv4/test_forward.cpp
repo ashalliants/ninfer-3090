@@ -248,6 +248,33 @@ int main() {
         print_tiers("probe, same token repeated (routing drifts)", w, warm, warm_steps);
     }
 
+    // NINFER_DSV4_SPEC_BENCH=1: what verifying k drafted tokens in one call costs against k single-token steps, on
+    // the model's own greedy continuation (the best case: every draft accepted), caches warm. Per token, ms.
+    if (const char* bench = std::getenv("NINFER_DSV4_SPEC_BENCH"); bench != nullptr && bench[0] == '1' && generated.size() >= 8) {
+        const std::size_t steps = generated.size() - 1;
+        for (const std::size_t k : {1, 2, 3, 4, 6, 8}) {
+            double seconds = 0;
+            experts.clear_cache(); // every k starts from empty tiers and warms them the same way
+            for (int pass = 0; pass < 4; ++pass) { // the last pass is the measured one
+                experts.reset_stats();
+                forward.run(prompt, 0);
+                cudaStreamSynchronize(stream);
+                const auto begin = std::chrono::steady_clock::now();
+                for (std::size_t i = 0; i < steps; i += k) {
+                    const std::size_t width = std::min(k, steps - i);
+                    forward.run(std::span<const std::int32_t>(generated).subspan(i, width), static_cast<std::int32_t>(prompt.size() + i));
+                    cudaStreamSynchronize(stream);
+                }
+                seconds = seconds_since(begin);
+            }
+            const auto& st = experts.stats();
+            std::printf("spec bench k=%zu: %.1f ms per token (%.1f ms per call); experts %llu VRAM, %llu RAM, %llu file reads\n", k,
+                        1000.0 * seconds / double(steps), 1000.0 * seconds / double((steps + k - 1) / k),
+                        static_cast<unsigned long long>(st.vram_hits), static_cast<unsigned long long>(st.ram_hits),
+                        static_cast<unsigned long long>(st.misses));
+        }
+    }
+
     // Checkpoints (prefix reuse): the state of an earlier position, captured and restored, equals having run to
     // that position. A 200-token sequence is run to a position past the first compressed row of the longest
     // ratio and off every compressor's group boundary, with the checkpoint taken there; a different continuation
