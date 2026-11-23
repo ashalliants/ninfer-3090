@@ -323,6 +323,12 @@ struct SteeringTable {
     std::vector<std::uint8_t> active; // per layer: some set steers it
 };
 
+// The reduced MTP draft head (--mtp-draft-vocab): copies rows ids[0..rows) of the GGML-blocked
+// output head `head` into `dst` (rows times the head's row bytes, on the device; ids on the device
+// too) and returns a Weight over the copy, whose row r is head row ids[r] byte for byte. Throws if
+// the head is not GGML blocks with an even row size.
+Weight gather_head_rows(const Weight& head, const std::int32_t* ids, std::int32_t rows, void* dst, cudaStream_t stream);
+
 // Opt-in execution choices of a Forward. Off (the default) runs every Op on the device's stream in
 // the order the forward has always run them; each option leaves the outputs bitwise unchanged
 // unless its comment says otherwise.

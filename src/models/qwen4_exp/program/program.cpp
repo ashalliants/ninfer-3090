@@ -1308,28 +1308,16 @@ public:
         const auto rows               = static_cast<std::int32_t>(ids.size());
         const std::uint64_t row_bytes = options_.mtp_draft_head_row_bytes;
         const GgmlBlock block         = ggml_block(head.qtype);
-        if (block.values == 0 || row_bytes != static_cast<std::uint64_t>(head.k) / block.values * block.bytes ||
-            row_bytes % 2 != 0 || head.layout != QuantLayout::GgmlBlocks) {
+        if (block.values == 0 || row_bytes != static_cast<std::uint64_t>(head.k) / block.values * block.bytes) {
             throw std::logic_error("Qwen3.8-Flash-Next: the draft head's row bytes differ from the output head's");
         }
         draft_head_ = DeviceBuffer(plan_.bytes.mtp_draft_head);
         auto* base  = static_cast<std::byte*>(draft_head_.p);
         auto* map   = reinterpret_cast<std::int32_t*>(base + mtp_draft_head_ids_offset(options_));
         CUDA_CHECK(cudaMemcpy(map, ids.data(), 4ULL * ids.size(), cudaMemcpyHostToDevice));
-        const auto words = static_cast<std::int32_t>(row_bytes / 2);
-        const Tensor source(const_cast<void*>(head.qdata), DType::BF16, {words, head.n});
-        const Tensor columns(map, DType::I32, {rows});
-        Tensor gathered(base, DType::BF16, {words, rows});
-        ops::gather_columns(source, columns, gathered, device_.stream);
+        draft_head_weight_ = execution::gather_head_rows(head, map, rows, base, device_.stream);
         CUDA_CHECK(cudaStreamSynchronize(device_.stream));
-        draft_head_weight_                 = head;
-        draft_head_weight_.payload         = base;
-        draft_head_weight_.qdata           = base;
-        draft_head_weight_.payload_bytes   = static_cast<std::uint64_t>(rows) * row_bytes;
-        draft_head_weight_.shape[0]        = rows;
-        draft_head_weight_.padded_shape[0] = rows;
-        draft_head_weight_.n               = rows;
-        draft_head_ids_                    = map;
+        draft_head_ids_ = map;
     }
 
     void build_steering_table() {

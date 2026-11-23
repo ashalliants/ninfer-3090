@@ -288,21 +288,22 @@ fetch_draft_vocab() {
   local sha='b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91'
   local path="$model.draft-vocab"
   if [ -f "$path" ] && graft_sha_ok "$path" "$sha"; then
-    printf 'MTP draft vocabulary ready: %s
-' "$path"
+    printf 'MTP draft vocabulary ready: %s\n' "$path"
     return 0
   fi
-  printf '%s
-' 'Downloading the MTP draft vocabulary from jesdga/Qwen3.8-Flash-Next-Basalt (Qwen Community License 1.0)...'
+  printf '%s\n' 'Downloading the MTP draft vocabulary from jesdga/Qwen3.8-Flash-Next-Basalt (Qwen Community License 1.0)...'
   if ! curl -sSL --fail --output "$path.part" "$url" 2>/dev/null || ! graft_sha_ok "$path.part" "$sha"; then
-    rm -f -- "$path.part" 2>/dev/null || true
-    printf '%s
-' 'MTP draft vocabulary: skipped (download or sha256 check failed); the drafter uses the full head.' >&2
+    # A stale file that failed its check goes too, so the server never reads an unverified list.
+    rm -f -- "$path.part" "$path" 2>/dev/null || true
+    printf '%s\n' 'MTP draft vocabulary: skipped (download or sha256 check failed); the drafter uses the full head.' >&2
     return 0
   fi
-  mv -f -- "$path.part" "$path"
-  printf 'MTP draft vocabulary ready: %s
-' "$path"
+  if ! mv -f -- "$path.part" "$path" 2>/dev/null; then
+    rm -f -- "$path.part" "$path" 2>/dev/null || true
+    printf '%s\n' 'MTP draft vocabulary: skipped (could not save it); the drafter uses the full head.' >&2
+    return 0
+  fi
+  printf 'MTP draft vocabulary ready: %s\n' "$path"
 }
 
 # Fetches one pinned file: folder, name, size, sha256, revision, description, and kind (model, part or

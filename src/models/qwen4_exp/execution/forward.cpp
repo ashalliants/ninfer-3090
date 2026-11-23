@@ -247,6 +247,29 @@ void Forward::SideStream::release() noexcept {
     if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
 }
 
+Weight gather_head_rows(const Weight& head, const std::int32_t* ids, std::int32_t rows, void* dst, cudaStream_t stream) {
+    const GgmlBlock block = ggml_block(head.qtype);
+    if (head.layout != QuantLayout::GgmlBlocks || block.values == 0 || head.k % block.values != 0 || rows < 1) {
+        throw std::invalid_argument("qwen4_exp: the draft head needs a GGML-blocked output head");
+    }
+    const std::uint64_t row_bytes = static_cast<std::uint64_t>(head.k) / block.values * block.bytes;
+    if (row_bytes % 2 != 0) { throw std::invalid_argument("qwen4_exp: the draft head's rows are an odd number of bytes"); }
+    // A row is copied as BF16 words: any 2-byte element moves the bytes unchanged.
+    const auto words = static_cast<std::int32_t>(row_bytes / 2);
+    const Tensor source(const_cast<void*>(head.qdata), DType::BF16, {words, head.n});
+    const Tensor columns(const_cast<std::int32_t*>(ids), DType::I32, {rows});
+    Tensor gathered(dst, DType::BF16, {words, rows});
+    ops::gather_columns(source, columns, gathered, stream);
+    Weight out           = head;
+    out.payload          = dst;
+    out.qdata            = dst;
+    out.payload_bytes    = static_cast<std::uint64_t>(rows) * row_bytes;
+    out.shape[0]         = rows;
+    out.padded_shape[0]  = rows;
+    out.n                = rows;
+    return out;
+}
+
 Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work, ForwardState state,
                  ForwardKV kv, ForwardExperts experts, std::optional<ForwardMtp> mtp, ForwardOptions options)
     : parameters_(parameters), config_(parameters.model.config()), device_(device), work_(&work),

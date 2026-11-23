@@ -271,7 +271,7 @@ so the output is the same token for token. The list is the one jesdga's
 chris83-dev's Lapilli (MIT). It is **not part of this repository**: `scripts/download-model.sh
 qwen38-flash-next` downloads it from that repository at a pinned revision, checks its sha256 and saves it as
 `<model>.draft-vocab` beside the model, under jesdga's licence. `ninfer-serve` reads that file by
-default on a V100 only (`--mtp-draft-vocab auto`); with no file it uses the full head, and
+default on a V100 only (`--mtp-draft-vocab auto`); with no file, or one that does not load, it uses the full head, and
 `--mtp-draft-vocab PATH` or `off` choose explicitly. The RTX 3090 keeps the full head: it was not
 measured there.
 

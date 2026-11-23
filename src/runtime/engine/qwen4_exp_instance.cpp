@@ -183,6 +183,10 @@ void validate(const EngineOptions& options) {
         refuse("--mtp-constrained keeps MTP speculation on for constrained requests and needs --spec mtp: add "
                "--spec mtp or remove --mtp-constrained");
     }
+    if (next.mtp_draft_vocab != "auto" && spec.backend != SpeculativeBackend::Mtp) {
+        refuse("--mtp-draft-vocab chooses the MTP drafter's head and needs --spec mtp: add --spec mtp or remove "
+               "--mtp-draft-vocab");
+    }
     if (next.mtp_joint_acceptance && spec.backend != SpeculativeBackend::Mtp) {
         refuse("--mtp-joint-acceptance chooses how many MTP drafts a round verifies and needs --spec mtp: add "
                "--spec mtp or remove --mtp-joint-acceptance");
@@ -399,10 +403,20 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         } else if (next.mtp_draft_vocab != "off") {
             vocab = next.mtp_draft_vocab;
         }
+        const auto public_tokens = static_cast<std::int32_t>(plan.resources().public_token_count);
         if (!vocab.empty()) {
-            const auto public_tokens = static_cast<std::int32_t>(plan.resources().public_token_count);
-            program_options.mtp_draft_vocab = std::make_shared<const std::vector<std::int32_t>>(
-                models::qwen4_exp::load_draft_vocab(vocab, public_tokens));
+            try {
+                program_options.mtp_draft_vocab = std::make_shared<const std::vector<std::int32_t>>(
+                    models::qwen4_exp::load_draft_vocab(vocab, public_tokens));
+            } catch (const std::exception& error) {
+                // An explicit file must load; the optional sidecar falls back to the full head.
+                if (next.mtp_draft_vocab != "auto") { throw; }
+                report(std::string("MTP draft vocabulary: ignoring ") + vocab.string() + " (" + error.what() +
+                       "); the drafter uses the full head");
+                vocab.clear();
+            }
+        }
+        if (!vocab.empty()) {
             const GgmlBlock block = ggml_block(plan.output_head_format());
             program_options.mtp_draft_head_row_bytes =
                 static_cast<std::uint64_t>(config.hidden_size) / block.values * block.bytes;
