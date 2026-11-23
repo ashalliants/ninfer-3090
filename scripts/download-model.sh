@@ -37,7 +37,7 @@ set -euo pipefail
 #                    on a terminal, puts the volume in another folder (default: beside the model): a
 #                    faster drive, since prefill from NVMe measured 1.1-1.4x that from a SATA SSD.
 #                    The launcher is then told with NINFER_NGRAM_VOLUME, which the script prints.
-#   inkling2-mini    Inkling-2-Mini (Tesla V100 32 GB, Linux), 22.3 GiB: this fork's exact conversion of
+#   inkling2-mini    Inkling-2-Mini (Tesla V100 32 GB or RTX 3090, Linux), 22.3 GiB: this fork's exact conversion of
 #                    Unsloth's UD-Q8_K_XL GGUF with the model's DSpark drafter and vision tower
 #                    (WarlaxZ/Inkling-2-Mini-NInfer-V100). One file serves --vision and --spec dspark.
 #
@@ -55,7 +55,7 @@ set -euo pipefail
 # otherwise. `apt-get install aria2` / `brew install aria2` to opt in.
 
 usage() {
-  printf 'usage: %s <model>\n\n  qwen38-27b (recommended)\n  bonsai2-27b\n  qwen36-27b\n  qwen36-35b-a3b\n  qwen38-flash-next (preview)\n  qwen38-flash-next-iq3 (preview, Unsloth UD-IQ3_XXS)\n  inkling2-mini (Tesla V100)\n' \
+  printf 'usage: %s <model>\n\n  qwen38-27b (recommended)\n  bonsai2-27b\n  qwen36-27b\n  qwen36-35b-a3b\n  qwen38-flash-next (preview)\n  qwen38-flash-next-iq3 (preview, Unsloth UD-IQ3_XXS)\n  inkling2-mini (Tesla V100 or RTX 3090)\n' \
     "${0##*/}" >&2
 }
 
@@ -109,7 +109,7 @@ case "${1:-}" in
     revision='e348ad671599db1db110447b9d9ebfb898070f67'
     expected_size=23914098432
     expected_sha256='2167c0c0ff2ebb5d9dcf7ea5c8289ce13239bdc5104aac053af79a3b8cf009c1'
-    label='the Inkling-2-Mini model for the Tesla V100 (22.3 GiB)'
+    label='the Inkling-2-Mini model for the Tesla V100 and RTX 3090 (22.3 GiB)'
     tests_variable='NINFER_TEST_INKLING2_ARTIFACT'
     ;;
   # The n-gram volume is pinned to the commit that uploaded it; the model file and its part are pinned

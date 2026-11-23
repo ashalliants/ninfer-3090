@@ -1598,6 +1598,114 @@ void test_tiled_experts(int h, int inter, const char* label) {
                 static_cast<unsigned long long>(inexact_before));
 }
 
+// The value of an E4M3FN code (no NaN codes are drawn).
+float e4m3_value(unsigned code) {
+    const int e = static_cast<int>((code >> 3) & 15), m = static_cast<int>(code & 7);
+    const float v = e == 0 ? std::ldexp(static_cast<float>(m), -9) : std::ldexp(1.0F + static_cast<float>(m) / 8.0F, e - 7);
+    return (code & 0x80U) != 0 ? -v : v;
+}
+
+// BF16 words of rows of `n` values that are MXFP8 values: E4M3 codes under one power of two per 32 (as Inkling-2's
+// layers 20-23 experts were stored), with subnormal codes, the largest code (448) and an all-zero block among them.
+std::vector<std::uint16_t> mxfp8_valued_bf16(std::size_t rows, int n) {
+    std::vector<std::uint16_t> out(rows * static_cast<std::size_t>(n));
+    for (std::size_t b = 0; b < out.size() / 32; ++b) {
+        const int k = static_cast<int>(uniform(-14.0F, -3.0F));
+        for (int j = 0; j < 32; ++j) {
+            unsigned code = static_cast<unsigned>(uniform(0.0F, 255.0F));
+            if ((code & 0x7FU) == 0x7FU) { code &= 0xFEU; } // not NaN
+            if (b % 7 == 3 && j == 5) { code = 0x7EU; }    // 448
+            if (b % 11 == 4 && j < 8) { code = j; }        // subnormal codes and zero
+            if (b == 9) { code = 0; }                      // an all-zero block
+            const float v = std::ldexp(e4m3_value(code), k);
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, &v, 4);
+            out[b * 32 + static_cast<std::size_t>(j)] = static_cast<std::uint16_t>(bits >> 16); // exact: 3 mantissa bits
+        }
+    }
+    return out;
+}
+
+// mxfp8_encode_bf16_rows, and BF16 banks against their MXFP8 form: every route (one column, per entry, expert-major,
+// the tensor cores) must give the same bits, with and without the combining weights.
+void test_mxfp8_experts(int h, int inter, int experts, const char* label) {
+    const int k = 8;
+    const std::vector<std::uint16_t> gu_host = mxfp8_valued_bf16(static_cast<std::size_t>(experts) * 2 * inter, h),
+                                     dn_host = mxfp8_valued_bf16(static_cast<std::size_t>(experts) * h, inter);
+    ninfer::DeviceBuffer gu(gu_host.size() * 2), dn(dn_host.size() * 2);
+    gu.copy_from_host(gu_host.data(), gu.bytes);
+    dn.copy_from_host(dn_host.data(), dn.bytes);
+    ninfer::DeviceBuffer gu_codes(gu_host.size()), gu_scales(gu_host.size() / 32), dn_codes(dn_host.size()), dn_scales(dn_host.size() / 32);
+    ninfer::DeviceBuffer count(8);
+    count.fill(0);
+    auto* inexact = static_cast<unsigned long long*>(count.p);
+    ninfer::ops::mxfp8_encode_bf16_rows(gu.p, std::int64_t(experts) * 2 * inter, h, static_cast<std::uint8_t*>(gu_codes.p),
+                                        static_cast<std::uint8_t*>(gu_scales.p), inexact, nullptr);
+    ninfer::ops::mxfp8_encode_bf16_rows(dn.p, std::int64_t(experts) * h, inter, static_cast<std::uint8_t*>(dn_codes.p),
+                                        static_cast<std::uint8_t*>(dn_scales.p), inexact, nullptr);
+    check(cudaDeviceSynchronize() == cudaSuccess, std::string(label) + ": encode");
+    const auto exact_count = t::from_device<unsigned long long>(count, 1)[0];
+    check(exact_count == 0, std::string(label) + ": MXFP8-valued BF16 encoded with " + std::to_string(exact_count) + " inexact values");
+    // Arbitrary BF16 values are not MXFP8 values: the count must say so.
+    {
+        std::vector<std::uint16_t> plain(64 * 32);
+        for (auto& w : plain) {
+            const float v = uniform();
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, &v, 4);
+            w = static_cast<std::uint16_t>(bits >> 16);
+        }
+        ninfer::DeviceBuffer p(plain.size() * 2), pc(plain.size()), ps(plain.size() / 32);
+        p.copy_from_host(plain.data(), p.bytes);
+        count.fill(0);
+        ninfer::ops::mxfp8_encode_bf16_rows(p.p, 64, 32, static_cast<std::uint8_t*>(pc.p), static_cast<std::uint8_t*>(ps.p), inexact, nullptr);
+        check(cudaDeviceSynchronize() == cudaSuccess && t::from_device<unsigned long long>(count, 1)[0] > 0,
+              std::string(label) + ": random BF16 values were reported exact");
+    }
+    ninfer::ops::SituExpertBank bf16;
+    bf16.format = ninfer::QType::BF16, bf16.experts = experts, bf16.hidden = h, bf16.intermediate = inter;
+    bf16.gate_up = gu.p, bf16.down = dn.p;
+    ninfer::ops::SituExpertBank mx = bf16;
+    mx.gate_up = nullptr, mx.down = nullptr;
+    mx.mx_gate_up = static_cast<const std::uint8_t*>(gu_codes.p), mx.mx_gate_up_scales = static_cast<const std::uint8_t*>(gu_scales.p);
+    mx.mx_down = static_cast<const std::uint8_t*>(dn_codes.p), mx.mx_down_scales = static_cast<const std::uint8_t*>(dn_scales.p);
+    const std::vector<float> z1 = randoms(static_cast<std::size_t>(h) * 32), w1 = randoms(static_cast<std::size_t>(k) * 32, 0.1F, 1.0F);
+    const auto run_all = [&](const ninfer::ops::SituExpertBank& b) {
+        std::vector<std::vector<float>> outs;
+        for (const int cols : {1, 2, 9, 32}) { // per entry (8, 16 entries), expert-major (72, 256)
+            std::vector<int> ids(static_cast<std::size_t>(k) * cols);
+            for (int c = 0; c < cols; ++c)
+                for (int j = 0; j < k; ++j) { ids[c * k + j] = (c * 5 + j * 3) % experts; }
+            Buf z(std::vector<float>(z1.begin(), z1.begin() + std::size_t(h) * cols)), w(std::vector<float>(w1.begin(), w1.begin() + std::size_t(k) * cols)),
+                out(static_cast<std::size_t>(h) * cols), each(static_cast<std::size_t>(h) * k * cols);
+            ninfer::DeviceBuffer did = t::to_device_i32(ids);
+            const Tensor tid(did.p, DType::I32, {k, cols}), tw = w.tensor({k, cols});
+            Tensor tout = out.tensor({h, cols}), teach = each.tensor({h, k * cols});
+            ninfer::DeviceArena arena(std::max(ninfer::ops::moe_situ_experts_workspace_bytes(b, std::int64_t(k) * cols),
+                                               ninfer::ops::moe_situ_experts_tc_workspace_bytes(b, std::int64_t(k) * cols)) + 4096);
+            ninfer::ops::moe_situ_experts(b, z.tensor({h, cols}), tid, &tw, 4.0F, 25.0F, arena, tout, nullptr);
+            outs.push_back(out.get(static_cast<std::size_t>(h) * cols));
+            ninfer::ops::moe_situ_experts(b, z.tensor({h, cols}), tid, nullptr, 4.0F, 25.0F, arena, teach, nullptr);
+            outs.push_back(each.get(static_cast<std::size_t>(h) * k * cols));
+            if (cols > 1) {
+                ninfer::ops::moe_situ_experts_tc(b, z.tensor({h, cols}), tid, &tw, 4.0F, 25.0F, arena, tout, nullptr);
+                outs.push_back(out.get(static_cast<std::size_t>(h) * cols));
+            }
+        }
+        check(cudaDeviceSynchronize() == cudaSuccess, std::string(label) + ": experts");
+        return outs;
+    };
+    const auto want = run_all(bf16), got = run_all(mx);
+    bool same = want.size() == got.size();
+    std::size_t first_diff = 0;
+    for (std::size_t i = 0; same && i < want.size(); ++i) {
+        same = want[i].size() == got[i].size() && std::memcmp(want[i].data(), got[i].data(), want[i].size() * 4) == 0;
+        if (!same) { first_diff = i; }
+    }
+    check(same, std::string(label) + ": MXFP8 differs from BF16 (result " + std::to_string(first_diff) + ")");
+    std::printf("%-44s MXFP8 == BF16 bit for bit (T 1, 2, 9, 32; per entry, expert-major, tensor cores)\n", label);
+}
+
 // NINFER_INKLING2_OP_BENCH=1: decode-shaped timing (T = 1, top 8 of 32 resident experts at the model's shape, each
 // call a different 8 so nothing stays in L2), printed as microseconds and effective weight bandwidth. Not a criterion.
 void bench_experts(bool nvfp4, int width = 1, const std::vector<int>& sweep_widths = {}) {
@@ -1961,6 +2069,8 @@ int main() {
         test_expert_widths(false);
         test_tiled_experts(2304, 1152, "nvfp4_tile_records [2304, 1152]");
         test_tiled_experts(1152, 192, "nvfp4_tile_records [1152, 192]");
+        test_mxfp8_experts(2304, 1152, 16, "moe_situ_experts MXFP8 [16, 2304, 1152]");
+        test_mxfp8_experts(256, 96, 8, "moe_situ_experts MXFP8 [8, 256, 96]");
         if (const char* bench = std::getenv("NINFER_INKLING2_OP_BENCH"); bench != nullptr && *bench == '1') {
             bench_experts(true);
             bench_experts(false);

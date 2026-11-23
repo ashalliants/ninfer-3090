@@ -32,6 +32,7 @@ APIs, and supports paged KV, compatible-prefix reuse, structured JSON output, CU
 DFlash2 speculative decoding, vision, reasoning-effort control, ReplaySSM state transactions, and
 concurrent cohorts through **C8**. A 32 GB **Tesla V100** (`sm_70`, built from source on Linux) runs
 Qwen3.8-27B and Qwen3.8-Flash-Next too, and is the first home of **Inkling-2-Mini**: [V100 guide](docs/tesla-v100.md).
+Inkling-2-Mini runs on the RTX 3090 as well, with 137,216 tokens of context.
 
 > **Two cards, both first class: the RTX 3090 (24 GB, `sm_86`) and the Tesla V100 32 GB (`sm_70`).**
 > This project is built for, and tuned on, exactly these two GPUs. Every kernel route, schedule and
@@ -46,7 +47,7 @@ Qwen3.8-27B and Qwen3.8-Flash-Next too, and is the first home of **Inkling-2-Min
 > **New: Inkling-2-Mini** (Thinking Machines, 2026-11-20), a 26B-total looped MoE (5.4B active per token) with
 > 128 experts, now runs on one Tesla V100 with images, its full 262,144-token context and its own DSpark
 > speculative drafter (up to 120.7 tok/s), served to up to 8 requests at once over the same OpenAI and
-> Anthropic APIs. See [Inkling-2-Mini](#inkling-2-mini-new-v100).
+> Anthropic APIs. It runs on one RTX 3090 too: 104 tok/s and 137,216 tokens of context, or 90,368 with images and DSpark. See [Inkling-2-Mini](#inkling-2-mini-new-v100-and-rtx-3090).
 
 ### Performance by model and card
 
@@ -61,11 +62,14 @@ Decode is one stream unless the column says otherwise.
 | Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | |
 | **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | 76-86 tok/s (MTP3); 47.9 at 40K and 25.0 at 162K context (200 W) | 79 tok/s at C2 (MTP3) |
 | Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K | 72-96 tok/s (MTP3), flat from 10K to 221K context | |
+| **Inkling-2-Mini** (new) | RTX 3090 | **137,216** plain; 90,368 with DSpark and vision | **2,410 tok/s** at 8.4K, 65,536 context with vision (1,784 at 1.2K) | **104 tok/s** plain (12 chats); 115.5 best with DSpark (code) | |
 | **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **1,930 tok/s** at 8K, 131,072 context (1,629 at 1K, 1,244 at 100K); 1,868 at 8K at the full 262,144 with DSpark and vision | **120.7 tok/s** (DSpark, maths); 93-94 average over 12 chats, 78.8 plain | **198 tok/s** at C8 (plain) |
 
 RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The V100 was
 measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host: Qwen rows on 2026-11-18 (the
-two-lane figure 2026-11-20), Inkling-2-Mini on 2026-11-22 (master `dad1623b`, 250 W limit). A blank cell has not been measured.
+two-lane figure 2026-11-20), Inkling-2-Mini on 2026-11-22 (master `dad1623b`, 250 W limit). Inkling-2-Mini on the RTX 3090:
+2026-11-23 under WSL, 315 W limit, its layers 20-23 experts held as their exact MXFP8 re-encoding (the default there).
+A blank cell has not been measured.
 Full methods: [RTX 3090 benchmarks](#performance-on-an-rtx-3090), [V100 guide](docs/tesla-v100.md),
 [Inkling-2-Mini spec](docs/maintainer/inkling2-model.md).
 
@@ -102,7 +106,7 @@ requests are not guaranteed.
 - [Quick start](#quick-start) — download, fetch a model, run
 - [Building from source](#building-from-source)
 - [Features](#features) and [serving APIs](#serving-apis)
-- [Models](#models), including [Inkling-2-Mini](#inkling-2-mini-new-v100) (new, V100)
+- [Models](#models), including [Inkling-2-Mini](#inkling-2-mini-new-v100-and-rtx-3090) (new, V100 and RTX 3090)
 - [Performance on an RTX 3090](#performance-on-an-rtx-3090), starting with the [latest benchmarks](#latest-benchmarks)
 - [Tesla V100](docs/tesla-v100.md) — building, running and measured performance on `sm_70`
 - [Choosing a KV format](#choosing-a-kv-format)
@@ -557,7 +561,7 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
 | Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time (two lanes opt-in), 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
-| **Inkling-2-Mini** (new, V100) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Inkling-2-Mini-NInfer-V100/tree/e348ad671599db1db110447b9d9ebfb898070f67) | 22.27 GiB with DSpark and vision | Tesla V100 32 GB, Linux, up to 8 requests at once. This fork's [exact conversion](model-cards/Inkling-2-Mini-NInfer-V100/README.md) of Unsloth's UD-Q8_K_XL GGUF: lossless, unpacking the expert records reproduces every source tensor byte for byte. See [Inkling-2-Mini](#inkling-2-mini-new-v100) |
+| **Inkling-2-Mini** (new, V100 and RTX 3090) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Inkling-2-Mini-NInfer-V100/tree/e348ad671599db1db110447b9d9ebfb898070f67) | 22.27 GiB with DSpark and vision | Tesla V100 32 GB (Linux, up to 8 requests at once) or RTX 3090 (measured under WSL). This fork's [exact conversion](model-cards/Inkling-2-Mini-NInfer-V100/README.md) of Unsloth's UD-Q8_K_XL GGUF: lossless, unpacking the expert records reproduces every source tensor byte for byte. See [Inkling-2-Mini](#inkling-2-mini-new-v100-and-rtx-3090) |
 | Qwen3.8-Flash-Next, UD-IQ3_XXS (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/tree/196f11834dfe4fc21342f0255bcee034a5120ae7) | 53.17 GiB in two files + the 27.13 GiB n-gram volume of the row above | Windows, one request at a time, 64 GB RAM (about 42 GiB available), text only. This fork's [conversion](model-cards/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/README.md) of Unsloth's Dynamic v3.1 UD-IQ3_XXS GGUF with the MTP drafter: lower perplexity than the row above, about half the speed |
 
 `download-model qwen38-27b`, `bonsai2-27b`, `qwen36-35b-a3b` or `qwen36-27b` (`.bat` on Windows, `.sh` on Linux; `inkling2-mini` with `.sh` only)
@@ -589,7 +593,7 @@ app `download-qwen36-35b-v2` tracks upstream `main` to try a newer artifact than
 so it has no size or hash to check and cannot safely resume. It writes to its own filename, refuses
 to resume, and is not the artifact the tests or the published figures use.
 
-### Inkling-2-Mini (new, V100)
+### Inkling-2-Mini (new, V100 and RTX 3090)
 
 [Inkling-2-Mini](https://thinkingmachines.ai/model-card/inkling-2-mini/) is Thinking Machines'
 26.2B-total MoE, 3.4B active per layer pass and 5.4B per token: 24 layers, of which the middle 12 run three times per token (48 layer
@@ -628,11 +632,28 @@ Gen3 x4 eGPU):
 - **Prefix reuse:** on by default; a prompt that starts with the same tokens and images resumes from a snapshot
   kept in pinned host memory (236 MiB), and the result reports `reused_prompt_tokens`. A chat's second turn at 8K
   answers in 1.10 s instead of 4.26 s, at 34K in 1.51 s instead of 21.4 s.
-- **Not yet:** the context store and host cache tiers, JSON-schema output and logprobs. Not measured on an RTX 3090.
+- **Not yet:** the context store and host cache tiers, JSON-schema output and logprobs. Several requests at once
+  have not been measured on the RTX 3090.
+
+**On an RTX 3090** (24 GB) the same artifact runs, measured under WSL on 2026-11-23 (315 W limit). Its layers 20-23
+experts, 7.6 GiB of BF16 in the file, are the checkpoint's MXFP8 values: the 3090 holds them as MXFP8 (3.9 GiB),
+re-encoded at load and checked exact, so every output is the same, bit for bit (`--mxfp8-experts`, automatic when the
+BF16 weights would leave under 4 GiB free; the V100 keeps BF16).
+
+- **Decode:** **104 tok/s** plain, the mean over 12 greedy chats (103.3-103.9 at 64K and 131K context). 2.9% faster
+  than holding the experts in BF16 (100.6), since a token reads half the bytes for those layers.
+- **Context:** 137,216 tokens plain; 119,040 with DSpark; 107,264 with vision; 90,368 with both (`--fit-context`
+  finds the largest that fits beside the desktop).
+- **Prefill:** 2,410 tok/s on an 8.4K-token prompt (TTFT 3.5 s) and 1,784 on 1.2K (0.65 s), at 65,536 context with
+  vision on.
+- **DSpark** gains less here than on the V100, because plain decode is already fast: 103.5 against 103.3 tok/s on
+  the 12 chats, 115.5 on a code prompt, but 73-74 against 98 for a short reply after a 1.2K-token prompt. Leave it off
+  unless the work is mostly code.
 
 ```bash
 scripts/download-model.sh inkling2-mini      # WarlaxZ/Inkling-2-Mini-NInfer-V100, 22.3 GiB, pinned and verified
-ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark
+ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark                        # Tesla V100
+ninfer-serve models/inkling2-mini-q8.ninfer --vision --max-context 65536                  # RTX 3090
 ```
 
 The [model card](model-cards/Inkling-2-Mini-NInfer-V100/README.md) has the file hashes and sources. To

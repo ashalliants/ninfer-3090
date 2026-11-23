@@ -35,8 +35,8 @@ Machines' looped mixture-of-experts model, for NInfer
 [UD-Q8_K_XL GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) rewritten into NInfer's `.ninfer`
 container without re-quantizing anything, plus the model's own DSpark speculative drafter and its vision
 tower, in one file. It is not a Transformers checkpoint, Safetensors distribution or GGUF file, and it
-needs NInfer's executables. It runs on one **Tesla V100 32 GB** (`sm_70`, Linux, built from source). It
-takes text and images; the model has no video input.
+needs NInfer's executables. It runs on one **Tesla V100 32 GB** (`sm_70`, Linux, built from source) or one
+**RTX 3090** (24 GB, `sm_86`). It takes text and images; the model has no video input.
 
 ## Get NInfer
 
@@ -137,6 +137,18 @@ calls (`parallel_tool_calls` honoured), reasoning and thinking budgets, stop str
 Not supported yet: the context store and host cache tiers (the server refuses those options), JSON-schema or
 grammar output, and logprobs.
 
+**On an RTX 3090**, build NInfer for the 3090 (the [release archives](https://github.com/ashalliants/ninfer-3090/releases/latest)
+or the Linux build guide) and serve with a context that fits beside the desktop:
+
+```bash
+ninfer-serve models/inkling2-mini-q8.ninfer --vision --max-context 65536
+```
+
+Layers 20-23 keep their experts in BF16 in this file (7.6 GiB); they are the checkpoint's MXFP8 values, so on a 24 GB
+card the engine holds them as MXFP8 (3.9 GiB), re-encoded at load and checked exact: every output is the same, bit
+for bit (`--mxfp8-experts auto`, the default; `off` keeps BF16). `--fit-context MIN` starts at the largest context that
+fits.
+
 ## Performance (one Tesla V100-PCIE-32GB, 2026-11-22)
 
 Measured through `ninfer-serve` built from NInfer master `dad1623b`, on a V100 at its 250 W power limit (peak
@@ -188,6 +200,23 @@ none 78.8, `"lora"` 75.4, `"graft"` 75.2 tok/s. With DSpark: none 94.1-94.4, `"l
 91.6-92.7 tok/s, and the output equals the adapter's plain output. The adapters take the refusals on the first 20
 prompts of `mlabonne/harmful_behaviors` from 20/20 to 0/20, at a KLD from the base model of 0.014 (LoRA) and 0.017
 (graft).
+
+## Performance (one RTX 3090, 2026-11-23)
+
+Measured through `ninfer-serve` under WSL on a 3090 at a 315 W power limit (PCIe Gen4 x16; power capping, no thermal
+slowdown during the runs), layers 20-23's experts held as MXFP8. 12 greedy chats of 300 tokens, each figure the range
+over two runs:
+
+| | |
+|---|---|
+| Decode, plain | **104 tok/s** (103.3-103.9 mean over the 12 chats, at 64K and 131K context); 100.6 with the experts in BF16 |
+| Decode, DSpark | 103.5 mean over the 12 chats, 115.5 on a code prompt; 73-74 against plain's 98 on a short reply after a 1.2K-token prompt |
+| Prefill (65,536 context, vision on, chunk 2048) | **2,410 tok/s** at 8.4K tokens (TTFT 3.5 s); 1,784 at 1.2K (0.65 s) |
+| Largest context | 137,216 plain; 119,040 with DSpark; 107,264 with vision; 90,368 with both |
+| Load | 75 s from a SATA SSD (300 MiB/s), the MXFP8 re-encode included |
+
+DSpark gains less on the 3090 than on the V100 because plain decode is already fast; leave it off unless the work is
+mostly code. Several requests at once have not been measured on the 3090.
 
 ## Accuracy
 

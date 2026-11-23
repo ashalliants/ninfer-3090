@@ -4,7 +4,9 @@ Status: **text MVP, correctness first**. `src/models/inkling2` runs the text mod
 naive FP32 kernels and matches the llama.cpp golden ("Engine (text MVP, correctness first)" and
 "Validation" below); the DSpark drafter and speculative decoding (greedy and sampled) are in ("DSpark drafter" below, measured on
 a physical Tesla V100); so is the vision tower and image prompts ("Vision tower" below). The public Engine and
-`ninfer-serve` run it with its chat template, sampling and output decoder ("Serving" below). This page is the mathematical authority for the work, plus the GGUF
+`ninfer-serve` run it with its chat template, sampling and output decoder ("Serving" below). It also runs on the RTX 3090
+(24 GB), where the layers 20-23 experts are held as their exact MXFP8 re-encoding so that DSpark, vision and long
+context fit ("MXFP8 experts" below). This page is the mathematical authority for the work, plus the GGUF
 mapping, reuse map and V100 plan. The
 converter's config and tensor map are `tools/convert/inkling2.py`, the NumPy reference is
 `tools/inkling2/reference.py`, and the C++ op oracles are `tests/ops/inkling2_reference.h`.
@@ -776,6 +778,54 @@ visits compound it). With `all`, one golden prompt's argmax differs from llama.c
 550-850 GB/s against BF16's 610-870 GB/s, because a call costs about 5 us whatever its size, so `all` gains less
 than its byte count suggests (1.35 ms of the 1.65 GB saved per token).
 
+## MXFP8 experts
+
+**Exact.** The artifact keeps layers 20-23's routed experts as two BF16 banks each (7.59 GiB). Their values are the
+checkpoint's MXFP8 values (see "GGUF mapping"), so `--mxfp8-experts on` (`EngineOptions::experts_mxfp8`,
+`LoadComponents::experts_mxfp8`) holds them as MXFP8 again: per 32 values of a row one E8M0 scale and 32 E4M3 codes,
+8.25 bits a weight, 3.92 GiB. The artifact is unchanged.
+
+- **Load.** The BF16 banks are bound to the file (`Residency::File`), never uploaded: `load_model` reads each
+  expert's gate_up and down from the artifact into pinned staging (two slots, so a read overlaps the previous upload
+  and encode), and `ops::mxfp8_encode_bf16_rows` writes the codes and scales. The startup log shows it as its own phase
+  (`loading experts as MXFP8`, 25 s at the RTX 3090's 300 MiB/s from a SATA SSD); the main weights load shrinks by the
+  same bytes, so startup takes as long as before.
+- **Exactness.** Per block, k = floor(log2 max|v|) - 8 (plus one when max|v| / 2^k > 448), and each code is E4M3FN of
+  v / 2^k rounded to nearest even. The encoder decodes every code back and counts the values that differ; the load
+  refuses any count above zero (`--mxfp8-experts off` keeps BF16). On the published artifact the count is 0.
+- **Decode.** An E4M3 code's bits placed in an FP16 (sign to bit 15, the rest from bit 7) are its value times 2^-8,
+  subnormals included, and the scale contributes 2^(s - 127 + 8): no FP8 hardware, the same on `sm_70` and `sm_86`.
+  `mx_row_dot` decodes each lane's 8 values to the BF16 values exactly and takes `bf16_row_dot`'s FMAs in the same
+  order, so the per-entry kernels (`gate_up_mx_kernel`, `down_mx_kernel`) and the expert-major kernels (the BF16 ones'
+  `MX` instantiation) return the BF16 route's bits. Prefill's `mxfp8_rows_to_f16` stages the same FP16 rows and row
+  scales as `bf16_rows_to_f16`, so the tensor-core GEMMs are the same too. `ninfer_inkling2_fp32_ops_test`
+  (`test_mxfp8_experts`) checks every route bit for bit, and greedy chats through `ninfer-serve` give the same text.
+- **Auto** (the default) re-encodes when the device bytes the BF16 form binds (the text model, and the vision tower
+  when resident) leave less than 4 GiB of free device memory (`kMxfp8AutoRoom`). On the RTX 3090 (24 GiB, about 1.5
+  GiB taken by the desktop) that is always; on the Tesla V100 32 GB it never is, so the V100 runs the BF16 kernels it
+  was tuned with. `on` and `off` force either form. The V100 has not been measured with `on`.
+
+Measured on the RTX 3090 (2026-11-23, WSL, 315 W power limit, PCIe Gen4 x16, `ninfer-serve`, 12 greedy chats of
+300 tokens plus a maths prompt; power capping but no thermal slowdown during the legs):
+
+| | BF16 (`off`) | MXFP8 (auto) |
+|---|---|---|
+| Decode at `--max-context 8192`, mean of 12 chats (ABBA, two legs each) | 100.61-100.62 tok/s | **103.51-103.57 tok/s** (+2.9%) |
+| Largest context, plain (`--fit-context`) | 17,408 | 137,216 |
+| Largest context, DSpark | none with the 256 MiB spare | 119,040 |
+| Largest context, vision resident | none | 107,264 |
+| Largest context, DSpark and vision | none | 90,368 |
+| Free after startup at 8,192 | 391 MiB, chunk 1024 | 3,846 MiB, chunk 2048 |
+
+The decode gain is the bytes: a token reads 8 experts of each of layers 20-23, 510 MB in BF16 and 263 MB in MXFP8.
+
+With the room, the 3090 at `--max-context 65536 --vision` (chunk 2048) prefills 2,410 tok/s at 8,447 tokens (TTFT
+3.5 s) and 1,784 at 1,167 (0.65 s), and decodes the 12 chats at 103.30-103.32 tok/s plain against 103.46-103.54 with
+`--spec dspark` (order DSpark, plain, plain, DSpark). DSpark pays off only where drafts are accepted: 115.5 on the code
+chat (85 of 87 drafts), 108.6-108.9 on the arithmetic one, but a 64-token reply after the 1,167-token prompt decodes at
+73.2-73.9 against 97.9 plain. Plain decode is 30% faster here than on the V100 (103 against 79), so the verify cost
+is a larger share of a round; tuning the adaptive gate for the 3090 is open.
+
 ## Split decode attention
 
 On by default; `--no-split-attention` (`EngineOptions::split_attention`, `ProgramLimits::split_attention`) turns it
@@ -1098,6 +1148,7 @@ Q8_K_XL streams 1.44x the bytes of Q4_K_XL, so the expected decode cost is 10-20
 (more after the lossless MXFP8 re-encode), it is the exact model, so the engine's quality reference and
 the llama.cpp golden are the same weights, and a faster Q8-dense artifact can still be derived from it with
 ninfer's own encoders. Q4_K_XL is the fallback if 210k context is not enough before the re-encode lands.
+(It landed as a load-time re-encode, not a second artifact: see "MXFP8 experts".)
 
 **Disk.** The GGUF is 22.87 GB. Put it in `/dev/shm` (30 GB tmpfs, 59 GB RAM). The converter streams
 (peak RSS ~0.6 GiB, as for `dsv4_gguf`) and writes an artifact of ~22.9 GB (BF16 kept) or ~18.9 GB (MXFP8

@@ -7,10 +7,12 @@
 
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
+#include "core/arena.h"
 #include "core/device.h"
 #include "core/weight_view.h"
 #include "models/inkling2/config.h"
 #include "ninfer/ops/moe_situ.h"
+#include "ninfer/types.h"
 
 #include <cstddef>
 #include <limits>
@@ -96,6 +98,15 @@ public:
     // Layer `layer`'s routed experts as the moe_situ_experts bank view.
     [[nodiscard]] const ops::SituExpertBank& expert_bank(std::uint32_t layer) const { return banks_.at(layer); }
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept { return backing_.stats(); }
+    // The device bytes of the BF16 expert banks held as MXFP8 (LoadComponents::experts_mxfp8), beside storage_stats();
+    // 0 when they are BF16.
+    [[nodiscard]] std::uint64_t mxfp8_expert_bytes() const noexcept {
+        std::uint64_t n = 0;
+        for (const DeviceBuffer& b : mxfp8_banks_) { n += b.bytes; }
+        return n;
+    }
+    // The layers whose BF16 experts are held as MXFP8.
+    [[nodiscard]] std::uint32_t mxfp8_expert_layers() const noexcept { return static_cast<std::uint32_t>(mxfp8_banks_.size()); }
     // The DSpark drafter, when the artifact has one (null otherwise).
     [[nodiscard]] const DSparkConfig* dspark_config() const noexcept { return dspark_config_ ? &*dspark_config_ : nullptr; }
     [[nodiscard]] const DSparkWeights& dspark_weights() const noexcept { return dspark_weights_; }
@@ -134,6 +145,7 @@ private:
     TextWeights weights_;
     std::vector<BoundWeight> bound_;
     std::vector<ops::SituExpertBank> banks_;
+    std::vector<DeviceBuffer> mxfp8_banks_; // one per MXFP8 layer: its four arrays
     void tile_expert_records();
 };
 
@@ -145,7 +157,14 @@ struct LoadComponents {
     bool vision = true;
     bool dspark = true;
     bool vision_overlay = false; // the tower's weights in pinned host memory, not on the device
+    // The BF16 expert banks (layers 20-23): Auto re-encodes them as MXFP8 when the BF16 weights would leave less than
+    // kMxfp8AutoRoom of the device free; On always, Off never. Re-encoded banks are read from the file, never
+    // uploaded as BF16; a bank whose values are not exactly MXFP8 values refuses the load.
+    ExpertsMxfp8 experts_mxfp8 = ExpertsMxfp8::Auto;
 };
+
+// The device memory --mxfp8-experts auto keeps for the KV rings, workspace and drafter beside the BF16 weights.
+inline constexpr std::uint64_t kMxfp8AutoRoom = 4ULL << 30;
 
 // Binds the text model's parameters and those of the components asked for, and materializes them in device memory.
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext& device,

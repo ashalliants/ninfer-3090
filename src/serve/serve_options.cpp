@@ -191,6 +191,13 @@ DenseQ8 parse_dense_q8(std::string_view value) {
     throw std::invalid_argument("invalid --dense-q8 (head or all): " + std::string(value));
 }
 
+ExpertsMxfp8 parse_experts_mxfp8(std::string_view value) {
+    if (value == "auto") { return ExpertsMxfp8::Auto; }
+    if (value == "on") { return ExpertsMxfp8::On; }
+    if (value == "off") { return ExpertsMxfp8::Off; }
+    throw std::invalid_argument("invalid --mxfp8-experts (auto, on or off): " + std::string(value));
+}
+
 KvCapacityPolicy parse_kv_capacity(const char* text) {
     if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
     const int value = parse_nonnegative_int(text, "kv-capacity");
@@ -251,7 +258,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-store-s3-upload-delay-seconds N]]] "
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16|fp32 (Inkling-2: fp16|fp32, or lossy opt-in global rings int8|rk8v4|rk4v4)] [--dense-q8 head|all (lossy)] [--no-split-attention] [--prefill-math tc|fp32] "
+           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|fp16|fp32 (Inkling-2: fp16|fp32, or lossy opt-in global rings int8|rk8v4|rk4v4)] [--dense-q8 head|all (lossy)] [--mxfp8-experts auto|on|off] [--no-split-attention] [--prefill-math tc|fp32] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N] [--draft-min-p P] [--dspark-adaptive on|off]] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
@@ -1050,6 +1057,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.prefill_math = form == "tc" ? PrefillMath::TensorCores : PrefillMath::FP32;
         } else if (arg == "--dense-q8") {
             options.dense_q8 = parse_dense_q8(require_value("--dense-q8"));
+        } else if (arg == "--mxfp8-experts") {
+            options.experts_mxfp8 = parse_experts_mxfp8(require_value("--mxfp8-experts"));
         } else if (arg == "--no-split-attention") {
             options.split_attention = false;
         } else if (arg == "--spec") {

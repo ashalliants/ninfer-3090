@@ -48,6 +48,11 @@ void moe_route_sigmoid_topk(const Tensor& x, const RouteInputNorm* norm, const T
 /// (`records`, `format` GGML_REC_NVFP4_NVFP4: gate [I, H], up [I, H] and down [H, I] per record,
 /// storage-layouts.md section 7) with optional per-expert FP32 multipliers of the gate/up and down
 /// products, or two BF16 banks: gate_up [H, 2I, E] (rows 0..I-1 gate, I..2I-1 up) and down [I, H, E].
+///
+/// BF16 banks may instead be held as their exact MXFP8 re-encoding (mxfp8_encode_bf16_rows): `format` stays BF16
+/// (the values are BF16 values), gate_up and down are null, and the four `mx_` arrays hold, in the BF16 banks' row
+/// order, each row's E4M3 codes and its E8M0 scales (one per 32 values). Every value decodes to the BF16 value it
+/// came from, and every route computes the same bits as from the BF16 banks.
 struct SituExpertBank {
     QType format                = QType::BF16;
     const std::uint8_t* records = nullptr;
@@ -56,9 +61,31 @@ struct SituExpertBank {
     const float* down_scale     = nullptr; // [E] or null
     const void* gate_up         = nullptr; // BF16 banks
     const void* down            = nullptr;
+    const std::uint8_t* mx_gate_up        = nullptr; // MXFP8 codes [H, 2I, E]
+    const std::uint8_t* mx_gate_up_scales = nullptr; // E8M0 [H / 32, 2I, E]
+    const std::uint8_t* mx_down           = nullptr; // MXFP8 codes [I, H, E]
+    const std::uint8_t* mx_down_scales    = nullptr; // E8M0 [I / 32, H, E]
     std::int32_t experts = 0, hidden = 0, intermediate = 0;
     bool tiled = false; // NVFP4: the records are in the tiled order of nvfp4_tile_records
+
+    [[nodiscard]] bool mxfp8() const noexcept { return mx_gate_up != nullptr; }
 };
+
+/**
+ * Op: mxfp8_encode_bf16_rows
+ *
+ * Math / indexing: for each block of 32 values v of a row (n values, n a multiple of 32):
+ *   k = floor(log2(max |v|)) - 8, plus 1 when max |v| / 2^k > 448 (k = 0 for an all-zero block);
+ *   scales[row, block] = k + 127 (E8M0); codes[row, i] = E4M3FN of v_i / 2^k, rounded to nearest even.
+ *   inexact (when not null) counts the values whose code times 2^k is not exactly v, and the blocks whose k is
+ *   outside E8M0's range.
+ * Logical shapes: rows BF16 [n, count] contiguous; codes U8 [n, count]; scales U8 [n / 32, count]; device memory.
+ * Numeric: exact for BF16 values that are E4M3 values under one power of two per 32 (the MXFP8 checkpoint
+ *   Inkling-2-Mini's layers 20-23 experts were stored in); the count says whether a bank was.
+ * Execution: asynchronous on `stream`, one thread per block of 32.
+ */
+void mxfp8_encode_bf16_rows(const void* rows, std::int64_t count, int n, std::uint8_t* codes, std::uint8_t* scales,
+                            unsigned long long* inexact, cudaStream_t stream);
 
 /**
  * NVFP4 tiled records (SituExpertBank::tiled). The decode kernels read each matrix in groups of `group_rows` rows
@@ -103,7 +130,8 @@ void nvfp4_tile_records(SituExpertBank& bank, std::uint8_t* records, void* scrat
  * Logical shapes: z FP32 [H, T] (any column stride); ids I32 [k, T], weights FP32 [k, T] contiguous or null; out
  *   FP32 [H, T] (or [H, k * T] with weights null) contiguous, exactly rank 2, with storage (refused otherwise).
  * Supported domain: format GGML_REC_NVFP4_NVFP4 (H and I multiples of 64, records and record stride 16-byte
- *   aligned) or BF16 (H and I multiples of 8, banks 16-byte aligned); H and I at most 8192.
+ *   aligned) or BF16 (H and I multiples of 8, banks 16-byte aligned; held as MXFP8, H and I multiples of 32 and
+ *   the code arrays 8-byte aligned); H and I at most 8192.
  * Numeric: FP32 activations and accumulation (no activation quantization); oracle FP64 over the decoded
  *   weights (inkling2_reference.h decode_nvfp4, situ).
  * Effects: writes out; it must not overlap z.

@@ -72,6 +72,7 @@ struct ServeOptions {
     std::vector<std::uint32_t> stage_layers;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     DenseQ8 dense_q8                       = DenseQ8::Off; // --dense-q8 head|all (Inkling-2)
+    ExpertsMxfp8 experts_mxfp8             = ExpertsMxfp8::Auto; // --mxfp8-experts auto|on|off (Inkling-2)
     bool split_attention                   = true;         // --no-split-attention: false (Inkling-2)
     KvRings kv_rings                       = KvRings::Default; // --kv-dtype fp16|fp32 (Inkling-2)
     bool kv_cache_explicit                 = false; // the last --kv-dtype was a kv_cache form (bf16 included)

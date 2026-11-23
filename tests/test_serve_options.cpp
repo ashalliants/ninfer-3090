@@ -798,6 +798,19 @@ int main() {
                           make_engine_options(parse({"ninfer-serve", "model.ninfer", "--dense-q8", "all"})).dense_q8 == ninfer::DenseQ8::All &&
                           make_engine_options(parse({"ninfer-serve", "model.ninfer"})).dense_q8 == ninfer::DenseQ8::Off,
                       "--dense-q8 did not reach the Engine options");
+    // --mxfp8-experts auto|on|off reaches the Engine options (Inkling-2's exact MXFP8 experts); auto by default.
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--mxfp8-experts", "on"})).experts_mxfp8 == ninfer::ExpertsMxfp8::On &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer", "--mxfp8-experts", "off"})).experts_mxfp8 == ninfer::ExpertsMxfp8::Off &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer", "--mxfp8-experts", "auto"})).experts_mxfp8 == ninfer::ExpertsMxfp8::Auto &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer"})).experts_mxfp8 == ninfer::ExpertsMxfp8::Auto,
+                      "--mxfp8-experts did not reach the Engine options");
+    {
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--mxfp8-experts", "yes"});
+        } catch (const std::invalid_argument&) { refused = true; }
+        failures += check(refused, "--mxfp8-experts accepted an unknown form");
+    }
     // --no-split-attention reaches the Engine options (Inkling-2's single-block attention, the earlier bits).
     failures += check(!make_engine_options(parse({"ninfer-serve", "model.ninfer", "--no-split-attention"})).split_attention &&
                           make_engine_options(parse({"ninfer-serve", "model.ninfer"})).split_attention,

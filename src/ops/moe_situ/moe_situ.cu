@@ -604,6 +604,58 @@ __device__ __forceinline__ float bf16_row_dot(const __nv_bfloat16* __restrict__ 
     return out[0][0];
 }
 
+// MXFP8 (SituExpertBank::mxfp8). An E4M3 code's bits placed in an FP16 (sign to bit 15, the rest from bit 7) are its
+// value times 2^-8, exactly, subnormals included; its block's E8M0 scale s then multiplies by 2^(s - 127 + 8). The
+// product is the BF16 value the code was encoded from (mxfp8_encode_bf16_rows checks it), so no FP8 hardware is used.
+__device__ __forceinline__ float mx_code(unsigned byte) {
+    return __half2float(__ushort_as_half(static_cast<unsigned short>(((byte & 0x80U) << 8) | ((byte & 0x7FU) << 7))));
+}
+__device__ __forceinline__ float mx_scale(unsigned s) { return __uint_as_float((s + 8U) << 23); }
+
+// bf16_row_dot over R MXFP8 rows (codes[r], n a multiple of 32, 8-byte aligned; one E8M0 scale per 32 values at
+// scales[r]): each lane's 8 values decode to the BF16 values and take the same FMAs in the same order, so every sum
+// is bf16_row_dot's over the BF16 rows, bit for bit.
+template <int R, int NT>
+__device__ void mx_row_dot(const std::uint8_t* const (&codes)[R], const std::uint8_t* const (&scales)[R], int n, const float* x, int x_step,
+                           float (&out)[R][NT]) {
+    const int lane = threadIdx.x & 31;
+    float acc[R][NT];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int i = 0; i < NT; ++i) { acc[r][i] = 0.0F; }
+    }
+#pragma unroll 3
+    for (int c = lane; c < n / 8; c += 32) {
+        float w[R][8];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint2 q = __ldg(reinterpret_cast<const uint2*>(codes[r]) + c);
+            const float f = mx_scale(__ldg(scales[r] + (c >> 2)));
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                w[r][i]     = mx_code((q.x >> (8 * i)) & 0xFFU) * f;
+                w[r][4 + i] = mx_code((q.y >> (8 * i)) & 0xFFU) * f;
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float4 x0 = *reinterpret_cast<const float4*>(x + t * x_step + 8 * c), x1 = *reinterpret_cast<const float4*>(x + t * x_step + 8 * c + 4);
+            const float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { acc[r][t] = fmaf(w[r][j], xs[j], acc[r][t]); }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int t = 0; t < NT; ++t) { out[r][t] = warp_sum(acc[r][t]); }
+    }
+}
+
 struct BankArgs {
     bool nvfp4, tiled;
     const std::uint8_t* records;
@@ -611,6 +663,12 @@ struct BankArgs {
     const float *gate_up_scale, *down_scale;
     const __nv_bfloat16 *gate_up, *down;
     int hidden, inter;
+};
+
+// BankArgs with a BF16 bank's MXFP8 arrays (SituExpertBank::mxfp8), taken only by the MXFP8 kernels: BankArgs itself is
+// unchanged, so every other kernel's parameters, and its code, are what they were.
+struct MxBankArgs : BankArgs {
+    const std::uint8_t *mx_gate_up, *mx_gate_up_scales, *mx_down, *mx_down_scales;
 };
 
 __device__ __forceinline__ float situ(float g, float u, float gate_cap, float up_cap) {
@@ -701,6 +759,48 @@ down_kernel(BankArgs b, const std::int32_t* __restrict__ ids, const float* __res
     if (h >= b.hidden) { return; }
     const float v = bf16_row_dot(b.down + (static_cast<std::int64_t>(e) * b.hidden + h) * b.inter, b.inter, a);
     if (lane == 0) { out[h] = v; }
+}
+
+// gate_up_kernel and down_kernel's BF16 path over MXFP8 banks: one row per warp, the same sums bit for bit. Dynamic
+// shared memory: the staged column (H or I floats).
+__global__ void __launch_bounds__(kThreads)
+gate_up_mx_kernel(MxBankArgs b, const float* __restrict__ z, std::int64_t zs, const std::int32_t* __restrict__ ids, int top_k, float gate_cap,
+                  float up_cap, float* __restrict__ act) {
+    extern __shared__ float2 shared[];
+    float* x = reinterpret_cast<float*>(shared);
+    const int entry = blockIdx.x, t = entry / top_k, e = ids[entry];
+    const float* col = z + t * zs;
+    for (int d = threadIdx.x; d < b.hidden; d += kThreads) { x[d] = col[d]; }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, i = blockIdx.y * kWarps + warp;
+    if (i >= b.inter) { return; }
+    const std::int64_t gate = static_cast<std::int64_t>(e) * 2 * b.inter + i, up = gate + b.inter, blocks = b.hidden / 32;
+    const std::uint8_t* gc[1] = {b.mx_gate_up + gate * b.hidden};
+    const std::uint8_t* gs[1] = {b.mx_gate_up_scales + gate * blocks};
+    const std::uint8_t* uc[1] = {b.mx_gate_up + up * b.hidden};
+    const std::uint8_t* us[1] = {b.mx_gate_up_scales + up * blocks};
+    float g[1][1], u[1][1];
+    mx_row_dot<1, 1>(gc, gs, b.hidden, x, 0, g);
+    mx_row_dot<1, 1>(uc, us, b.hidden, x, 0, u);
+    if (lane == 0) { act[static_cast<std::int64_t>(entry) * b.inter + i] = situ(g[0][0], u[0][0], gate_cap, up_cap); }
+}
+
+__global__ void __launch_bounds__(kThreads)
+down_mx_kernel(MxBankArgs b, const std::int32_t* __restrict__ ids, const float* __restrict__ act, float* __restrict__ y) {
+    extern __shared__ float2 shared[];
+    float* a = reinterpret_cast<float*>(shared);
+    const int entry = blockIdx.x, e = ids[entry];
+    const float* src = act + static_cast<std::int64_t>(entry) * b.inter;
+    for (int d = threadIdx.x; d < b.inter; d += kThreads) { a[d] = src[d]; }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, h = blockIdx.y * kWarps + warp;
+    if (h >= b.hidden) { return; }
+    const std::int64_t row = static_cast<std::int64_t>(e) * b.hidden + h;
+    const std::uint8_t* dc[1] = {b.mx_down + row * b.inter};
+    const std::uint8_t* ds[1] = {b.mx_down_scales + row * (b.inter / 32)};
+    float v[1][1];
+    mx_row_dot<1, 1>(dc, ds, b.inter, a, 0, v);
+    if (lane == 0) { y[static_cast<std::int64_t>(entry) * b.hidden + h] = v[0][0]; }
 }
 
 constexpr std::size_t kMaxShared = 96 * 1024; // the most dynamic shared memory a block may have on sm_70
@@ -973,10 +1073,11 @@ down_narrow_kernel(BankArgs b, const std::int32_t* __restrict__ ids, int entries
 // BF16 banks: grid (ceil(I / (kWarps * kBf16Rows)), min(entries, E)): warp w of block (g, s) takes the intermediate
 // rows (g * kWarps + w) * kBf16Rows + (0 ..) (their gate and up rows) of slot s's expert over its entries.
 constexpr int kBf16Rows = 2;
-template <int kCols>
+template <int kCols, class Args = BankArgs>
 __global__ void __launch_bounds__(kThreads)
-gate_up_narrow_bf16_kernel(BankArgs b, const float* __restrict__ z, std::int64_t zs, const std::int32_t* __restrict__ ids, int entries, int top_k,
+gate_up_narrow_bf16_kernel(Args b, const float* __restrict__ z, std::int64_t zs, const std::int32_t* __restrict__ ids, int entries, int top_k,
                            float gate_cap, float up_cap, float* __restrict__ act) {
+    constexpr bool MX = std::is_same_v<Args, MxBankArgs>;
     extern __shared__ float2 shared[];
     __shared__ int first[kMaxExperts], scratch[kWarps + 1];
     float* x  = reinterpret_cast<float*>(shared);
@@ -985,13 +1086,26 @@ gate_up_narrow_bf16_kernel(BankArgs b, const float* __restrict__ z, std::int64_t
     if (s.expert < 0) { return; }
     const int e = s.expert, n = s.count;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, first_row = (blockIdx.x * kWarps + warp) * kBf16Rows;
-    const __nv_bfloat16* base = b.gate_up + static_cast<std::int64_t>(e) * 2 * b.inter * b.hidden;
     const __nv_bfloat16* rows[2 * kBf16Rows];
+    [[maybe_unused]] const std::uint8_t* mx_rows[2 * kBf16Rows];
+    [[maybe_unused]] const std::uint8_t* mx_scales[2 * kBf16Rows];
+    if constexpr (MX) {
 #pragma unroll
-    for (int r = 0; r < kBf16Rows; ++r) {
-        const int i = min(first_row + r, b.inter - 1);
-        rows[r]             = base + static_cast<std::int64_t>(i) * b.hidden;
-        rows[kBf16Rows + r] = base + static_cast<std::int64_t>(b.inter + i) * b.hidden;
+        for (int r = 0; r < kBf16Rows; ++r) {
+            const std::int64_t gate = static_cast<std::int64_t>(e) * 2 * b.inter + min(first_row + r, b.inter - 1), up = gate + b.inter;
+            mx_rows[r]               = b.mx_gate_up + gate * b.hidden;
+            mx_rows[kBf16Rows + r]   = b.mx_gate_up + up * b.hidden;
+            mx_scales[r]             = b.mx_gate_up_scales + gate * (b.hidden / 32);
+            mx_scales[kBf16Rows + r] = b.mx_gate_up_scales + up * (b.hidden / 32);
+        }
+    } else {
+        const __nv_bfloat16* base = b.gate_up + static_cast<std::int64_t>(e) * 2 * b.inter * b.hidden;
+#pragma unroll
+        for (int r = 0; r < kBf16Rows; ++r) {
+            const int i = min(first_row + r, b.inter - 1);
+            rows[r]             = base + static_cast<std::int64_t>(i) * b.hidden;
+            rows[kBf16Rows + r] = base + static_cast<std::int64_t>(b.inter + i) * b.hidden;
+        }
     }
     for (int tile = 0; tile < n; tile += kCols) {
         __syncthreads();
@@ -1005,7 +1119,11 @@ gate_up_narrow_bf16_kernel(BankArgs b, const float* __restrict__ z, std::int64_t
         const auto run = [&](auto cols) {
             constexpr int NT = decltype(cols)::value;
             float gu[2 * kBf16Rows][NT];
-            bf16_row_dot<2 * kBf16Rows, NT>(rows, b.hidden, x, b.hidden, gu);
+            if constexpr (MX) {
+                mx_row_dot<2 * kBf16Rows, NT>(mx_rows, mx_scales, b.hidden, x, b.hidden, gu);
+            } else {
+                bf16_row_dot<2 * kBf16Rows, NT>(rows, b.hidden, x, b.hidden, gu);
+            }
 #pragma unroll
             for (int r = 0; r < kBf16Rows; ++r) {
 #pragma unroll
@@ -1025,9 +1143,10 @@ gate_up_narrow_bf16_kernel(BankArgs b, const float* __restrict__ z, std::int64_t
 
 // grid (ceil(H / (kWarps * 2 * kBf16Rows)), min(entries, E)): warp w of block (g, s) takes the hidden rows
 // (g * kWarps + w) * 2 * kBf16Rows + (0 ..) of slot s's expert over its entries.
-template <int kCols>
+template <int kCols, class Args = BankArgs>
 __global__ void __launch_bounds__(kThreads)
-down_narrow_bf16_kernel(BankArgs b, const std::int32_t* __restrict__ ids, int entries, const float* __restrict__ act, float* __restrict__ y) {
+down_narrow_bf16_kernel(Args b, const std::int32_t* __restrict__ ids, int entries, const float* __restrict__ act, float* __restrict__ y) {
+    constexpr bool MX = std::is_same_v<Args, MxBankArgs>;
     extern __shared__ float2 shared[];
     __shared__ int first[kMaxExperts], scratch[kWarps + 1];
     float* x  = reinterpret_cast<float*>(shared);
@@ -1038,8 +1157,19 @@ down_narrow_bf16_kernel(BankArgs b, const std::int32_t* __restrict__ ids, int en
     constexpr int kRows = 2 * kBf16Rows;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, first_row = (blockIdx.x * kWarps + warp) * kRows;
     const __nv_bfloat16* rows[kRows];
+    [[maybe_unused]] const std::uint8_t* mx_rows[kRows];
+    [[maybe_unused]] const std::uint8_t* mx_scales[kRows];
+    if constexpr (MX) {
 #pragma unroll
-    for (int r = 0; r < kRows; ++r) { rows[r] = b.down + (static_cast<std::int64_t>(e) * b.hidden + min(first_row + r, b.hidden - 1)) * b.inter; }
+        for (int r = 0; r < kRows; ++r) {
+            const std::int64_t row = static_cast<std::int64_t>(e) * b.hidden + min(first_row + r, b.hidden - 1);
+            mx_rows[r]   = b.mx_down + row * b.inter;
+            mx_scales[r] = b.mx_down_scales + row * (b.inter / 32);
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) { rows[r] = b.down + (static_cast<std::int64_t>(e) * b.hidden + min(first_row + r, b.hidden - 1)) * b.inter; }
+    }
     for (int tile = 0; tile < n; tile += kCols) {
         __syncthreads();
         const int nt = min(kCols, n - tile);
@@ -1052,7 +1182,11 @@ down_narrow_bf16_kernel(BankArgs b, const std::int32_t* __restrict__ ids, int en
         const auto run = [&](auto cols) {
             constexpr int NT = decltype(cols)::value;
             float v[kRows][NT];
-            bf16_row_dot<kRows, NT>(rows, b.inter, x, b.inter, v);
+            if constexpr (MX) {
+                mx_row_dot<kRows, NT>(mx_rows, mx_scales, b.inter, x, b.inter, v);
+            } else {
+                bf16_row_dot<kRows, NT>(rows, b.inter, x, b.inter, v);
+            }
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
 #pragma unroll
@@ -1092,6 +1226,7 @@ struct NarrowLaunch {
     dim3 gate_grid, down_grid;
     std::size_t gate_shared, down_shared;
     cudaStream_t stream;
+    const MxBankArgs* mx = nullptr; // an MXFP8 bank's arrays, or null
 };
 
 // The dynamic shared memory an expert-major kernel may take, beside its static grouping arrays.
@@ -1108,7 +1243,9 @@ bool configure_narrow() {
     for (const void* k : {reinterpret_cast<const void*>(gate_up_narrow_kernel<1, Q, C>), reinterpret_cast<const void*>(gate_up_narrow_kernel<2, Q, C>),
                           reinterpret_cast<const void*>(gate_up_narrow_kernel<4, Q, C>), reinterpret_cast<const void*>(down_narrow_kernel<1, Q, C>),
                           reinterpret_cast<const void*>(down_narrow_kernel<2, Q, C>), reinterpret_cast<const void*>(down_narrow_kernel<4, Q, C>),
-                          reinterpret_cast<const void*>(gate_up_narrow_bf16_kernel<C>), reinterpret_cast<const void*>(down_narrow_bf16_kernel<C>)}) {
+                          reinterpret_cast<const void*>(gate_up_narrow_bf16_kernel<C>), reinterpret_cast<const void*>(down_narrow_bf16_kernel<C>),
+                          reinterpret_cast<const void*>(gate_up_narrow_bf16_kernel<C, MxBankArgs>),
+                          reinterpret_cast<const void*>(down_narrow_bf16_kernel<C, MxBankArgs>)}) {
         ok = ok && cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kNarrowShared)) == cudaSuccess;
     }
     return ok;
@@ -1120,6 +1257,14 @@ void launch_narrow(const NarrowLaunch& l, int gate_p, int down_p) {
     static const bool configured = configure_narrow<C>();
     require(configured, "moe_situ_experts", "the expert-major kernels' shared memory could not be configured");
     const BankArgs& b = l.b;
+    if (l.mx != nullptr) {
+        gate_up_narrow_bf16_kernel<C, MxBankArgs><<<l.gate_grid, kThreads, l.gate_shared, l.stream>>>(*l.mx, l.z, l.zs, l.ids, l.entries, l.top_k,
+                                                                                                    l.gate_cap, l.up_cap, l.act);
+        check_launch("moe_situ_experts");
+        down_narrow_bf16_kernel<C, MxBankArgs><<<l.down_grid, kThreads, l.down_shared, l.stream>>>(*l.mx, l.ids, l.entries, l.act, l.y);
+        check_launch("moe_situ_experts");
+        return;
+    }
     if (!b.nvfp4) {
         gate_up_narrow_bf16_kernel<C><<<l.gate_grid, kThreads, l.gate_shared, l.stream>>>(b, l.z, l.zs, l.ids, l.entries, l.top_k, l.gate_cap, l.up_cap, l.act);
         check_launch("moe_situ_experts");
@@ -1167,6 +1312,12 @@ BankArgs bank_args(const SituExpertBank& bank) {
         b.down_offset = align256(b.up_offset + gate_bytes);
         b.stride = align256(b.down_offset + b.down_row_bytes * bank.hidden);
         require(bank.record_stride == b.stride, op, "record stride differs from the NVFP4 record geometry");
+    } else if (bank.format == QType::BF16 && bank.mxfp8()) {
+        require(bank.mx_gate_up_scales != nullptr && bank.mx_down != nullptr && bank.mx_down_scales != nullptr, op, "an MXFP8 array is null");
+        require(bank.gate_up_scale == nullptr && bank.down_scale == nullptr, op, "BF16 banks carry no multipliers");
+        require(bank.hidden % 32 == 0 && bank.intermediate % 32 == 0, op, "MXFP8 banks need H and I multiples of 32");
+        require(reinterpret_cast<std::uintptr_t>(bank.mx_gate_up) % 8 == 0 && reinterpret_cast<std::uintptr_t>(bank.mx_down) % 8 == 0, op,
+                "MXFP8 code arrays must be 8-byte aligned");
     } else {
         require(bank.format == QType::BF16 && bank.gate_up != nullptr && bank.down != nullptr, op,
                 "the bank must be GGML_REC_NVFP4_NVFP4 records or two BF16 banks");
@@ -1178,6 +1329,17 @@ BankArgs bank_args(const SituExpertBank& bank) {
         b.down = static_cast<const __nv_bfloat16*>(bank.down);
     }
     return b;
+}
+
+// An MXFP8 bank's arguments (bank_args has checked it).
+MxBankArgs mx_bank_args(const SituExpertBank& bank, const BankArgs& b) {
+    MxBankArgs m{};
+    static_cast<BankArgs&>(m) = b;
+    m.mx_gate_up        = bank.mx_gate_up;
+    m.mx_gate_up_scales = bank.mx_gate_up_scales;
+    m.mx_down           = bank.mx_down;
+    m.mx_down_scales    = bank.mx_down_scales;
+    return m;
 }
 
 std::size_t workspace_for(const SituExpertBank& bank, std::int64_t entries) {
@@ -1302,9 +1464,10 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
         const int slots = std::min(entries, bank.experts);
         const int gate_rows = b.nvfp4 ? kWarps * kNarrowPlanes * kGateRows : kWarps * kBf16Rows;
         const int down_rows = b.nvfp4 ? kWarps * kNarrowPlanes * kDownRows : 2 * kWarps * kBf16Rows;
+        const MxBankArgs mx = bank.mxfp8() ? mx_bank_args(bank, b) : MxBankArgs{};
         const NarrowLaunch l{b, zp, zs, id, entries, top_k, gate_cap, up_cap, act, y,
                              dim3((bank.intermediate + gate_rows - 1) / gate_rows, slots), dim3((bank.hidden + down_rows - 1) / down_rows, slots),
-                             narrow_gate_shared, narrow_down_shared, stream};
+                             narrow_gate_shared, narrow_down_shared, stream, bank.mxfp8() ? &mx : nullptr};
         switch (columns) {
         case 2: launch_narrow<2>(l, gate_p, down_p); break;
         case 3: launch_narrow<3>(l, gate_p, down_p); break;
@@ -1339,6 +1502,12 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
         default: by_down(I4{}); break;
         }
         check_launch(op);
+    } else if (bank.mxfp8()) {
+        const MxBankArgs mx = mx_bank_args(bank, b);
+        gate_up_mx_kernel<<<gate_grid, kThreads, static_cast<std::size_t>(bank.hidden) * 4, stream>>>(mx, zp, zs, id, top_k, gate_cap, up_cap, act);
+        check_launch(op);
+        down_mx_kernel<<<down_grid, kThreads, static_cast<std::size_t>(bank.intermediate) * 4, stream>>>(mx, id, act, y);
+        check_launch(op);
     } else {
         switch (gate_p) {
         case 1: gate_up_kernel<1><<<gate_grid, kThreads, staged(bank.hidden), stream>>>(b, zp, zs, id, top_k, gate_cap, up_cap, act); break;
@@ -1370,6 +1539,70 @@ __global__ void tile_matrix_kernel(const std::uint32_t* __restrict__ src, std::u
     std::uint32_t* to         = dst + nvfp4_tiled_block(r, b, blocks, group_rows, run_rows) * kBlockWords;
 #pragma unroll
     for (int w = 0; w < kBlockWords; ++w) { to[w] = from[w]; }
+}
+
+// E4M3FN of x (|x| at most 448), rounded to nearest even; larger magnitudes give 448 (counted inexact by the caller).
+__device__ unsigned e4m3_encode(float x) {
+    const unsigned sign = signbit(x) ? 0x80U : 0U;
+    const float a = fabsf(x);
+    if (a == 0.0F) { return sign; }
+    int e = 0;
+    (void)frexpf(a, &e);
+    --e; // a = m 2^e, m in [1, 2)
+    if (e < -6) { // subnormal: multiples of 2^-9
+        const unsigned q = static_cast<unsigned>(rintf(ldexpf(a, 9)));
+        return sign | (q >= 8U ? 0x08U : q);
+    }
+    unsigned mantissa = static_cast<unsigned>(rintf((ldexpf(a, -e) - 1.0F) * 8.0F));
+    if (mantissa == 8U) { mantissa = 0U, ++e; }
+    if (e > 8 || (e == 8 && mantissa > 6U)) { return sign | 0x7EU; }
+    return sign | (static_cast<unsigned>(e + 7) << 3) | mantissa;
+}
+
+// One thread per block of 32 values: the block's scale, its codes, and the values whose code does not decode exactly.
+__global__ void mxfp8_encode_kernel(const __nv_bfloat16* __restrict__ rows, std::int64_t blocks, std::uint8_t* __restrict__ codes,
+                                    std::uint8_t* __restrict__ scales, unsigned long long* __restrict__ inexact) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= blocks) { return; }
+    float v[32];
+    float most = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        v[j] = __bfloat162float(rows[i * 32 + j]);
+        most = fmaxf(most, fabsf(v[j]));
+    }
+    int k = 0;
+    if (most > 0.0F) {
+        int e = 0;
+        (void)frexpf(most, &e);
+        k = e - 1 - 8;
+        if (ldexpf(most, -k) > 448.0F) { ++k; }
+    }
+    unsigned bad = 0;
+    if (k + 127 < 0 || k + 127 > 246) { // E8M0's range, less the 2^8 the decode folds into the scale
+        bad = 32, k = 0;
+    }
+    const unsigned scale = static_cast<unsigned>(k + 127);
+    const float f = mx_scale(scale);
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const unsigned code = e4m3_encode(ldexpf(v[j], -k));
+        codes[i * 32 + j] = static_cast<std::uint8_t>(code);
+        bad += mx_code(code) * f != v[j] ? 1U : 0U;
+    }
+    scales[i] = static_cast<std::uint8_t>(scale);
+    if (bad != 0U && inexact != nullptr) { atomicAdd(inexact, static_cast<unsigned long long>(bad)); }
+}
+
+void mxfp8_encode_bf16_rows(const void* rows, std::int64_t count, int n, std::uint8_t* codes, std::uint8_t* scales, unsigned long long* inexact,
+                            cudaStream_t stream) {
+    const char* op = "mxfp8_encode_bf16_rows";
+    require(rows != nullptr && codes != nullptr && scales != nullptr, op, "null array");
+    require(count > 0 && n > 0 && n % 32 == 0, op, "rows of a positive multiple of 32 values");
+    const std::int64_t blocks = count * (n / 32);
+    mxfp8_encode_kernel<<<static_cast<unsigned>((blocks + 255) / 256), 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(rows), blocks, codes,
+                                                                                       scales, inexact);
+    check_launch(op);
 }
 
 void nvfp4_tile_records(SituExpertBank& bank, std::uint8_t* records, void* scratch, cudaStream_t stream) {

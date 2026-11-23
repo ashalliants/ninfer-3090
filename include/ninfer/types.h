@@ -37,6 +37,13 @@ inline constexpr std::size_t kDefaultHostCacheReserveBytes = 3ULL << 30;
 // docs/maintainer/inkling2-model.md, "Dense 8-bit re-encoding", for the measured KLD and speed.
 enum class DenseQ8 : std::uint8_t { Off, Head, All };
 
+// Inkling-2's layers 20-23 experts (--mxfp8-experts): the artifact stores them as BF16, which are the MXFP8 values
+// of the checkpoint. On re-encodes them at load to MXFP8 (8.25 bits a weight instead of 16), exactly: every result
+// is the same bits. Auto does so when the BF16 weights would leave less than 4 GiB of the device free (a 24 GB card),
+// and keeps BF16 otherwise (the Tesla V100 32 GB). Off always keeps BF16. See docs/maintainer/inkling2-model.md,
+// "MXFP8 experts".
+enum class ExpertsMxfp8 : std::uint8_t { Auto, Off, On };
+
 // Inkling-2's KV rings (--kv-dtype fp16|fp32): Default is FP16; FP32 reproduces the exact FP32 program.
 enum class KvRings : std::uint8_t { Default, FP16, FP32 };
 // Inkling-2's prefill arithmetic (--prefill-math tc|fp32): Default is TensorCores, or FP32 with KvRings::FP32 (so
@@ -183,6 +190,7 @@ enum class StartupPhase : std::uint8_t {
     HostContextPin,
     CudaGraphPrepare,
     EngineFinalize,
+    WeightsReencode, // weights read from the artifact and re-encoded at load (Inkling-2's MXFP8 experts)
 };
 
 enum class StartupStatus : std::uint8_t {
@@ -890,6 +898,8 @@ struct EngineOptions {
     bool embedding_q6                      = false;
     // Inkling-2 only (other models refuse anything but Off): DenseQ8 above.
     DenseQ8 dense_q8                       = DenseQ8::Off;
+    // Inkling-2 only (other models refuse anything but Auto): ExpertsMxfp8 above.
+    ExpertsMxfp8 experts_mxfp8             = ExpertsMxfp8::Auto;
     // Inkling-2 only (other models refuse false): decode and verification forwards split each attention column's
     // keys into blocks of 256 (FP32, the softmax sums in another order). false (--no-split-attention): one block per
     // column and head, the earlier builds' bits.
