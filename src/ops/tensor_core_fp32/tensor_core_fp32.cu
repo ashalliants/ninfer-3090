@@ -1,6 +1,7 @@
 // Written for NInfer-3090. The contract is include/ninfer/ops/tensor_core_fp32.h.
 
 #include "ninfer/ops/tensor_core_fp32.h"
+#include "ops/tensor_core_fp32/blas_fp32.h"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -32,19 +33,22 @@ void check_blas(cublasStatus_t status, const char* what) {
     if (status != CUBLAS_STATUS_SUCCESS) { throw std::runtime_error(std::string("tensor_core_fp32: ") + what + " failed: " + std::to_string(int(status))); }
 }
 
-// One handle per device, made on first use.
-cublasHandle_t handle() {
+// One handle per device and math mode, made on first use. The FP16 GEMMs take CUBLAS_TENSOR_OP_MATH; the FP32 ones
+// (detail::blas_sgemm_tn) must not: under it cuBLAS runs single-precision GEMMs as CUBLAS_COMPUTE_32F_FAST_16F, its
+// inputs rounded to FP16 on the tensor cores, whatever compute type the call names.
+cublasHandle_t handle(bool fp32 = false) {
     constexpr int kMaxDevices = 16;
-    static cublasHandle_t handles[kMaxDevices] = {};
+    static cublasHandle_t handles[2][kMaxDevices] = {};
     static std::mutex mutex;
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= kMaxDevices) { throw std::runtime_error("tensor_core_fp32: no device"); }
     std::lock_guard<std::mutex> lock(mutex);
-    if (handles[device] == nullptr) {
-        check_blas(cublasCreate(&handles[device]), "cublasCreate");
-        check_blas(cublasSetMathMode(handles[device], CUBLAS_TENSOR_OP_MATH), "cublasSetMathMode");
+    cublasHandle_t& h = handles[fp32 ? 1 : 0][device];
+    if (h == nullptr) {
+        check_blas(cublasCreate(&h), "cublasCreate");
+        check_blas(cublasSetMathMode(h, fp32 ? CUBLAS_DEFAULT_MATH : CUBLAS_TENSOR_OP_MATH), "cublasSetMathMode");
     }
-    return handles[device];
+    return h;
 }
 
 __device__ float block_max(float v, float* red) {
@@ -404,6 +408,70 @@ __global__ void __launch_bounds__(kEThreads) expert_gemm_kernel(ExpertGemmArgs a
     }
 }
 
+// ---- The cuBLAS route of a hot NVFP4 expert (moe_situ_experts_tc's blas_min_entries).
+
+// One thread per (row, 64-value block) of an NVFP4 matrix [rows, blocks * 64] (tiled with group_rows > 0): its values
+// into FP16 row-major [rows, blocks * 64], unscaled (each NVFP4 value is exact in FP16).
+__global__ void __launch_bounds__(kThreads)
+nvfp4_decode_f16(const std::uint8_t* __restrict__ matrix, int rows, int blocks, int group_rows, int run_rows, __half* __restrict__ dst) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * kThreads + threadIdx.x;
+    if (i >= static_cast<std::int64_t>(rows) * blocks) { return; }
+    const int r = static_cast<int>(i / blocks), b = static_cast<int>(i % blocks);
+    const std::uint64_t index = group_rows > 0 ? nvfp4_tiled_block(r, b, blocks, group_rows, run_rows) : static_cast<std::uint64_t>(r) * blocks + b;
+    const std::uint8_t* blk = matrix + index * kNvfp4Bytes;
+    const unsigned scales = *reinterpret_cast<const unsigned*>(blk);
+    uint4* out = reinterpret_cast<uint4*>(dst + static_cast<std::int64_t>(r) * blocks * kNvfp4Values + static_cast<std::int64_t>(b) * kNvfp4Values);
+#pragma unroll
+    for (int sub = 0; sub < 4; ++sub) { // 16 values: code bytes 8 sub + j, j < 8 the low nibbles, then the high ones
+        const float sc = ue4m3_half((scales >> (8 * sub)) & 0xFF);
+        const unsigned* q = reinterpret_cast<const unsigned*>(blk + 4 + 8 * sub); // 4-byte aligned (36-byte blocks)
+        const unsigned q0 = q[0], q1 = q[1];
+        unsigned lo[4], hi[4];
+#pragma unroll
+        for (int j = 0; j < 8; j += 2) {
+            const unsigned word = j < 4 ? q0 : q1;
+            const unsigned b0 = (word >> (8 * (j % 4))) & 0xFF, b1 = (word >> (8 * (j % 4 + 1))) & 0xFF;
+            lo[j / 2] = nvfp4_pair(b0, b1, sc);
+            hi[j / 2] = nvfp4_pair(b0 >> 4, b1 >> 4, sc);
+        }
+        out[2 * sub]     = make_uint4(lo[0], lo[1], lo[2], lo[3]);
+        out[2 * sub + 1] = make_uint4(hi[0], hi[1], hi[2], hi[3]);
+    }
+}
+
+// Grid (n): xg[:, j] = x16 row order[at + j] / top_k (the entry's column's FP16 input, H values).
+__global__ void __launch_bounds__(kThreads)
+gather_cols_f16(const __half* __restrict__ x16, int hidden, const int* __restrict__ order, int top_k, __half* __restrict__ xg) {
+    const int j = blockIdx.x;
+    const uint4* src = reinterpret_cast<const uint4*>(x16 + static_cast<std::int64_t>(order[j] / top_k) * hidden);
+    uint4* dst       = reinterpret_cast<uint4*>(xg + static_cast<std::int64_t>(j) * hidden);
+    for (int i = threadIdx.x; i < hidden / 8; i += kThreads) { dst[i] = src[i]; }
+}
+
+// Grid (n): act[:, at + j] = FP16(situ(g s, u s) act_scale), s = se x_inverse[order[at + j] / top_k] (expert_gemm_kernel's
+// gate/up epilogue), from the gate/up results c [2I, n].
+__global__ void __launch_bounds__(kThreads)
+situ_act_f16(const float* __restrict__ c, int inter, const int* __restrict__ order, int top_k, const float* __restrict__ x_inverse, const float* scale_e,
+             int expert, float gate_cap, float up_cap, float act_scale, __half* __restrict__ act) {
+    const int j = blockIdx.x;
+    const float s = (scale_e != nullptr ? scale_e[expert] : 1.0F) * x_inverse[order[j] / top_k];
+    const float* cj = c + static_cast<std::int64_t>(j) * 2 * inter;
+    __half* aj      = act + static_cast<std::int64_t>(j) * inter;
+    for (int r = threadIdx.x; r < inter; r += kThreads) {
+        const float g = cj[r] * s, u = cj[inter + r] * s;
+        aj[r] = __float2half_rn(situ(g, u, gate_cap, up_cap) * act_scale);
+    }
+}
+
+// Grid (n): y[:, order[j]] = c[:, j] act_inverse se (expert_gemm_kernel's down epilogue).
+__global__ void __launch_bounds__(kThreads)
+scatter_down(const float* __restrict__ c, int hidden, const int* __restrict__ order, float act_inverse, const float* scale_e, int expert, float* __restrict__ y) {
+    const int j = blockIdx.x;
+    const float se = scale_e != nullptr ? scale_e[expert] : 1.0F;
+    float* yj = y + static_cast<std::int64_t>(order[j]) * hidden;
+    for (int r = threadIdx.x; r < hidden; r += kThreads) { yj[r] = c[static_cast<std::int64_t>(j) * hidden + r] * act_inverse * se; }
+}
+
 struct BankGeometry {
     bool nvfp4;
     std::uint64_t gate_row_bytes, down_row_bytes, up_offset, down_offset, stride;
@@ -478,6 +546,25 @@ void projection_tc_fp32(std::span<const Tensor* const> inputs, std::span<const T
     }
 }
 
+namespace detail {
+
+std::size_t blas_sgemm_workspace_bytes() { return kCublasWorkspaceBytes + 256; }
+
+void blas_sgemm_tn(int m, int n, int k, const float* a, int lda, const float* b, int ldb, float beta, float* c, int ldc,
+                   DeviceArena& workspace, cudaStream_t stream) {
+    const auto scope = workspace.scope();
+    void* blas_ws    = workspace.alloc_bytes(kCublasWorkspaceBytes).data;
+    cublasHandle_t h = handle(true);
+    check_blas(cublasSetStream(h, stream), "cublasSetStream");
+    check_blas(cublasSetWorkspace(h, blas_ws, kCublasWorkspaceBytes), "cublasSetWorkspace");
+    const float one = 1.0F;
+    check_blas(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, &one, a, CUDA_R_32F, lda, b, CUDA_R_32F, ldb, &beta, c, CUDA_R_32F, ldc,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+               "cublasGemmEx (FP32)");
+}
+
+} // namespace detail
+
 std::uint64_t bf16_fp16_inexact(const Tensor& w, cudaStream_t stream) {
     const char* op = "bf16_fp16_inexact";
     require(w.dtype == DType::BF16 && w.is_contiguous(), op, "w must be contiguous BF16 [K, N]");
@@ -493,7 +580,8 @@ std::uint64_t bf16_fp16_inexact(const Tensor& w, cudaStream_t stream) {
     return host;
 }
 
-std::size_t moe_situ_experts_tc_workspace_bytes(const SituExpertBank& bank, std::int64_t entries, std::int64_t columns, bool combined) {
+std::size_t moe_situ_experts_tc_workspace_bytes(const SituExpertBank& bank, std::int64_t entries, std::int64_t columns, bool combined,
+                                                 int blas_min_entries) {
     const std::size_t h = static_cast<std::size_t>(bank.hidden), i = static_cast<std::size_t>(bank.intermediate), n = static_cast<std::size_t>(entries);
     // The columns, which bound one expert's entries (a column's ids are distinct): unknown, at most the entries.
     const std::size_t m = columns > 0 && columns < entries ? static_cast<std::size_t>(columns) : n;
@@ -506,11 +594,18 @@ std::size_t moe_situ_experts_tc_workspace_bytes(const SituExpertBank& bank, std:
                                                                aligned(2 * i * m * 4) + aligned(i * m * 4) + aligned(i * m * 2) + aligned(m * 4) +
                                                                aligned(h * m * 4) + kCublasWorkspaceBytes
                                                          : aligned(i * n * 2);
-    return common + route + 20 * 256;
+    // A hot NVFP4 expert's decoded gate/up and down rows, and one batch's gathered inputs, gate/up results, activation
+    // and down results.
+    const std::size_t batch = std::min<std::size_t>(m, kExpertsBlasBatch);
+    const std::size_t hot   = bank.format == QType::GGML_REC_NVFP4_NVFP4 && blas_min_entries > 0
+                                  ? aligned(2 * i * h * 2) + aligned(h * i * 2) + aligned(h * batch * 2) + aligned(2 * i * batch * 4) +
+                                        aligned(i * batch * 2) + aligned(h * batch * 4) + kCublasWorkspaceBytes
+                                  : 0;
+    return common + route + hot + 26 * 256;
 }
 
 void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor* weights, float gate_cap, float up_cap,
-                         DeviceArena& workspace, Tensor& out, cudaStream_t stream) {
+                         DeviceArena& workspace, Tensor& out, cudaStream_t stream, int blas_min_entries) {
     const char* op = "moe_situ_experts_tc";
     const int hidden = bank.hidden, inter = bank.intermediate;
     const std::int32_t cols = z.ne[1], top_k = ids.ne[0];
@@ -544,8 +639,11 @@ void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tens
         std::vector<int> next(offsets.begin(), offsets.end() - 1);
         for (std::int64_t i = 0; i < n; ++i) { order[static_cast<std::size_t>(next[host_ids[i]]++)] = static_cast<int>(i); }
     }
+    // An NVFP4 expert with at least blas_min_entries entries takes cuBLAS (hot); the kernels' tiles cover the others.
+    const auto hot = [&](int e) { return g.nvfp4 && blas_min_entries > 0 && counts[static_cast<std::size_t>(e)] >= blas_min_entries; };
     std::vector<ExpertTile> tiles;
     for (int e = 0; e < bank.experts; ++e) {
+        if (hot(e)) { continue; }
         for (int at = offsets[e]; at < offsets[e + 1]; at += kEN) { tiles.push_back({e, at, std::min(kEN, offsets[e + 1] - at)}); }
     }
 
@@ -589,6 +687,57 @@ void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tens
             a.x = act, a.x_inverse = nullptr, a.x_top_k = 0, a.x_scale_inverse = act_inverse, a.scale_e = bank.down_scale;
             expert_gemm_kernel<false><<<dim3(hidden / kEM, static_cast<unsigned>(tiles.size())), kEThreads, 0, stream>>>(a);
             check_launch(op);
+        }
+        // The hot experts: decoded whole, then cuBLAS in batches of up to kExpertsBlasBatch entries, scaled as above.
+        if (blas_min_entries > 0) {
+            __half* w_gu = nullptr;
+            __half* w_d  = nullptr;
+            __half* xg   = nullptr;
+            __half* a16  = nullptr;
+            float* c1    = nullptr;
+            float* c2    = nullptr;
+            const int batch = std::min(kExpertsBlasBatch, static_cast<int>(std::min<std::int64_t>(n, cols)));
+            for (int e = 0; e < bank.experts; ++e) {
+                if (!hot(e)) { continue; }
+                if (w_gu == nullptr) { // the first hot expert: the operands, once for the call
+                    w_gu = static_cast<__half*>(take(static_cast<std::size_t>(2) * inter * hidden * 2));
+                    w_d  = static_cast<__half*>(take(static_cast<std::size_t>(hidden) * inter * 2));
+                    xg   = static_cast<__half*>(take(static_cast<std::size_t>(hidden) * batch * 2));
+                    c1   = static_cast<float*>(take(static_cast<std::size_t>(2) * inter * batch * 4));
+                    a16  = static_cast<__half*>(take(static_cast<std::size_t>(inter) * batch * 2));
+                    c2   = static_cast<float*>(take(static_cast<std::size_t>(hidden) * batch * 4));
+                    void* blas_ws = take(kCublasWorkspaceBytes);
+                    cublasHandle_t hb = handle();
+                    check_blas(cublasSetStream(hb, stream), "cublasSetStream");
+                    check_blas(cublasSetWorkspace(hb, blas_ws, kCublasWorkspaceBytes), "cublasSetWorkspace");
+                }
+                const std::uint8_t* rec = bank.records + static_cast<std::uint64_t>(e) * g.stride;
+                const int hb_blocks = hidden / kNvfp4Values, ib_blocks = inter / kNvfp4Values;
+                const auto decode = [&](const std::uint8_t* matrix, int rows, int blocks, int group_rows, __half* dst) {
+                    const std::int64_t threads = static_cast<std::int64_t>(rows) * blocks;
+                    nvfp4_decode_f16<<<static_cast<unsigned>((threads + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+                        matrix, rows, blocks, bank.tiled ? group_rows : 0, nvfp4_rows_per_run(blocks), dst);
+                };
+                decode(rec, inter, hb_blocks, kNvfp4GateGroupRows, w_gu);
+                decode(rec + g.up_offset, inter, hb_blocks, kNvfp4GateGroupRows, w_gu + static_cast<std::size_t>(inter) * hidden);
+                decode(rec + g.down_offset, hidden, ib_blocks, kNvfp4DownGroupRows, w_d);
+                check_launch(op);
+                cublasHandle_t hb = handle();
+                const float one = 1.0F, zero = 0.0F;
+                for (int at = offsets[e]; at < offsets[e + 1]; at += batch) {
+                    const int ne = std::min(batch, offsets[e + 1] - at);
+                    gather_cols_f16<<<ne, kThreads, 0, stream>>>(x16, hidden, d_order + at, top_k, xg);
+                    check_blas(cublasGemmEx(hb, CUBLAS_OP_T, CUBLAS_OP_N, 2 * inter, ne, hidden, &one, w_gu, CUDA_R_16F, hidden, xg, CUDA_R_16F, hidden, &zero,
+                                            c1, CUDA_R_32F, 2 * inter, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                               "cublasGemmEx gate_up (NVFP4)");
+                    situ_act_f16<<<ne, kThreads, 0, stream>>>(c1, inter, d_order + at, top_k, x_inv, bank.gate_up_scale, e, gate_cap, up_cap, act_scale, a16);
+                    check_blas(cublasGemmEx(hb, CUBLAS_OP_T, CUBLAS_OP_N, hidden, ne, inter, &one, w_d, CUDA_R_16F, inter, a16, CUDA_R_16F, inter, &zero, c2,
+                                            CUDA_R_32F, hidden, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                               "cublasGemmEx down (NVFP4)");
+                    scatter_down<<<ne, kThreads, 0, stream>>>(c2, hidden, d_order + at, act_inverse, bank.down_scale, e, y);
+                    check_launch(op);
+                }
+            }
         }
     } else {
         auto* w_gu = static_cast<__half*>(take(static_cast<std::size_t>(2) * inter * hidden * 2));

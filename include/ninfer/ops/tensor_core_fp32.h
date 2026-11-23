@@ -44,17 +44,24 @@ void projection_tc_fp32(std::span<const Tensor* const> inputs, std::span<const T
  *   whole call (situ is at most gate_cap up_cap in magnitude); the down kernel scatters each entry's column.
  *   BF16 banks: each expert's rows in FP16 under a power of two per row, cuBLAS FP32-accumulating GEMMs, the
  *   activation under a power of two per entry.
+ *   NVFP4 banks with blas_min_entries > 0: an expert with at least that many entries in the call is decoded whole
+ *   into FP16 (exact, as above) and multiplied by cuBLAS (FP32 accumulate) in batches of up to
+ *   kExpertsBlasBatch entries, its inputs and activation scaled as the kernels scale them; the other experts take
+ *   the kernels. Only the order of the FP32 sums differs between the two, so which route an expert takes is a
+ *   question of speed (cuBLAS wins once an expert has enough entries to amortise its decode).
  * The combine over the k slots is moe_situ_experts' (in order, one FMA each from 0). gate_cap and up_cap positive.
  * Workspace: moe_situ_experts_tc_workspace_bytes(bank, k * T) from `workspace`, released on return. The FP16 inputs
  *   take one row per column (NVFP4) or per entry of the expert with the most (BF16 banks, whose GEMM results take as
  *   many); given `columns` T (a column's k ids distinct, so no expert has more than T entries) and `combined` false
- *   (weights null: out holds the entries) the bound is tighter.
+ *   (weights null: out holds the entries) the bound is tighter. A call with blas_min_entries > 0 needs the query's
+ *   with the same value (an NVFP4 expert's decoded rows and one batch's operands, about 46 MiB at H 2304, I 1152).
  * Execution: stream-ordered; syncs the stream; not graph capturable.
  */
+inline constexpr int kExpertsBlasBatch = 1024;
 [[nodiscard]] std::size_t moe_situ_experts_tc_workspace_bytes(const SituExpertBank& bank, std::int64_t entries, std::int64_t columns = 0,
-                                                              bool combined = true);
+                                                              bool combined = true, int blas_min_entries = 0);
 void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor* weights, float gate_cap,
-                         float up_cap, DeviceArena& workspace, Tensor& out, cudaStream_t stream);
+                         float up_cap, DeviceArena& workspace, Tensor& out, cudaStream_t stream, int blas_min_entries = 0);
 
 /// The values of NVFP4 rows (records of an expert bank: every gate, up and down row of every expert) that the row
 /// scaling does not carry exactly into FP16 (a diagnostic; syncs).

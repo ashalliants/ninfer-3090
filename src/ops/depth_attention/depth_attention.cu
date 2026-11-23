@@ -1,9 +1,11 @@
 // Written for NInfer-3090. The contract is include/ninfer/ops/depth_attention.h.
 
 #include "ninfer/ops/depth_attention.h"
+#include "ops/tensor_core_fp32/blas_fp32.h"
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -334,6 +336,52 @@ __global__ void __launch_bounds__(kThreads) control_apply_wide_kernel(ControlArg
     }
 }
 
+// ---- loop_controller_blas: the products on cuBLAS, these kernels around them.
+
+// count BF16 values to FP32 (exact).
+__global__ void __launch_bounds__(kThreads) widen_bf16_kernel(const __nv_bfloat16* __restrict__ src, std::int64_t count, float* __restrict__ dst) {
+    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * kThreads + threadIdx.x; i < count; i += static_cast<std::int64_t>(gridDim.x) * kThreads) {
+        dst[i] = __bfloat162float(src[i]);
+    }
+}
+
+// Grid (T): z[:, t] = zc[:, t] / rms(c[:, t]) + zm[:, t] / rms(m[:, t]), in place over zc (R rows, column stride R).
+__global__ void __launch_bounds__(kThreads)
+control_blas_z_kernel(const float* __restrict__ c, std::int64_t cs, const float* __restrict__ m, std::int64_t ms, int hidden, int rank, float eps,
+                      float* __restrict__ zc, const float* __restrict__ zm) {
+    __shared__ float red[2][kThreads / 32];
+    const std::int64_t t = blockIdx.x;
+    const float* ct = c + t * cs;
+    const float* mt = m + t * ms;
+    float sc = 0.0F, sm = 0.0F;
+    for (int d = threadIdx.x; d < hidden; d += kThreads) {
+        sc = fmaf(ct[d], ct[d], sc);
+        sm = fmaf(mt[d], mt[d], sm);
+    }
+    sc = warp_sum(sc);
+    sm = warp_sum(sm);
+    if ((threadIdx.x & 31) == 0) { red[0][threadIdx.x >> 5] = sc, red[1][threadIdx.x >> 5] = sm; }
+    __syncthreads();
+    if (threadIdx.x >= rank) { return; }
+    float tc = 0.0F, tm = 0.0F;
+#pragma unroll
+    for (int w = 0; w < kThreads / 32; ++w) { tc += red[0][w], tm += red[1][w]; }
+    const float inv_h = 1.0F / static_cast<float>(hidden);
+    const std::int64_t at = t * rank + threadIdx.x;
+    zc[at] = zc[at] * rsqrtf(tc * inv_h + eps) + zm[at] * rsqrtf(tm * inv_h + eps);
+}
+
+// Grid (ceil(H / kThreads), n): out[d, t0 + j] = (1 - tanh(F)) c + tanh(G) m, G and F rows d and H + d of gf's column j.
+__global__ void __launch_bounds__(kThreads)
+control_blas_apply_kernel(const float* __restrict__ gf, int hidden, std::int64_t t0, const float* c, std::int64_t cs, const float* m, std::int64_t ms,
+                          float* out, std::int64_t os) {
+    const int d = blockIdx.x * kThreads + threadIdx.x;
+    if (d >= hidden) { return; }
+    const std::int64_t j = blockIdx.y, t = t0 + j;
+    const float g = tanhf(gf[j * 2 * hidden + d]), f = tanhf(gf[j * 2 * hidden + hidden + d]);
+    out[t * os + d] = (1.0F - f) * c[t * cs + d] + g * m[t * ms + d];
+}
+
 } // namespace
 
 std::size_t depth_attention_mix_workspace_bytes(std::int32_t rows, std::int64_t columns, int sources) {
@@ -427,6 +475,71 @@ void loop_controller_fp32(std::span<const LoopControllerJob> jobs, float eps, De
         control_apply_kernel<<<dim3(cols, (h + kApplyRows - 1) / kApplyRows, a.jobs), kThreads, 0, stream>>>(a, zs);
     }
     check_launch();
+}
+
+namespace {
+
+std::size_t padded(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
+
+} // namespace
+
+std::size_t loop_controller_blas_workspace_bytes(int hidden, int rank, int cols) {
+    (void)loop_controller_workspace_bytes(hidden, rank, cols, 1); // validates H, R and T
+    const std::size_t h = static_cast<std::size_t>(hidden), r = static_cast<std::size_t>(rank), t = static_cast<std::size_t>(cols);
+    const std::size_t tile = std::min<std::size_t>(t, kLoopControllerBlasTile);
+    // FP32 down [2H, R] and gain | forget [R, 2H]; zc and zm [R, T]; gf [2H, tile]; cuBLAS's own.
+    return padded(2 * h * r * 4) + padded(2 * h * r * 4) + 2 * padded(r * t * 4) + padded(2 * h * tile * 4) + detail::blas_sgemm_workspace_bytes() +
+           4 * 256;
+}
+
+void loop_controller_blas(std::span<const LoopControllerJob> jobs, float eps, DeviceArena& workspace, cudaStream_t stream) {
+    require(!jobs.empty() && jobs.size() <= static_cast<std::size_t>(kJ), "1 to 3 controller jobs");
+    require(eps > 0.0F, "eps must be positive");
+    require(jobs[0].c != nullptr && jobs[0].down != nullptr, "a controller job is incomplete");
+    const std::int32_t h = jobs[0].c->ne[0], cols = jobs[0].c->ne[1], rank = jobs[0].down->ne[1];
+    (void)loop_controller_blas_workspace_bytes(h, rank, cols); // validates H, R and T
+    const auto scope = workspace.scope();
+    auto* down  = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(2) * h * rank * 4).data);
+    auto* gf_w  = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(2) * h * rank * 4).data);
+    auto* zc    = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(rank) * cols * 4).data);
+    auto* zm    = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(rank) * cols * 4).data);
+    const int tile = std::min(cols, kLoopControllerBlasTile);
+    auto* gf    = static_cast<float*>(workspace.alloc_bytes(static_cast<std::size_t>(2) * h * tile * 4).data);
+    const auto widen = [&](const Tensor* w, std::int32_t k, std::int32_t n, float* dst, const char* name) {
+        require(w != nullptr && w->data != nullptr && w->dtype == DType::BF16 && w->is_contiguous() && w->ne[0] == k && w->ne[1] == n && w->ne[2] == 1 &&
+                    w->ne[3] == 1,
+                (std::string(name) + " must be contiguous BF16").c_str());
+        const std::int64_t count = static_cast<std::int64_t>(k) * n;
+        widen_bf16_kernel<<<static_cast<unsigned>(std::min<std::int64_t>((count + kThreads - 1) / kThreads, 1024)), kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(w->data), count, dst);
+        check_launch();
+    };
+    for (const LoopControllerJob& job : jobs) {
+        require(job.c != nullptr && job.m != nullptr && job.down != nullptr && job.gain != nullptr && job.forget != nullptr && job.out != nullptr,
+                "a controller job is incomplete");
+        require(job.c->ne[0] == h && job.c->ne[1] == cols && job.down->ne[1] == rank, "every job must have the same H, R and T");
+        const std::int64_t cs = column_stride(*job.c, h, cols, "c"), ms = column_stride(*job.m, h, cols, "m"), os = column_stride(*job.out, h, cols, "out");
+        const auto* c = static_cast<const float*>(job.c->data);
+        const auto* m = static_cast<const float*>(job.m->data);
+        auto* out     = static_cast<float*>(job.out->data);
+        // down [2H, R] as FP32: column r of a (2H x R) column-major matrix; gain then forget as one (R x 2H).
+        widen(job.down, 2 * h, rank, down, "down [2H, R]");
+        widen(job.gain, rank, h, gf_w, "gain [R, H]");
+        widen(job.forget, rank, h, gf_w + static_cast<std::size_t>(rank) * h, "forget [R, H]");
+        // zc = down_c^T c, zm = down_m^T m: [R, T].
+        detail::blas_sgemm_tn(rank, cols, h, down, 2 * h, c, static_cast<int>(cs), 0.0F, zc, rank, workspace, stream);
+        detail::blas_sgemm_tn(rank, cols, h, down + h, 2 * h, m, static_cast<int>(ms), 0.0F, zm, rank, workspace, stream);
+        control_blas_z_kernel<<<static_cast<unsigned>(cols), kThreads, 0, stream>>>(c, cs, m, ms, h, rank, eps, zc, zm);
+        check_launch();
+        for (std::int32_t t0 = 0; t0 < cols; t0 += tile) {
+            const std::int32_t n = std::min(tile, cols - t0);
+            // gf[:, j] = [gain; forget] z[:, t0 + j]: [2H, n].
+            detail::blas_sgemm_tn(2 * h, n, rank, gf_w, rank, zc + static_cast<std::size_t>(t0) * rank, rank, 0.0F, gf, 2 * h, workspace, stream);
+            control_blas_apply_kernel<<<dim3((h + kThreads - 1) / kThreads, static_cast<unsigned>(n)), kThreads, 0, stream>>>(gf, h, t0, c, cs, m, ms, out,
+                                                                                                                             os);
+            check_launch();
+        }
+    }
 }
 
 } // namespace ninfer::ops

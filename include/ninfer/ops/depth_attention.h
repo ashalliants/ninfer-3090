@@ -83,4 +83,24 @@ inline constexpr int kLoopControllerMaxRank = 64;
 [[nodiscard]] std::size_t loop_controller_workspace_bytes(int hidden, int rank, int cols, int jobs);
 void loop_controller_fp32(std::span<const LoopControllerJob> jobs, float eps, DeviceArena& workspace, cudaStream_t stream);
 
+/**
+ * Op: loop_controller_blas (loop_controller_fp32's math on cuBLAS FP32 GEMMs; for wide prefill calls)
+ *
+ * Math, shapes and domain: loop_controller_fp32's (the same jobs, any T >= 1).
+ *
+ * Numeric:
+ *   Not bit-exact with loop_controller_fp32: the same FP32 values in, FP32 products and sums (CUBLAS_COMPUTE_32F,
+ *   the BF16 weights widened exactly to FP32), but cuBLAS's order of the sums. down_c . c and down_m . m are
+ *   two GEMMs, scaled per column by 1 / rms of c and of m (each sum of squares in one block's order); gain . z
+ *   and forget . z one GEMM over the two weights stacked. Oracle FP64 as loop_controller_fp32's.
+ *
+ * Effects: as loop_controller_fp32's (out may equal its job's c or m).
+ * Workspace: loop_controller_blas_workspace_bytes(H, R, T): the jobs run one after another, the gain and forget
+ *   products in tiles of kLoopControllerBlasTile columns. Execution: stream-ordered; graph capturable only once
+ *   cuBLAS's handle exists (the prefill never captures).
+ */
+inline constexpr int kLoopControllerBlasTile = 1024;
+[[nodiscard]] std::size_t loop_controller_blas_workspace_bytes(int hidden, int rank, int cols);
+void loop_controller_blas(std::span<const LoopControllerJob> jobs, float eps, DeviceArena& workspace, cudaStream_t stream);
+
 } // namespace ninfer::ops

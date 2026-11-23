@@ -664,13 +664,17 @@ int main() {
         // NINFER_INKLING2_PREFILL_BENCH=<ids>: one prefill of NINFER_INKLING2_PREFILL_CONTEXT (default 2048) tokens in chunks of
         //   NINFER_INKLING2_PREFILL_CHUNK (default 256), tensor cores with NINFER_INKLING2_TC=1, FP16 rings with
         //   NINFER_INKLING2_KV=fp16; one untimed warm-up prefill, then the timed one inside cudaProfilerStart/Stop.
-        // NINFER_INKLING2_TC_PARTS: a comma list of dense, experts, attention (default all) for the two harnesses below.
+        // NINFER_INKLING2_TC_PARTS: a comma list of dense, experts, attention, blas (default the first three) for the two harnesses
+        //   below.
         const auto tc_parts = [] {
             ink::ProgramLimits::TensorCoreParts parts;
             const char* env = std::getenv("NINFER_INKLING2_TC_PARTS");
             const std::string list = env != nullptr ? env : "dense,experts,attention";
             parts.dense = list.find("dense") != std::string::npos, parts.experts = list.find("experts") != std::string::npos;
             parts.attention = list.find("attention") != std::string::npos;
+            parts.blas      = list.find("blas") != std::string::npos; // the controllers and router scores on cuBLAS
+            // NINFER_INKLING2_BLAS_EXPERTS=N (with blas): NVFP4 experts with N or more entries on cuBLAS.
+            if (const char* n = std::getenv("NINFER_INKLING2_BLAS_EXPERTS"); n != nullptr) { parts.blas_experts = std::atoi(n); }
             return parts;
         };
         if (const char* pf_ids = std::getenv("NINFER_INKLING2_PREFILL_BENCH"); pf_ids != nullptr) {
