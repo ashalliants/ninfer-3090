@@ -682,9 +682,18 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                         hi = mid;
                     }
                 }
-                if (lo == 0 || !fits(chunks.back(), lo * step)) {
-                    throw std::runtime_error("inkling2: " + who + "not even " + std::to_string(step) + " positions" +
-                                             (slots_ > 1 ? " per slot" : "") + " fit on the device");
+                // Free device memory moves by tens of MiB between builds (the desktop, the driver), so the context the
+                // search found can miss the spare by a few MiB when built again. On native Windows 133,120 fitted in the
+                // search and then missed on this build in 3 of 8 plain --fit-context starts (2026-11-23), which refused
+                // with "not even 1024 positions". Step down until one fits, never under the floor.
+                const std::uint32_t lowest = std::max<std::uint32_t>(floor_steps, 1);
+                while (lo >= lowest && !fits(chunks.back(), lo * step)) { --lo; }
+                if (lo < lowest) {
+                    throw std::runtime_error(floor_steps > 0
+                                                 ? "inkling2: " + who + "the context floor of " + std::to_string(options_.fit_context_floor) +
+                                                       " positions" + (slots_ > 1 ? " per slot" : "") + " does not fit on the device"
+                                                 : "inkling2: " + who + "not even " + std::to_string(step) + " positions" +
+                                                       (slots_ > 1 ? " per slot" : "") + " fit on the device");
                 }
                 options_.max_context = lo * step;
             }
