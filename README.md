@@ -140,7 +140,8 @@ requests are not guaranteed.
 **You do not need to build anything.** Prebuilt archives for Windows x64 and Linux x64 are on
 [the latest release](https://github.com/ashalliants/ninfer-3090/releases/latest), each with
 `ninfer-serve`, the CLI, the benchmark tool, every launcher and, on Windows, the DLLs. Both
-platforms need an RTX 3090 or 3090 Ti and a recent NVIDIA driver.
+platforms need an RTX 3090 or 3090 Ti and a recent NVIDIA driver. A **Tesla V100 32 GB** has its own
+Linux archive (below).
 
 **Windows 11** — download `ninfer-rtx3090-windows-x64-*.zip`, unzip it, and from that folder:
 
@@ -159,6 +160,17 @@ tar -xzf ninfer-rtx3090-linux-x64-*.tar.gz && cd ninfer-rtx3090-linux-x64-*/
 ./download-model.sh qwen38-27b           # downloads qwen3_8_27b.ninfer (~19 GB, resumable)
 ./run.sh qwen38-27b                      # one user, 262,144 tokens (headless), DFlash2 + draft head, vision
 ```
+
+**Tesla V100 32 GB (Linux)** — download `ninfer-v100-linux-x64-*.tar.gz` (the 3090 archives do not start on a V100),
+unpack it, and use its V100 launcher, which listens on the network, so set `NINFER_API_KEY` first:
+
+```bash
+tar -xzf ninfer-v100-linux-x64-*.tar.gz && cd ninfer-v100-linux-x64-*/
+./download-model.sh qwen38-27b           # ~19 GB, resumable
+NINFER_API_KEY=<a secret> ./run-v100.sh qwen38-27b   # MTP3 with INT8 KV, 262,144 tokens; also qwen38-flash-next
+```
+
+[V100 guide](docs/tesla-v100.md) for Flash-Next, Inkling-2-Mini and the measurements.
 
 Then point your harness at `http://127.0.0.1:8080/v1`. It is an OpenAI-compatible endpoint (the
 Anthropic Messages API is served too), so anything that speaks `/v1/chat/completions` works; leave

@@ -3,6 +3,8 @@
 #
 #   NINFER_BUILD_ROOT=~/ninfer/build-linux scripts/package-release.sh
 #   scripts/build.sh --package         configure + build, then this
+#   NINFER_PACKAGE_TARGET=v100 NINFER_BUILD_ROOT=~/ninfer/build-v100 scripts/package-release.sh
+#                                      the Tesla V100 (sm_70) archive from a scripts/v100_build.sh-style tree
 #
 # There is one packager, not one per release. Everything version-specific is derived from VERSION,
 # whose content is the full release tag (for example 0.10.0-rtx3090): the text before the first `-`
@@ -25,13 +27,23 @@ release_notes="docs/release-notes/RELEASE_NOTES_$release_version.md"
   exit 1
 }
 
+# One packager, two cards: the RTX 3090 archive (sm_86, the default) and the Tesla V100 archive (sm_70).
+# A build holds one architecture, so each card has its own tree and its own archive.
+target="${NINFER_PACKAGE_TARGET:-rtx3090}"
+case "$target" in
+  rtx3090) product_prefix="ninfer-rtx3090-linux-x64"; readme_source="docs/release-archive-linux.md"
+           checksum_suffix="linux"; extra_scripts=() ;;
+  v100)    product_prefix="ninfer-v100-linux-x64"; readme_source="docs/release-archive-v100.md"
+           checksum_suffix="linux-v100"; extra_scripts=(run-v100.sh) ;;
+  *) printf 'NINFER_PACKAGE_TARGET must be rtx3090 or v100, not %s\n' "$target" >&2; exit 1 ;;
+esac
 build_root="${NINFER_BUILD_ROOT:-$repo_root/build-linux}"
 dist_root="$repo_root/dist"
-product_name="ninfer-rtx3090-linux-x64-$release_tag"
+product_name="$product_prefix-$release_tag"
 product_root="$dist_root/$product_name"
 archive_name="$product_name.tar.gz"
 archive_path="$dist_root/$archive_name"
-checksum_path="$dist_root/SHA256SUMS-v$release_version-linux.txt"
+checksum_path="$dist_root/SHA256SUMS-v$release_version-$checksum_suffix.txt"
 
 mkdir -p -- "$dist_root"
 case "$product_root" in "$dist_root/$product_name") ;; *) exit 1 ;; esac
@@ -47,6 +59,17 @@ for product in 'apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve' 'bench/ninf
   source_path="$build_root/${product%%:*}"
   destination="$product_root/${product#*:}"
   [[ -f "$source_path" ]] || { printf 'Missing release product: %s\n' "$source_path" >&2; exit 1; }
+  # A tree built for the other card would package without complaint and then fail on first use, so
+  # when cuobjdump is available the archive's server must hold machine code for this card.
+  if [[ "$product" == 'apps/ninfer-serve:ninfer-serve' ]] && command -v cuobjdump >/dev/null; then
+    case "$target" in rtx3090) want_arch=sm_86 ;; v100) want_arch=sm_70 ;; esac
+    # Captured first: `grep -q` closing the pipe early would fail cuobjdump under pipefail.
+    elf_list="$(cuobjdump --list-elf "$source_path")"
+    grep -q "$want_arch" <<<"$elf_list" || {
+      printf '%s holds no %s code: it was built for another card (target %s)\n' "$source_path" "$want_arch" "$target" >&2
+      exit 1
+    }
+  fi
   cp -- "$source_path" "$destination"
 done
 cp -- "$repo_root/VERSION" "$repo_root/LICENSE" "$repo_root/$release_notes" "$product_root/"
@@ -57,10 +80,11 @@ cp -- "$repo_root/src/runtime/engine/compaction/NOTICE" "$product_root/THIRD_PAR
 # The archive README must describe the archive. docs/rtx-3090-linux.md is a guide to *building* from
 # source and points at ./scripts/download-model.sh; the packager copies that to the archive root, so
 # a user following it from inside the archive got a missing-file error.
-cp -- "$repo_root/docs/release-archive-linux.md" "$product_root/README.md"
+cp -- "$repo_root/$readme_source" "$product_root/README.md"
 # Explicit rather than globbed, so a new script is shipped only once someone has decided it belongs
 # in the archive.
 cp -- "$repo_root"/scripts/{run.sh,download-model.sh} "$product_root/"
+for extra in ${extra_scripts[@]+"${extra_scripts[@]}"}; do cp -- "$repo_root/scripts/$extra" "$product_root/"; done
 # run.sh serves each profile from its --config file, which it looks for in profiles/ beside itself.
 mkdir -- "$product_root/profiles"
 cp -- "$repo_root"/scripts/profiles/*.json "$product_root/profiles/"

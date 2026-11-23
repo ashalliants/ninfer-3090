@@ -9,8 +9,7 @@ the two Qwen models, their measured performance, and the limits; Inkling-2-Mini'
 are in its [model card](../model-cards/Inkling-2-Mini-NInfer-V100/README.md) and its spec.
 How the port works, and every measurement behind it, is in [docs/maintainer/volta-port.md](maintainer/volta-port.md).
 
-There are no prebuilt V100 archives: the release binaries are `sm_86`. You build from source on
-Linux.
+Each release ships a prebuilt V100 archive for Linux, `ninfer-v100-linux-x64-<version>.tar.gz` (the 3090 archives are `sm_86` and do not start on a V100): unpack it, install the CUDA 12.8 runtime libraries and FFmpeg 6 it lists, and use its `run-v100.sh`. Or build from source on Linux, below.
 
 ## At a glance
 
@@ -392,7 +391,7 @@ come over the PCIe link when needed.
 
 ## Limits
 
-- **No prebuilt binaries.** Build with `scripts/v100_build.sh`.
+- **Linux only, prebuilt or from source.** The release archive is `ninfer-v100-linux-x64-<version>.tar.gz`; `scripts/v100_build.sh` builds the same thing from a checkout.
 - **Linux only on the V100.** It was tested on Ubuntu 24.04 with CUDA 12.9 (a 16-thread host).
 - **Not bit-identical with tensor cores on.** With `NINFER_SM70_TENSOR_CORES=1` (the Flash-Next
   default), prefill output is close to the plain server's but not bit for bit. Set it to 0 to get
