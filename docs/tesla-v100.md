@@ -14,15 +14,16 @@ Linux.
 
 ## At a glance
 
-All figures were measured on one V100-PCIE-32GB with a 250 W power limit, connected over an
-OCuLink PCIe Gen3 x4 eGPU link (3.3 GB/s host-to-device), on a Linux host with 59 GiB of RAM.
-Decode is greedy with MTP3 speculation, as `run-v100.sh` serves it (2026-11-16 to 2026-11-18).
+All figures were measured on one V100-PCIE-32GB, connected over an OCuLink PCIe Gen3 x4 eGPU link
+(3.3 GB/s host-to-device), on a Linux host with 59 GiB of RAM, with a 250 W power limit
+(2026-11-16 to 2026-11-18), except Flash-Next's MTP3 decode, re-measured at 200 W on 2026-11-23.
+Decode is greedy with MTP3 speculation, as `run-v100.sh` serves it.
 
 | | Qwen3.8-27B | Qwen3.8-Flash-Next |
 |---|---:|---:|
 | **Context** | 262,144 tokens | **262,144 tokens** (`run-v100.sh` default) |
 | **Decode**, one stream, MTP3 | **76-86 tok/s** | **119 tok/s** on code, 79-97 on other text, with a warm cache (2026-11-23, 200 W) |
-| **Decode**, plain | 42 tok/s | 53 tok/s |
+| **Decode**, plain (250 W) | 42 tok/s | 53 tok/s |
 | **Prefill**, ~4K-token prompt | **~1,020 tok/s** | **~990 tok/s** (3,798 tokens in 3.8 s) |
 | **Prefill**, long prompts | | 38K tokens in 38.4 s (~1,000 tok/s) |
 
