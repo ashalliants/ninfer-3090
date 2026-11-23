@@ -158,8 +158,13 @@ changes, both inside the shared kernel:
   ABBA (`ninfer_causal_softmax_attention_bench`, 2026-11-22): T = 2 (the chunk every MTP verify runs
   as) 13.5-19% faster in INT8 (4K-128K keys; 128K: 2.60 -> 2.10 ms a call) and 14-22% in rk8v4, T = 4
   (two chunks) 14-21% and 14-25%. At T = 1 the staged registers raised the spills of a kernel already
-  at its 128-register cap (4 -> 56 bytes) and it ran 4-10% slower, so T = 1 keeps the old path. The
-  end-to-end decode effect on the 27B is not measured yet.
+  at its 128-register cap (4 -> 56 bytes) and it ran 4-10% slower, so T = 1 keeps the old path. End to
+  end, Qwen3.8-27B, MTP3, INT8 KV, `ninfer-serve` with the `run-v100.sh` flags, 256 greedy tokens on
+  exact-hit repeats of a checkpointed prompt, ABBA at a 200 W power limit (2026-11-23): 46.75 -> 47.88
+  tok/s at 40K context (+2.4%) and 23.46 -> 25.02 at 162K (+6.7%); 4K (57.83 -> 57.92), the 12 short
+  chats (63.6 both) and plain `ninfer_bench` 4K decode (41.5 both) are unchanged, and all 24 responses
+  are md5-identical. The sm_86 SASS of the kernel is identical with and without the change, so the
+  RTX 3090 is unaffected by construction (not measured on a 3090).
 
 What is left in decode, by size: the GEMVs' gap to the read rate (~3.5 ms), the per-kernel
 overhead of ~690 launches per token (~1.2 ms of gaps plus ramp/tail), and the GDN recurrent update
