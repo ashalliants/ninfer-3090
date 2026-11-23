@@ -62,13 +62,13 @@ Decode is one stream unless the column says otherwise.
 | Ternary Bonsai 2 27B | RTX 3090 | **262,144** (with DFlash2, 9.6 GiB free) | 2.8-2.9K tok/s | 88-90 plain; **238** mean over 12 chats, 372 maths (DFlash2, 7 drafts, Windows; 235 and 364 under WSL); 74 after a 245K-token document | **573 tok/s** at C8 (MTP3; 572.5 under WSL) |
 | Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | ~115 tok/s at C2 (MTP; 103-125, Linux) |
 | **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | 76-86 tok/s (MTP3); 47.9 at 40K and 25.0 at 162K context (200 W) | 79 tok/s at C2 (MTP3) |
-| Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K | 72-96 tok/s (MTP3), flat from 10K to 221K context | |
+| Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K | **119 tok/s** (MTP3, code); 79-97 on story, Chinese, French and a thinking prompt (200 W); flat from 10K to 221K context | |
 | **Inkling-2-Mini** (new) | RTX 3090 | **137,216** plain, 89,088 with DSpark and vision; **262,144** with both on `--kv-dtype rk4v4` (lossy, opt-in) | **2,421 tok/s** at 8.4K, 65,536 context with vision (Windows; 2,410 under WSL); 2,416 at 1.2K | **104 tok/s** plain (12 chats, WSL; 101.8 on Windows); 115.5 best with DSpark (code) | **282 tok/s** at C8 (plain, WSL; 277 on Windows) |
 | **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **1,930 tok/s** at 8K, 131,072 context (1,629 at 1K, 1,244 at 100K); 1,868 at 8K at the full 262,144 with DSpark and vision | **120.7 tok/s** (DSpark, maths); 93-94 average over 12 chats, 78.8 plain | **198 tok/s** at C8 (plain) |
 
 RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The V100 was
 measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host: Qwen rows on 2026-11-18 (the
-two-lane figure 2026-11-20), Inkling-2-Mini on 2026-11-22 (master `dad1623b`, 250 W limit). Inkling-2-Mini on the RTX 3090:
+two-lane figure 2026-11-20; Flash-Next decode re-measured 2026-11-23 on master `61b3e032c` at 200 W with the router's flags, [conditions](docs/tesla-v100.md#qwen38-flash-next)), Inkling-2-Mini on 2026-11-22 (master `dad1623b`, 250 W limit). Inkling-2-Mini on the RTX 3090:
 2026-11-23 under WSL and natively on Windows (master `311ad169a`), 315 W limit, its layers 20-23 experts held as their exact MXFP8 re-encoding (the default there).
 Ternary Bonsai 2 27B's context and C8 figures: 2026-11-23, WSL and Windows, 315 W limit
 ([method](docs/performance/bonsai2-27b-rtx3090.md#several-requests-and-context)). Flash-Next's two-lane figure is the median of four runs on a rented Linux RTX 3090 (420 W limit, 2026-11-11;

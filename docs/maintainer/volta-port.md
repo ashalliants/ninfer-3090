@@ -296,6 +296,11 @@ story/code/zh/fr 76.0/95.3/69.0/79.1 -> 78.1/95.7/71.5/80.9 tok/s, tokens per ro
 (2.14). `run-v100.sh` turns it on for Flash-Next. Plain `--draft-tokens 2` gained on zh/fr (+2) but
 lost 6.6 on code; staged drafting keeps the third draft for the rounds that use it.
 
+Re-measured on master `61b3e032c` (2026-11-23, 200 W, the router's flags: the `run-v100.sh` profile
+plus the refusal-vector graft and `--presence-penalty 1.0`; 300 greedy tokens, warm second request, best of
+five runs): story / code / Chinese / French / thinking 80.1 / 119.1 / 78.6 / 88.7 / 97.1 tok/s at
+1.94 / 3.31 / 1.90 / 2.18 / 2.62 tokens per round. Conditions and ranges: [tesla-v100.md](../tesla-v100.md#qwen38-flash-next).
+
 Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
 - In steady decode the link costs almost nothing: the expert cache hits 99.6-100% and
   `stage_kernel` is ~5 us a call. The link matters for prefill and for refilling the cache.
