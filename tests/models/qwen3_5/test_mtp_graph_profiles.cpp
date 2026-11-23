@@ -206,10 +206,11 @@ void check_dflash(std::uint32_t capacity, std::uint32_t draft_window, std::uint3
 // AR steps run on the MTP cache alone, which check() covers through `storage`. DFlash2, whose
 // uniform caches keep fixed bands, must break on a mixed cache's verify changes too.
 void check_mixed(std::uint32_t capacity, std::uint32_t draft_window, const MtpGraphAttention& attention,
-                 bool dflash, ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::DFlash) {
+                 bool dflash, ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::DFlash,
+                 std::uint32_t batch_size = 1) {
     namespace detail = ninfer::models::qwen3_5::detail;
     const auto profiles =
-        dflash ? detail::dflash_graph_profiles(backend, capacity, draft_window, 1, attention)
+        dflash ? detail::dflash_graph_profiles(backend, capacity, draft_window, batch_size, attention)
                : detail::mtp_graph_profiles(capacity, draft_window, attention);
     std::vector<KvCacheStorage> storages = attention.target_storages;
     if (!dflash) { storages.push_back(attention.storage); }
@@ -219,15 +220,16 @@ void check_mixed(std::uint32_t capacity, std::uint32_t draft_window, const MtpGr
         return std::string(!dflash ? "mixed mtp"
                            : backend == ninfer::SpeculativeBackend::DFlash2 ? "mixed dflash2" : "mixed dflash") +
                " capacity=" + std::to_string(capacity) +
-               " k=" + std::to_string(draft_window) + " heads=" + std::to_string(attention.geometry.query_heads) +
-               " kv=" + kinds;
+               " k=" + std::to_string(draft_window) + " b=" + std::to_string(batch_size) +
+               " heads=" + std::to_string(attention.geometry.query_heads) + " kv=" + kinds;
     };
     const auto verify = [&](KvCacheStorage storage, std::uint32_t frontier) {
         const auto visible = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(frontier) + draft_window + 1ULL));
         return ninfer::ops::causal_softmax_attention_launch_shape(
-            attention.geometry, storage, CausalAttentionExecutionEnvelope{1U, visible}, 1,
-            static_cast<std::int32_t>(draft_window) + 1, {nullptr, attention.multiprocessor_count});
+            attention.geometry, storage, CausalAttentionExecutionEnvelope{1U, visible},
+            static_cast<std::int32_t>(batch_size), static_cast<std::int32_t>(draft_window) + 1,
+            {nullptr, attention.multiprocessor_count});
     };
     std::uint32_t expected_min = 0;
     std::map<std::uint32_t, std::vector<std::uint32_t>> nodes_of_class;
@@ -239,7 +241,14 @@ void check_mixed(std::uint32_t capacity, std::uint32_t draft_window, const MtpGr
         expected_min = profile.max + 1;
         std::vector<std::uint32_t> nodes;
         for (const KvCacheStorage storage : storages) {
-            if (!(verify(storage, profile.min) == verify(storage, profile.max))) {
+            // Every frontier where shapes need not be monotone in the key count, the ends above.
+            bool spans = !(verify(storage, profile.min) == verify(storage, profile.max));
+            for (std::uint32_t frontier = profile.min;
+                 !spans && frontier < profile.max && frontier <= ninfer::ops::kCausalAttentionNonMonotoneShapeKeys;
+                 ++frontier) {
+                spans = !(verify(storage, frontier) == verify(storage, profile.max));
+            }
+            if (spans) {
                 std::cerr << label() << ": profile [" << profile.min << "," << profile.max
                           << "] spans a verify launch-shape change of storage " << static_cast<int>(storage) << "\n";
                 ++failures;
@@ -388,8 +397,12 @@ int main() {
                     for (std::uint32_t draft_window = 1; draft_window <= kSweptDraftWindows; ++draft_window) {
                         check_mixed(capacity, draft_window, attention, false);
                         if (draft_window <= 15) {
-                            check_mixed(capacity, draft_window, attention, true);
-                            check_mixed(capacity, draft_window, attention, true, ninfer::SpeculativeBackend::DFlash2);
+                            for (const std::uint32_t batch_size : {1U, 2U, 4U}) {
+                                check_mixed(capacity, draft_window, attention, true,
+                                            ninfer::SpeculativeBackend::DFlash, batch_size);
+                                check_mixed(capacity, draft_window, attention, true,
+                                            ninfer::SpeculativeBackend::DFlash2, batch_size);
+                            }
                         }
                     }
                 }

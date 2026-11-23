@@ -124,6 +124,22 @@ void collect_shape_changes(std::uint32_t lo, std::uint32_t hi, const Shapes& sha
     collect_shape_changes(mid, hi, shapes, changes);
 }
 
+// collect_shape_changes for a per-layer cache's target verify: at or below
+// ops::kCausalAttentionNonMonotoneShapeKeys a multi-row launch shape need not be monotone in the
+// key count, so every frontier there is compared with its predecessor; bisection above.
+template <class Shapes>
+void collect_mixed_shape_changes(std::uint32_t lo, std::uint32_t hi, const Shapes& shapes,
+                                 std::vector<std::uint32_t>& changes) {
+    const std::uint32_t dense_end = std::max(lo, std::min(hi, ops::kCausalAttentionNonMonotoneShapeKeys));
+    auto previous                 = shapes(lo);
+    for (std::uint32_t frontier = lo + 1; frontier <= dense_end; ++frontier) {
+        auto current = shapes(frontier);
+        if (!(current == previous)) { changes.push_back(frontier); }
+        previous = std::move(current);
+    }
+    collect_shape_changes(dense_end, hi, shapes, changes);
+}
+
 } // namespace
 
 std::vector<KvCacheStorage> target_kv_storages(std::span<const KvCacheStorage> kv_layers) {
@@ -254,7 +270,7 @@ std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend back
             // shape changes, so no profile replays one storage's route across its own change.
             // A uniform cache keeps the fixed bands above.
             std::vector<std::uint32_t> changes;
-            collect_shape_changes(
+            collect_mixed_shape_changes(
                 0U, capacity - 1,
                 [&](std::uint32_t frontier) {
                     return dflash_verify_shape(capacity, draft_window, batch_size, frontier, attention);
@@ -280,7 +296,11 @@ std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend back
     };
     std::vector<std::uint32_t> ends = dflash_base_ends(draft_window);
     std::vector<std::uint32_t> changes;
-    collect_shape_changes(0U, max_frontier, shape, changes);
+    if (attention.target_storages.empty()) {
+        collect_shape_changes(0U, max_frontier, shape, changes);
+    } else {
+        collect_mixed_shape_changes(0U, max_frontier, shape, changes);
+    }
     for (const std::uint32_t change : changes) { ends.push_back(change - 1U); }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());

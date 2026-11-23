@@ -229,6 +229,13 @@ struct CausalAttentionLaunchShape {
                            const CausalAttentionLaunchShape&) = default;
 };
 
+// Launch shapes change monotonically in the visible-key count above this many keys, so a planner
+// may find their changes there by bisecting on the shapes at an interval's ends. At or below it they
+// need not be: a multi-row INT8-family chunked small-T launch's chunk width follows key tiers (the
+// last edge is 8198 keys) that its shape does not carry, and neighbouring tiers can agree. A planner
+// that must not step over a change scans every key count up to here.
+inline constexpr std::uint32_t kCausalAttentionNonMonotoneShapeKeys = 8198;
+
 [[nodiscard]] CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t tokens,
