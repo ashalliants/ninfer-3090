@@ -254,7 +254,8 @@ int main() {
         const std::size_t steps = generated.size() - 1;
         for (const std::size_t k : {1, 2, 3, 4, 6, 8}) {
             double seconds = 0;
-            for (int pass = 0; pass < 3; ++pass) { // the last pass is the measured one
+            experts.clear_cache(); // every k starts from empty tiers and warms them the same way
+            for (int pass = 0; pass < 4; ++pass) { // the last pass is the measured one
                 experts.reset_stats();
                 forward.run(prompt, 0);
                 cudaStreamSynchronize(stream);
