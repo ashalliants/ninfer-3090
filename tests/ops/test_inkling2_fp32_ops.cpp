@@ -2062,6 +2062,19 @@ void test_blas_routes() {
         compare("loop_controller_blas job " + std::to_string(j) + (j == 1 ? " (out = c), T 1030" : ", T 1030"), (j == 1 ? dc[j] : dout[j]).get(h * cols),
                 want, 2e-6);
     }
+    {
+        // A column stride past cuBLAS's int leading dimension throws before any work (the layout itself is valid).
+        Tensor wide = tc[0];
+        wide.nb[1] = (static_cast<std::int64_t>(INT32_MAX) + 1) * 4;
+        ninfer::ops::LoopControllerJob job = jobs[0];
+        job.c = &wide;
+        bool threw = false;
+        try {
+            ninfer::ops::loop_controller_blas(std::span<const ninfer::ops::LoopControllerJob>(&job, 1), 1e-6F, control_arena, nullptr);
+        } catch (const std::invalid_argument&) { threw = true; }
+        if (!threw) { throw std::runtime_error("loop_controller_blas accepted a column stride past INT32_MAX"); }
+        std::printf("loop_controller_blas                         column stride past INT32_MAX rejected\n");
+    }
 
     const int rows = 2304, experts = 128, k = 8, rcols = 333;
     auto x = randoms(rows * rcols, -2, 2), g = randoms(rows, 0.5F, 1.5F), rt = randoms(experts * rows, -0.05F, 0.05F), bs = randoms(experts, -0.01F, 0.01F);

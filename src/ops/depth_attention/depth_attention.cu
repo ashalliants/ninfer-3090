@@ -519,6 +519,7 @@ void loop_controller_blas(std::span<const LoopControllerJob> jobs, float eps, De
                 "a controller job is incomplete");
         require(job.c->ne[0] == h && job.c->ne[1] == cols && job.down->ne[1] == rank, "every job must have the same H, R and T");
         const std::int64_t cs = column_stride(*job.c, h, cols, "c"), ms = column_stride(*job.m, h, cols, "m"), os = column_stride(*job.out, h, cols, "out");
+        require(cs <= INT32_MAX && ms <= INT32_MAX, "loop_controller_blas: the column strides of c and m must fit cuBLAS's int");
         const auto* c = static_cast<const float*>(job.c->data);
         const auto* m = static_cast<const float*>(job.m->data);
         auto* out     = static_cast<float*>(job.out->data);

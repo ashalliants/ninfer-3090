@@ -86,7 +86,8 @@ void loop_controller_fp32(std::span<const LoopControllerJob> jobs, float eps, De
 /**
  * Op: loop_controller_blas (loop_controller_fp32's math on cuBLAS FP32 GEMMs; for wide prefill calls)
  *
- * Math, shapes and domain: loop_controller_fp32's (the same jobs, any T >= 1).
+ * Math, shapes and domain: loop_controller_fp32's (the same jobs, any T >= 1), except that the column strides of
+ *   c and m must fit cuBLAS's int leading dimension (<= INT32_MAX elements); a larger one throws before any work.
  *
  * Numeric:
  *   Not bit-exact with loop_controller_fp32: the same FP32 values in, FP32 products and sums (CUBLAS_COMPUTE_32F,
