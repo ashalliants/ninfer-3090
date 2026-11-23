@@ -595,18 +595,22 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         // Builds the programs and checks they are resident: under the Windows WDDM sysmem fallback (Windows and WSL) a
         // cudaMalloc past the free device memory succeeds in system memory instead of failing, and the step's device
         // free memory drops by less than it allocated (spill_shortfall). Such a build does not fit: its KV rings or
-        // workspace would be read over PCIe. `spare` also requires kStartupSpare left free.
+        // workspace would be read over PCIe. The driver spills only once device memory runs out, so a spill also leaves
+        // free memory at about nothing (kSpilledFree); a shortfall with memory still free is a release landing during the
+        // build (an earlier attempt's), not a spill. `spare` also requires kStartupSpare left free.
+        constexpr std::size_t kSpilledFree = 64U << 20;
         const auto build_resident = [&](bool with_drafter, bool spare) {
             std::size_t free_before = 0, free_bytes = 0, total_bytes = 0;
+            check_cuda(cudaDeviceSynchronize(), "device synchronize"); // earlier attempts' releases land first
             check_cuda(cudaMemGetInfo(&free_before, &total_bytes), "memory info");
             const std::uint64_t live_before = device_bytes_live();
             build_programs(limits, dense, vision, with_drafter);
             check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
             const std::uint64_t grown = device_bytes_live() - live_before;
-            if (spill_shortfall(free_before, free_bytes, grown) != 0) {
+            if (spill_shortfall(free_before, free_bytes, grown) != 0 && free_bytes < kSpilledFree) {
                 // A second reading, since another program can change free device memory during the build.
                 check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
-                if (const std::uint64_t spilled = spill_shortfall(free_before, free_bytes, grown); spilled != 0) {
+                if (const std::uint64_t spilled = spill_shortfall(free_before, free_bytes, grown); spilled != 0 && free_bytes < kSpilledFree) {
                     throw std::runtime_error("inkling2: at --max-context " + std::to_string(limits.max_context) + " the driver placed " +
                                              std::to_string(spilled >> 20) + " MiB of the KV rings and workspace in system memory "
                                              "(the sysmem fallback): lower --max-context, or pass --fit-context MIN to start at the "

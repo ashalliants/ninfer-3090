@@ -1280,8 +1280,11 @@ Every build of the programs is checked for residency. Under the Windows WDDM sys
 card used to start and then read part of its KV rings over PCIe: on an RTX 3090, `--max-context 262144` started and
 decoded at 69 tok/s against 99. Startup now compares each build's growth in `device_bytes_live()` (every
 `DeviceBuffer` and owning `DeviceArena`, `core/arena.h`) with the drop in free device memory (`spill_shortfall`,
-32 MiB tolerance, read twice). A spilled build does not fit: the fit tries the next attempt, and the last one
-refuses to start, naming the spilled MiB. On Linux an oversized `cudaMalloc` fails, as before.
+32 MiB tolerance, read twice), after a device synchronize so an earlier attempt's releases have landed. The driver
+spills only once device memory runs out, so a spill also needs free memory under 64 MiB after the build: a shortfall
+with memory still free is a release landing during the build, not a spill (one such, 60 MiB with 2.4 GiB free,
+refused a fit that started). A spilled build does not fit: the fit tries the next attempt, and the last one refuses
+to start, naming the spilled MiB. On Linux an oversized `cudaMalloc` fails, as before.
 
 `--fit-context MIN` treats `--max-context` as a ceiling. With one slot it halves the context (multiples of 1,024)
 with the drafter at its cheapest form and the narrowest chunk, keeping the 256 MiB spare, then runs the attempts
