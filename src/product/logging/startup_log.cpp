@@ -28,7 +28,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr std::size_t kStartupPhaseCount =
-    static_cast<std::size_t>(StartupPhase::EngineFinalize) + 1;
+    static_cast<std::size_t>(StartupPhase::WeightsReencode) + 1;
 constexpr auto kInteractiveRefresh = std::chrono::milliseconds(200);
 constexpr auto kPersistentRefresh  = std::chrono::seconds(10);
 
@@ -73,6 +73,8 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
         return {"preparing CUDA graphs", "CUDA graphs ready", PhaseVisibility::Info, false, false};
     case StartupPhase::EngineFinalize:
         return {"finalizing engine", "engine finalized", PhaseVisibility::Debug, false, false};
+    case StartupPhase::WeightsReencode:
+        return {"loading experts as MXFP8", "experts ready (MXFP8, exact)", PhaseVisibility::Info, true, true};
     }
     return {"starting unknown phase", "unknown phase complete", PhaseVisibility::Debug, false,
             false};

@@ -1,13 +1,22 @@
-// Written for NInfer-3090. The pattern follows src/models/dsv4/load.cpp; every parameter is device resident.
+// Written for NInfer-3090. The pattern follows src/models/dsv4/load.cpp; every parameter is device resident (the BF16
+// expert banks as their exact MXFP8 re-encoding with --mxfp8-experts, read from the file and never uploaded as BF16).
 
 #include "models/inkling2/model.h"
 
 #include "artifact/binder.h"
 #include "artifact/views.h"
 #include "core/arena.h"
+#include "core/startup.h"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdlib>
+#include <optional>
+#include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -22,14 +31,16 @@ class Bindings {
 public:
     explicit Bindings(artifact::Binder& binder) : binder_(binder) {}
 
-    WeightId parameter(const std::string& name, Shape shape) {
+    WeightId parameter(const std::string& name, Shape shape, std::optional<artifact::Residency> where = std::nullopt) {
         const WeightId id{references.size()};
-        references.push_back(binder_.parameter(name, std::move(shape), residency));
+        references.push_back(binder_.parameter(name, std::move(shape), where.value_or(residency)));
         return id;
     }
 
     // Where the parameters bound next live: on the device, or (vision overlay) in pinned host memory.
     artifact::Residency residency = artifact::Residency::Device;
+    // --mxfp8-experts: the BF16 expert banks stay in the file (load_model re-encodes them from it).
+    bool bf16_experts_in_file = false;
 
     [[nodiscard]] bool contains(const std::string& name) const { return binder_.contains(name); }
 
@@ -85,8 +96,10 @@ LayerWeights bind_layer(Bindings& b, const TextConfig& c, std::uint32_t layer) {
         w.gate_up_scale = b.parameter(m + "experts_gate_up_scale", {e});
         w.down_scale    = b.parameter(m + "experts_down_scale", {e});
     } else {
-        w.experts_gate_up = b.parameter(m + "experts_gate_up", {e, 2 * i, h});
-        w.experts_down    = b.parameter(m + "experts_down", {e, h, i});
+        const std::optional<artifact::Residency> where =
+            b.bf16_experts_in_file ? std::optional{artifact::Residency::File} : std::nullopt;
+        w.experts_gate_up = b.parameter(m + "experts_gate_up", {e, 2 * i, h}, where);
+        w.experts_down    = b.parameter(m + "experts_down", {e, h, i}, where);
     }
     return w;
 }
@@ -217,6 +230,8 @@ ops::SituExpertBank bind_bank(const std::vector<BoundWeight>& bound, const Layer
         bank.record_stride = parent.geometry.record_stride;
         bank.gate_up_scale = fp32_data(bound.at(w.gate_up_scale.index));
         bank.down_scale    = fp32_data(bound.at(w.down_scale.index));
+    } else if (bound.at(w.experts_gate_up.index).view.parts.empty()) {
+        bank.format = QType::BF16; // left in the file: load_model fills in the MXFP8 arrays
     } else {
         for (const WeightId id : {w.experts_gate_up, w.experts_down}) {
             const auto& parent = whole_parent(bound.at(id.index));
@@ -251,6 +266,45 @@ void check_dspark_formats(const std::vector<BoundWeight>& bound, const DSparkWei
             require(id, QType::FP32, "FP32");
         }
     }
+}
+
+// --mxfp8-experts auto: re-encode when the parameters bound to the device (the text model's, and the vision tower's
+// when resident) leave less than kMxfp8AutoRoom of free device memory. The artifact's BF16 expert banks only.
+bool want_mxfp8(const artifact::Reader& reader, const LoadComponents& components) {
+    if (components.experts_mxfp8 == ExpertsMxfp8::Off) { return false; }
+    const auto& directory = reader.directory();
+    bool any = false;
+    for (const auto& [name, binding] : directory.bindings) {
+        (void)binding;
+        if (name.starts_with("text/layers/") && name.ends_with("/moe/experts_gate_up")) { any = true; }
+    }
+    if (!any) { return false; } // every layer's experts are NVFP4 records
+    if (components.experts_mxfp8 == ExpertsMxfp8::On) { return true; }
+    std::set<std::size_t> seen;
+    std::uint64_t need = 0;
+    const bool vision = components.vision && !components.vision_overlay;
+    for (const auto& [name, binding] : directory.bindings) {
+        if (!name.starts_with("text/") && !(vision && name.starts_with("vision/"))) { continue; }
+        for (const auto& part : binding.parts) {
+            if (seen.insert(part.object.index).second) { need += artifact::object_bytes(directory.object(part.object)); }
+        }
+    }
+    std::size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) { throw std::runtime_error("inkling2: cudaMemGetInfo failed"); }
+    return need + kMxfp8AutoRoom > free_bytes;
+}
+
+// A BF16 bank left in the file: its single object, checked to hold exactly `rows` x `cols` contiguous BF16 values.
+std::uint64_t file_bank_offset(const artifact::Reader& reader, const artifact::ParameterReference& reference, std::uint64_t rows,
+                               std::uint64_t cols) {
+    const auto& parts = reference.binding.parts;
+    if (parts.size() != 1) { throw ArtifactError(reference.name + ": a BF16 expert bank must be one stored object"); }
+    const auto& g = reader.geometry(parts.front().object);
+    if (g.format != QType::BF16 || g.layout != QuantLayout::Contiguous || parts.front().begin != 0 || parts.front().end != rows * cols ||
+        g.elements != rows * cols) {
+        throw ArtifactError(reference.name + ": BF16 expert banks must be contiguous BF16");
+    }
+    return artifact::object_offset(reader.directory().object(parts.front().object));
 }
 
 } // namespace
@@ -317,6 +371,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
     TextConfig config = parse_config(reader.directory());
     artifact::Binder binder(reader);
     Bindings bindings(binder);
+    bindings.bf16_experts_in_file = want_mxfp8(reader, components);
     TextWeights weights = bind_text(bindings, config);
     std::optional<DSparkConfig> dspark;
     DSparkWeights dspark_weights;
@@ -351,8 +406,96 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
     auto backing        = artifact::materialize(*plan.source, std::move(plan), device, observer);
     std::vector<BoundWeight> bound;
     bound.reserve(references.size());
-    for (auto& reference : references) { bound.push_back({reference.name, artifact::bind_view(reference, backing)}); }
+    for (auto& reference : references) {
+        // A bank left in the file has no view: it is re-encoded below.
+        bound.push_back({reference.name, reference.residency == artifact::Residency::File ? WeightView{} : artifact::bind_view(reference, backing)});
+    }
     auto model = std::unique_ptr<Model>(new Model(std::move(config), std::move(weights), std::move(bound), std::move(backing)));
+    if (bindings.bf16_experts_in_file) {
+        // Each BF16 bank, an expert at a time: read from the file into pinned staging (two slots, so the next read
+        // overlaps this one's copy and encode), copied to the device and encoded into the layer's MXFP8 arrays.
+        const TextConfig& c = model->config_;
+        const std::uint64_t h = c.hidden_size, inter = c.moe_intermediate, e = c.experts;
+        const std::uint64_t gu_values = e * 2 * inter * h, dn_values = e * h * inter;
+        const auto align = [](std::uint64_t n) { return (n + 255) / 256 * 256; };
+        const std::uint64_t gu_codes = 0, gu_scales = align(gu_values), dn_codes = gu_scales + align(gu_values / 32),
+                            dn_scales = dn_codes + align(dn_values), layer_bytes = dn_scales + align(dn_values / 32);
+        std::uint64_t total = 0;
+        for (const LayerWeights& l : model->weights_.layers) { total += l.experts.valid() ? 0 : 2 * (gu_values + dn_values); }
+        const StartupObserver none{};
+        StartupPhaseScope phase(observer != nullptr ? *observer : none, StartupPhase::WeightsReencode, StartupProgressUnit::Bytes, total);
+        const std::uint64_t slot_bytes = 2 * inter * h * 2; // one expert's gate_up, the larger matrix
+        std::array<PinnedHostBuffer, 2> host{PinnedHostBuffer(slot_bytes), PinnedHostBuffer(slot_bytes)};
+        std::array<DeviceBuffer, 2> staging{DeviceBuffer(slot_bytes), DeviceBuffer(slot_bytes)};
+        DeviceBuffer count(sizeof(unsigned long long));
+        count.fill(0);
+        std::array<cudaEvent_t, 2> done{};
+        cudaStream_t stream = nullptr;
+        const auto check = [](cudaError_t error, const char* what) {
+            if (error != cudaSuccess) { throw std::runtime_error(std::string("inkling2: MXFP8 experts: ") + what + ": " + cudaGetErrorString(error)); }
+        };
+        // Owns the stream and events from before they exist, so a failure part-way through their creation (or any
+        // later read, upload or encode) releases whatever was made.
+        struct Release {
+            cudaStream_t& stream;
+            std::array<cudaEvent_t, 2>& done;
+            ~Release() {
+                if (stream != nullptr) { (void)cudaStreamSynchronize(stream), (void)cudaStreamDestroy(stream); }
+                for (auto& event : done) {
+                    if (event != nullptr) { (void)cudaEventDestroy(event); }
+                }
+            }
+        } release{stream, done};
+        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+        for (auto& event : done) { check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
+        const auto started = std::chrono::steady_clock::now();
+        std::uint64_t read = 0;
+        int slot = 0;
+        for (std::size_t p = 0; p < model->weights_.layers.size(); ++p) {
+            const LayerWeights& l = model->weights_.layers[p];
+            if (l.experts.valid()) { continue; }
+            DeviceBuffer arrays(layer_bytes);
+            auto* base = static_cast<std::uint8_t*>(arrays.p);
+            const std::uint64_t gu_at = file_bank_offset(reader, references.at(l.experts_gate_up.index), e * 2 * inter, h);
+            const std::uint64_t dn_at = file_bank_offset(reader, references.at(l.experts_down.index), e * h, inter);
+            for (std::uint64_t x = 0; x < e; ++x) {
+                for (const bool gate_up : {true, false}) {
+                    const std::uint64_t rows = gate_up ? 2 * inter : h, cols = gate_up ? h : inter, bytes = rows * cols * 2;
+                    check(cudaEventSynchronize(done[slot]), "staging"); // this slot's previous copy has finished
+                    auto* bytes_out = static_cast<std::byte*>(host[slot].data());
+                    reader.read_into((gate_up ? gu_at : dn_at) + x * bytes, std::span<std::byte>(bytes_out, bytes));
+                    check(cudaMemcpyAsync(staging[slot].p, bytes_out, bytes, cudaMemcpyHostToDevice, stream), "upload");
+                    const std::uint64_t first = x * rows * cols;
+                    ops::mxfp8_encode_bf16_rows(staging[slot].p, static_cast<std::int64_t>(rows), static_cast<int>(cols),
+                                                base + (gate_up ? gu_codes : dn_codes) + first, base + (gate_up ? gu_scales : dn_scales) + first / 32,
+                                                static_cast<unsigned long long*>(count.p), stream);
+                    check(cudaEventRecord(done[slot], stream), "record");
+                    slot ^= 1;
+                    read += bytes;
+                    phase.progress(read, total);
+                }
+            }
+            ops::SituExpertBank& bank = model->banks_.at(p);
+            bank.mx_gate_up        = base + gu_codes;
+            bank.mx_gate_up_scales = base + gu_scales;
+            bank.mx_down           = base + dn_codes;
+            bank.mx_down_scales    = base + dn_scales;
+            model->mxfp8_banks_.push_back(std::move(arrays));
+        }
+        check(cudaStreamSynchronize(stream), "encode");
+        unsigned long long inexact = 0;
+        count.copy_to_host(&inexact, sizeof inexact);
+        if (inexact != 0) {
+            throw ArtifactError("inkling2: " + std::to_string(inexact) +
+                                " values of the BF16 expert banks are not MXFP8 values, so they cannot be re-encoded exactly; "
+                                "start with --mxfp8-experts off");
+        }
+        model->mxfp8_load_ = {.read_bytes    = read,
+                              .h2d_bytes     = read,
+                              .staging_bytes = 2 * slot_bytes,
+                              .seconds       = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()};
+        phase.complete(read, total);
+    }
     if (dspark) {
         check_dspark_formats(model->bound_, dspark_weights, model->weights_);
         for (const DSparkLayerWeights& l : dspark_weights.layers) {

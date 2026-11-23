@@ -207,6 +207,11 @@ int main() {
                       "CLI --dspark-window without --spec dspark was accepted, or its presence not marked");
     failures += check(rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--dense-q8", "q4"}); }),
                       "CLI accepted an unknown --dense-q8 form");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--mxfp8-experts", "on"}).experts_mxfp8 == ninfer::ExpertsMxfp8::On &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--mxfp8-experts", "off"}).experts_mxfp8 == ninfer::ExpertsMxfp8::Off &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).experts_mxfp8 == ninfer::ExpertsMxfp8::Auto &&
+                          rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--mxfp8-experts", "yes"}); }),
+                      "CLI --mxfp8-experts was not parsed, or an unknown form accepted");
     // --spec dspark: an omitted --draft-tokens takes 3; an explicit one is kept and must be in [1,7].
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark"}).speculative.draft_tokens == 3,
                       "CLI --spec dspark did not default to 3 drafts");

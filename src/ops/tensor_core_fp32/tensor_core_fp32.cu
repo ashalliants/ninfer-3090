@@ -87,6 +87,29 @@ bf16_rows_to_f16(const __nv_bfloat16* __restrict__ src, std::int64_t stride, int
     if (inverse != nullptr && threadIdx.x == 0) { inverse[blockIdx.x] = ldexpf(1.0F, -e); }
 }
 
+// An MXFP8 value (SituExpertBank::mxfp8), decoded as moe_situ.cu decodes it: the E4M3 code's bits in an FP16 are its
+// value times 2^-8, and the E8M0 scale s multiplies by 2^(s - 127 + 8). Exactly the BF16 value the code came from.
+__device__ __forceinline__ float mx_value(unsigned code, unsigned scale) {
+    const float c = __half2float(__ushort_as_half(static_cast<unsigned short>(((code & 0x80U) << 8) | ((code & 0x7FU) << 7))));
+    return c * __uint_as_float((scale + 8U) << 23);
+}
+
+// bf16_rows_to_f16 over MXFP8 rows (codes [n] and n / 32 scales per row): the same values, so the same FP16 rows and
+// inverses, and every GEMM over them the same bits.
+__global__ void __launch_bounds__(kThreads)
+mxfp8_rows_to_f16(const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales, int n, __half* __restrict__ dst,
+                  float* __restrict__ inverse) {
+    __shared__ float red[kThreads / 32];
+    const std::uint8_t* row = codes + static_cast<std::int64_t>(blockIdx.x) * n;
+    const std::uint8_t* rs  = scales + static_cast<std::int64_t>(blockIdx.x) * (n / 32);
+    __half* out = dst + static_cast<std::int64_t>(blockIdx.x) * n;
+    float m = 0.0F;
+    for (int i = threadIdx.x; i < n; i += kThreads) { m = fmaxf(m, fabsf(mx_value(row[i], rs[i / 32]))); }
+    const int e = scale_exponent(block_max(m, red));
+    for (int i = threadIdx.x; i < n; i += kThreads) { out[i] = __float2half_rn(ldexpf(mx_value(row[i], rs[i / 32]), e)); }
+    if (inverse != nullptr && threadIdx.x == 0) { inverse[blockIdx.x] = ldexpf(1.0F, -e); }
+}
+
 // out[r, t] *= row_inverse[r] col_inverse[t] for rows [0, rows) of each column (column stride ld).
 __global__ void __launch_bounds__(kThreads)
 unscale(float* __restrict__ out, std::int64_t ld, int rows, const float* __restrict__ row_inverse, const float* __restrict__ col_inverse) {
@@ -498,8 +521,11 @@ void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tens
             "out must be FP32 [H, T] (or [H, k T] without weights)");
     const BankGeometry g = geometry(bank);
     require(g.nvfp4 ? bank.record_stride == g.stride && hidden % kEM == 0 && inter % kEK == 0 && hidden % kEK == 0
-                    : bank.format == QType::BF16 && hidden % 8 == 0 && inter % 8 == 0,
-            op, "the bank must be NVFP4 records (H a multiple of 128, I of 64) or BF16 banks");
+                    : bank.format == QType::BF16 && hidden % 8 == 0 && inter % 8 == 0 &&
+                          (bank.mxfp8() ? hidden % 32 == 0 && inter % 32 == 0 && bank.mx_gate_up_scales != nullptr && bank.mx_down != nullptr &&
+                                              bank.mx_down_scales != nullptr
+                                        : bank.gate_up != nullptr && bank.down != nullptr),
+            op, "the bank must be NVFP4 records (H a multiple of 128, I of 64) or BF16 banks (or their MXFP8 form)");
     require(gate_cap > 0.0F && up_cap > 0.0F, op, "the caps must be positive");
     const std::int64_t zs = cols == 1 ? hidden : z.nb[1] / 4;
 
@@ -583,10 +609,18 @@ void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tens
         for (int e = 0; e < bank.experts; ++e) {
             const int ne = counts[e], at = offsets[e];
             if (ne == 0) { continue; }
-            const auto* gu = static_cast<const __nv_bfloat16*>(bank.gate_up) + static_cast<std::int64_t>(e) * 2 * inter * hidden;
-            const auto* dn = static_cast<const __nv_bfloat16*>(bank.down) + static_cast<std::int64_t>(e) * hidden * inter;
-            bf16_rows_to_f16<<<2 * inter, kThreads, 0, stream>>>(gu, hidden, hidden, w_gu, w_gu_inv, nullptr);
-            bf16_rows_to_f16<<<hidden, kThreads, 0, stream>>>(dn, inter, inter, w_d, w_d_inv, nullptr);
+            if (bank.mxfp8()) {
+                const std::int64_t gu_rows = static_cast<std::int64_t>(e) * 2 * inter, dn_rows = static_cast<std::int64_t>(e) * hidden;
+                mxfp8_rows_to_f16<<<2 * inter, kThreads, 0, stream>>>(bank.mx_gate_up + gu_rows * hidden, bank.mx_gate_up_scales + gu_rows * (hidden / 32),
+                                                                      hidden, w_gu, w_gu_inv);
+                mxfp8_rows_to_f16<<<hidden, kThreads, 0, stream>>>(bank.mx_down + dn_rows * inter, bank.mx_down_scales + dn_rows * (inter / 32), inter,
+                                                                   w_d, w_d_inv);
+            } else {
+                const auto* gu = static_cast<const __nv_bfloat16*>(bank.gate_up) + static_cast<std::int64_t>(e) * 2 * inter * hidden;
+                const auto* dn = static_cast<const __nv_bfloat16*>(bank.down) + static_cast<std::int64_t>(e) * hidden * inter;
+                bf16_rows_to_f16<<<2 * inter, kThreads, 0, stream>>>(gu, hidden, hidden, w_gu, w_gu_inv, nullptr);
+                bf16_rows_to_f16<<<hidden, kThreads, 0, stream>>>(dn, inter, inter, w_d, w_d_inv, nullptr);
+            }
             check_launch(op);
             fp32_cols_to_f16<true><<<ne, kThreads, 0, stream>>>(static_cast<const float*>(z.data), zs, d_order + at, top_k, hidden, x16, nullptr, x_inv + at);
             const __half* xe = x16;

@@ -481,7 +481,8 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     model_ = ink::load_model(reader, device_,
                              {.vision         = options_.enable_vision,
                               .dspark         = options_.speculative.backend == SpeculativeBackend::DSpark && slots_ == 1,
-                              .vision_overlay = options_.enable_vision && options_.vision_residency == VisionResidency::Overlay},
+                              .vision_overlay = options_.enable_vision && options_.vision_residency == VisionResidency::Overlay,
+                              .experts_mxfp8  = options_.experts_mxfp8},
                              &options_.startup_observer);
     const ink::VisionConfig* vision = options_.enable_vision ? model_->vision_config() : nullptr;
     for (const auto& adapter : loras) {
@@ -728,6 +729,14 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     load_.artifact_id         = artifact::artifact_id_hex(reader.artifact_id());
     load_.weight_formats      = {"bf16", "ggml_q8_0", "ggml_rec_nvfp4_nvfp4", "fp32"};
     if (options_.dense_q8 != DenseQ8::Off) { load_.weight_formats.push_back("q8_g32_fp16 (re-encoded at load)"); }
+    if (model_->mxfp8_expert_layers() > 0) {
+        load_.weight_formats.push_back("mxfp8 (BF16 experts re-encoded at load, exact)");
+        load_.notes.push_back("experts | " + std::to_string(model_->mxfp8_expert_layers()) + " BF16 layers held as MXFP8 (exact, " +
+                              std::to_string(model_->mxfp8_expert_bytes() >> 20) + " MiB" +
+                              (options_.experts_mxfp8 == ExpertsMxfp8::On ? ", --mxfp8-experts on"
+                                                                          : ": the BF16 weights would leave under 4 GiB free; --mxfp8-experts off keeps BF16") +
+                              ")");
+    }
     const bool fp32_prefill   = prefill_is_fp32(options_.kv_rings, options_.prefill_math);
     load_.prefill_signature   = fp32_prefill ? "inkling2-fp32" : "inkling2-tc";
     std::size_t device_free = 0, device_total = 0;
@@ -771,10 +780,12 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     }
     load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());
-    load_.upload_seconds       = stats.upload_seconds;
-    load_.artifact_bytes_read  = stats.read_bytes;
-    load_.host_to_device_bytes = stats.h2d_bytes;
-    load_.peak_staging_bytes   = stats.peak_staging_bytes;
+    // The MXFP8 re-encode reads and uploads the BF16 expert banks itself, outside the materializer: both count.
+    const auto& reencode       = model_->mxfp8_load_stats();
+    load_.upload_seconds       = stats.upload_seconds + reencode.seconds;
+    load_.artifact_bytes_read  = stats.read_bytes + reencode.read_bytes;
+    load_.host_to_device_bytes = stats.h2d_bytes + reencode.h2d_bytes;
+    load_.peak_staging_bytes   = std::max<std::uint64_t>(stats.peak_staging_bytes, reencode.staging_bytes);
     load_.device_object_count  = stats.device_object_count;
     load_.host_object_count    = stats.host_object_count;
     // The worker binds the device before it takes requests; a failure there fails the construction.
@@ -2028,7 +2039,7 @@ MemorySummary Inkling2Core::memory_summary() const {
     // The weights on the device: the artifact's device backing (its allocations, alignment included; h2d_bytes is
     // the payload transferred) and any --dense-q8 re-encoding kept beside it.
     const std::size_t weights = static_cast<std::size_t>(model_->storage_stats().device_capacity_bytes) +
-                                (programs_->dense ? programs_->dense->bytes() : 0);
+                                static_cast<std::size_t>(model_->mxfp8_expert_bytes()) + (programs_->dense ? programs_->dense->bytes() : 0);
     m.weights = {.capacity_bytes = weights, .used_bytes = weights, .peak_used_bytes = weights};
     m.available_after_weights_bytes = free_after_weights_;
     return m;
