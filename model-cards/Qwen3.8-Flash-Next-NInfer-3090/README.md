@@ -104,6 +104,11 @@ sha256sum --check SHA256SUMS
   from 0.95x / 0.97x / 0.98x Strata's to 1.23x / 1.01x / 1.09x at 4K / 32K / 128K tokens, and the
   spread between prompts almost disappeared (table below). Decode barely moved (+0.8%).
 - **OS:** Windows. The `run.bat qwen38-flash-next` launcher is the supported way to serve it.
+- **Tesla V100 32 GB (Linux, built from source):** the same file serves its full 262,144-token
+  context on a V100 through `scripts/run-v100.sh`. Decode with MTP3 (2026-11-23, master `61b3e032c`,
+  200 W, 300 greedy tokens, warm cache): **119.1 tok/s** on code, 97.1 on a thinking prompt, 88.7
+  French, 80.1 story, 78.6 Chinese (best of five runs; the ranges are in the
+  [V100 guide](https://github.com/ashalliants/ninfer-3090/blob/master/docs/tesla-v100.md#qwen38-flash-next)).
 
 ## Measurements
 
