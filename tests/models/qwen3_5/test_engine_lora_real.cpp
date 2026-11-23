@@ -32,9 +32,21 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
+
+int current_process_id() noexcept {
+#ifdef _WIN32
+    return ::_getpid();
+#else
+    return ::getpid();
+#endif
+}
 
 namespace fs = std::filesystem;
 using Json   = nlohmann::json;
@@ -197,7 +209,7 @@ void write_zero_adapter(const fs::path& dir) {
 }
 
 int zero_scenario(const char* artifact) {
-    const fs::path dir = fs::temp_directory_path() / ("ninfer_lora_zero_" + std::to_string(::getpid()));
+    const fs::path dir = fs::temp_directory_path() / ("ninfer_lora_zero_" + std::to_string(current_process_id()));
     write_zero_adapter(dir);
     int failures = 0;
     std::vector<ninfer::TokenId> plain;

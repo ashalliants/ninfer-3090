@@ -842,6 +842,25 @@ chat (85 of 87 drafts), 108.6-108.9 on the arithmetic one, but a 64-token reply 
 73.2-73.9 against 97.9 plain. Plain decode is 30% faster here than on the V100 (103 against 79), so the verify cost
 is a larger share of a round; tuning the adaptive gate for the 3090 is open.
 
+Natively on Windows (2026-11-23, master `311ad169a` with the `--fit-context` fix below, same card, 315 W limit,
+`ninfer-serve`; power capping, and one thermal-slowdown sample at the first burst after idle, outside the legs used):
+
+| | Windows | WSL (above) |
+|---|---|---|
+| Startup log | `loading experts as MXFP8`, `experts ready (MXFP8, exact)` (22.4 s at 347 MiB/s from disk, 1.2 s from the file cache), `experts \| 4 BF16 layers held as MXFP8` | the same |
+| Greedy prime-function prompt (400 tokens) | the WSL text, word for word | |
+| Decode, mean of 12 chats, `--max-context 8192` (three runs) | 101.44 / 101.79 / 101.48 tok/s | 103.51-103.57 |
+| Decode, mean of 12 chats, `--max-context 131072` (two runs) | 101.02 / 101.02 tok/s | 103.3-103.9 |
+| Prefill at 65,536 with vision (chunk 2048), warm | 2,421 tok/s at 8,447 (TTFT 3.49 s), 2,416 at 1,167 (0.48 s) | 2,410, 1,784 |
+| Prefill at 131,072 (FP16 rings, chunk 512) | 1,455 / 1,640 / 1,449 / 1,077 tok/s at 1,167 / 8,447 / 36,302 / 111,650 (TTFT 0.8 s / 5.2 s / 25.1 s / 1 m 44 s); decode after 96.1 / 93.1 / 83.6 / 60.6 | 1,310 / 1,650 / 1,440 / 1,090 |
+| Largest context, `--fit-context` (plain / DSpark / vision / both) | 128,000-136,192 / 113,664-116,736 / 101,376-105,472 / 80,896-87,040 | 137,216 / 118,784 / 106,496 / 89,088 |
+| `--kv-dtype rk4v4 --spec dspark --vision` at 262,144 | starts, chunk 2048, 591 MiB free | starts, 444 MiB free |
+| `--max-context 32768 --mxfp8-experts off` | refuses: the driver placed 249 MiB in system memory | refuses |
+
+The first prompt after a start prefills slower (942-1,107 tok/s at 1,167 tokens) and is left out of the warm figures.
+The fit ranges are the spread over 11 starts across the session: what the desktop holds moves the result by up to 8K
+positions. Decode is about 2% slower natively than under WSL (not investigated); prefill is the same or faster.
+
 ## Split decode attention
 
 On by default; `--no-split-attention` (`EngineOptions::split_attention`, `ProgramLimits::split_attention`) turns it
@@ -1355,9 +1374,14 @@ to start, naming the spilled MiB. On Linux an oversized `cudaMalloc` fails, as b
 
 `--fit-context MIN` treats `--max-context` as a ceiling. With one slot it halves the context (multiples of 1,024)
 with the drafter at its cheapest form and the narrowest chunk, keeping the 256 MiB spare, then runs the attempts
-above at the context found. On the RTX 3090 (24 GiB, about 1.5 GiB taken by the desktop), plain text fits 17,408
-positions with 240 MiB free; DSpark and vision do not fit beside the 21.3 GiB of resident weights at any context
-with the spare kept.
+above at the context found. The search releases the largest build that fitted and builds it again; free device
+memory moves by tens of MiB between builds (the desktop, the driver), so when that rebuild misses the spare the context
+steps down 1,024 at a time until one fits, never under `MIN`. Natively on Windows the rebuild missed in 3 of 8 plain
+starts (133,120 fitted in the search, then not), and the start used to refuse with "not even 1024 positions fit"; with
+the step-down 11 of 11 started, one to three steps lower (2026-11-23). On the RTX 3090 (24 GiB, about 1.5 GiB taken by
+the desktop) with the experts in BF16 (`--mxfp8-experts off`), plain text fits 17,408 positions with 240 MiB free, and
+DSpark and vision do not fit beside the 21.3 GiB of resident weights at any context with the spare kept; with the
+MXFP8 experts (the default there) see "MXFP8 experts".
 
 Other memory the stack frees or reserves:
 
@@ -1603,7 +1627,10 @@ section's earlier measurement:
   most of the rest of the step.
 On the RTX 3090 (2026-11-23, MXFP8 experts, WSL, 315 W limit; same method, two runs each, every request's output
 the same at every N): aggregate 100.5-101.2 / 151.3-152.8 / 224.2-227.8 / **275.0-281.9 tok/s** at N = 1 / 2 / 4 / 8,
-per request 103.9 / 78.9 / 59.5-59.7 / 37.3-37.4. Asked for 262,144 at N = 8, each slot gets 11,520 positions.
+per request 103.9 / 78.9 / 59.5-59.7 / 37.3-37.4. Asked for 262,144 at N = 8, each slot gets 11,520 positions. Natively on Windows (2026-11-23,
+master `311ad169a`, same method at `--max-context 8192`, two runs, outputs again the same at every N): 99.2-99.4 /
+148.2-149.8 / 223.1-223.6 / **273.9-276.9 tok/s**, per request 102.7-103.3 / 76.6-78.1 / 58.8-59.3 / 36.7-37.0; asked
+for 262,144 at N = 8 with the desktop holding more, each slot got 9,984.
 
 - Context per slot when `--max-context 262144` is asked with N = 8: 27,392 positions (8 x 27,392 KV rows, chunk 256),
   reported by `/v1/models`. Lower N or a smaller `--max-context` keeps more context per slot. With `--vision` and

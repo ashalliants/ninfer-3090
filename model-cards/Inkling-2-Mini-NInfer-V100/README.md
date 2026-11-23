@@ -147,7 +147,7 @@ ninfer-serve models/inkling2-mini-q8.ninfer --vision --max-context 65536
 Layers 20-23 keep their experts in BF16 in this file (7.6 GiB); they are the checkpoint's MXFP8 values, so on a 24 GB
 card the engine holds them as MXFP8 (3.9 GiB), re-encoded at load and checked exact: every output is the same, bit
 for bit (`--mxfp8-experts auto`, the default; `off` keeps BF16). `--fit-context MIN` starts at the largest context that
-fits.
+fits. On Windows, `scripts\download-model.bat inkling2-mini` downloads and verifies this file.
 
 ## Performance (one Tesla V100-PCIE-32GB, 2026-11-22)
 
@@ -216,6 +216,19 @@ over two runs:
 | Long prompts (every token computed) | FP16 rings at 131,072: 1,650 tok/s at 8.4K, 1,440 at 36K (TTFT 25 s), 1,090 at 112K (1 m 43 s), then decode at 58.7 tok/s. `rk4v4` at 262,144: 1,424 at 112K (78 s, decode 69.5), 1,030 at 200K (3 m 13 s, decode 56.0), 887 at 254K (4 m 46 s, decode 49.9) |
 | Several requests (`--max-concurrency`, 8,192 context) | **282 tok/s** aggregate at 8, 228 at 4, 153 at 2; each request's tokens the same as alone |
 | Load | 75 s from a SATA SSD (300 MiB/s), the MXFP8 re-encode included |
+
+**Natively on Windows** (same card and limit, NInfer master `311ad169a`, 2026-11-23) the output is the same, word for
+word, and the figures are close:
+
+| | Windows | WSL |
+|---|---|---|
+| Decode, plain (12 chats) | 101.4-101.8 tok/s | 103.3-103.9 |
+| Prefill (65,536 context, vision on) | **2,421 tok/s** at 8.4K (TTFT 3.5 s); 2,416 at 1.2K (0.48 s) | 2,410; 1,784 |
+| Long prompts at 131,072 | 1,640 tok/s at 8.4K, 1,449 at 36K, 1,077 at 112K (1 m 44 s) | 1,650, 1,440, 1,090 |
+| Largest context (`--fit-context`) | 128,000-136,192 plain; 113,664-116,736 DSpark; 101,376-105,472 vision; 80,896-87,040 both | 137,216; 118,784; 106,496; 89,088 |
+| Several requests (8,192 context) | 277 tok/s at 8, 224 at 4, 150 at 2 | 282, 228, 153 |
+
+The context range is what the desktop left free across the session's starts.
 
 DSpark gains less on the 3090 than on the V100 because plain decode is already fast; leave it off unless the work is
 mostly code.
