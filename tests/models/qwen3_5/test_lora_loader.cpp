@@ -19,9 +19,21 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
+
+int current_process_id() noexcept {
+#ifdef _WIN32
+    return ::_getpid();
+#else
+    return ::getpid();
+#endif
+}
 
 namespace q  = ninfer::models::qwen3_5;
 using Json   = nlohmann::json;
@@ -169,7 +181,7 @@ std::vector<double> rotate_input(const std::vector<double>& x, const std::vector
 
 int main() {
     int failures         = 0;
-    const fs::path root  = fs::temp_directory_path() / ("ninfer_lora_loader_" + std::to_string(::getpid()));
+    const fs::path root  = fs::temp_directory_path() / ("ninfer_lora_loader_" + std::to_string(current_process_id()));
     fs::remove_all(root);
     const q::TextConfig text = model();
     int case_index           = 0;
