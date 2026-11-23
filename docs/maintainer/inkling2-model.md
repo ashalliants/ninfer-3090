@@ -811,14 +811,14 @@ Measured on the RTX 3090 (2026-11-23, WSL, 315 W power limit, PCIe Gen4 x16, `ni
 | | BF16 (`off`) | MXFP8 (auto) |
 |---|---|---|
 | Decode at `--max-context 8192`, mean of 12 chats (ABBA, two legs each) | 100.61-100.62 tok/s | **103.51-103.57 tok/s** (+2.9%) |
-| Largest context, plain (`--fit-context`) | 17,408 | 131,072-132,096 |
-| Largest context, DSpark | none with the 256 MiB spare | 114,688 |
-| Largest context, vision resident | none | 102,400 |
-| Largest context, DSpark and vision | none | 84,992 |
+| Largest context, plain (`--fit-context`) | 17,408 | 137,216 |
+| Largest context, DSpark | none with the 256 MiB spare | 118,784 |
+| Largest context, vision resident | none | 106,496 |
+| Largest context, DSpark and vision | none | 89,088 |
 
-(The contexts are `--fit-context` results, multiples of 1,024, measured after the one-slot fit was fixed to size the
-drafter at each candidate. A fit follows the VRAM Windows leaves the process: the same build fitted 137,216 plain in
-the morning and 131,072-132,096 in the afternoon, when a start at 137,216 left 113 MiB free instead of 291.)
+(`--fit-context` results with the desktop idle. The DSpark and vision ones were found in 256-position steps (119,040,
+107,264, 90,368) before the one-slot search moved to `--fit-context`'s 1,024; shown at the multiple of 1,024 below
+them, which is what the search reports now. A busier desktop leaves the process less VRAM and a smaller fit.)
 | Free after startup at 8,192 | 391 MiB, chunk 1024 | 3,846 MiB, chunk 2048 |
 
 The decode gain is the bytes: a token reads 8 experts of each of layers 20-23, 510 MB in BF16 and 263 MB in MXFP8.
