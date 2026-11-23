@@ -63,6 +63,8 @@ button { cursor: pointer; white-space: nowrap; }
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 12px; margin-bottom: 16px; }
 .panel { padding: 12px; position: relative; }
 .panel canvas { width: 100%; height: 160px; display: block; }
+.stats { color: var(--text-2); font-size: 12px; font-variant-numeric: tabular-nums; margin-top: 6px; min-height: 17px; }
+.stats b { color: var(--text); font-weight: 600; }
 .tip {
   position: absolute; pointer-events: none; background: var(--surface); color: var(--text);
   border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; font-size: 12px;
@@ -199,8 +201,8 @@ button[aria-pressed="true"] { background: var(--series); color: #fff; border-col
 </div>
 
 <section class="charts">
-  <div class="panel"><h2>Decode tokens/s</h2><canvas id="c-decode" role="img" aria-label="Decode tokens per second"></canvas><div class="tip"></div></div>
-  <div class="panel"><h2>Prefill tokens/s</h2><canvas id="c-prefill" role="img" aria-label="Prefill tokens per second"></canvas><div class="tip"></div></div>
+  <div class="panel"><h2>Decode tokens/s</h2><canvas id="c-decode" role="img" aria-label="Decode tokens per second"></canvas><div class="stats" id="s-c-decode"></div><div class="tip"></div></div>
+  <div class="panel"><h2>Prefill tokens/s</h2><canvas id="c-prefill" role="img" aria-label="Prefill tokens per second"></canvas><div class="stats" id="s-c-prefill"></div><div class="tip"></div></div>
   <div class="panel"><h2>Draft acceptance %</h2><canvas id="c-accept" role="img" aria-label="Draft acceptance percent"></canvas><div class="tip"></div></div>
   <div class="panel"><h2>GPU power W</h2><canvas id="c-power" role="img" aria-label="GPU power in watts"></canvas><div class="tip"></div></div>
 </section>
@@ -232,8 +234,8 @@ const laneSeen = new Map();   // lane id -> { req, t, pre }: when this page firs
 let slotsPolled = false;
 
 const charts = [
-  { id: 'c-decode', field: 'decode', unit: 'tok/s' },
-  { id: 'c-prefill', field: 'prefill', unit: 'tok/s' },
+  { id: 'c-decode', field: 'decode', unit: 'tok/s', stats: true },
+  { id: 'c-prefill', field: 'prefill', unit: 'tok/s', stats: true },
   { id: 'c-accept', field: 'accept', unit: '%', max: 100, empty: 'No drafts yet' },
   { id: 'c-power', field: 'power', unit: 'W' },
 ];
@@ -622,6 +624,24 @@ function niceMax(v) {
   return 10 * p;
 }
 
+// Mean, median and max of the readings in the visible window, leaving out the idle seconds (0):
+// the server reads 0 whenever nothing is generating, which would drag every figure down.
+function drawStats(chart, values) {
+  const el = $('s-' + chart.id);
+  const active = values.filter((v) => v > 0).sort((a, b) => a - b);
+  el.textContent = '';
+  if (active.length === 0) { el.textContent = 'No activity in this window'; return; }
+  const mid = active.length >> 1;
+  const median = active.length % 2 ? active[mid] : (active[mid - 1] + active[mid]) / 2;
+  const mean = active.reduce((a, b) => a + b, 0) / active.length;
+  const add = (label, v) => {
+    const b = document.createElement('b'); b.textContent = nf1.format(v);
+    el.append(label + ' ', b, '  ·  ');
+  };
+  add('Mean', mean); add('Median', median); add('Max', active[active.length - 1]);
+  el.append('tok/s while active (' + active.length + ' s of ' + (windowS === 900 ? '15 min' : '2 min') + ')');
+}
+
 function draw(chart) {
   const canvas = $(chart.id);
   const css = getComputedStyle(document.documentElement);
@@ -638,6 +658,7 @@ function draw(chart) {
   const pw = w - left - right, ph = h - top - bottom;
   const now = frozenAt !== null ? frozenAt : performance.now(), t0 = now - windowS * 1000;
   const values = samples.filter((s) => s.t >= t0 && s.t <= now).map((s) => s[chart.field]).filter((v) => v !== null && isFinite(v));
+  if (chart.stats) drawStats(chart, values);
   const max = chart.max || niceMax(Math.max(0, ...values) * 1.1);
   const x = (t) => left + pw * (t - t0) / (windowS * 1000);
   const y = (v) => top + ph * (1 - Math.min(v, max) / max);

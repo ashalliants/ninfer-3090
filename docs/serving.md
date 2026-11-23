@@ -610,7 +610,10 @@ works offline. Once a second while its tab is visible (it stops polling when the
 reads `/metrics`, `/v1/load` and `/slots` from the same server and shows:
 
 - the current decode and prefill tokens/s, and charts of both over the last two minutes, from
-  `ninfer_decode_tokens_total` and `ninfer_prefill_tokens_total` (prefix-cache hits excluded);
+  `ninfer_decode_tokens_total` and `ninfer_prefill_tokens_total` (prefix-cache hits excluded).
+  Under each chart a line gives the mean, median and max of the seconds in the visible window
+  (2 or 15 minutes) in which anything was generated or read: idle seconds, which read 0, are left
+  out, so a quiet server does not drag the figures down;
 - draft acceptance: a chart of each second's accepted / drafted tokens, and the figure since startup
   (`off` without a draft source);
 - running and waiting requests, and the share of the Main KV pool in use (retained prefixes
