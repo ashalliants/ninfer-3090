@@ -50,6 +50,21 @@ Inkling-2-Mini runs on the RTX 3090 as well, on Windows and Linux, with 137,216 
 > Anthropic APIs. It runs on one RTX 3090 too: 104 tok/s and 137,216 tokens of context, or the full 262,144 with images and DSpark
 > on the opt-in low-bit KV. See [Inkling-2-Mini](#inkling-2-mini-new-v100-and-rtx-3090).
 
+> **Inkling-2-Mini: exact, and the fastest V100 figures we know of.**
+> - **Nothing re-quantized on our side.** The artifact is Unsloth's UD-Q8_K_XL (their KLD reference quant) converted
+>   losslessly: unpacking the expert records reproduces every source tensor byte for byte.
+> - **Speculation that never changes the answer.** With DSpark on, greedy output equals plain greedy decode, and a
+>   sampled request draws the same tokens plain sampling draws under the same seed, on every DSpark request
+>   measured ([model card](model-cards/Inkling-2-Mini-NInfer-V100/README.md)). Unsloth's DSpark notes for llama.cpp
+>   say its greedy output with the drafter "is not guaranteed to be bit identical to a run without it".
+> - **Faster on the same card.** On one Tesla V100 32 GB, NInfer decodes **78.8 tok/s** plain and **93-94 tok/s** with
+>   DSpark (12-chat average; **120.7** on maths), and prefills **1,930 tok/s** at 8K (1,868 with DSpark and images at
+>   the full 262,144-token context). The other published V100 port, Csavoldi's Inkling port onto Lapilli
+>   ([report](https://github.com/chris83-dev/lapilli-v100/blob/f9b7dd093a9ff018bc68f177f81a1d27d3ffec91/docs/community/inkling2-mini.md),
+>   official NVFP4 experts), reports 69 tok/s writing without a drafter (its DSpark kernels need sm_120a) and 850
+>   tok/s reading a short prompt. Those figures are theirs, from a different machine and prompts, so read the
+>   ratios as indicative.
+
 ### Performance by model and card
 
 Every figure below was measured on the card in its row: one GPU, one model, defaults unless noted.
