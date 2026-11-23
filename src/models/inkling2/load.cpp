@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <optional>
 #include <set>
@@ -433,8 +434,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
         const auto check = [](cudaError_t error, const char* what) {
             if (error != cudaSuccess) { throw std::runtime_error(std::string("inkling2: MXFP8 experts: ") + what + ": " + cudaGetErrorString(error)); }
         };
-        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
-        for (auto& event : done) { check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
+        // Owns the stream and events from before they exist, so a failure part-way through their creation (or any
+        // later read, upload or encode) releases whatever was made.
         struct Release {
             cudaStream_t& stream;
             std::array<cudaEvent_t, 2>& done;
@@ -445,6 +446,9 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
                 }
             }
         } release{stream, done};
+        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+        for (auto& event : done) { check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
+        const auto started = std::chrono::steady_clock::now();
         std::uint64_t read = 0;
         int slot = 0;
         for (std::size_t p = 0; p < model->weights_.layers.size(); ++p) {
@@ -486,6 +490,10 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
                                 " values of the BF16 expert banks are not MXFP8 values, so they cannot be re-encoded exactly; "
                                 "start with --mxfp8-experts off");
         }
+        model->mxfp8_load_ = {.read_bytes    = read,
+                              .h2d_bytes     = read,
+                              .staging_bytes = 2 * slot_bytes,
+                              .seconds       = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()};
         phase.complete(read, total);
     }
     if (dspark) {

@@ -780,10 +780,12 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     }
     load_.takes_video         = false;
     load_.load_seconds        = seconds_between(start, Clock::now());
-    load_.upload_seconds       = stats.upload_seconds;
-    load_.artifact_bytes_read  = stats.read_bytes;
-    load_.host_to_device_bytes = stats.h2d_bytes;
-    load_.peak_staging_bytes   = stats.peak_staging_bytes;
+    // The MXFP8 re-encode reads and uploads the BF16 expert banks itself, outside the materializer: both count.
+    const auto& reencode       = model_->mxfp8_load_stats();
+    load_.upload_seconds       = stats.upload_seconds + reencode.seconds;
+    load_.artifact_bytes_read  = stats.read_bytes + reencode.read_bytes;
+    load_.host_to_device_bytes = stats.h2d_bytes + reencode.h2d_bytes;
+    load_.peak_staging_bytes   = std::max<std::uint64_t>(stats.peak_staging_bytes, reencode.staging_bytes);
     load_.device_object_count  = stats.device_object_count;
     load_.host_object_count    = stats.host_object_count;
     // The worker binds the device before it takes requests; a failure there fails the construction.

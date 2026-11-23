@@ -32,7 +32,7 @@ APIs, and supports paged KV, compatible-prefix reuse, structured JSON output, CU
 DFlash2 speculative decoding, vision, reasoning-effort control, ReplaySSM state transactions, and
 concurrent cohorts through **C8**. A 32 GB **Tesla V100** (`sm_70`, built from source on Linux) runs
 Qwen3.8-27B and Qwen3.8-Flash-Next too, and is the first home of **Inkling-2-Mini**: [V100 guide](docs/tesla-v100.md).
-Inkling-2-Mini runs on the RTX 3090 as well, with 137,216 tokens of context.
+Inkling-2-Mini runs on the RTX 3090 as well, with about 131,000 tokens of context (all 262,144 on the opt-in low-bit KV).
 
 > **Two cards, both first class: the RTX 3090 (24 GB, `sm_86`) and the Tesla V100 32 GB (`sm_70`).**
 > This project is built for, and tuned on, exactly these two GPUs. Every kernel route, schedule and
@@ -47,7 +47,7 @@ Inkling-2-Mini runs on the RTX 3090 as well, with 137,216 tokens of context.
 > **New: Inkling-2-Mini** (Thinking Machines, 2026-11-20), a 26B-total looped MoE (5.4B active per token) with
 > 128 experts, now runs on one Tesla V100 with images, its full 262,144-token context and its own DSpark
 > speculative drafter (up to 120.7 tok/s), served to up to 8 requests at once over the same OpenAI and
-> Anthropic APIs. It runs on one RTX 3090 too: 104 tok/s and 137,216 tokens of context, or the full 262,144 with images and DSpark
+> Anthropic APIs. It runs on one RTX 3090 too: 104 tok/s and about 131,000 tokens of context, or the full 262,144 with images and DSpark
 > on the opt-in low-bit KV. See [Inkling-2-Mini](#inkling-2-mini-new-v100-and-rtx-3090).
 
 ### Performance by model and card
@@ -63,7 +63,7 @@ Decode is one stream unless the column says otherwise.
 | Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | ~115 tok/s at C2 (MTP; 103-125, Linux) |
 | **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | 76-86 tok/s (MTP3); 47.9 at 40K and 25.0 at 162K context (200 W) | 79 tok/s at C2 (MTP3) |
 | Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K | 72-96 tok/s (MTP3), flat from 10K to 221K context | |
-| **Inkling-2-Mini** (new) | RTX 3090 | **137,216** plain, 90,368 with DSpark and vision; **262,144** with both on `--kv-dtype rk4v4` (lossy, opt-in) | **2,410 tok/s** at 8.4K, 65,536 context with vision (1,784 at 1.2K) | **104 tok/s** plain (12 chats); 115.5 best with DSpark (code) | **282 tok/s** at C8 (plain) |
+| **Inkling-2-Mini** (new) | RTX 3090 | **131,072** plain, 84,992 with DSpark and vision; **262,144** with both on `--kv-dtype rk4v4` (lossy, opt-in) | **2,410 tok/s** at 8.4K, 65,536 context with vision (1,784 at 1.2K) | **104 tok/s** plain (12 chats); 115.5 best with DSpark (code) | **282 tok/s** at C8 (plain) |
 | **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **1,930 tok/s** at 8K, 131,072 context (1,629 at 1K, 1,244 at 100K); 1,868 at 8K at the full 262,144 with DSpark and vision | **120.7 tok/s** (DSpark, maths); 93-94 average over 12 chats, 78.8 plain | **198 tok/s** at C8 (plain) |
 
 RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The V100 was
@@ -645,8 +645,9 @@ BF16 weights would leave under 4 GiB free; the V100 keeps BF16).
 
 - **Decode:** **104 tok/s** plain, the mean over 12 greedy chats (103.3-103.9 at 64K and 131K context). 2.9% faster
   than holding the experts in BF16 (100.6), since a token reads half the bytes for those layers.
-- **Context:** 137,216 tokens plain; 119,040 with DSpark; 107,264 with vision; 90,368 with both (`--fit-context`
-  finds the largest that fits beside the desktop). With the opt-in low-bit global rings (`--kv-dtype rk4v4`, lossy,
+- **Context:** 131,072-132,096 tokens plain; 114,688 with DSpark; 102,400 with vision; 84,992 with both
+  (`--fit-context` finds the largest multiple of 1,024 that fits beside the desktop; it follows the VRAM Windows leaves
+  the process, which moved it by about 5,000 tokens between sessions). With the opt-in low-bit global rings (`--kv-dtype rk4v4`, lossy,
   one request at a time) the full 262,144 fits plain (1.5 GiB to spare) and with DSpark and vision both on; decode
   after a 111,650-token prompt is 69.5 tok/s against 58.7 with FP16 rings (+18%), and the 12 chats run at 102.7.
 - **Prefill:** 2,410 tok/s on an 8.4K-token prompt (TTFT 3.5 s) and 1,784 on 1.2K (0.65 s), at 65,536 context with

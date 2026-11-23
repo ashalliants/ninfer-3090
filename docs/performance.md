@@ -24,7 +24,7 @@
 The V100 artifact runs on the 3090 (WSL, 315 W limit, PCIe Gen4 x16). Its layers 20-23 experts are held as their
 exact MXFP8 re-encoding (`--mxfp8-experts auto`, the default on a 24 GB card), which frees 3.7 GiB and reads half the
 bytes for those layers: decode 103.5-103.6 tok/s against 100.6 in BF16 (12 greedy chats, ABBA at 8,192 context), and
-the largest context grows from 17,408 to 137,216 (90,368 with DSpark and vision). Plain decode is 104 tok/s; DSpark
+the largest context grows from 17,408 to about 131,000 (84,992 with DSpark and vision; all 262,144 with `--kv-dtype rk4v4`). Plain decode is 104 tok/s; DSpark
 averages about the same on chats (103.5) and reaches 115.5 on code. Prefill is 2,410 tok/s at 8.4K tokens with
 vision on, 1,090 at 112K (FP16 rings) and 887 at 254K with `--kv-dtype rk4v4`, which fits the full 262,144. Several requests at once: 282 tok/s aggregate at `--max-concurrency 8` (153 at 2, 228 at 4). Details: [Inkling-2-Mini spec, "MXFP8 experts"](maintainer/inkling2-model.md#mxfp8-experts).
 

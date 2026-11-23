@@ -105,6 +105,13 @@ public:
         for (const DeviceBuffer& b : mxfp8_banks_) { n += b.bytes; }
         return n;
     }
+    // What the MXFP8 re-encode read from the artifact, uploaded (through `staging_bytes` of pinned staging) and took,
+    // beside storage_stats(), which covers only the materialized weights. Zero when the experts are BF16.
+    struct Mxfp8LoadStats {
+        std::uint64_t read_bytes = 0, h2d_bytes = 0, staging_bytes = 0;
+        double seconds = 0;
+    };
+    [[nodiscard]] const Mxfp8LoadStats& mxfp8_load_stats() const noexcept { return mxfp8_load_; }
     // The layers whose BF16 experts are held as MXFP8.
     [[nodiscard]] std::uint32_t mxfp8_expert_layers() const noexcept { return static_cast<std::uint32_t>(mxfp8_banks_.size()); }
     // The DSpark drafter, when the artifact has one (null otherwise).
@@ -146,6 +153,7 @@ private:
     std::vector<BoundWeight> bound_;
     std::vector<ops::SituExpertBank> banks_;
     std::vector<DeviceBuffer> mxfp8_banks_; // one per MXFP8 layer: its four arrays
+    Mxfp8LoadStats mxfp8_load_;
     void tile_expert_records();
 };
 
