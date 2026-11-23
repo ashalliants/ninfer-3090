@@ -286,6 +286,12 @@ is about 33% slower with MTP3, because acceptance halves: the rk4v4 numerics sen
 greedy stream somewhere the draft model predicts worse. Rounds cost the same. We did not look for the
 cause. Treat `ninfer_bench` MTP rows as comparable only between runs that use the same KV format.
 
+**Per-layer KV mixes** (`--kv-dtype rk4v4x12,int8x4`, opt-in) sit between these two: on the 27B the
+last four full-attention layers carry half of `rk4v4`'s perplexity penalty, so `rk4v4x12,int8x4`
+halves it for 22% more KV, and `rk4v4x4,int8x12` matches `int8` in 12% less. Measured on the V100 only
+so far (decode 3% faster than `rk4v4` at 40K and 162K; see [tesla-v100.md](tesla-v100.md)); not yet
+on this card, where the `tuned` profile's `rk4v4` would be the one to compare.
+
 **`ninfer_bench`, Engine route** (mean of 5 repetitions after one warm-up; model flags as noted)
 
 | Model | Test | Setting | Result |

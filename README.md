@@ -466,7 +466,8 @@ On Bazzite and other distributions the Dockerfile is the shortest path:
 - Structured JSON output (`response_format` / `text.format` / `output_config.format`), enforced
   during sampling under every speculative backend.
 - MTP3 and DFlash2 speculative decoding, with ReplaySSM keeping speculation inside 24 GB.
-- Seven KV-cache formats, from `bf16` to the 4-bit-key `rk4v4` that reaches the native 262K context.
+- Seven KV-cache formats, from `bf16` to the 4-bit-key `rk4v4` that reaches the native 262K context,
+  plus per-layer INT8-family mixes (`--kv-dtype rk4v4x12,int8x4`).
 - Image understanding on Qwen3.8-27B and Qwen3.6-35B-A3B, with overlay residency that keeps the
   vision tower off the device between images.
 - Prefix reuse and a host-tier context cache for repeated or shared prompts, backed by one pinned
@@ -931,6 +932,39 @@ desktop running (1.8 GiB in use):
 
 For a shared pool serving several lanes, the same memory holds 1.46x as many `rk4v4` tokens as
 `rk8v4` tokens.
+
+### Per-layer mixes (`--kv-dtype rk4v4x12,int8x4`, opt-in)
+
+The 27B keeps its whole KV cache in 16 full-attention layers, and they are not equally sensitive:
+on Qwen3.8-27B the last four carry half of `rk4v4`'s perplexity penalty and the first four none of it.
+`--kv-dtype` also takes a per-layer spec, runs of `FORMATxCOUNT` over those layers in model order,
+mixing `int8`, `rk8v4` and `rk4v4` (the MTP layer stays `int8`), so the bytes go where they buy the
+most. It is opt-in and lossy like its members; nothing defaults to it.
+
+Measured on a Tesla V100 at 200 W (2026-11-23), `ninfer-perplexity` on the held-out corpus, `--quick`,
+context/stride 65,536/32,768 (391,000 tokens, 6 domains); ΔNLL is the paired per-domain difference
+from `int8` in millinats, with its standard error over the domains:
+
+| KV | Bytes/token | Perplexity | ΔNLL vs `int8` |
+|---|---:|---:|---:|
+| `int8` | 33,792 | 4.16760 | — |
+| **`rk4v4x4,int8x12`** | **29,824** | 4.16706 | −0.13 (se 0.36) |
+| `rk4v4x4,int8x4,rk4v4x4,int8x4` | 25,856 | 4.17029 | +0.65 (se 0.32) |
+| `rk8v4` | 26,112 | 4.17761 | +2.41 (se 0.73) |
+| **`rk4v4x12,int8x4`** | **21,888** | 4.17463 | +1.69 (se 0.47) |
+| `rk4v4` | 17,920 | 4.18245 | +3.56 (se 0.58) |
+
+- **`rk4v4x4,int8x12`** is `int8` within noise in 12% fewer bytes.
+- **`rk4v4x12,int8x4`** halves `rk4v4`'s penalty for 22% more bytes, and beats `rk8v4` in 16% fewer.
+- `rk4v4x4,int8x4,rk4v4x4,int8x4` has `rk8v4`'s size at a quarter of its penalty.
+
+Speed on the V100 through `ninfer-serve` with MTP3 (the V100 router's 27B flags, two interleaved
+runs per format, which agreed within 0.1%): `rk4v4x12,int8x4` decodes 3% faster than `rk4v4` at 40K
+and 162K (43.5 / 20.9 against 42.2 / 20.3 tok/s) and prefills a 162K prompt 18% faster; `rk4v4x4,int8x12`
+decodes like `int8` at 40K (48.4 against 47.9 tok/s) and 5% slower at 162K (24.4 against 25.7), and
+prefills 30% slower at 40K. The 12 short chats are level (62.7-63.7 tok/s). The RTX 3090 has not been
+measured with a mix; its sizes are the same, so a mix trades context for perplexity there. Details
+in [quality-trade-experiments.md](docs/maintainer/quality-trade-experiments.md#per-layer-kv-precision---kv-dtype-mixes).
 
 ## Several GPUs: pipeline stages (`--devices A,B,...`)
 

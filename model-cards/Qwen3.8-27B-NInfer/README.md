@@ -207,7 +207,9 @@ The artifact supports:
 - MTP speculative decoding with draft windows from one to fifteen;
 - DFlash2 with draft windows from one to fifteen using the included
   DFlash2 companion weights (`--spec dflash2 --draft-tokens 7`, optionally `--lm-head-draft`);
-- BF16, INT8, FP8, NVFP4, and K8V4 KV cache;
+- BF16, INT8, FP8, NVFP4, and K8V4 KV cache, and per-layer INT8-family mixes
+  (`--kv-dtype rk4v4x12,int8x4`: half of `rk4v4`'s perplexity penalty for 22% more KV;
+  `rk4v4x4,int8x12`: `int8`'s perplexity within noise in 12% less, measured on a Tesla V100);
 - CUDA Graph decode and compatible-prefix reuse;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - the NInfer CLI;

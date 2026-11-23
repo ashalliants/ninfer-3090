@@ -529,6 +529,92 @@ What the rows say:
   allocation exactly: the held-out perplexity of the rebuilt file is bit-identical (4.322391) and 8
   greedy coding answers are token-for-token identical to the measured artifact's.
 
+## Per-layer KV precision (`--kv-dtype` mixes)
+
+The 27B's 16 full-attention layers hold all of its KV cache (the other 48 are GDN layers), and they
+are not equally sensitive to KV coding. `--kv-dtype` takes a per-layer spec, runs of `FORMATxCOUNT`
+over those layers in model order (`int8`, `rk8v4`, `rk4v4`; the MTP layer's cache stays `int8`), so
+the bytes go where they buy the most perplexity. Opt-in and lossy like its members. Follow-up of
+closed PR #575, whose early-int8 half-and-half did no better than `rk8v4` but whose late-int8 reverse
+did.
+
+**Protocol.** Tesla V100 at 200 W, `ninfer-perplexity --corpus perplexity-heldout-2026-09 --quick
+--context 65536 --stride 32768`: 391,000 scored tokens in 6 windows, one per domain. No llama.cpp or
+reference GGUF on that box, so no KLD; each run is compared with all-`int8` by the paired per-domain
+mean NLL difference, the mean over the 6 domains with its standard error (se). The `int8` run was
+repeated and reproduced bit for bit (mean NLL 1.427339), and the measurement patch and the shipped
+option give bit-identical totals for `rk4v4x8,int8x8`. Bytes are per KV head and position; a token
+of the 27B is 64 of them (16 layers, 4 KV heads).
+
+**Which layers matter.** Quarter probes, one quarter of the layers at `int8` and the rest `rk4v4`
+(all-`rk4v4` is +3.56 mnat):
+
+| `int8` quarter | Spec | ΔNLL vs `int8` (mnat) | Recovered of `rk4v4`'s +3.56 |
+|---|---|---:|---:|
+| layers 0-3 | `int8x4,rk4v4x12` | +3.79 (se 0.82) | none |
+| layers 4-7 | `rk4v4x4,int8x4,rk4v4x8` | +2.43 (se 0.47) | 1.13 |
+| layers 8-11 | `rk4v4x8,int8x4,rk4v4x4` | +2.96 (se 0.55) | 0.60 |
+| layers 12-15 | `rk4v4x12,int8x4` | +1.69 (se 0.47) | 1.87 |
+
+The recoveries add up: the two late quarters predict 2.47 of the late half's measured 2.43, the
+two early ones 0.90 of the early half's 1.07. The last four layers carry half of `rk4v4`'s penalty
+and the first four none of it (last quarter minus third: -1.27 mnat, se 0.27).
+
+**Mixes against the uniform formats:**
+
+| KV | Bytes/head-pos | Bytes/token | PPL | ΔNLL vs `int8` (mnat) |
+|---|---:|---:|---:|---:|
+| `int8` | 528 | 33,792 | 4.16760 | 0 |
+| `rk4v4x4,int8x12` | 466 | 29,824 | 4.16706 | -0.13 (se 0.36) |
+| `rk4v4x4,int8x4,rk4v4x4,int8x4` | 404 | 25,856 | 4.17029 | +0.65 (se 0.32) |
+| `rk4v4x8,int8x8` | 404 | 25,856 | 4.17228 | +1.13 (se 0.54) |
+| `int8x8,rk4v4x8` | 404 | 25,856 | 4.17800 | +2.49 (se 0.37) |
+| `rk8v4` | 408 | 26,112 | 4.17761 | +2.41 (se 0.73) |
+| `rk4v4x12,int8x4` | 342 | 21,888 | 4.17463 | +1.69 (se 0.47) |
+| `rk4v4` | 280 | 17,920 | 4.18245 | +3.56 (se 0.58) |
+
+- `rk4v4x4,int8x12` is `int8` within noise at 88% of its bytes.
+- `rk4v4x4,int8x4,rk4v4x4,int8x4` has `rk8v4`'s bytes and a quarter of its penalty (-1.76 mnat
+  against `rk8v4`, se 1.01; better in 5 of 6 domains).
+- `rk4v4x12,int8x4` halves `rk4v4`'s penalty for 22% more bytes, and still beats `rk8v4` with 16%
+  fewer (-0.72 mnat, se 0.39).
+
+**Speed on the V100.** `ninfer-serve` with the V100 router's 27B flags (`--spec mtp --draft-tokens 3
+--lm-head-draft --gdn-state-fp16 --prefill-cublas --prefill-chunk 2048 --max-concurrency 2
+--max-context 262144 --kv-capacity 262144 --fit-context 32768 --vision --vision-residency overlay
+--host-context-mib 8192`), only `--kv-dtype` varied, 200 W power limit, legs interleaved
+`int8`, `rk4v4`, mix A, mix B, mix B, mix A, `rk4v4`, `int8` (the paired legs agreed within 0.1% and
+gave identical greedy text). Decode is 256 greedy tokens on exact-hit repeats of a checkpointed
+prompt (three per depth), the chats 12 greedy 300-token prompts; requests that overlapped a thermal
+pause are dropped (only the two `int8` legs' long prefills):
+
+| KV | Bytes/token | Runtime at 262K | Chats | 4K | 40K | 162K | Prefill 40K / 162K | MTP acceptance 40K / 162K |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `int8` | 33,792 | 11.0 GiB | 63.7 | 57.9 | 47.9 | 25.7 | 47.0 s / paused | 0.64 / 0.76 |
+| `rk4v4x4,int8x12` | 29,824 | 10.1 GiB | 63.7 | 60.0 | 48.4 | 24.4 | 61.1 s / 535 s | 0.68 / 0.77 |
+| `rk4v4x12,int8x4` | 21,888 | 8.13 GiB | 63.1 | 63.6 | 43.5 | 20.9 | 89.5 s / 975 s | 0.63 / 0.72 |
+| `rk4v4` | 17,920 | 5.87 GiB | 62.7 | 58.4 | 42.2 | 20.3 | 103.6 s / 1,194 s | 0.63 / 0.74 |
+
+Decode in tok/s; the 40K and 162K prompts are 40,252 and 161,830 tokens. On sm_70 decode attention
+is compute-bound rather than byte-bound (the attention op bench has `int8` fastest at the MTP verify
+widths), so a mix's decode lands between its members': `rk4v4x12,int8x4` is 3% faster than `rk4v4`,
+`rk4v4x4,int8x12` within 1% of `int8` at 40K and 5% slower at 162K. Prefill follows the share of
+`rk4v4` layers, whose long-prompt attention is much slower on this card (`rk4v4` takes 3.5x
+`int8`'s time at 162K). The V100 router keeps `int8`: it fits 262K at two lanes with 5.2 GiB free
+and prefills fastest.
+
+**The RTX 3090** (sm_86, x16) was not measured. The mixes add no kernel: each layer runs its own
+format's existing sm_86 routes, and the graph planner breaks profiles wherever any of them changes.
+There the trade is bytes: the `tuned` profile runs `rk4v4` to reach 262K on 24 GB, and
+`rk4v4x12,int8x4` costs 22% more KV per token (0.97 GiB more at 262,144 tokens), so it buys half of
+`rk4v4`'s perplexity penalty back for some context. A mix also plans the largest of its members'
+attention workspaces: on the V100 the runtime reservation at 262K rose 2.26 GiB over `rk4v4`, the
+0.97 GiB of KV plus `int8`'s larger prompt-attention workspace (sm_86's may differ). The 3090's MTP3
+two-lane profile has 1.19 GiB free at 262K, so it would need a shorter context there. Whether that fits, and its speed there
+(where `rk4v4`'s MTP acceptance loss is the known cost, see
+[performance.md](../performance.md)), needs a 3090 run before a launcher profile changes.
+
+
 ## Tried and rejected: two-stage output head (Basalt X-B)
 
 **The idea.** Basalt (8d73a39, `src/kernels/cuda/head_proxy.cuh`) scores its draft head from a

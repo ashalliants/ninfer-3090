@@ -208,6 +208,24 @@ Attention over the 16 full-attention layers' KV is what slows long-context decod
 tile in registers (sm_70 only) raised the 40K figure from 46.8 and the 162K figure from 23.5 tok/s, with
 byte-identical output.
 
+**Per-layer KV mixes** (`--kv-dtype rk4v4x12,int8x4` and the like, opt-in, lossy). Same server
+flags, only `--kv-dtype` varied, 200 W, interleaved legs (2026-11-23; the paired legs agreed within
+0.1%). Perplexity is the held-out corpus at a 65,536-token context; ΔNLL is the paired difference
+from `int8` in millinats (se over 6 domains):
+
+| KV | Bytes/token | ΔNLL vs `int8` | Decode 4K / 40K / 162K | Prefill 40K / 162K |
+|---|---:|---:|---|---:|
+| `int8` | 33,792 | — | 57.9 / 47.9 / 25.7 tok/s | 47.0 s / — |
+| `rk4v4x4,int8x12` | 29,824 | −0.13 (se 0.36) | 60.0 / 48.4 / 24.4 tok/s | 61.1 s / 535 s |
+| `rk4v4x12,int8x4` | 21,888 | +1.69 (se 0.47) | 63.6 / 43.5 / 20.9 tok/s | 89.5 s / 975 s |
+| `rk4v4` | 17,920 | +3.56 (se 0.58) | 58.4 / 42.2 / 20.3 tok/s | 103.6 s / 1,194 s |
+
+The `int8` legs' 162K prefills overlapped a thermal pause and are not given. The last four
+full-attention layers are the sensitive ones, so a little `int8` there buys back most of `rk4v4`'s
+loss. On this card `int8` stays the right choice (it fits 262K at two lanes with 5.2 GiB free and
+prefills fastest); the mixes are for when KV bytes are short. See
+[the README](../README.md#per-layer-mixes---kv-dtype-rk4v4x12int8x4-opt-in).
+
 ### Qwen3.8-Flash-Next
 
 Decode with a warm expert cache, MTP3: 78 / 96 / 72 / 81 tok/s on story / code / Chinese / French
