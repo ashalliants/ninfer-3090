@@ -31,6 +31,7 @@
 #include "ninfer/ops/rows.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/sigmoid_mul.h"
+#include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/silu_mul.h"
 
 #include <algorithm>
@@ -255,7 +256,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
       moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
       moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read),
-      ggml_decode_mma_(options.ggml_decode_mma), steering_(options.steering) {
+      ggml_decode_mma_(options.ggml_decode_mma), steering_(options.steering), draft_head_(options.draft_head),
+      draft_head_ids_(options.draft_head_ids) {
     require_hc_int8(parameters_, hc_int8_, hc_fused_read_);
     require_ggml_decode_mma(parameters_, ggml_decode_mma_);
     require_steering(parameters_, steering_);
@@ -288,7 +290,8 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
       cold_embedding_(options.cold_embedding), gdn_head_map_(options.gdn_head_map),
       moe_precast_input_(options.moe_precast_input), moe_gate_up_registers_(options.moe_gate_up_registers),
       moe_fused_route_(options.moe_fused_route), hc_int8_(options.hc_int8), hc_fused_read_(options.hc_fused_read),
-      ggml_decode_mma_(options.ggml_decode_mma), steering_(options.steering) {
+      ggml_decode_mma_(options.ggml_decode_mma), steering_(options.steering), draft_head_(options.draft_head),
+      draft_head_ids_(options.draft_head_ids) {
     require_hc_int8(parameters_, hc_int8_, hc_fused_read_);
     require_ggml_decode_mma(parameters_, ggml_decode_mma_);
     require_steering(parameters_, steering_);
@@ -1954,25 +1957,31 @@ void Forward::mtp_block(const MtpCall& call) {
         ops::hyper_connection_inject(ym, mlp_inject, residual, s);
         CUDA_CHECK(cudaMemcpyAsync(call.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
 
-        // The draft: argmax of the text head over the public tokens, from BF16 logits.
-        Tensor final_x = mix(p.final_mixer, residual, nullptr);
-        Tensor head    = work_->alloc(DType::FP32, {dim(config_.vocab_size), T});
-        ops::projection_fp32(final_x, parameters_.output_head, head, s);
+        // The draft: argmax of the text head over the public tokens, from BF16 logits. With a
+        // reduced draft head (--mtp-draft-vocab) the argmax runs over its rows only, each the head
+        // row of a listed public token, and maps back to that token id. Verification decides what
+        // is emitted, so a draft the reduced head cannot propose only costs acceptance.
+        const bool reduced       = draft_head_ids_ != nullptr && call.tap == nullptr;
+        const Weight& head_w     = reduced ? draft_head_ : parameters_.output_head;
+        Tensor final_x           = mix(p.final_mixer, residual, nullptr);
+        Tensor head              = work_->alloc(DType::FP32, {head_w.n, T});
+        ops::projection_fp32(final_x, head_w, head, s);
         if (call.tap != nullptr) {
             tap(call.tap->final_x, final_x);
             tap(call.tap->logits, head);
         }
         Tensor drafts            = call.drafts;
-        const std::int32_t valid = dim(parameters_.model.resources().public_token_count);
+        const std::int32_t valid = reduced ? head_w.n : dim(parameters_.model.resources().public_token_count);
         if (call.probs.data != nullptr) {
             // The same ids (its argmax keys are the BF16 roundings) and the draft's probability.
             Tensor probs = call.probs;
             ops::argmax_probability(head, drafts, probs, valid, *work_, s);
         } else {
-            Tensor narrow = work_->alloc(DType::BF16, {dim(config_.vocab_size), T});
+            Tensor narrow = work_->alloc(DType::BF16, {head_w.n, T});
             ops::cast_fp32_to_bf16(head, narrow, s);
             ops::argmax(narrow, drafts, valid, s);
         }
+        if (reduced) { ops::proposal_remap_token_ids(drafts, draft_head_ids_, head_w.n, s); }
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string("qwen4_exp/mtp: ") + error.what());
     }

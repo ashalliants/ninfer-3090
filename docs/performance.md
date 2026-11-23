@@ -17,6 +17,15 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next MTP draft vocabulary (2026-11-23)
+
+On the V100 (200 W, x4 eGPU), `run-v100.sh` now serves Flash-Next with up to seven MTP drafts and a
+reduced draft head (`--mtp-draft-vocab`: jesdga's Basalt token list, downloaded at install, 106,056 of
+248,077 rows). Decode (greedy, 300 tokens, warm cache, same text) reaches **123.3 tok/s on code** (119.1
+before), 100.3 thinking (97.1), 80.5 story (80.1) and 78.8 Chinese (78.6). **French drops to 71.8
+(88.7)** because the list covers it poorly; `--mtp-draft-vocab off` restores the full head. The RTX
+3090 is unchanged. Details: [tesla-v100.md](tesla-v100.md#qwen38-flash-next).
+
 ## RTX 3090 (`sm_86`) findings — this fork
 
 ### Inkling-2-Mini on the RTX 3090 (2026-11-23)

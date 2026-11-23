@@ -455,6 +455,7 @@ struct LoadPlan::Impl {
     InstanceInfo info;
     std::vector<std::uint64_t> strides;
     QType token_embedding = QType::GGML_IQ4_XS;
+    QType output_head     = QType::GGML_IQ4_XS;
     // Partial RAM residency: the text banks, left in the file (empty otherwise).
     std::vector<ExpertBank> file_banks;
 };
@@ -470,6 +471,7 @@ std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.dev
 std::uint64_t LoadPlan::pinned_bytes() const { return impl_->materialization.pinned_capacity_bytes; }
 const std::vector<std::uint64_t>& LoadPlan::expert_record_strides() const { return impl_->strides; }
 QType LoadPlan::token_embedding_format() const { return impl_->token_embedding; }
+QType LoadPlan::output_head_format() const { return impl_->output_head; }
 
 Model::Model(TextConfig config, TextWeights weights, std::optional<MtpWeights> mtp, std::vector<BoundWeight> bound,
              std::vector<ExpertBank> banks, std::optional<ExpertBank> mtp_bank, std::optional<VisionWeights> vision,
@@ -511,6 +513,7 @@ LoadPlan plan_load(const artifact::Reader& reader, bool mtp, bool vision, bool h
     out->pending         = std::move(bindings.weights);
     require_text_formats(reader, out->pending, out->weights, hot_embedding);
     out->token_embedding = bound_format(reader, out->pending.at(out->weights.token_embedding.index));
+    out->output_head     = bound_format(reader, out->pending.at(out->weights.output_head.index));
     for (const auto& layer : out->weights.layers) {
         const auto& parts = out->pending.at(layer.moe.experts.index).reference.binding.parts;
         if (parts.size() != 1) { throw ArtifactError("an expert bank must be one complete parent"); }

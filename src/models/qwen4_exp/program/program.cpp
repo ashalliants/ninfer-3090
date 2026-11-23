@@ -68,6 +68,7 @@
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
+#include "ninfer/ops/rows.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
@@ -89,6 +90,8 @@
 #include <cstring>
 #include <functional>
 #include <exception>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -789,6 +792,7 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
                                                  o.hot_embedding_format).hot;
     b.cpu_misses              = plan_cpu_misses(o).device;
     b.hc_int8_bytes           = plan_hc_int8(o, c);
+    b.mtp_draft_head          = plan_mtp_draft_head(o);
     b.steering                = plan_steering(o, c);
     b.ngram_flag_wait         = plan_ngram_flag_wait(o).device;
     b.staging   = d.staging;
@@ -996,6 +1000,10 @@ public:
             hot_embedding_  = DeviceBuffer(plan_.bytes.hot_embedding);
             allocated += plan_.bytes.hot_embedding;
             CUDA_CHECK(cudaMemcpy(hot_embedding_.p, table.qdata, plan_.bytes.hot_embedding, cudaMemcpyHostToDevice));
+        }
+        if (plan_.bytes.mtp_draft_head != 0) {
+            build_draft_head();
+            allocated += plan_.bytes.mtp_draft_head;
         }
 
         // The shared expert's side-stream carve (when on) comes out of the same arena.
@@ -1292,6 +1300,38 @@ public:
     // The forward's options; with --hot-embedding-rows its two embedding planes: the device copy of
     // the first rows and the whole table through its device pointer in the mapped pinned block.
     // Refusal steering: every vector's directions as one device table, FP32 [vectors][layers][hidden].
+    // --mtp-draft-vocab: the listed rows of the output head, gathered once into device memory (an
+    // exact copy of their GGML blocks, viewed as BF16 words), and the token id of each row.
+    void build_draft_head() {
+        const Weight& head            = parameters_.output_head;
+        const auto& ids               = *options_.mtp_draft_vocab;
+        const auto rows               = static_cast<std::int32_t>(ids.size());
+        const std::uint64_t row_bytes = options_.mtp_draft_head_row_bytes;
+        const GgmlBlock block         = ggml_block(head.qtype);
+        if (block.values == 0 || row_bytes != static_cast<std::uint64_t>(head.k) / block.values * block.bytes ||
+            row_bytes % 2 != 0 || head.layout != QuantLayout::GgmlBlocks) {
+            throw std::logic_error("Qwen3.8-Flash-Next: the draft head's row bytes differ from the output head's");
+        }
+        draft_head_ = DeviceBuffer(plan_.bytes.mtp_draft_head);
+        auto* base  = static_cast<std::byte*>(draft_head_.p);
+        auto* map   = reinterpret_cast<std::int32_t*>(base + mtp_draft_head_ids_offset(options_));
+        CUDA_CHECK(cudaMemcpy(map, ids.data(), 4ULL * ids.size(), cudaMemcpyHostToDevice));
+        const auto words = static_cast<std::int32_t>(row_bytes / 2);
+        const Tensor source(const_cast<void*>(head.qdata), DType::BF16, {words, head.n});
+        const Tensor columns(map, DType::I32, {rows});
+        Tensor gathered(base, DType::BF16, {words, rows});
+        ops::gather_columns(source, columns, gathered, device_.stream);
+        CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+        draft_head_weight_                 = head;
+        draft_head_weight_.payload         = base;
+        draft_head_weight_.qdata           = base;
+        draft_head_weight_.payload_bytes   = static_cast<std::uint64_t>(rows) * row_bytes;
+        draft_head_weight_.shape[0]        = rows;
+        draft_head_weight_.padded_shape[0] = rows;
+        draft_head_weight_.n               = rows;
+        draft_head_ids_                    = map;
+    }
+
     void build_steering_table() {
         const std::size_t sets = options_.steering.size(), layers = c_.num_hidden_layers, hidden = c_.hidden_size;
         std::vector<float> host(sets * layers * hidden, 0.0f);
@@ -1354,6 +1394,10 @@ public:
                                       .hc_fused_read         = options_.hc_fused_read,
                                       .ggml_decode_mma       = options_.ggml_decode_mma,
                                       .steering = steering_table_.directions != nullptr ? &steering_table_ : nullptr};
+        if (draft_head_ids_ != nullptr) {
+            out.draft_head     = draft_head_weight_;
+            out.draft_head_ids = draft_head_ids_;
+        }
         if (plan_.bytes.hot_embedding == 0) { return out; }
         const Weight& table        = parameters_.token_embedding;
         const auto rows            = static_cast<std::int32_t>(options_.hot_embedding_rows);
@@ -6244,6 +6288,9 @@ private:
     PinnedHostBuffer draft_probs_host_{1};
     // --hot-embedding-rows: the token embedding's first rows (ProgramDevicePlan::hot_embedding).
     DeviceBuffer hot_embedding_;
+    DeviceBuffer draft_head_;               // --mtp-draft-vocab: the gathered head rows and their ids
+    Weight draft_head_weight_;
+    const std::int32_t* draft_head_ids_ = nullptr;
     const void* cold_embedding_ = nullptr; // the whole table's device pointer in the mapped pinned block
     PinnedHostBuffer config_host_{1};
     // Relaxed drafting's tokenizer facts (ProgramOptions::relaxed_drafting; empty when off).
@@ -6524,6 +6571,40 @@ std::uint64_t plan_hc_int8(const ProgramOptions& options, const TextConfig& conf
 std::uint64_t plan_steering(const ProgramOptions& options, const TextConfig& config) {
     return static_cast<std::uint64_t>(options.steering.size()) * config.num_hidden_layers * config.hidden_size *
            sizeof(float);
+}
+
+std::uint64_t mtp_draft_head_ids_offset(const ProgramOptions& options) {
+    if (!options.mtp_draft_vocab || options.mtp_draft_tokens == 0) { return 0; }
+    const std::uint64_t rows = options.mtp_draft_vocab->size();
+    return (rows * options.mtp_draft_head_row_bytes + 255) / 256 * 256;
+}
+
+std::uint64_t plan_mtp_draft_head(const ProgramOptions& options) {
+    if (!options.mtp_draft_vocab || options.mtp_draft_tokens == 0) { return 0; }
+    return mtp_draft_head_ids_offset(options) + 4ULL * options.mtp_draft_vocab->size();
+}
+
+std::vector<std::int32_t> load_draft_vocab(const std::filesystem::path& path, std::int32_t public_tokens) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { throw std::runtime_error("--mtp-draft-vocab: cannot read " + path.string()); }
+    std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (raw.empty() || raw.size() % 4 != 0) {
+        throw std::runtime_error("--mtp-draft-vocab: " + path.string() + " is not a list of int32 token ids");
+    }
+    std::vector<std::int32_t> ids;
+    ids.reserve(raw.size() / 4);
+    for (std::size_t at = 0; at < raw.size(); at += 4) {
+        const auto* b = reinterpret_cast<const unsigned char*>(raw.data() + at);
+        const auto v  = static_cast<std::int32_t>(static_cast<std::uint32_t>(b[0]) | (static_cast<std::uint32_t>(b[1]) << 8U) |
+                                                  (static_cast<std::uint32_t>(b[2]) << 16U) |
+                                                  (static_cast<std::uint32_t>(b[3]) << 24U));
+        if (v >= 0 && v < public_tokens) { ids.push_back(v); }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    if (ids.size() < 2) { throw std::runtime_error("--mtp-draft-vocab: " + path.string() + " lists fewer than two usable ids"); }
+    if (ids.size() % 2 != 0) { ids.push_back(ids.back()); }
+    return ids;
 }
 
 std::uint64_t plan_mtp_draft_probs(const ProgramOptions& options) {

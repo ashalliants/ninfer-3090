@@ -726,6 +726,13 @@ struct FlashNextOptions {
     // same; a round pays a host sync per extra step instead of always running --draft-tokens steps.
     // Off: every round drafts --draft-tokens in one graph.
     bool mtp_staged_drafts = false;
+    // The MTP drafter's reduced draft vocabulary (--mtp-draft-vocab PATH|auto|off; Flash-Next with
+    // --spec mtp): a file of int32 token ids. The drafter scores only those rows of the output head
+    // and proposes only those tokens; verification is unchanged, so output is the same token for
+    // token, though acceptance drops where the list is thin (French: about -14% tok/s on a V100).
+    // "auto" (the default) reads <artifact>.draft-vocab when it exists, on a Tesla V100 (sm_70)
+    // only; a path reads that file on any card; "off" keeps the full head.
+    std::string mtp_draft_vocab = "auto";
     // Batches a genuine draft-and-verify across every eligible row when two or more lanes decode
     // together (--mtp-rows-verify; needs --mtp-joint-acceptance), instead of always falling back to
     // a plain round. Off by default: a known bug (docs/maintainer/mtp-multi-row-lanes-design.md)

@@ -60,7 +60,7 @@ usage() {
 }
 
 # Only the qwen38-flash-next models have continuation parts and an n-gram volume.
-part_sizes=() part_sha256s=() ngram_name='' ngram_repo=''
+part_sizes=() part_sha256s=() ngram_name='' ngram_repo='' draft_vocab=''
 case "${1:-}" in
   qwen38-27b)
     artifact='qwen3_8_27b.ninfer'
@@ -127,6 +127,7 @@ case "${1:-}" in
     ngram_revision='95b1b0169bd25db96ceb772a8a67cc6e87088a1f'
     ngram_size=29127258112
     ngram_sha256='7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051'
+    draft_vocab=1
     label='the Qwen3.8-Flash-Next model (38.2 GiB in two files)'
     tests_variable='NINFER_TEST_QWEN4EXP_ARTIFACT'
     ;;
@@ -146,6 +147,7 @@ case "${1:-}" in
     ngram_revision='95b1b0169bd25db96ceb772a8a67cc6e87088a1f'
     ngram_size=29127258112
     ngram_sha256='7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051'
+    draft_vocab=1
     label='the Qwen3.8-Flash-Next UD-IQ3_XXS model (53.17 GiB in two files)'
     tests_variable='NINFER_TEST_QWEN4EXP_ARTIFACT'
     ;;
@@ -272,6 +274,37 @@ graft_sha_ok() {
   [ "$actual" = "$2" ]
 }
 
+# Flash-Next's MTP draft vocabulary (ninfer-serve reads <model>.draft-vocab on a Tesla V100; --mtp-draft-vocab off ignores it): the
+# 106,299 token ids the drafter of jesdga's Basalt packs proposes from (convert/mtp/rt/draft_vocab.bin in
+# huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt, also used by chris83-dev's Lapilli-V100 port). It is
+# their file, under their licence (Qwen Community License 1.0, the LICENSE in that repo): this script
+# downloads it from their repo, pinned to a revision and sha256, and NInfer does not redistribute it.
+# Best-effort: without it the drafter scores the full head, and the output is the same either way.
+# NINFER_DRAFT_VOCAB=off skips it.
+fetch_draft_vocab() {
+  [ -n "${draft_vocab:-}" ] && [ "${NINFER_DRAFT_VOCAB:-}" != 'off' ] || return 0
+  local rev='fc721830e519ab52012d372e89b90d9a7df30ff2'
+  local url="https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt/resolve/$rev/convert/mtp/rt/draft_vocab.bin"
+  local sha='b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91'
+  local path="$model.draft-vocab"
+  if [ -f "$path" ] && graft_sha_ok "$path" "$sha"; then
+    printf 'MTP draft vocabulary ready: %s
+' "$path"
+    return 0
+  fi
+  printf '%s
+' 'Downloading the MTP draft vocabulary from jesdga/Qwen3.8-Flash-Next-Basalt (Qwen Community License 1.0)...'
+  if ! curl -sSL --fail --output "$path.part" "$url" 2>/dev/null || ! graft_sha_ok "$path.part" "$sha"; then
+    rm -f -- "$path.part" 2>/dev/null || true
+    printf '%s
+' 'MTP draft vocabulary: skipped (download or sha256 check failed); the drafter uses the full head.' >&2
+    return 0
+  fi
+  mv -f -- "$path.part" "$path"
+  printf 'MTP draft vocabulary ready: %s
+' "$path"
+}
+
 # Fetches one pinned file: folder, name, size, sha256, revision, description, and kind (model, part or
 # volume). Returns non-zero unless the file ends at its final name, verified. A file already there that
 # verifies is kept without any download.
@@ -374,4 +407,5 @@ if [ -n "$ngram_name" ]; then
   fi
 fi
 printf 'Point the tests at it with:  export %s=%s\n' "$tests_variable" "$model"
+fetch_draft_vocab
 fetch_graft "$1"

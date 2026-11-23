@@ -16,13 +16,13 @@ Linux.
 
 All figures were measured on one V100-PCIE-32GB, connected over an OCuLink PCIe Gen3 x4 eGPU link
 (3.3 GB/s host-to-device), on a Linux host with 59 GiB of RAM, with a 250 W power limit
-(2026-11-16 to 2026-11-18), except Flash-Next's MTP3 decode, re-measured at 200 W on 2026-11-23.
-Decode is greedy with MTP3 speculation, as `run-v100.sh` serves it.
+(2026-11-16 to 2026-11-18), except Flash-Next's MTP decode, re-measured at 200 W on 2026-11-23.
+Decode is greedy with MTP speculation, as `run-v100.sh` serves it (three drafts; seven for Flash-Next).
 
 | | Qwen3.8-27B | Qwen3.8-Flash-Next |
 |---|---:|---:|
 | **Context** | 262,144 tokens | **262,144 tokens** (`run-v100.sh` default) |
-| **Decode**, one stream, MTP3 | **76-86 tok/s** | **119 tok/s** on code, 79-97 on other text, with a warm cache (2026-11-23, 200 W) |
+| **Decode**, one stream, MTP | **76-86 tok/s** (MTP3) | **123 tok/s** on code, 100 thinking, 79-81 story and Chinese, 72 French (MTP7 + draft vocabulary, warm cache, 2026-11-23, 200 W) |
 | **Decode**, plain (250 W) | 42 tok/s | 53 tok/s |
 | **Prefill**, ~4K-token prompt | **~1,020 tok/s** | **~990 tok/s** (3,798 tokens in 3.8 s) |
 | **Prefill**, long prompts | | 38K tokens in 38.4 s (~1,000 tok/s) |
@@ -229,21 +229,56 @@ prefills fastest); the mixes are for when KV bytes are short. See
 
 ### Qwen3.8-Flash-Next
 
-Decode with a warm expert cache, MTP3 (2026-11-23, master `61b3e032c`, **200 W** power limit, no thermal
-throttling sampled during any run):
+Decode with a warm expert cache (2026-11-23, **200 W** power limit, no thermal throttling sampled
+during any run). `run-v100.sh` now drafts up to seven tokens a round with the reduced MTP draft head
+(below); the three-draft, full-head figures of master `61b3e032c` are beside them:
 
-| Prompt | Best | Range over 5 runs | Tokens per verification round |
-|---|---:|---:|---:|
-| Code (Python CSV parser) | **119.1 tok/s** | 117.9-119.1 | 3.31 |
-| Thinking (a maths word problem) | **97.1 tok/s** | 94.5-97.1 | 2.62 |
-| French essay | **88.7 tok/s** | 83.1-88.7 | 2.18 |
-| Story | **80.1 tok/s** | 77.7-80.1 | 1.94 |
-| Chinese essay | **78.6 tok/s** | 76.7-78.6 | 1.90 |
+| Prompt | MTP7 + draft vocabulary (default) | Tokens per round | MTP3, full head (before) | Tokens per round |
+|---|---:|---:|---:|---:|
+| Code (Python CSV parser) | **123.3 tok/s** (123.1-123.3) | 3.93 | 119.1 (117.9-119.1) | 3.31 |
+| Thinking (a maths word problem) | **100.3 tok/s** (99.7-100.3) | 3.05 | 97.1 (92.0-97.1) | 2.62 |
+| Story | **80.5 tok/s** (80.3-80.5) | 1.92 | 80.1 (77.7-80.1) | 1.94 |
+| Chinese essay | **78.8 tok/s** (78.6-78.8) | 1.88 | 78.6 (76.7-78.6) | 1.90 |
+| French essay | **71.8 tok/s** (71.4-71.8) | 1.78 | 88.7 (83.1-88.7) | 2.18 |
+
+**French is slower with the draft vocabulary: 71.4-71.8 tok/s against 83.1-88.7, 14-19% down.** The
+list (below) holds few of the tokens French text uses, so the drafter proposes the wrong ones more
+often (1.78 tokens a round against 2.18); the text itself is unchanged. If you mostly generate French,
+or any language whose decode drops, turn the head off with `--mtp-draft-vocab off` (or
+`NINFER_DRAFT_TOKENS=3` as well for the previous configuration).
+
+Every combination was run in one interleaved sequence on the same server binary, two runs each
+(order A B C D E E D C B A; tok/s, means of the two):
+
+| Drafts, head | Code | Thinking | Story | Chinese | French |
+|---|---:|---:|---:|---:|---:|
+| 3, full (before) | 119.1 | 94.4 | 80.1 | 78.6 | 85.1 |
+| **7, draft vocabulary** | **123.2** | **100.0** | **80.5** | **78.7** | 71.6 |
+| 5, draft vocabulary | 119.9 | 99.4 | 80.5 | 78.6 | 71.4 |
+| 5, full | 121.9 | 98.3 | 79.9 | 77.9 | 84.6 |
+| 7, full | 124.2 | 99.1 | 79.9 | 77.8 | 84.4 |
+
+Seven drafts with the full head is 0.8% faster on code but 1.0% slower on Chinese and 0.2% on story;
+the draft vocabulary makes each draft step cheaper, which brings Chinese and story back level while
+code and thinking keep most of the gain.
+
+**The MTP draft vocabulary.** Each draft step ends in the 248,077-row output head. With
+`--mtp-draft-vocab` the drafter scores only the tokens of a list instead: 106,056 of them, whose head
+rows (137 MiB, IQ4_XS) are copied once into VRAM at load. Drafts are still checked by the full model,
+so the output is the same token for token. The list is the one jesdga's
+[Qwen3.8-Flash-Next-Basalt](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) pack ships
+(`convert/mtp/rt/draft_vocab.bin`, Qwen Community License 1.0), whose use on a V100 we learned from
+chris83-dev's Lapilli (MIT). It is **not part of this repository**: `scripts/download-model.sh
+qwen38-flash-next` downloads it from that repository at a pinned revision, checks its sha256 and saves it as
+`<model>.draft-vocab` beside the model, under jesdga's licence. `ninfer-serve` reads that file by
+default on a V100 only (`--mtp-draft-vocab auto`); with no file it uses the full head, and
+`--mtp-draft-vocab PATH` or `off` choose explicitly. The RTX 3090 keeps the full head: it was not
+measured there.
 
 Conditions: `ninfer-serve` with the exact flags the V100 box's router gives Flash-Next (the `run-v100.sh`
 profile: INT8 KV, 262,144 context, `--draft-tokens 3`, `--mtp-joint-acceptance`, `--mtp-staged-drafts`,
 `--cpu-verify-misses`, plus the refusal-vector graft as the default, `--presence-penalty 1.0` and
-`NINFER_SM70_TENSOR_CORES=1`); 300 tokens at temperature 0, thinking off except on the thinking prompt;
+`NINFER_SM70_TENSOR_CORES=1`; the new default adds `--draft-tokens 7` and the draft vocabulary); 300 tokens at temperature 0, thinking off except on the thinking prompt;
 each figure is the second of two identical requests, so the expert cache and context store are warm.
 Every run produced byte-identical text. These replace the 2026-11-17 figures (78 / 96 / 72 / 81 on
 story / code / Chinese / French at 250 W, without the graft and presence penalty), which predate the
@@ -274,11 +309,33 @@ Decode against context length, one request each, 256 tokens:
 | 148,129 | 77.9 tok/s | 27.3 | 99.3% |
 | 221,567 | 78.8 tok/s | 28.2 | 98.4% |
 
-### Qwen3.8-Flash-Next, UD-IQ3_XXS (not yet run on a V100)
+### Qwen3.8-Flash-Next, UD-IQ3_XXS
 
 `scripts/run-v100.sh qwen38-flash-next-iq3` serves Unsloth's 3-bit build (README, "Which Flash-Next
-build?"). **It has not been run on a V100**: it was built and tested on an RTX 3090, and what is known
-for this card is what compiles and what the op tests check.
+build?"). It was built and tuned on an RTX 3090; first V100 measurements (2026-11-23, master
+`61b3e032c`, 200 W, no thermal throttling sampled):
+
+- **It fits with every expert pinned and no flag changes** beside dropping `--vision`. With the IQ2_XS
+  router flags (INT8 KV, 262,144 context, MTP3, `--ngram-ram-mib auto`, the context store) and
+  `--ngram-volume` pointed at the shared IQ2_XS volume, the RAM ledger gives the experts all
+  47.96 GiB they need ("every expert fits in RAM") by leaving the n-gram table on disk (0.10 GiB of RAM
+  cache), and VRAM holds 9,830 experts (40% of 24,576; IQ2_XS holds 73.6%).
+- **Decode is 19-48% slower than IQ2_XS.** Same prompts and conditions as above, best of two runs:
+
+  | Prompt | UD-IQ3_XXS | IQ2_XS | Tokens per round, IQ3 / IQ2 |
+  |---|---:|---:|---:|
+  | Code | 61.9 tok/s | 119.1 | 3.22 / 3.31 |
+  | Thinking | 58.3 tok/s | 97.1 | 2.69 / 2.62 |
+  | French | 58.7 tok/s | 88.7 | 2.13 / 2.18 |
+  | Story | 64.9 tok/s | 80.1 | 1.95 / 1.94 |
+  | Chinese | 56.7 tok/s | 78.6 | 2.08 / 1.90 |
+
+  Acceptance is about the same; the smaller expert cache is the cost.
+- **Perplexity** on the six fixture texts (5,114 positions, scored by `ninfer_qwen4_exp_forward_real_test
+  --dump-logits` on the V100): 5.872 against IQ2_XS's 6.280 (-6.5%), the same ranking as on the 3090
+  (5.859 / 6.315; the small differences are the sm_70 kernels' summation order).
+
+What follows was written before the build ran here and still holds for the parts not measured above:
 
 - **Formats.** The build's dense weights and embedding are Q6_K and Q8_0. The sm_70 linear routes
   are generic over the GGML block formats and already cover both: the dp4a decode GEMV (`ggml_mmvq`,
@@ -295,9 +352,8 @@ for this card is what compiles and what the op tests check.
 - **Memory.** The bank is 42.3 GiB. By default the build runs with `--partial-ram-residency`, which
   pins only the experts the VRAM cache does not hold, takes no images and no elastic KV pool, so the
   context defaults to 32,768 tokens; the memory-lock limit it asks for is 42 GiB. With
-  `NINFER_PARTIAL_RAM_RESIDENCY=off` every expert is pinned (about 50 GiB of available RAM: the 59 GiB
-  test host should fit it, and nothing else should be running), and the full 262,144-token context and
-  images come back. Neither mode has been measured on this card.
+  `NINFER_PARTIAL_RAM_RESIDENCY=off` every expert is pinned and the full 262,144-token context comes
+  back; that is the mode measured above (the 59 GiB host fit it).
 - **Not done: Volta tuning of Q6_K.** The IQ4_XS decode GEMV has an sm_70 form that reads a
   sub-block's header in one load (+2-8% per call, about +0.5% in the model). Q6_K, the build's main
   dense format, has none; it would need the same standalone bench on a V100 (`ggml_mmvq` at Flash-Next's

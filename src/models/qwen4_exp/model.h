@@ -63,6 +63,8 @@ public:
     [[nodiscard]] const std::vector<std::uint64_t>& expert_record_strides() const;
     // The token embedding's stored format (GGML IQ4_XS, IQ3_S or Q6_K): --hot-embedding-rows reads it.
     [[nodiscard]] QType token_embedding_format() const;
+    // The output head's stored format (GGML IQ4_XS, Q6_K or Q5_K): --mtp-draft-vocab sizes its rows.
+    [[nodiscard]] QType output_head_format() const;
 
     struct Impl;
 

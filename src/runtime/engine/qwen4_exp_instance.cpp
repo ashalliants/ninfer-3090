@@ -387,6 +387,31 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_joint_acceptance = next.mtp_joint_acceptance;
     program_options.mtp_rows_verify      = next.mtp_rows_verify;
     program_options.mtp_staged_drafts    = next.mtp_staged_drafts;
+    if (mtp) {
+        // --mtp-draft-vocab: an explicit file on any card; "auto" (the default) reads
+        // <artifact>.draft-vocab when it exists, on a Tesla V100 (sm_70) only, where it was measured
+        // (the RTX 3090 cannot be measured here); off: the full head.
+        std::filesystem::path vocab;
+        if (next.mtp_draft_vocab == "auto") {
+            const std::filesystem::path sidecar = options.artifact_path.string() + ".draft-vocab";
+            std::error_code ec;
+            if (device.compute_capability() == 70 && std::filesystem::is_regular_file(sidecar, ec)) { vocab = sidecar; }
+        } else if (next.mtp_draft_vocab != "off") {
+            vocab = next.mtp_draft_vocab;
+        }
+        if (!vocab.empty()) {
+            const auto public_tokens = static_cast<std::int32_t>(plan.resources().public_token_count);
+            program_options.mtp_draft_vocab = std::make_shared<const std::vector<std::int32_t>>(
+                models::qwen4_exp::load_draft_vocab(vocab, public_tokens));
+            const GgmlBlock block = ggml_block(plan.output_head_format());
+            program_options.mtp_draft_head_row_bytes =
+                static_cast<std::uint64_t>(config.hidden_size) / block.values * block.bytes;
+            report("MTP draft vocabulary: " + std::to_string(program_options.mtp_draft_vocab->size()) + " of " +
+                   std::to_string(public_tokens) + " tokens from " + vocab.string() + " (" +
+                   std::to_string(mib(program_options.mtp_draft_vocab->size() * program_options.mtp_draft_head_row_bytes)) +
+                   " MiB of head rows in VRAM)");
+        }
+    }
     program_options.relaxed_drafting     = options.relaxed_drafting.has_value();
     program_options.ngram_prefetch       = next.ngram_prefetch;
     program_options.vision           = vision;
