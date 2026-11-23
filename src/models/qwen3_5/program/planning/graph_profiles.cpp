@@ -236,7 +236,11 @@ std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
         return mtp_attention_shapes(capacity, draft_window, frontier, attention);
     };
     std::vector<std::uint32_t> changes;
-    collect_shape_changes(0U, max_frontier, shapes, changes);
+    if (attention.target_storages.empty()) {
+        collect_shape_changes(0U, max_frontier, shapes, changes);
+    } else {
+        collect_mixed_shape_changes(0U, max_frontier, shapes, changes);
+    }
     for (const std::uint32_t change : changes) { ends.push_back(change - 1U); }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
