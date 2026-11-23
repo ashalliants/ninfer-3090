@@ -194,6 +194,20 @@ can reach at most about 57 tok/s; speculation gets past that ceiling. Prefill ru
 tensor cores through cuBLAS, and prompt attention through FP16 flash attention. 1,150 / 2,186 /
 4,392-token prompts prefill at 868 / 959 / 1,020 tok/s.
 
+Decode against context length, MTP3, INT8 KV, `ninfer-serve` with the `run-v100.sh` flags, 256 greedy
+tokens on an exact-hit repeat of a checkpointed prompt, one request at a time (2026-11-23, **200 W**
+power limit, three repeats each, range under 0.5%):
+
+| Context | Decode |
+|---:|---:|
+| 4,170 | 57.9 tok/s |
+| 40,259 | 47.9 tok/s |
+| 162,152 | 25.0 tok/s |
+
+Attention over the 16 full-attention layers' KV is what slows long-context decode. Staging the next K/V
+tile in registers (sm_70 only) raised the 40K figure from 46.8 and the 162K figure from 23.5 tok/s, with
+byte-identical output.
+
 ### Qwen3.8-Flash-Next
 
 Decode with a warm expert cache, MTP3: 78 / 96 / 72 / 81 tok/s on story / code / Chinese / French

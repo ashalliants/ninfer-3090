@@ -26,6 +26,7 @@
 #include "ops/kv_cache/int8_g64_codec.cuh"
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -562,6 +563,100 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         ninfer::ops::cp_commit();
     };
 
+    // sm_70 has no cp.async: issue_kv_tile's copies are a load and a store each, so a warp stalls on
+    // every load right before PV, and the next tile's latency is not hidden behind anything. With
+    // StagedTiles the next tile's INT8 key codes, value codes and scales are loaded into registers at
+    // the top of the iteration (in flight across QK, softmax and the V dequant) and stored after the
+    // softmax barrier, where issue_kv_tile stored them: the same bytes at the same addresses before
+    // the same barrier, so every later read and every result is unchanged. SimtDecode only, i.e.
+    // sm_70 at one row tile, two or more tokens; every other target and shape compiles the unchanged
+    // issue_kv_tile path. At one token the staged registers push the kernel (already at the 128-register
+    // cap of its launch bounds) into more spills: on the V100 the 27B's T=1 partial ran 4-10% slower
+    // with them (4K-128K keys) while T=2 (the chunk every MTP verify runs as) ran 14-20% faster.
+    // rk4v4 keeps its own key staging (load_k_tile) and stays on issue_kv_tile for its values.
+    constexpr bool StagedTiles         = SimtDecode && TokenTile >= 2 && !PackedKeys;
+    constexpr int StagedChunks         = Bc * (D / 16);
+    constexpr int StagedChunksPerThread = (StagedChunks + Threads - 1) / Threads;
+    static_assert(!StagedTiles || Threads >= Bc, "one thread stages each key's scales");
+    using StagedValue = std::conditional_t<PackedValues, uint2, int4>;
+    using StagedVScale = std::conditional_t<PackedValues, int4, int2>;
+    int4 staged_k[StagedTiles ? StagedChunksPerThread : 1];
+    StagedValue staged_v[StagedTiles ? StagedChunksPerThread : 1];
+    int2 staged_k_scale = make_int2(0, 0);
+    StagedVScale staged_v_scale{};
+    auto stage_kv_tile = [&](int tile_k0, int page) {
+        if constexpr (StagedTiles) {
+            if (tid < Bc) {
+                const int key = tile_k0 + tid;
+                staged_k_scale = make_int2(0, 0);
+                staged_v_scale = StagedVScale{};
+                if (key >= split_start && key < split_end) {
+                    const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
+                        page, kv_head, 0, key & kPagedKVPageMask);
+                    staged_k_scale = *reinterpret_cast<const int2*>(&cache_k_scale[off]);
+                    if constexpr (PackedValues) {
+                        const std::int64_t voff = kv_cache_int4_value_scale_index<Geometry>(
+                            page, kv_head, 0, key & kPagedKVPageMask);
+                        staged_v_scale = *reinterpret_cast<const int4*>(&cache_v_scale[voff]);
+                    } else {
+                        staged_v_scale = *reinterpret_cast<const int2*>(&cache_v_scale[off]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < StagedChunksPerThread; ++i) {
+                const int chunk = tid + i * Threads;
+                staged_k[i]     = make_int4(0, 0, 0, 0);
+                staged_v[i]     = StagedValue{};
+                if (chunk < StagedChunks) {
+                    const int key_l = chunk / (D / 16);
+                    const int d     = (chunk - key_l * (D / 16)) * 16;
+                    const int key   = tile_k0 + key_l;
+                    if (key >= split_start && key < split_end) {
+                        // Plain loads: the fused append above may have written these bytes in
+                        // this launch, so the read-only path is not an option.
+                        const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
+                            page, kv_head, d, key & kPagedKVPageMask);
+                        staged_k[i] = *reinterpret_cast<const int4*>(&cache_k_i8[off]);
+                        if constexpr (PackedValues) {
+                            const std::int64_t voff = kv_cache_int4_value_code_index<Geometry>(
+                                page, kv_head, d >> 1, key & kPagedKVPageMask);
+                            staged_v[i] = *reinterpret_cast<const uint2*>(
+                                reinterpret_cast<const std::uint8_t*>(cache_v_i8) + voff);
+                        } else {
+                            staged_v[i] = *reinterpret_cast<const int4*>(&cache_v_i8[off]);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    // The stores issue_kv_tile would make for the staged tile (zeros outside the split included).
+    auto store_staged_kv_tile = [&]() {
+        if constexpr (StagedTiles) {
+            if (tid < Bc) {
+                store_vec(&k_scale_s[tid * Groups], staged_k_scale);
+                store_vec(value_scale_row(tid), staged_v_scale);
+            }
+#pragma unroll
+            for (int i = 0; i < StagedChunksPerThread; ++i) {
+                const int chunk = tid + i * Threads;
+                if (chunk < StagedChunks) {
+                    const int key_l = chunk / (D / 16);
+                    const int dc    = chunk - key_l * (D / 16);
+                    const int d     = dc * 16;
+                    store_vec(&k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2],
+                              staged_k[i]);
+                    if constexpr (PackedValues) {
+                        store_vec(&v_i8[key_l * D + (d >> 1)], staged_v[i]);
+                    } else {
+                        store_vec(&v_i8[key_l * D + d], staged_v[i]);
+                    }
+                }
+            }
+        }
+    };
+
     int physical_page = physical_pages_s[0];
     load_k_tile(first_tile, physical_page);
     issue_kv_tile(first_tile, physical_page);
@@ -580,6 +675,16 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                                          ? physical_pages_s[(next_k0 >> kPagedKVPageShift) -
                                                             first_page]
                                          : physical_page);
+            }
+        }
+        if constexpr (StagedTiles) {
+            // The next tile's codes and scales, in flight from here to store_staged_kv_tile.
+            if (kb + 1 < key_blocks) {
+                const int next_k0 = k0 + Bc;
+                stage_kv_tile(next_k0, (next_k0 & kPagedKVPageMask) == 0
+                                           ? physical_pages_s[(next_k0 >> kPagedKVPageShift) -
+                                                              first_page]
+                                           : physical_page);
             }
         }
 
@@ -842,7 +947,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             if ((next_k0 & kPagedKVPageMask) == 0) {
                 physical_page = physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
             }
-            issue_kv_tile(next_k0, physical_page);
+            if constexpr (StagedTiles) {
+                store_staged_kv_tile();
+            } else {
+                issue_kv_tile(next_k0, physical_page);
+            }
         }
 
         const int consumer_tile     = warp % RowTiles;

@@ -59,7 +59,7 @@ Decode is one stream unless the column says otherwise.
 | Qwen3.6-35B-A3B (MoE) | RTX 3090 | 262,144, shared by 3 lanes | 8,848 tok/s at 4K | 313 tok/s (MTP3 + draft head) | 453 tok/s at C6 (MTP3) |
 | Ternary Bonsai 2 27B | RTX 3090 | | 2.8-2.9K tok/s | 88 plain, 250-300 (DFlash2, 7 drafts) | |
 | Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | |
-| **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | 76-86 tok/s (MTP3) | 79 tok/s at C2 (MTP3) |
+| **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | 76-86 tok/s (MTP3); 47.9 at 40K and 25.0 at 162K context (200 W) | 79 tok/s at C2 (MTP3) |
 | Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K | 72-96 tok/s (MTP3), flat from 10K to 221K context | |
 | **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **1,930 tok/s** at 8K, 131,072 context (1,629 at 1K, 1,244 at 100K); 1,868 at 8K at the full 262,144 with DSpark and vision | **120.7 tok/s** (DSpark, maths); 93-94 average over 12 chats, 78.8 plain | **198 tok/s** at C8 (plain) |
 
