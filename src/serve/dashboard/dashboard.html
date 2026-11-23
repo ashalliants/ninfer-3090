@@ -63,6 +63,9 @@ button { cursor: pointer; white-space: nowrap; }
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 12px; margin-bottom: 16px; }
 .panel { padding: 12px; position: relative; }
 .panel canvas { width: 100%; height: 160px; display: block; }
+.tile .stat { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.tile .stat .when { display: block; color: var(--muted); font-size: 11px; }
+.tile .stat b { color: var(--text); font-weight: 600; }
 .tip {
   position: absolute; pointer-events: none; background: var(--surface); color: var(--text);
   border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; font-size: 12px;
@@ -166,14 +169,14 @@ button[aria-pressed="true"] { background: var(--series); color: #fff; border-col
 <section class="attention" id="attention" hidden aria-live="polite"></section>
 
 <section class="tiles" aria-label="Current values">
-  <div class="tile"><div class="label">Decode</div><div class="value" id="t-decode">-</div><div class="sub">tokens/s</div></div>
-  <div class="tile"><div class="label">Prefill<span class="info" tabindex="0" role="img" aria-label="About Prefill" data-tip="How fast the server reads incoming prompts, in tokens per second.">?</span></div><div class="value" id="t-prefill">-</div><div class="sub">tokens/s</div></div>
-  <div class="tile"><div class="label">Draft acceptance<span class="info" tabindex="0" role="img" aria-label="About Draft acceptance" data-tip="The server guesses several tokens ahead and checks them. A higher share accepted means faster replies.">?</span></div><div class="value" id="t-accept">-</div><div class="sub" id="t-accept-sub">since start</div></div>
+  <div class="tile"><div class="label">Decode</div><div class="value" id="t-decode">-</div><div class="sub">tokens/s</div><div class="stat" id="st-decode"></div></div>
+  <div class="tile"><div class="label">Prefill<span class="info" tabindex="0" role="img" aria-label="About Prefill" data-tip="How fast the server reads incoming prompts, in tokens per second.">?</span></div><div class="value" id="t-prefill">-</div><div class="sub">tokens/s</div><div class="stat" id="st-prefill"></div></div>
+  <div class="tile"><div class="label">Draft acceptance<span class="info" tabindex="0" role="img" aria-label="About Draft acceptance" data-tip="The server guesses several tokens ahead and checks them. A higher share accepted means faster replies.">?</span></div><div class="value" id="t-accept">-</div><div class="sub" id="t-accept-sub">since start</div><div class="stat" id="st-accept"></div></div>
   <div class="tile"><div class="label">Requests<span class="info" tabindex="0" role="img" aria-label="About Requests" data-tip="Running is being answered now. Waiting is queued until a lane is free.">?</span></div><div class="value" id="t-requests">-</div><div class="sub" id="t-requests-sub">running / waiting</div></div>
   <div class="tile"><div class="label">Conversation memory<span class="info" tabindex="0" role="img" aria-label="About conversation memory" data-tip="Also called the KV cache. The memory that holds conversations so they need not be re-read. It includes older prompts kept for reuse. Red means it is nearly full.">?</span></div><div class="value" id="t-kv">-</div><div class="sub" id="t-kv-sub">incl. retained prefixes</div></div>
-  <div class="tile"><div class="label">GPU power</div><div class="value" id="t-power">-</div><div class="sub" id="t-util">utilization</div></div>
+  <div class="tile"><div class="label">GPU power</div><div class="value" id="t-power">-</div><div class="sub" id="t-util">utilization</div><div class="stat" id="st-power"></div></div>
   <div class="tile"><div class="label">VRAM</div><div class="value" id="t-vram">-</div><div class="sub" id="t-vram-sub">all processes</div></div>
-  <div class="tile"><div class="label">GPU temperature</div><div class="value" id="t-temp">-</div><div class="sub">core</div></div>
+  <div class="tile"><div class="label">GPU temperature</div><div class="value" id="t-temp">-</div><div class="sub">core</div><div class="stat" id="st-temp"></div></div>
 </section>
 
 <section class="panel lanes-panel">
@@ -325,7 +328,8 @@ function onMetrics(text, now) {
   }
   previous = { t: now, m };
   const power = m.has('ninfer_gpu_power_watts') ? m.get('ninfer_gpu_power_watts') : null;
-  samples.push({ t: now, decode, prefill, accept, power });
+  const tempNow = m.has('ninfer_gpu_temperature_celsius') ? m.get('ninfer_gpu_temperature_celsius') : null;
+  samples.push({ t: now, decode, prefill, accept, power, temp: tempNow });
 
   show('t-decode', orDash(decode, nf1.format));
   show('t-prefill', orDash(prefill, nf0.format));
@@ -721,7 +725,40 @@ function draw(chart) {
   tip.style.top = (canvas.offsetTop + Math.max(0, by - 28)) + 'px';
 }
 
-function drawAll() { for (const c of charts) draw(c); }
+// Median, mean and max of each tile's readings over the chart window (2 or 15 minutes). Decode and
+// prefill read 0 whenever nothing is running, which would drag every figure down, so those two
+// count only the seconds with a reading above 0; the others have no such idle value.
+const TILE_STATS = [
+  { id: 'st-decode', field: 'decode', fmt: (v) => nf1.format(v), activeOnly: true, idle: 'No decoding in this window' },
+  { id: 'st-prefill', field: 'prefill', fmt: (v) => nf0.format(v), activeOnly: true, idle: 'No prefill in this window' },
+  { id: 'st-accept', field: 'accept', fmt: (v) => nf1.format(v) + '%', idle: 'No drafts in this window' },
+  { id: 'st-power', field: 'power', fmt: (v) => nf0.format(v) + ' W', idle: 'No reading in this window' },
+  { id: 'st-temp', field: 'temp', fmt: (v) => nf0.format(v) + ' °C', idle: 'No reading in this window' },
+];
+function drawTileStats() {
+  const now = frozenAt !== null ? frozenAt : performance.now(), t0 = now - windowS * 1000;
+  const span = windowS === 900 ? '15 min' : '2 min';
+  for (const t of TILE_STATS) {
+    const el = $(t.id);
+    const vals = samples.filter((s) => s.t >= t0 && s.t <= now).map((s) => s[t.field])
+      .filter((v) => v !== null && v !== undefined && isFinite(v) && (!t.activeOnly || v > 0)).sort((a, b) => a - b);
+    el.textContent = '';
+    if (vals.length === 0) { el.textContent = t.idle; continue; }
+    const mid = vals.length >> 1;
+    const median = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const when = document.createElement('span');
+    when.className = 'when';
+    when.textContent = 'last ' + span + (t.activeOnly ? ', while running' : '');
+    el.append(when);
+    [['median', median], ['mean', mean], ['max', vals[vals.length - 1]]].forEach(([label, v], i) => {
+      const b = document.createElement('b'); b.textContent = t.fmt(v);
+      el.append((i ? ' · ' : '') + label + ' ', b);
+    });
+  }
+}
+
+function drawAll() { for (const c of charts) draw(c); drawTileStats(); }
 
 async function tick() {
   if (busy) return;
