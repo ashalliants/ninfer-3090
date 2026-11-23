@@ -63,7 +63,9 @@ for product in 'apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve' 'bench/ninf
   # when cuobjdump is available the archive's server must hold machine code for this card.
   if [[ "$product" == 'apps/ninfer-serve:ninfer-serve' ]] && command -v cuobjdump >/dev/null; then
     case "$target" in rtx3090) want_arch=sm_86 ;; v100) want_arch=sm_70 ;; esac
-    cuobjdump --list-elf "$source_path" | grep -q "$want_arch" || {
+    # Captured first: `grep -q` closing the pipe early would fail cuobjdump under pipefail.
+    elf_list="$(cuobjdump --list-elf "$source_path")"
+    grep -q "$want_arch" <<<"$elf_list" || {
       printf '%s holds no %s code: it was built for another card (target %s)\n' "$source_path" "$want_arch" "$target" >&2
       exit 1
     }
