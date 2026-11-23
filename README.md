@@ -58,17 +58,20 @@ Decode is one stream unless the column says otherwise.
 |---|---|---:|---:|---:|---:|
 | **Qwen3.8-27B** (dense) | RTX 3090 | **262,144** | **3,222 tok/s** at 4K | **140 tok/s** (DFlash2) | **477 tok/s** at C8 (MTP3) |
 | Qwen3.6-35B-A3B (MoE) | RTX 3090 | 262,144, shared by 3 lanes | 8,848 tok/s at 4K | 313 tok/s (MTP3 + draft head) | 453 tok/s at C6 (MTP3) |
-| Ternary Bonsai 2 27B | RTX 3090 | | 2.8-2.9K tok/s | 88 plain, 250-300 (DFlash2, 7 drafts) | |
-| Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | |
+| Ternary Bonsai 2 27B | RTX 3090 | **262,144** (with DFlash2, 9.6 GiB free) | 2.8-2.9K tok/s | 88-90 plain, 250-300 (DFlash2, 7 drafts) | **572 tok/s** at C8 (MTP3) |
+| Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | ~115 tok/s at C2 (MTP; 103-125, Linux) |
 | **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | 76-86 tok/s (MTP3); 47.9 at 40K and 25.0 at 162K context (200 W) | 79 tok/s at C2 (MTP3) |
 | Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K | 72-96 tok/s (MTP3), flat from 10K to 221K context | |
-| **Inkling-2-Mini** (new) | RTX 3090 | **137,216** plain; 90,368 with DSpark and vision | **2,410 tok/s** at 8.4K, 65,536 context with vision (1,784 at 1.2K) | **104 tok/s** plain (12 chats); 115.5 best with DSpark (code) | |
+| **Inkling-2-Mini** (new) | RTX 3090 | **137,216** plain; 90,368 with DSpark and vision | **2,410 tok/s** at 8.4K, 65,536 context with vision (1,784 at 1.2K) | **104 tok/s** plain (12 chats); 115.5 best with DSpark (code) | **282 tok/s** at C8 (plain) |
 | **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **1,930 tok/s** at 8K, 131,072 context (1,629 at 1K, 1,244 at 100K); 1,868 at 8K at the full 262,144 with DSpark and vision | **120.7 tok/s** (DSpark, maths); 93-94 average over 12 chats, 78.8 plain | **198 tok/s** at C8 (plain) |
 
 RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The V100 was
 measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host: Qwen rows on 2026-11-18 (the
 two-lane figure 2026-11-20), Inkling-2-Mini on 2026-11-22 (master `dad1623b`, 250 W limit). Inkling-2-Mini on the RTX 3090:
 2026-11-23 under WSL, 315 W limit, its layers 20-23 experts held as their exact MXFP8 re-encoding (the default there).
+Ternary Bonsai 2 27B's context and C8 figures: 2026-11-23, WSL, 315 W limit
+([method](docs/performance/bonsai2-27b-rtx3090.md#several-requests-and-context)). Flash-Next's two-lane figure is the median of four runs on a rented Linux RTX 3090 (420 W limit, 2026-11-11;
+[method](docs/performance.md#a-linux-aio-bug-found-and-fixed-this-session-and-the-tuned-profiles-absolute-numbers-rtx-3090-2026-11-11)).
 A blank cell has not been measured.
 Full methods: [RTX 3090 benchmarks](#performance-on-an-rtx-3090), [V100 guide](docs/tesla-v100.md),
 [Inkling-2-Mini spec](docs/maintainer/inkling2-model.md).
@@ -557,7 +560,7 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | Model | Artifact | Size | Notes |
 |---|---|---:|---|
 | **Qwen3.8-27B** | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090/tree/349987303604180bef448d0accbb838b4465d862) | 17.68 GiB | **Recommended.** Validated at C1–C8 with ReplaySSM. This fork's [3090 conversion](model-cards/Qwen3.8-27B-NInfer-3090/README.md): imatrix-weighted encoder, 4-bit embedding, 6-bit head. Carries vision, MTP and the DFlash2 bundle for `--spec dflash2` |
-| Ternary Bonsai 2 27B | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Ternary-Bonsai-2-27B-NInfer-3090/tree/983a9be22f3623f3a2799655741d2a92db86d37d) | 8.87 GiB | Prism ML's ternary Qwen3.8-27B (2.125 bits per weight), this fork's [3090 conversion](model-cards/Ternary-Bonsai-2-27B-NInfer-3090/README.md) with vision, MTP, DFlash2 and a proposal head. 6.7 GiB of weights; on one RTX 3090 about 88 tok/s plain and 250-300 with `--spec dflash2 --draft-tokens 7`, prefill 2.8-2.9k tok/s, quick-corpus perplexity 5.627. Run it with `ninfer` or `ninfer-serve` directly: it has no `run.bat` profile yet |
+| Ternary Bonsai 2 27B | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Ternary-Bonsai-2-27B-NInfer-3090/tree/983a9be22f3623f3a2799655741d2a92db86d37d) | 8.87 GiB | Prism ML's ternary Qwen3.8-27B (2.125 bits per weight), this fork's [3090 conversion](model-cards/Ternary-Bonsai-2-27B-NInfer-3090/README.md) with vision, MTP, DFlash2 and a proposal head. 6.7 GiB of weights; on one RTX 3090 about 88-90 tok/s plain and 250-300 with `--spec dflash2 --draft-tokens 7`, 572 tok/s aggregate at 8 requests with MTP3, the full 262,144-token context, prefill 2.8-2.9k tok/s, quick-corpus perplexity 5.627. Run it with `ninfer` or `ninfer-serve` directly: it has no `run.bat` profile yet |
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
 | Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time (two lanes opt-in), 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
@@ -632,8 +635,7 @@ Gen3 x4 eGPU):
 - **Prefix reuse:** on by default; a prompt that starts with the same tokens and images resumes from a snapshot
   kept in pinned host memory (236 MiB), and the result reports `reused_prompt_tokens`. A chat's second turn at 8K
   answers in 1.10 s instead of 4.26 s, at 34K in 1.51 s instead of 21.4 s.
-- **Not yet:** the context store and host cache tiers, JSON-schema output and logprobs. Several requests at once
-  have not been measured on the RTX 3090.
+- **Not yet:** the context store and host cache tiers, JSON-schema output and logprobs.
 
 **On an RTX 3090** (24 GB) the same artifact runs, measured under WSL on 2026-11-23 (315 W limit). Its layers 20-23
 experts, 7.6 GiB of BF16 in the file, are the checkpoint's MXFP8 values: the 3090 holds them as MXFP8 (3.9 GiB),
@@ -645,7 +647,10 @@ BF16 weights would leave under 4 GiB free; the V100 keeps BF16).
 - **Context:** 137,216 tokens plain; 119,040 with DSpark; 107,264 with vision; 90,368 with both (`--fit-context`
   finds the largest that fits beside the desktop).
 - **Prefill:** 2,410 tok/s on an 8.4K-token prompt (TTFT 3.5 s) and 1,784 on 1.2K (0.65 s), at 65,536 context with
-  vision on.
+  vision on. At 131,072 context: 2,103 tok/s at 7.4K, 1,758 at 28K (TTFT 16 s) and 1,147 at 76K (66 s); decode after
+  the 76K prompt runs at 60 tok/s.
+- **Several requests:** `--max-concurrency` up to 8, **282 tok/s** aggregate at 8 (153 at 2, 228 at 4), each
+  request's tokens the same as alone. Asked for 262,144 at 8, each request gets 11,520 positions.
 - **DSpark** gains less here than on the V100, because plain decode is already fast: 103.5 against 103.3 tok/s on
   the 12 chats, 115.5 on a code prompt, but 73-74 against 98 for a short reply after a 1.2K-token prompt. Leave it off
   unless the work is mostly code.

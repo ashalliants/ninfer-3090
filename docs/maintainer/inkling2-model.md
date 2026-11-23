@@ -819,6 +819,10 @@ Measured on the RTX 3090 (2026-11-23, WSL, 315 W power limit, PCIe Gen4 x16, `ni
 
 The decode gain is the bytes: a token reads 8 experts of each of layers 20-23, 510 MB in BF16 and 263 MB in MXFP8.
 
+Long prompts at `--max-context 131072` (plain, chunk 1024; a summary of 128 tokens): 1,408 tok/s at 1,167 tokens
+(TTFT 0.83 s), 2,103 at 7,423 (3.5 s), 1,758 at 28,110 (16.0 s), 1,147 at 75,810 (66.1 s); decode after them 98.2,
+94.8, 83.2 and 60.3 tok/s. Batched decode: see "Batched decode".
+
 With the room, the 3090 at `--max-context 65536 --vision` (chunk 2048) prefills 2,410 tok/s at 8,447 tokens (TTFT
 3.5 s) and 1,784 at 1,167 (0.65 s), and decodes the 12 chats at 103.30-103.32 tok/s plain against 103.46-103.54 with
 `--spec dspark` (order DSpark, plain, plain, DSpark). DSpark pays off only where drafts are accepted: 115.5 on the code
@@ -1585,6 +1589,10 @@ section's earlier measurement:
   distinct expert's bytes must be read each step (op bench of the routes against that floor:
   `NINFER_INKLING2_OP_SWEEP=1 ninfer_inkling2_fp32_ops_test`). The 8-column projections and the attention take
   most of the rest of the step.
+On the RTX 3090 (2026-11-23, MXFP8 experts, WSL, 315 W limit; same method, two runs each, every request's output
+the same at every N): aggregate 100.5-101.2 / 151.3-152.8 / 224.2-227.8 / **275.0-281.9 tok/s** at N = 1 / 2 / 4 / 8,
+per request 103.9 / 78.9 / 59.5-59.7 / 37.3-37.4. Asked for 262,144 at N = 8, each slot gets 11,520 positions.
+
 - Context per slot when `--max-context 262144` is asked with N = 8: 27,392 positions (8 x 27,392 KV rows, chunk 256),
   reported by `/v1/models`. Lower N or a smaller `--max-context` keeps more context per slot. With `--vision` and
   the snapshots in host memory (2026-11-22): 29,696 at N = 8 and 66,048 at N = 4 (24,576 and 60,928 while they

@@ -17,11 +17,19 @@ unless stated. The artifact is `bonsai2_27b.ninfer` (8.87 GiB, SHA-256 `97512677
 | Prefill, 1k / 4k / 16k | 2,905 / 2,820 / 2,618 tok/s (2026-10-24, Linux, stock 350 W; the rest of this table is Windows) | 1,717 / 1,687 / 1,615 tok/s |
 | `--prefill-cublas --prefill-chunk 4096`, 1k / 4k / 16k | 2,791 / 2,447 / 2,294 tok/s | 2,421 / 3,093 / 2,869 tok/s |
 | Quick-corpus perplexity | 5.627 | n/a (a different model) |
+| Aggregate decode, 8 requests, MTP3 | 572.5 tok/s (2026-11-23, Linux under WSL, 315 W) | 477 tok/s (README, 2026-10-02) |
+| Largest context, `rk4v4` KV | 262,144, 11.2 GiB free (9.6 with DFlash2) | 262,144 |
 
 The ternary model decodes 1.8 times faster plain on 2.2 times fewer weight bytes, so decode here is
 bound by weight traffic and the ternary dequantisation is cheap.
 `--prefill-cublas` is slower than the default on the ternary artifact, where it adds 43-83% to the
 6-bit one.
+
+## Several requests and context
+
+**Several requests at once** (2026-11-23, Linux under WSL, 315 W limit): `ninfer_bench --concurrency N -n 128 --kv-dtype int8 --max-ctx 4096 --spec mtp --draft-tokens 3 -r 3 --warmup 1`, the protocol of the Qwen3.6-35B-A3B figures, gives 175.7 / 305.3 / 457.7 / **572.5 tok/s** aggregate at 1 / 2 / 4 / 8 requests (90.2 plain at one), agreeing with a first run within 0.4%.
+
+**Context.** The full 262,144 tokens fit with `--kv-dtype rk4v4` (the Linux launcher's KV), with 11.2 GiB of the card still free, and 9.6 GiB free with DFlash2 on (2026-11-23).
 
 ## Speculative decoding
 

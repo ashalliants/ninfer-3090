@@ -213,10 +213,12 @@ over two runs:
 | Decode, DSpark | 103.5 mean over the 12 chats, 115.5 on a code prompt; 73-74 against plain's 98 on a short reply after a 1.2K-token prompt |
 | Prefill (65,536 context, vision on, chunk 2048) | **2,410 tok/s** at 8.4K tokens (TTFT 3.5 s); 1,784 at 1.2K (0.65 s) |
 | Largest context | 137,216 plain; 119,040 with DSpark; 107,264 with vision; 90,368 with both |
+| Prefill (131,072 context) | 2,103 tok/s at 7.4K; 1,758 at 28K (TTFT 16 s); 1,147 at 76K (66 s), then decode at 60 tok/s |
+| Several requests (`--max-concurrency`, 8,192 context) | **282 tok/s** aggregate at 8, 228 at 4, 153 at 2; each request's tokens the same as alone |
 | Load | 75 s from a SATA SSD (300 MiB/s), the MXFP8 re-encode included |
 
 DSpark gains less on the 3090 than on the V100 because plain decode is already fast; leave it off unless the work is
-mostly code. Several requests at once have not been measured on the 3090.
+mostly code.
 
 ## Accuracy
 

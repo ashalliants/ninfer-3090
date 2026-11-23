@@ -104,6 +104,10 @@ Four varied prompts (code, networking, arithmetic, an email) with DFlash2 and 7 
 249.9 tok/s, from 173 to 325 depending on how predictable the text was. For comparison, this
 fork's 6-bit Qwen3.8-27B on the coding prompt decodes 48 tok/s plain and 195 with DFlash2.
 
+**Several requests at once** (2026-11-23, Linux under WSL, 315 W limit): `ninfer_bench --concurrency N -n 128 --kv-dtype int8 --max-ctx 4096 --spec mtp --draft-tokens 3 -r 3 --warmup 1`, the protocol of the Qwen3.6-35B-A3B figures, gives 175.7 / 305.3 / 457.7 / **572.5 tok/s** aggregate at 1 / 2 / 4 / 8 requests (90.2 plain at one), agreeing with a first run within 0.4%.
+
+**Context.** The full 262,144 tokens fit with `--kv-dtype rk4v4` (the Linux launcher's KV), with 11.2 GiB of the card still free, and 9.6 GiB free with DFlash2 on (2026-11-23).
+
 **Memory.** Weights are 6.70 GiB on the device without drafter heads and 7.28 GiB with MTP, against
 14.6 GiB for the fork's 6-bit Qwen3.8-27B.
 
