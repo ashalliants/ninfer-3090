@@ -69,6 +69,7 @@ if /i "%~1"=="qwen36-27b" goto :model_qwen36_27b
 if /i "%~1"=="qwen36-35b-a3b" goto :model_qwen36_35b_a3b
 if /i "%~1"=="qwen38-flash-next" goto :model_qwen38_flash_next
 if /i "%~1"=="qwen38-flash-next-iq3" goto :model_qwen38_flash_next_iq3
+if /i "%~1"=="inkling2-mini" goto :model_inkling2_mini
 if /i "%~1"=="-h" goto :usage_help
 if /i "%~1"=="--help" goto :usage_help
 goto :usage_error
@@ -82,11 +83,13 @@ echo   3 = Qwen3.6-27B                     qwen36-27b
 echo   4 = Qwen3.8-Flash-Next (preview)    qwen38-flash-next   (needs 64 GB of RAM)
 echo   5 = Ternary Bonsai 2 27B            bonsai2-27b
 echo   6 = Qwen3.8-Flash-Next UD-IQ3_XXS    qwen38-flash-next-iq3   (preview, needs 64 GB of RAM)
+echo   7 = Inkling-2-Mini                  inkling2-mini
 echo.
-choice /c 123456 /n /m "Choose 1-6: "
+choice /c 1234567 /n /m "Choose 1-7: "
 rem choice reports 255 when it cannot read a key (no console, closed stdin). Refuse rather than
 rem let that fall through and pick a model nobody chose.
 if errorlevel 255 exit /b 2
+if errorlevel 7 goto :model_inkling2_mini
 if errorlevel 6 goto :model_qwen38_flash_next_iq3
 if errorlevel 5 goto :model_bonsai2_27b
 if errorlevel 4 goto :model_qwen38_flash_next
@@ -112,6 +115,7 @@ echo   qwen36-27b
 echo   qwen36-35b-a3b
 echo   qwen38-flash-next (preview)
 echo   qwen38-flash-next-iq3 (preview, Unsloth UD-IQ3_XXS)
+echo   inkling2-mini
 exit /b 0
 
 :model_qwen38_27b
@@ -197,6 +201,17 @@ set "NGRAM_SIZE=29127258112"
 set "NGRAM_SHA256=7623459b2385eef4505891c2ff133b3dd8ad4ecd0ad334c901878f3fa1d1b051"
 set "LABEL=the Qwen3.8-Flash-Next UD-IQ3_XXS model (53.17 GiB in two files)"
 set "TESTS_VARIABLE=NINFER_TEST_QWEN4EXP_ARTIFACT"
+goto :model_selected
+
+:model_inkling2_mini
+set "ARTIFACT=inkling2-mini-q8.ninfer"
+set "OWNER=WarlaxZ"
+set "REPO=Inkling-2-Mini-NInfer-V100"
+set "REVISION=e348ad671599db1db110447b9d9ebfb898070f67"
+set "EXPECTED_SIZE=23914098432"
+set "EXPECTED_SHA256=2167c0c0ff2ebb5d9dcf7ea5c8289ce13239bdc5104aac053af79a3b8cf009c1"
+set "LABEL=the Inkling-2-Mini model for the RTX 3090 (22.3 GiB)"
+set "TESTS_VARIABLE=NINFER_TEST_INKLING2_ARTIFACT"
 goto :model_selected
 
 :model_selected
