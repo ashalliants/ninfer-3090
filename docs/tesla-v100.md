@@ -31,7 +31,8 @@ Flash-Next's decode does not slow down with context. From 10K to 221K tokens of 
 27-29 ms per MTP verification round (69-79 tok/s on those prompts). What moves tok/s is how many
 drafted tokens are accepted, which depends on the text, not on the context length.
 
-**Inkling-2-Mini** on the same card (master `dad1623b`, 2026-11-22, 250 W limit, through `ninfer-serve`; the
+**Inkling-2-Mini** on the same card (master `dad1623b`, 2026-11-22, 250 W limit, through `ninfer-serve`, except the
+rows marked 200 W, re-measured 2026-11-23; the
 [model card](../model-cards/Inkling-2-Mini-NInfer-V100/README.md) has the conditions and ranges):
 
 | | Inkling-2-Mini |
@@ -39,8 +40,9 @@ drafted tokens are accepted, which depends on the text, not on the context lengt
 | **Context** | 262,144 tokens with DSpark and vision |
 | **Decode**, one stream, DSpark | **up to 120.7 tok/s** (maths prompt); 93.4-94.4 average over 12 chats |
 | **Decode**, plain | 78.5-78.8 tok/s; 48 tok/s at 100K context |
+| **Decode at 262,144** (200 W) | **94.3 tok/s** DSpark, **78.0** plain, average over 12 chats (`--max-context 262144 --vision --kv-dtype int8`, master `dc867300`) |
 | **Decode**, `--max-concurrency 8` | **198.2 tok/s** aggregate (plain) |
-| **Prefill** | **1,930 tok/s** at 8K (131,072 context, chunk 2048); 1,629 at 1K, 1,244 at 100K. At 262,144 with DSpark and vision (chunk 2048 by default): 1,868 at 8K, 1,671 at 1K, 1,219 at 100K |
+| **Prefill** (200 W) | **2,687 tok/s** at 8K (131,072 context, `--prefill-chunk 8192`); 2,195 at 34K, 1,563 at 100K. At the default chunk 2048: 2,069 at 8K, 1,810 at 1K, 1,298 at 100K. At 262,144 with DSpark and vision (chunk 2048): 2,032 at 8K, 1,779 at 1K, 1,284 at 100K |
 | **Low-bit KV** (`--kv-dtype rk4v4`, opt-in, lossy) | plain decode **41.1 tok/s at 200K** (FP16 34.8), 53.2 at 100K (47.8); frees 5,952 MiB at 262,144; KLD 2.8x the FP32 floor (`int8`: 1.06x, 40.7 tok/s) |
 | **Load** | 9.2-14.2 s |
 
@@ -101,7 +103,16 @@ These are the model defaults it sets:
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
 on, so the 27B's wide prefill GEMMs run on the tensor cores through cuBLAS instead of emulated integer
-kernels. `--no-prefill-cublas` (`NINFER_NO_PREFILL_CUBLAS=1`) turns it off.
+kernels. For Inkling-2-Mini it moves the tensor-core prefill's loop controllers and router to cuBLAS
+SGEMM (FP32) and each chunk's busiest experts (512 or more routed positions) to FP16 cuBLAS GEMMs on
+exactly decoded weights: through the server at 8K and the default chunk, 2,069 tok/s against 1,893
+(+9%, 200 W); on the program at chunk 8192, +21% (2,514 against 2,082). `--no-prefill-cublas` (`NINFER_NO_PREFILL_CUBLAS=1`) turns it off.
+
+Inkling-2-Mini's prefill chunk stays 2048 by default, because prefix reuse resumes a chat at a multiple
+of the chunk: a second turn at 8K answers in 1.03 s at chunk 2048, 1.77 s at 4096 and 3.04 s at 8192.
+For long single-shot prompts, `--prefill-chunk 4096` or `8192` is the throughput setting (2,004 and
+2,195 tok/s at 34K). They need 872 and 1,710 MiB of workspace: at 262,144 with DSpark and vision they
+fit with `--kv-dtype int8`, not with the default FP16 KV.
 
 ### Refusal steering (Flash-Next)
 
