@@ -329,6 +329,14 @@ void validate_flash_next_options_unused(const EngineOptions& options) {
 }
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    // A per-layer list whose layers all agree is that plain cache: the same planes, routes and
+    // bindings as asking for the format directly.
+    if (!options.kv_layers.empty() &&
+        std::all_of(options.kv_layers.begin(), options.kv_layers.end(),
+                    [&](KvCacheStorage storage) { return storage == options.kv_layers.front(); })) {
+        options.kv_cache = options.kv_layers.front();
+        options.kv_layers.clear();
+    }
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
@@ -630,6 +638,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         const std::vector<std::uint64_t> free_bytes(free_now.begin(), free_now.end());
         const models::qwen3_5::StageSizing sizing{
             .kv_storage  = options.kv_cache,
+            .kv_layers   = options.kv_layers,
             .state_slots = options.max_concurrency +
                            options.context_cache.device_state_slots.value_or(0U)};
         options.stage_layers = models::qwen3_5::default_stage_layers(

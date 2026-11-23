@@ -179,6 +179,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             .kv_heads                  = dimension(config.attention->num_key_value_heads),
             .attention_head_dim        = dimension(config.attention->head_dim),
             .kv_storage                = plan.kv_storage,
+            .text_layer_storage        = plan.kv_layers,
             .enable_mtp                = plan.features.mtp(),
             .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
             .text_physical_page_groups = physical_pages,
@@ -462,12 +463,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                         *attention, first, last, prefill));
                     lora_scratch(layout, 3, config.hidden_size, last);
                     (void)workspace::text_attention_results(layout, config, last);
-                    scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
-                                        {dimension(config.attention->head_dim),
-                                         dimension(config.attention->num_attention_heads),
-                                         dimension(config.attention->num_key_value_heads)},
-                                        plan.kv_storage, envelope, batch_size, min_width, max_width,
-                                        device_execution));
+                    // A per-layer cache plans the largest of its storages' workspaces.
+                    std::size_t attention_bytes = 0;
+                    for (const KvCacheStorage storage :
+                         qwen3_5::decoder_kv_storages(plan.kv_storage, plan.kv_layers)) {
+                        attention_bytes = std::max(
+                            attention_bytes,
+                            ops::causal_softmax_attention_workspace_capacity_bytes(
+                                {dimension(config.attention->head_dim),
+                                 dimension(config.attention->num_attention_heads),
+                                 dimension(config.attention->num_key_value_heads)},
+                                storage, envelope, batch_size, min_width, max_width,
+                                device_execution));
+                    }
+                    scratch(layout, attention_bytes);
                     add_scratch(layout, attention->output, first, last, prefill);
                     lora_scratch(layout, 1, config.attention->query_width(), last);
                 } else {
@@ -1223,6 +1232,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
+    impl->kv_layers            = inputs.kv_layers;
     impl->adaptive_draft_tokens = inputs.adaptive_draft_tokens;
     impl->lossy_prefill        = inputs.lossy_prefill;
     impl->round_shapes = speculative_round_shapes(inputs.speculative_backend, inputs.draft_window,
@@ -1249,6 +1259,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                      dimension(attention.num_attention_heads),
                                      dimension(attention.num_key_value_heads)},
             .storage              = impl->kv_storage,
+            .target_storages      = target_kv_storages(impl->kv_layers),
             .multiprocessor_count = impl->multiprocessor_count};
         // LoRA adapters capture every target-running family twice (prepare_graphs: the base
         // graphs and the adapted ones); the adapted executables are charged like the base ones.
@@ -1406,6 +1417,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .relaxed_drafting     = options.relaxed_drafting.has_value(),
         .draft_context_rows   = options.draft_context_rows,
         .kv_storage           = options.kv_cache,
+        .kv_layers            = options.kv_layers,
         .proposal_head        = options.speculative.proposal_head,
         .features             = models::load_options(options),
         .numeric_tripwire     = options.numeric_tripwire,

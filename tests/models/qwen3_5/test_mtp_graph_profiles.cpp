@@ -200,6 +200,61 @@ void check_dflash(std::uint32_t capacity, std::uint32_t draft_window, std::uint3
 }
 
 
+// A per-layer text cache (MtpGraphAttention::target_storages): the target verify runs once per
+// storage its layers hold, so every profile must replay one verify launch shape for each of them
+// (and for the MTP layer's own `storage`), and a class must agree on each one's kernel count. The
+// AR steps run on the MTP cache alone, which check() covers through `storage`.
+void check_mixed(std::uint32_t capacity, std::uint32_t draft_window, const MtpGraphAttention& attention,
+                 bool dflash) {
+    namespace detail = ninfer::models::qwen3_5::detail;
+    const auto profiles =
+        dflash ? detail::dflash_graph_profiles(ninfer::SpeculativeBackend::DFlash, capacity, draft_window, 1, attention)
+               : detail::mtp_graph_profiles(capacity, draft_window, attention);
+    std::vector<KvCacheStorage> storages = attention.target_storages;
+    if (!dflash) { storages.push_back(attention.storage); }
+    const auto label = [&] {
+        std::string kinds;
+        for (const KvCacheStorage storage : storages) { kinds += std::to_string(static_cast<int>(storage)) + ' '; }
+        return std::string(dflash ? "mixed dflash" : "mixed mtp") + " capacity=" + std::to_string(capacity) +
+               " k=" + std::to_string(draft_window) + " heads=" + std::to_string(attention.geometry.query_heads) +
+               " kv=" + kinds;
+    };
+    const auto verify = [&](KvCacheStorage storage, std::uint32_t frontier) {
+        const auto visible = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(frontier) + draft_window + 1ULL));
+        return ninfer::ops::causal_softmax_attention_launch_shape(
+            attention.geometry, storage, CausalAttentionExecutionEnvelope{1U, visible}, 1,
+            static_cast<std::int32_t>(draft_window) + 1, {nullptr, attention.multiprocessor_count});
+    };
+    std::uint32_t expected_min = 0;
+    std::map<std::uint32_t, std::vector<std::uint32_t>> nodes_of_class;
+    for (const auto& profile : profiles) {
+        if (profile.min != expected_min || profile.max < profile.min) {
+            std::cerr << label() << ": frontier coverage has a hole at [" << profile.min << "," << profile.max << "]\n";
+            ++failures;
+        }
+        expected_min = profile.max + 1;
+        std::vector<std::uint32_t> nodes;
+        for (const KvCacheStorage storage : storages) {
+            if (!(verify(storage, profile.min) == verify(storage, profile.max))) {
+                std::cerr << label() << ": profile [" << profile.min << "," << profile.max
+                          << "] spans a verify launch-shape change of storage " << static_cast<int>(storage) << "\n";
+                ++failures;
+            }
+            nodes.push_back(verify(storage, profile.max).kernel_nodes);
+        }
+        const auto [it, inserted] = nodes_of_class.emplace(profile.topology_class, nodes);
+        if (!inserted && it->second != nodes) {
+            std::cerr << label() << ": class " << profile.topology_class << " mixes verify kernel counts\n";
+            ++failures;
+        }
+    }
+    if (profiles.empty() || profiles.back().max != capacity - 1) {
+        std::cerr << label() << ": coverage does not reach the capacity\n";
+        ++failures;
+    }
+}
+
 // Decode scoring runs eagerly with served_decode_envelope. At every frontier its envelope must be
 // the one the served graph captured for the profile holding that frontier -- the ordinary graph's
 // {min+1, max+1}, or the MTP round's target verify {1, min(capacity, max+K+1)}, rebuilt here from
@@ -310,6 +365,28 @@ int main() {
                     check_served_decode(capacity, width, attention, true);
                 }
                 check_served_decode(65536U, width, attention, false);
+            }
+        }
+    }
+    // Per-layer INT8-family caches, the MTP layer at int8: on the RTX 3090's 82 SMs and the V100's 80.
+    const std::vector<std::vector<KvCacheStorage>> mixes = {
+        {KvCacheStorage::RotatedLloyd4KeyInt4Value, KvCacheStorage::Int8Group64},
+        {KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::Int8Group64},
+        {KvCacheStorage::RotatedLloyd4KeyInt4Value, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64},
+    };
+    for (const AttentionHeadGeometry geometry : kGeometries) {
+        for (const std::int32_t sms : {82, 80}) {
+            for (const auto& mix : mixes) {
+                const MtpGraphAttention attention{.geometry             = geometry,
+                                                  .storage              = KvCacheStorage::Int8Group64,
+                                                  .target_storages      = mix,
+                                                  .multiprocessor_count = sms};
+                for (const std::uint32_t capacity : {16384U, 262144U}) {
+                    for (std::uint32_t draft_window = 1; draft_window <= kSweptDraftWindows; ++draft_window) {
+                        check_mixed(capacity, draft_window, attention, false);
+                        if (draft_window <= 15) { check_mixed(capacity, draft_window, attention, true); }
+                    }
+                }
             }
         }
     }

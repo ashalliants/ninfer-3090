@@ -18,6 +18,10 @@ struct DecoderStateSpec {
     std::int32_t kv_heads                   = 0;
     std::int32_t attention_head_dim         = 0;
     KvCacheStorage kv_storage                = KvCacheStorage::BFloat16;
+    // A per-layer text cache (EngineOptions::kv_layers): one INT8-family storage per full-attention
+    // layer, which the text cache stores instead of kv_storage (itself INT8-family; the MTP cache
+    // keeps it). Empty: every layer stores kv_storage.
+    std::vector<KvCacheStorage> text_layer_storage;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -36,6 +40,8 @@ struct PagedKVCacheLayout {
     std::int32_t kv_heads     = 0;
     std::int32_t head_dim     = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    // Per-layer storages of a mixed cache (DecoderStateSpec::text_layer_storage); empty: `storage`.
+    std::vector<KvCacheStorage> layer_storage;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -91,6 +97,8 @@ public:
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
     // The rank holding this layer's KV planes, which is also the rank whose block table it reads.
     [[nodiscard]] std::size_t layer_rank(std::uint32_t layer) const;
+    // The storage one layer's planes hold.
+    [[nodiscard]] KvCacheStorage layer_storage(std::uint32_t layer) const;
 
 private:
     friend class PagedKVCacheView;
@@ -104,7 +112,13 @@ private:
     std::int32_t kv_heads_     = 0;
     std::int32_t head_dim_     = 0;
     KvCacheStorage storage_    = KvCacheStorage::BFloat16;
+    std::vector<KvCacheStorage> layer_storage_;
 };
+
+// Every storage a cache of this spec holds: kv_storage first, then each other one its text layers
+// hold, without repeats. Workspace and graph planning size and route for all of them.
+[[nodiscard]] std::vector<KvCacheStorage> decoder_kv_storages(KvCacheStorage kv_storage,
+                                                             std::span<const KvCacheStorage> text_layer_storage);
 
 struct DecoderStateLayout {
     PagedKVCacheLayout text_kv;

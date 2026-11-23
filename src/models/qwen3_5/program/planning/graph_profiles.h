@@ -71,10 +71,19 @@ inline constexpr std::uint32_t kMeasuredCopyPartnerDraftWindow = 7;
 // DFlash round records and therefore where its graph topology classes break.
 struct MtpGraphAttention {
     ops::AttentionHeadGeometry geometry;
+    // The MTP layer's cache storage, and the text layers' when target_storages is empty.
     KvCacheStorage storage = KvCacheStorage::BFloat16;
+    // A per-layer text cache (EngineOptions::kv_layers): each distinct storage its full-attention
+    // layers hold. The target verify runs every one of them, so a frontier breaks wherever any of
+    // their routes changes. Empty: every text layer stores `storage`.
+    std::vector<KvCacheStorage> target_storages;
     // The executing device's SM count, which the INT8-family prompt route plans its launch from.
     std::int32_t multiprocessor_count = 0;
 };
+
+// MtpGraphAttention::target_storages of a per-layer text cache: each distinct storage of
+// `kv_layers`, in first-seen order; empty when kv_layers is (every layer stores the MTP storage).
+[[nodiscard]] std::vector<KvCacheStorage> target_kv_storages(std::span<const KvCacheStorage> kv_layers);
 
 [[nodiscard]] std::vector<GraphExecutionProfile> mtp_graph_profiles(
     std::uint32_t capacity, std::uint32_t draft_window, const MtpGraphAttention& attention);

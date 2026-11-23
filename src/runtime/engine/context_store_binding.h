@@ -40,6 +40,9 @@ inline std::string context_store_binding(const EngineOptions& options, const Loa
                std::to_string(static_cast<unsigned>(options.speculative.proposal_head)) + ',' +
                (options.gdn_state_fp16 ? "gdn-fp16" : "gdn-fp32") + ',' +
                (options.enable_vision ? "vision" : "text") + '\n';
+    // A per-layer KV cache: its layer list, so a mix never matches another mix of equal page bytes
+    // or a uniform cache. Absent for a uniform cache, whose bindings are unchanged.
+    if (!options.kv_layers.empty()) { binding += "kv-layers " + format_kv_layer_spec(options.kv_layers) + '\n'; }
     // The artifact by the id its conversion wrote: a re-converted artifact never matches, and every
     // copy of the same one does, on any machine. Not its file time: a download stamps the copy with
     // when it finished, so no two machines sharing a bucket would ever agree.

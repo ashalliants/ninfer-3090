@@ -50,17 +50,28 @@ std::vector<std::uint32_t> dflash_base_ends(std::uint32_t draft_window) {
     return ends;
 }
 
-// The target verify a DFlash round records at one execution frontier: T=K+1 over E+K+1 keys.
-ops::CausalAttentionLaunchShape dflash_verify_shape(std::uint32_t capacity,
-                                                    std::uint32_t draft_window,
-                                                    std::uint32_t batch_size,
-                                                    std::uint32_t frontier,
-                                                    const MtpGraphAttention& attention) {
+// The storages the target's full-attention layers hold: `storage`, or each of a per-layer cache's.
+std::vector<KvCacheStorage> target_storages(const MtpGraphAttention& attention) {
+    return attention.target_storages.empty() ? std::vector<KvCacheStorage>{attention.storage}
+                                             : attention.target_storages;
+}
+
+// The target verify a DFlash round records at one execution frontier: T=K+1 over E+K+1 keys, one
+// shape per storage the target's layers hold.
+std::vector<ops::CausalAttentionLaunchShape> dflash_verify_shape(std::uint32_t capacity,
+                                                                 std::uint32_t draft_window,
+                                                                 std::uint32_t batch_size,
+                                                                 std::uint32_t frontier,
+                                                                 const MtpGraphAttention& attention) {
     const auto visible = static_cast<std::uint32_t>(std::min<std::uint64_t>(
         capacity, static_cast<std::uint64_t>(frontier) + draft_window + 1ULL));
-    return ops::causal_softmax_attention_launch_shape(
-        attention.geometry, attention.storage, {1U, visible}, static_cast<std::int32_t>(batch_size),
-        static_cast<std::int32_t>(draft_window) + 1, {nullptr, attention.multiprocessor_count});
+    std::vector<ops::CausalAttentionLaunchShape> shapes;
+    for (const KvCacheStorage storage : target_storages(attention)) {
+        shapes.push_back(ops::causal_softmax_attention_launch_shape(
+            attention.geometry, storage, {1U, visible}, static_cast<std::int32_t>(batch_size),
+            static_cast<std::int32_t>(draft_window) + 1, {nullptr, attention.multiprocessor_count}));
+    }
+    return shapes;
 }
 
 // How every causal attention an MTP round records at one execution frontier executes: the target
@@ -85,6 +96,15 @@ std::vector<ops::CausalAttentionLaunchShape> mtp_attention_shapes(
             {1U, visible(static_cast<std::uint64_t>(frontier) + draft_window + step + 2ULL)}, 1,
             1, {nullptr, attention.multiprocessor_count}));
     }
+    // A per-layer text cache: the target verify (T=K+1 over E+K+1 keys) of each other storage its
+    // layers hold. The first shape above is the MTP layer's, whose cache stores `storage`.
+    for (const KvCacheStorage storage : attention.target_storages) {
+        if (storage == attention.storage) { continue; }
+        shapes.push_back(ops::causal_softmax_attention_launch_shape(
+            attention.geometry, storage,
+            {1U, visible(static_cast<std::uint64_t>(frontier) + draft_window + 1ULL)}, 1,
+            static_cast<std::int32_t>(draft_window) + 1, {nullptr, attention.multiprocessor_count}));
+    }
     return shapes;
 }
 
@@ -105,6 +125,14 @@ void collect_shape_changes(std::uint32_t lo, std::uint32_t hi, const Shapes& sha
 }
 
 } // namespace
+
+std::vector<KvCacheStorage> target_kv_storages(std::span<const KvCacheStorage> kv_layers) {
+    std::vector<KvCacheStorage> out;
+    for (const KvCacheStorage storage : kv_layers) {
+        if (std::find(out.begin(), out.end(), storage) == out.end()) { out.push_back(storage); }
+    }
+    return out;
+}
 
 std::vector<SpeculativeRoundShape> speculative_round_shapes(SpeculativeBackend backend,
                                                             std::uint32_t draft_window,
@@ -242,10 +270,12 @@ std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend back
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
 
     std::vector<GraphExecutionProfile> profiles = graph_profiles_through(max_frontier, ends);
-    std::vector<std::pair<std::uint32_t, bool>> classes;
+    std::vector<std::pair<std::vector<std::uint32_t>, bool>> classes;
     for (GraphExecutionProfile& profile : profiles) {
-        const std::pair<std::uint32_t, bool> key{shape(profile.max).kernel_nodes,
-                                                 profile.max > 96U};
+        std::pair<std::vector<std::uint32_t>, bool> key{{}, profile.max > 96U};
+        for (const ops::CausalAttentionLaunchShape verify : shape(profile.max)) {
+            key.first.push_back(verify.kernel_nodes);
+        }
         const auto found       = std::find(classes.begin(), classes.end(), key);
         profile.topology_class = static_cast<std::uint32_t>(found - classes.begin());
         if (found == classes.end()) { classes.push_back(key); }

@@ -410,6 +410,7 @@ void ProgramImpl::prepare_graphs() {
                                      dimension(attention.num_attention_heads),
                                      dimension(attention.num_key_value_heads)},
             .storage              = kv_storage,
+            .target_storages      = target_kv_storages(kv_layers),
             .multiprocessor_count = device.multiprocessor_count()};
         const auto forward_profiles_for = [&](std::uint32_t batch) {
             auto profiles = mtp ? mtp_graph_profiles(capacity, draft_window, target_attention)

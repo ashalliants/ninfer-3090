@@ -571,6 +571,8 @@ public:
     const bool relaxed_drafting;
     frontend::RelaxedDraftingTokens relaxed_tokens;
     const KvCacheStorage kv_storage;
+    // EngineOptions::kv_layers: the text cache's per-layer storages (empty: kv_storage).
+    const std::vector<KvCacheStorage> kv_layers;
     const ProposalHead proposal_head;
     const bool vision_enabled;
     const bool use_cuda_graph;

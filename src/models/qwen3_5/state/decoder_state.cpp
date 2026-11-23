@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace ninfer::models::qwen3_5 {
@@ -18,8 +19,8 @@ std::uint32_t page_count(std::uint32_t capacity) {
 PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
                               std::span<const std::size_t> layer_rank, std::uint32_t layers,
                               std::uint32_t capacity, std::int32_t kv_heads, std::int32_t head_dim,
-                              KvCacheStorage storage, std::int32_t table_rows,
-                              std::uint32_t physical_page_groups) {
+                              KvCacheStorage storage, std::span<const KvCacheStorage> layer_storage,
+                              std::int32_t table_rows, std::uint32_t physical_page_groups) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -28,8 +29,23 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
     if (head_dim != ops::kD256KVCacheHeadDim) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
-    const ops::D256KVCacheProfile profile = ops::d256_kv_cache_profile(storage);
-    const bool scaled                     = profile.quant_group != 0;
+    const bool scaled = ops::d256_kv_cache_profile(storage).quant_group != 0;
+    if (!layer_storage.empty()) {
+        // Mixing is for formats that share one plane set (four scaled planes) and kernel family.
+        if (layer_storage.size() != layers) {
+            throw std::invalid_argument("a per-layer KV spec names " + std::to_string(layer_storage.size()) +
+                                        " layers; this model has " + std::to_string(layers) +
+                                        " full-attention layers");
+        }
+        for (const KvCacheStorage layer : layer_storage) {
+            if (!ops::kv_cache_is_int8_family(layer) || !ops::kv_cache_is_int8_family(storage)) {
+                throw std::invalid_argument("a per-layer KV cache mixes only int8, rk8v4 and rk4v4");
+            }
+        }
+    }
+    const auto storage_of = [&](std::uint32_t layer) {
+        return layer_storage.empty() ? storage : layer_storage[layer];
+    };
 
     const std::uint32_t logical_pages = page_count(capacity);
     if (physical_page_groups < logical_pages) {
@@ -49,6 +65,7 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
     geometry.planes.reserve(static_cast<std::size_t>(layers) * planes_per_layer);
     plane_rank.reserve(static_cast<std::size_t>(layers) * planes_per_layer);
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const ops::D256KVCacheProfile profile = ops::d256_kv_cache_profile(storage_of(layer));
         geometry.planes.push_back(
             {profile.key_code_dtype, profile.key_leading_extent, kv_heads, 256});
         geometry.planes.push_back(
@@ -84,6 +101,7 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
         .kv_heads       = kv_heads,
         .head_dim       = head_dim,
         .storage        = storage,
+        .layer_storage  = std::vector<KvCacheStorage>(layer_storage.begin(), layer_storage.end()),
     };
     for (const std::size_t rank : table_ranks) {
         if (rank >= builders.size() || builders[rank] == nullptr) {
@@ -109,10 +127,11 @@ DecoderStateLayout plan_decoder_state(std::span<LayoutBuilder* const> builders,
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builders, spec.text_layer_rank, spec.full_attention_layers,
                                 spec.capacity, spec.kv_heads, spec.attention_head_dim,
-                                spec.kv_storage, spec.kv_table_rows, spec.text_physical_page_groups);
+                                spec.kv_storage, spec.text_layer_storage, spec.kv_table_rows,
+                                spec.text_physical_page_groups);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builders.first(1), {}, spec.mtp_layers, spec.capacity,
-                                   spec.kv_heads, spec.attention_head_dim, spec.kv_storage,
+                                   spec.kv_heads, spec.attention_head_dim, spec.kv_storage, {},
                                    spec.kv_table_rows, spec.mtp_physical_page_groups);
     }
     return layout;
@@ -124,7 +143,7 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
 PagedKVCache::PagedKVCache(std::span<const DeviceSpan> backings, const PagedKVCacheLayout& layout)
     : pages_(backings, layout.pages), execution_tables_(backings, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
-      head_dim_(layout.head_dim), storage_(layout.storage) {}
+      head_dim_(layout.head_dim), storage_(layout.storage), layer_storage_(layout.layer_storage) {}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, KVExecutionRowHandle row) noexcept
     : cache_(&cache), row_(row) {}
@@ -170,8 +189,22 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer,
         .block_table   = block_table,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
-        .storage       = storage_,
+        .storage       = layer_storage(layer),
     };
+}
+
+KvCacheStorage PagedKVCache::layer_storage(std::uint32_t layer) const {
+    if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
+    return layer_storage_.empty() ? storage_ : layer_storage_[layer];
+}
+
+std::vector<KvCacheStorage> decoder_kv_storages(KvCacheStorage kv_storage,
+                                                std::span<const KvCacheStorage> text_layer_storage) {
+    std::vector<KvCacheStorage> out{kv_storage};
+    for (const KvCacheStorage storage : text_layer_storage) {
+        if (std::find(out.begin(), out.end(), storage) == out.end()) { out.push_back(storage); }
+    }
+    return out;
 }
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {

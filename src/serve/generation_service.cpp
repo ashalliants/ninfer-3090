@@ -341,6 +341,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.progress_anchor_tokens   = options.progress_anchor_tokens;
     engine_options.progress_anchors_shared  = options.progress_anchors_shared;
     engine_options.kv_cache                = options.kv_cache;
+    engine_options.kv_layers               = options.kv_layers;
     engine_options.dense_q8                = options.dense_q8;
     engine_options.experts_mxfp8           = options.experts_mxfp8;
     engine_options.split_attention         = options.split_attention;

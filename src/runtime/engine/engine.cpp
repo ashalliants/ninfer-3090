@@ -350,6 +350,11 @@ public:
         if (options.kv_rings != KvRings::Default && !runtime::artifact_is_inkling2(options.artifact_path)) {
             throw std::invalid_argument("--kv-dtype fp16|fp32 are Inkling-2's KV ring forms; this model takes bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4");
         }
+        if (!options.kv_layers.empty() &&
+            (runtime::artifact_is_qwen4_exp(options.artifact_path) || runtime::artifact_is_inkling2(options.artifact_path) ||
+             runtime::artifact_is_dsv4(options.artifact_path))) {
+            throw std::invalid_argument("--kv-dtype: a per-layer KV spec (e.g. rk4v4x8,int8x8) is for Qwen3.5-family models; this model takes one KV dtype");
+        }
         if (runtime::artifact_is_qwen4_exp(options.artifact_path)) {
             construct_qwen4_exp();
             return;
