@@ -53,6 +53,10 @@ constexpr std::int32_t kHeld = 256;
 // memory left free after the programs for what the first requests allocate (cuBLAS's handle, say).
 constexpr std::int32_t kChunks[] = {2048, 1024, 512, 256};
 constexpr std::size_t kStartupSpare = 256U << 20;
+// With --prefill-cublas, an NVFP4 expert with at least this many entries in a prefill forward runs on cuBLAS over its
+// decoded rows (ProgramLimits::TensorCoreParts::blas_experts): measured best on a V100 of 256 / 384 / 512 / 768 / 1024
+// at chunks 2048 and 4096 (docs/maintainer/inkling2-model.md, "Tensor-core prefill").
+constexpr std::int32_t kBlasExpertsMin = 512;
 // With several slots, a context that does not fit is lowered in steps of this many positions per slot.
 constexpr std::int32_t kFitStep = 256;
 
@@ -534,7 +538,16 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
             ink::parse_kv_quant(model_->config(), kvq, limits);
             load_.notes.push_back(std::string("experimental | NINFER_INKLING2_KVQ ") + kvq + " (lossy, measuring only)");
         }
-        if (!prefill_is_fp32(options_.kv_rings, options_.prefill_math)) { limits.prefill_tc = ink::ProgramLimits::TensorCoreParts::all(); }
+        if (!prefill_is_fp32(options_.kv_rings, options_.prefill_math)) {
+            limits.prefill_tc      = ink::ProgramLimits::TensorCoreParts::all();
+            limits.prefill_tc.blas = options_.prefill_cublas; // the controllers and router scores on cuBLAS FP32 GEMMs
+            limits.prefill_tc.blas_experts = options_.prefill_cublas ? kBlasExpertsMin : 0;
+            // Measuring knob for the hot-expert threshold (docs/maintainer/inkling2-model.md, "Tensor-core prefill").
+            if (const char* n = std::getenv("NINFER_INKLING2_BLAS_EXPERTS"); n != nullptr && *n != '\0' && options_.prefill_cublas) {
+                limits.prefill_tc.blas_experts = std::atoi(n);
+                load_.notes.push_back(std::string("experimental | NINFER_INKLING2_BLAS_EXPERTS ") + n + " (measuring only)");
+            }
+        }
         limits.slots = slots_;
         // Batched decode runs every request plain: with several slots there is no drafter.
         const bool dspark  = options_.speculative.backend == SpeculativeBackend::DSpark && slots_ == 1;
@@ -747,7 +760,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                               ")");
     }
     const bool fp32_prefill   = prefill_is_fp32(options_.kv_rings, options_.prefill_math);
-    load_.prefill_signature   = fp32_prefill ? "inkling2-fp32" : "inkling2-tc";
+    load_.prefill_signature   = fp32_prefill ? "inkling2-fp32" : options_.prefill_cublas ? "inkling2-tc-cublas" : "inkling2-tc";
     std::size_t device_free = 0, device_total = 0;
     check_cuda(cudaMemGetInfo(&device_free, &device_total), "memory info");
     load_.notes.push_back("prefill | chunk " + std::to_string(chunk_) + (options_.prefill_chunk_auto ? " (widest that fits)" : " (--prefill-chunk)") +
@@ -755,7 +768,10 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                           (programs_->drafter ? std::string(drafter_head_copy_ ? " | drafter head Q8 copy" : " | drafter head: the target's BF16") +
                                                     " | drafter window " + (drafter_window_ == 0 ? std::string("whole context") : std::to_string(drafter_window_))
                                               : std::string()) +
-                          " | " + (fp32_prefill ? "FP32" : "tensor cores (--prefill-math fp32: the exact FP32 prefill)") +
+                          " | " + (fp32_prefill ? "FP32"
+                                   : options_.prefill_cublas ? "tensor cores, controllers and router on cuBLAS (--no-prefill-cublas: on our FP32 kernels; "
+                                                               "--prefill-math fp32: the exact FP32 prefill)"
+                                                             : "tensor cores (--prefill-math fp32: the exact FP32 prefill)") +
                           (options_.kv_cache == KvCacheStorage::Int8Group64 ? " | global KV rings int8 (K8 V8, lossy, opt-in)"
                            : options_.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ? " | global KV rings rk8v4 (K8 V4, lossy, opt-in)"
                            : options_.kv_cache == KvCacheStorage::RotatedLloyd4KeyInt4Value ? " | global KV rings rk4v4 (K4 V4, lossy, opt-in)"

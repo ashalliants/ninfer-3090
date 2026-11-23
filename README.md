@@ -57,9 +57,10 @@ Inkling-2-Mini runs on the RTX 3090 as well, on Windows and Linux, with 137,216 
 >   sampled request draws the same tokens plain sampling draws under the same seed, on every DSpark request
 >   measured ([model card](model-cards/Inkling-2-Mini-NInfer-V100/README.md)). Unsloth's DSpark notes for llama.cpp
 >   say its greedy output with the drafter "is not guaranteed to be bit identical to a run without it".
-> - **Faster on the same card.** On one Tesla V100 32 GB, NInfer decodes **78.8 tok/s** plain and **93-94 tok/s** with
->   DSpark (12-chat average; **120.7** on maths), and prefills **1,930 tok/s** at 8K (1,868 with DSpark and images at
->   the full 262,144-token context). The other published V100 port, Csavoldi's Inkling port onto Lapilli
+> - **Faster on the same card.** On one Tesla V100 32 GB at 200 W, NInfer decodes **94.3 tok/s** with DSpark and
+>   **78.0** plain (12-chat averages at the full 262,144-token context with images and INT8 KV; **120.7** on maths at
+>   250 W), and prefills **2,687 tok/s** at 8K with `--prefill-chunk 8192` (131,072 context), 2,069 at the default
+>   chunk (2,032 with DSpark and images at the full 262,144). The other published V100 port, Csavoldi's Inkling port onto Lapilli
 >   ([report](https://github.com/chris83-dev/lapilli-v100/blob/f9b7dd093a9ff018bc68f177f81a1d27d3ffec91/docs/community/inkling2-mini.md),
 >   official NVFP4 experts), reports 69 tok/s writing without a drafter (its DSpark kernels need sm_120a) and 850
 >   tok/s reading a short prompt. Those figures are theirs, from a different machine and prompts, so read the
@@ -79,11 +80,11 @@ Decode is one stream unless the column says otherwise.
 | **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | 76-86 tok/s (MTP3); 47.9 at 40K and 25.0 at 162K context (200 W) | 79 tok/s at C2 (MTP3) |
 | Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K (250 W) | **123 tok/s** (MTP7 + draft vocabulary, code); 100 thinking, 79-81 story and Chinese, 72 French (200 W); flat from 10K to 221K context | |
 | **Inkling-2-Mini** (new) | RTX 3090 | **137,216** plain, 89,088 with DSpark and vision; **262,144** with both on `--kv-dtype rk4v4` (lossy, opt-in) | **2,421 tok/s** at 8.4K, 65,536 context with vision (Windows; 2,410 under WSL); 2,416 at 1.2K | **104 tok/s** plain (12 chats, WSL; 101.8 on Windows); 115.5 best with DSpark (code) | **282 tok/s** at C8 (plain, WSL; 277 on Windows) |
-| **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **1,930 tok/s** at 8K, 131,072 context (1,629 at 1K, 1,244 at 100K); 1,868 at 8K at the full 262,144 with DSpark and vision | **120.7 tok/s** (DSpark, maths); 93-94 average over 12 chats, 78.8 plain | **198 tok/s** at C8 (plain) |
+| **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **2,687 tok/s** at 8K, 131,072 context, `--prefill-chunk 8192` (200 W); 2,069 at the default chunk (1,810 at 1K, 1,298 at 100K); 2,032 at 8K at the full 262,144 with DSpark and vision | **120.7 tok/s** (DSpark, maths, 250 W); 94.3 average over 12 chats, 78.0 plain (262,144 with vision, INT8 KV, 200 W) | **198 tok/s** at C8 (plain) |
 
 RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The V100 was
 measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host: Qwen rows on 2026-11-18 (the
-two-lane figure 2026-11-20; Flash-Next decode re-measured 2026-11-23 on master `61b3e032c` at 200 W with the router's flags; [conditions](docs/tesla-v100.md#qwen38-flash-next)), Inkling-2-Mini on 2026-11-22 (master `dad1623b`, 250 W limit). Inkling-2-Mini on the RTX 3090:
+two-lane figure 2026-11-20; Flash-Next decode re-measured 2026-11-23 on master `61b3e032c` at 200 W with the router's flags; [conditions](docs/tesla-v100.md#qwen38-flash-next)), Inkling-2-Mini on 2026-11-22 (master `dad1623b`, 250 W limit; prefill and the 12-chat decode figures re-measured 2026-11-23 at 200 W, prefill with `--prefill-cublas`). Inkling-2-Mini on the RTX 3090:
 2026-11-23 under WSL and natively on Windows (master `311ad169a`), 315 W limit, its layers 20-23 experts held as their exact MXFP8 re-encoding (the default there).
 Ternary Bonsai 2 27B's context and C8 figures: 2026-11-23, WSL and Windows, 315 W limit
 ([method](docs/performance/bonsai2-27b-rtx3090.md#several-requests-and-context)). Flash-Next's two-lane figure is the median of four runs on a rented Linux RTX 3090 (420 W limit, 2026-11-11;
@@ -639,17 +640,22 @@ Responses routes, with streaming, tool calls, reasoning and thinking budgets, an
 `--vision`. Its own trained block drafter, DSpark, speculates on greedy and sampled requests
 (`--spec dspark`); greedy output is plain decoding's, and a sampled request draws plain sampling's tokens
 under the same seed. Measured through `ninfer-serve` on master `dad1623b` (2026-11-22, 250 W limit, PCIe
-Gen3 x4 eGPU):
+Gen3 x4 eGPU) unless a figure says 200 W:
 
 - **Decode:** up to **120.7 tok/s** with DSpark (a maths prompt; code 115.4, lists 99.8, prose 88.2), and
   93.4-94.4 tok/s on average over 12 chat requests against 78.5-78.8 plain. Sampled at temperature 0.8,
-  83.5 against 74.9 plain.
-- **Prefill:** up to 1,930 tok/s (a 7,979-token prompt, TTFT 4.1 s, at `--max-context 131072`, where the
-  engine picks chunk 2048); 1,629 tok/s at 1K (TTFT 0.67 s) and 1,244 at 100K (TTFT 80.5 s). At the full 262,144
-  with DSpark and vision the engine picks chunk 2048 as well: 1,868 tok/s at 8K (TTFT 4.27 s), 1,671 at 1K
-  (0.66 s), 1,613 at 34K (21.5 s) and 1,219 at 100K (82.1 s), against 782, 699, 739 and 629 at the chunk 256 it
-  picked before the prefix-reuse snapshot moved to host memory. A 230-token image prompt answers its first token
-  in 375-398 ms.
+  83.5 against 74.9 plain. Re-measured on master `dc867300` (2026-11-23) at **200 W** in the full serving
+  configuration (`--max-context 262144 --vision --kv-dtype int8`, both adapters loaded but unused): **94.3 tok/s**
+  with DSpark (94.32-94.37 over two legs, 61.0% of drafts accepted) against **78.0** plain (78.03-78.04).
+- **Prefill** (200 W, 2026-11-23; the prefill's controllers, router and busiest experts on cuBLAS, the
+  `--prefill-cublas` default of a V100 build): up to **2,687 tok/s** (a 7,974-token prompt, TTFT 2.97 s, at
+  `--max-context 131072 --prefill-chunk 8192`); 2,195 at 34K and 1,563 at 100K at that chunk. At the default
+  chunk (2048, which the engine picks) 2,069 tok/s at 8K (TTFT 3.85 s), 1,810 at 1K (0.59 s), 1,763 at 34K and
+  1,298 at 100K (77.1 s), against 1,893, 1,719, 1,644 and 1,226 with `--no-prefill-cublas`. At the full 262,144
+  with DSpark and vision (chunk 2048): 2,032 tok/s at 8K (TTFT 3.92 s), 1,779 at 1K, 1,734 at 34K and 1,284 at
+  100K (against 1,860, 1,694, 1,613 and 1,212). A wider chunk prefills a long prompt faster but resumes a chat
+  only at its multiples (see prefix reuse), and with FP16 KV it does not fit beside DSpark and vision at 262,144.
+  A 230-token image prompt answers its first token in 375-398 ms (250 W).
 - **Context:** the full 262,144 tokens with DSpark and vision on. Decode at 100K context runs at 48 tok/s.
 - **Low-bit KV (opt-in, lossy):** `--kv-dtype rk4v4` (or `int8`, `rk8v4`) codes the 8 global KV rings in 4 or 8 bits:
   plain decode **41.1 tok/s at 200K** context against 34.8 (+18%), 53.2 against 47.8 at 100K; it frees 5,952 MiB at
@@ -665,7 +671,9 @@ Gen3 x4 eGPU):
   pixels. The defaults (FP16 KV, tensor-core prefill) differ from it by about as much as reordering FP32 sums.
 - **Prefix reuse:** on by default; a prompt that starts with the same tokens and images resumes from a snapshot
   kept in pinned host memory (236 MiB), and the result reports `reused_prompt_tokens`. A chat's second turn at 8K
-  answers in 1.10 s instead of 4.26 s, at 34K in 1.51 s instead of 21.4 s.
+  answers in 1.03 s instead of 3.93 s (200 W, 262,144 with DSpark, vision and INT8 KV; 6,144 positions reused at the default chunk 2048; 1.77 s at
+  `--prefill-chunk 4096`, 3.04 s at 8192, which reuses nothing below 8,192), at 34K in 1.51 s instead of 21.4 s
+  (250 W).
 - **Not yet:** the context store and host cache tiers, JSON-schema output and logprobs.
 
 **On an RTX 3090** (24 GB) the same artifact runs, measured under WSL on 2026-11-23 (315 W limit). Its layers 20-23

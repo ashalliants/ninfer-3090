@@ -44,8 +44,9 @@ needs NInfer's executables. It runs on one **Tesla V100 32 GB** (`sm_70`, Linux,
   DSpark speculation never changes the answer: greedy output equals plain greedy decode, and sampled requests draw
   the same tokens plain sampling draws under the same seed. Unsloth's DSpark notes for llama.cpp say its greedy
   output with the drafter "is not guaranteed to be bit identical to a run without it".
-- **Fast on a V100.** 78.8 tok/s plain, 93-94 tok/s with DSpark over 12 chats (120.7 on maths), 1,930 tok/s prefill
-  at 8K (1,868 with DSpark and images at the full 262,144-token context). The other published V100 port (Csavoldi's, onto Lapilli)
+- **Fast on a V100.** At 200 W: 94.3 tok/s with DSpark and 78.0 plain over 12 chats at the full 262,144-token
+  context with images and INT8 KV (120.7 on maths at 250 W), and 2,687 tok/s prefill at 8K with `--prefill-chunk 8192`
+  (2,069 at the default chunk; 2,032 with DSpark and images at the full 262,144-token context). The other published V100 port (Csavoldi's, onto Lapilli)
   reports 69 tok/s without a drafter and 850 tok/s prompt reading, on a different machine and prompts
   ([report](https://github.com/chris83-dev/lapilli-v100/blob/f9b7dd093a9ff018bc68f177f81a1d27d3ffec91/docs/community/inkling2-mini.md)).
 
@@ -135,7 +136,9 @@ calls (`parallel_tool_calls` honoured), reasoning and thinking budgets, stop str
   tokens are its one-at-a-time tokens. At N > 1 requests decode without DSpark, and `--lora`/`--graft` are refused.
 - **Prefix reuse** is on by default. A prompt that starts with the same tokens and images resumes from a snapshot
   kept in pinned host memory (one per request slot: 236 MiB with DSpark, 163 MiB per slot at `--max-concurrency N`),
-  and the result reports `reused_prompt_tokens`. A chat's second turn at 8K answers in 1.10 s instead of 4.26 s.
+  and the result reports `reused_prompt_tokens`. A chat's second turn at 8K answers in 1.03 s instead of 3.93 s
+  (200 W, the default chunk 2048; snapshots sit at multiples of the prefill chunk, so `--prefill-chunk 8192`
+  reuses nothing below 8,192 tokens).
 - **Opt-in uncensoring adapters:** `--lora NAME=DIR` loads the
   [OpenUncensored](https://huggingface.co/OpenUncensored/Inkling-2-Mini-Uncensored) LoRA and `--graft NAME=FILE`
   the [satellitedown](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine) per-visit ablation.
@@ -160,23 +163,26 @@ card the engine holds them as MXFP8 (3.9 GiB), re-encoded at load and checked ex
 for bit (`--mxfp8-experts auto`, the default; `off` keeps BF16). `--fit-context MIN` starts at the largest context that
 fits. On Windows, `scripts\download-model.bat inkling2-mini` downloads and verifies this file.
 
-## Performance (one Tesla V100-PCIE-32GB, 2026-11-22)
+## Performance (one Tesla V100-PCIE-32GB, 2026-11-22 and 2026-11-23)
 
 Measured through `ninfer-serve` built from NInfer master `dad1623b`, on a V100 at its 250 W power limit (peak
 draw 236 W) over a PCIe Gen3 x4 eGPU link (OCuLink, 3.3 GB/s), with the default FP16 KV and tensor-core prefill, at the server's default 8,192-token context unless a row says
-otherwise. `gpu_guard.sh` reported no thermal throttle and no power capping in any run used here. Each row gives the best
+otherwise. Rows marked 200 W were re-measured on 2026-11-23 at a 200 W limit (master `dc867300` for decode; the
+prefill rows with `--prefill-cublas`, the default of a V100 build since that change). `gpu_guard.sh` reported no thermal throttle and no power capping in any run used here. Each row gives the best
 clean run first, then the typical range across repeated or ABBA legs.
 
 | | Best measured | Conditions | Typical range |
 |---|---:|---|---|
 | **Decode, DSpark** | **120.7 tok/s** | maths prompt, greedy, 300 tokens, `--spec dspark` | 114.3-120.7 on maths, 105.5-115.4 on code, 81.2-99.8 on prose and lists |
 | **Decode, DSpark, 12 chats** | **94.4 tok/s** | 12 chat requests of 300 tokens, greedy, mean of each request's tok/s | 93.4-94.4 over four legs, 60.5-60.7% of drafts accepted; plain 78.5-78.8 |
+| **Decode, 12 chats at 262,144** (200 W) | **94.3 tok/s** DSpark, **78.0** plain | the 12 chats, `--max-context 262144 --vision --kv-dtype int8 --spec dspark --draft-tokens 3`, both adapters loaded but unused (master `dc867300`, 2026-11-23) | DSpark 94.32-94.37 over two ABBA legs, 61.0% of drafts accepted, 78.7-119.8 per chat; plain 78.03-78.04; greedy output identical across all four legs |
 | **Decode, DSpark, sampled** | **83.5 tok/s** | the same 12 chats at temperature 0.8, top-p 0.95, seeded | 83.4-83.5; plain sampled 74.9 |
 | **Decode, plain** | **78.8 tok/s** | the 12 chats, greedy | 78.2-78.8 |
 | **Batched decode, aggregate** | **198.2 tok/s** | `--max-concurrency 8`, 8 greedy chats of 256 tokens at once, prefill included | 196.8-198.2 at N = 8 (26.4 tok/s each); 170.5 at N = 4, 121.8 at N = 2 |
-| **Prefill** | **1,930 tok/s** | 7,979-token prompt, TTFT 4.1 s, `--max-context 131072` (chunk 2048, picked by the engine) | 1,629 at 1,098 tokens (TTFT 0.67 s), 1,896 at 9,798 (5.2 s), 1,244 at 100,107 (80.5 s); with DSpark and vision on, 1-4% lower (1,900 at 7,979) |
-| **Prefill at 262,144** | **1,868 tok/s** | 7,979-token prompt, TTFT 4.27 s, `--max-context 262144 --spec dspark --vision` with both adapters loaded, the default chunk 2048 (2026-11-22, branch `perf/inkling2-host-snapshots`) | 1,566-1,671 at 1,098 (0.66-0.70 s), 1,613 at 34,701 (21.5 s), 1,219 at 100,107 (82.1 s). Before the prefix-reuse snapshot moved to host memory the engine picked chunk 256 here: 699-703, 782-786, 739-743 and 629-632 tok/s |
-| **Second turn of a chat** | **TTFT 1.10 s** | 7,977-token prompt, 6,144 positions resumed from the first turn's snapshot, same server | 4.26 s cold; 1.51 s against 21.4 s at 34,699 tokens; the same output as cold |
+| **Prefill** (200 W) | **2,687 tok/s** | 7,974-token prompt, TTFT 2.97 s, `--max-context 131072 --prefill-chunk 8192` | 2,648-2,687 over ABBA legs; 2,195 at 34,674 and 1,563 at 100,074 tokens. Chunk 4096: 2,360-2,394 at 8K, 2,004 at 34K, 1,459 at 100K |
+| **Prefill, default chunk** (200 W) | **2,069 tok/s** | 7,974-token prompt, TTFT 3.85 s, `--max-context 131072` (chunk 2048, picked by the engine) | 2,052-2,069; 1,797-1,810 at 1,074 (0.59 s), 1,763 at 34,674 (19.7 s), 1,298 at 100,074 (77.1 s). With `--no-prefill-cublas`: 1,885-1,893, 1,703-1,719, 1,644, 1,226 |
+| **Prefill at 262,144** (200 W) | **2,032 tok/s** | 7,974-token prompt, TTFT 3.92 s, `--max-context 262144 --spec dspark --vision`, the default chunk 2048 | 2,015-2,032; 1,771-1,779 at 1,074 (0.60 s), 1,734 at 34,674 (20.0 s), 1,284 at 100,074 (77.9 s). With `--no-prefill-cublas`: 1,854-1,860, 1,680-1,694, 1,613, 1,212. A wider chunk does not fit here with FP16 KV; with `--kv-dtype int8` chunk 4096 and 8192 fit |
+| **Second turn of a chat** (200 W) | **TTFT 1.03 s** | 7,988-token prompt, 6,144 positions resumed from the first turn's snapshot, same server, 262,144 with DSpark, vision and INT8 KV, chunk 2048 | 3.93 s cold; 1.77 s at chunk 4096 (4,096 reused), 3.04 s at 8192 (none reused). At 250 W: 1.51 s against 21.4 s at 34,699 tokens; the same output as cold |
 | **Decode at long context** | **91.2 tok/s** | DSpark, 128 tokens after a 7,979-token prompt (summarize it) | DSpark 84.9-91.2 at 8K and 88.0-89.8 at 10K; plain 71.5 at 8K and 48.1 at 100K (DSpark 47.4-48.0 there) |
 | **Image prompt** | **TTFT 375 ms** | 230-token prompt (llama.cpp's 640 x 488 `test-1.jpeg`, correctly described), vision encode and prefill, `--vision --spec dspark` at 262,144 | 375-398 ms (382-425 at 131,072); then 100-105 tok/s decode |
 | **Load** | **9.2 s** | engine ready, plain server | 9.2-14.2 s over 23 starts; weights read at 1.7-2.5 GiB/s |

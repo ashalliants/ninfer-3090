@@ -80,7 +80,11 @@ std::size_t forward_bytes(const TextConfig& c, std::int32_t cols, std::int32_t l
     const std::size_t dyn = std::size_t(c.kv_heads) * c.conv_kernel_size, rel = std::size_t(c.heads) * c.d_rel;
     const std::size_t col = h * 4 * t; // one FP32 [hidden, cols]
     const std::size_t mix = ops::depth_attention_mix_workspace_bytes(i32(c.hidden_size), cols, ops::kDepthAttentionMaxSources);
-    const auto control    = [&](int jobs) { return ops::loop_controller_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), cols, jobs); };
+    const bool blas       = tc.blas && tc.any() && cols >= kTensorCoreMinColumns;
+    const auto control    = [&](int jobs) {
+        return blas ? ops::loop_controller_blas_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), cols)
+                    : ops::loop_controller_workspace_bytes(i32(c.hidden_size), i32(c.loop_gate_rank), cols, jobs);
+    };
     const std::size_t persistent = (static_cast<std::size_t>(max_live_outputs(c)) + 1) * col + padded(t * 4);
     const std::size_t crossing   = 3 * col;
     const std::size_t normed     = 3 * h * 2 * t; // the BF16 inputs of q, k and v
@@ -106,8 +110,11 @@ std::size_t forward_bytes(const TextConfig& c, std::int32_t cols, std::int32_t l
     bank.format = expert_format, bank.hidden = i32(h), bank.intermediate = i32(c.moe_intermediate), bank.experts = i32(c.experts);
     const std::int64_t entries = static_cast<std::int64_t>(top_k * t);
     const std::size_t routed   = col + 2 * padded(top_k * t * 4);
-    const std::size_t route    = 2 * col + std::max({mix, ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), cols), control(1)});
-    const std::size_t experts  = tc.experts && wide ? ops::moe_situ_experts_tc_workspace_bytes(bank, entries, cols, false)
+    const std::size_t route    = 2 * col + std::max({mix,
+                                                         blas ? ops::moe_route_sigmoid_topk_blas_workspace_bytes(i32(c.experts), cols)
+                                                              : ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), cols),
+                                                         control(1)});
+    const std::size_t experts  = tc.experts && wide ? ops::moe_situ_experts_tc_workspace_bytes(bank, entries, cols, false, blas ? tc.blas_experts : 0)
                                                     : padded(top_k * t * c.moe_intermediate * 4) + padded(top_k * t * h * 4) + padded((1 + top_k * t) * 4);
     const std::size_t moe      = routed + std::max(route, top_k * col + (saving ? col : 0) + experts);
     // The output: its mix and norm, the head's BF16 input and the logits (the head is the widest weight a tensor-core
@@ -638,7 +645,12 @@ void TextProgram::control(std::span<const ControllerWeights* const> w, std::span
         views[3 * j + 2] = model_.tensor(w[j]->forget, {rank, h});
         jobs[j] = {c[j], m[j], &views[3 * j], &views[3 * j + 1], &views[3 * j + 2], out[j]};
     }
-    ops::loop_controller_fp32(std::span<const ops::LoopControllerJob>(jobs.data(), w.size()), config_.rms_norm_eps, workspace_, stream_);
+    const std::span<const ops::LoopControllerJob> batch(jobs.data(), w.size());
+    if (blas_wide(c[0]->ne[1])) {
+        ops::loop_controller_blas(batch, config_.rms_norm_eps, workspace_, stream_);
+    } else {
+        ops::loop_controller_fp32(batch, config_.rms_norm_eps, workspace_, stream_);
+    }
 }
 
 Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, std::span<const Tensor* const> loop_sources, Tensor next,
@@ -919,14 +931,16 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
             control(cw, cin, min, cout);
             z = zc;
         }
-        ops::moe_route_sigmoid_topk(z, &norm, model_.tensor(w.router, {h, i32(c.experts)}), model_.tensor(w.router_bias, {i32(c.experts)}),
-                                    top_k, c.route_scale, workspace_, ids, weights, stream_);
+        const auto route = blas_wide(cols) ? ops::moe_route_sigmoid_topk_blas : ops::moe_route_sigmoid_topk;
+        route(z, &norm, model_.tensor(w.router, {h, i32(c.experts)}), model_.tensor(w.router_bias, {i32(c.experts)}), top_k, c.route_scale,
+              workspace_, ids, weights, stream_);
     }
     // The experts' outputs are combined by the output convolution's launch (the same FMAs as the experts' own
     // combine); the combined y is written out only when the convolution inputs are being saved.
     Tensor entries = workspace_.alloc(DType::FP32, {h, top_k * cols});
     if (limits_.prefill_tc.experts && cols >= kTensorCoreMinColumns) {
-        ops::moe_situ_experts_tc(model_.expert_bank(p), zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_);
+        ops::moe_situ_experts_tc(model_.expert_bank(p), zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_,
+                                 blas_wide(cols) ? limits_.prefill_tc.blas_experts : 0);
     } else {
         ops::moe_situ_experts(model_.expert_bank(p), zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_);
     }

@@ -44,6 +44,21 @@ struct RouteInputNorm {
 void moe_route_sigmoid_topk(const Tensor& x, const RouteInputNorm* norm, const Tensor& router, const Tensor& bias, int top_k, float scale,
                             DeviceArena& workspace, Tensor& ids, Tensor& weights, cudaStream_t stream);
 
+/**
+ * Op: moe_route_sigmoid_topk_blas (moe_route_sigmoid_topk with the logits on a cuBLAS FP32 GEMM; for wide prefill
+ *   calls)
+ *
+ * Math, shapes and domain: moe_route_sigmoid_topk's.
+ * Numeric: norm->z is the same bits as moe_route_sigmoid_topk's (rmsnorm_fp32's). The logits are FP32 products and
+ *   sums (CUBLAS_COMPUTE_32F) in cuBLAS's order rather than the score kernels', so a near tie at the k-th place
+ *   may select another expert than moe_route_sigmoid_topk does; the selection after them is the same kernel.
+ * Workspace: moe_route_sigmoid_topk_blas_workspace_bytes(E, T), released on return.
+ * Execution: stream-ordered; graph capturable only once cuBLAS's handle exists (the prefill never captures).
+ */
+[[nodiscard]] std::size_t moe_route_sigmoid_topk_blas_workspace_bytes(std::int32_t experts, std::int64_t columns);
+void moe_route_sigmoid_topk_blas(const Tensor& x, const RouteInputNorm* norm, const Tensor& router, const Tensor& bias, int top_k, float scale,
+                                 DeviceArena& workspace, Tensor& ids, Tensor& weights, cudaStream_t stream);
+
 /// A layer's routed experts, resident in device memory. Either a ggml_expert_record_v1 bank
 /// (`records`, `format` GGML_REC_NVFP4_NVFP4: gate [I, H], up [I, H] and down [H, I] per record,
 /// storage-layouts.md section 7) with optional per-expert FP32 multipliers of the gate/up and down

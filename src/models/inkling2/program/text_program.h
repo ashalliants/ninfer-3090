@@ -74,8 +74,16 @@ struct ProgramLimits {
     // TextProgram::lent()): no forward leaves anything it returns there (its logits; the taps are in the state), and the
     // workspace grows if needed to keep the region clear of them.
     std::size_t lend_bytes = 0;
+    // blas (EngineOptions::prefill_cublas): the loop controllers and the router scores of those forwards on cuBLAS
+    // FP32 GEMMs (ops::loop_controller_blas, ops::moe_route_sigmoid_topk_blas) instead of the CUDA-core kernels: FP32
+    // products in another order, so not the bits of the FP32 program either. Only with another part on (it is not a
+    // tensor-core part, but it belongs to the same lossy prefill).
+    // blas_experts (with blas and experts): an NVFP4 expert with at least this many entries in a forward runs on
+    // cuBLAS over its rows decoded to FP16 (ops::moe_situ_experts_tc's blas_min_entries); 0 keeps every expert on the
+    // kernels.
     struct TensorCoreParts {
-        bool dense = false, experts = false, attention = false;
+        bool dense = false, experts = false, attention = false, blas = false;
+        std::int32_t blas_experts = 0;
         [[nodiscard]] bool any() const { return dense || experts || attention; }
         [[nodiscard]] static TensorCoreParts all() { return {true, true, true}; }
     } prefill_tc;
@@ -214,6 +222,10 @@ private:
     // loop_sources: a later pass's core layer's loop-message sources (the previous pass's bank and output), else empty.
     Tensor visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor>& blocks, std::span<const Tensor* const> loop_sources, Tensor next,
                  std::int64_t start, const Trace* trace);
+    // Whether a forward of `cols` columns runs its controllers and router scores on cuBLAS (ProgramLimits::prefill_tc.blas).
+    [[nodiscard]] bool blas_wide(std::int32_t cols) const noexcept {
+        return limits_.prefill_tc.blas && limits_.prefill_tc.any() && cols >= kTensorCoreMinColumns;
+    }
     // The loop controllers of one site (q, k and v at once, or the FFN input): out[j] = controller w[j] of (c[j], m[j]).
     void control(std::span<const ControllerWeights* const> w, std::span<const Tensor* const> c, std::span<const Tensor* const> m,
                  std::span<Tensor* const> out);

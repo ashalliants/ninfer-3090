@@ -1432,6 +1432,18 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
         std::vector<float> tc_scaled(tc_got.size());
         for (std::size_t i = 0; i < tc_got.size(); ++i) { tc_scaled[i] = static_cast<float>(tc_got[i] / scale); }
         compare(label + " (tensor cores)", tc_scaled, scaled, 3e-3);
+        if (nvfp4) {
+            // Every expert on cuBLAS (blas_min_entries 1): the same FP16 operands, only the FP32 sums' order differs.
+            ninfer::DeviceArena blas_arena(ninfer::ops::moe_situ_experts_tc_workspace_bytes(bank, entries, 0, true, 1) + 4096);
+            ninfer::ops::moe_situ_experts_tc(bank, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), &tw, 4.0F, 25.0F, blas_arena, ttc,
+                                             nullptr, 1);
+            const std::vector<float> blas_got = tc_out.get(h * cols);
+            std::vector<float> blas_scaled(blas_got.size());
+            Vec tc_ref(tc_scaled.begin(), tc_scaled.end());
+            for (std::size_t i = 0; i < blas_got.size(); ++i) { blas_scaled[i] = static_cast<float>(blas_got[i] / scale); }
+            compare(label + " (cuBLAS experts)", blas_scaled, scaled, 3e-3);
+            compare(label + " (cuBLAS experts against the kernels)", blas_scaled, tc_ref, 2e-4);
+        }
     }
     if (cols > 2) {
         bool same = true;
@@ -1571,6 +1583,10 @@ void test_tiled_experts(int h, int inter, const char* label) {
             if (cols > 1) {
                 ninfer::ops::moe_situ_experts_tc(b, z.tensor({h, cols}), tid, &tw, 4.0F, 25.0F, arena, tout, nullptr);
                 outs.push_back(out.get(static_cast<std::size_t>(h) * cols));
+                // The cuBLAS route decodes the records through the tiling too.
+                ninfer::DeviceArena blas_arena(ninfer::ops::moe_situ_experts_tc_workspace_bytes(b, std::int64_t(k) * cols, 0, true, 1) + 4096);
+                ninfer::ops::moe_situ_experts_tc(b, z.tensor({h, cols}), tid, &tw, 4.0F, 25.0F, blas_arena, tout, nullptr, 1);
+                outs.push_back(out.get(static_cast<std::size_t>(h) * cols));
             }
         }
         return outs;
@@ -1594,7 +1610,7 @@ void test_tiled_experts(int h, int inter, const char* label) {
     std::vector<std::uint8_t> tiled(host.size());
     check(cudaMemcpy(tiled.data(), records.p, tiled.size(), cudaMemcpyDeviceToHost) == cudaSuccess && tiled != host,
           std::string(label) + ": the records were not repacked");
-    std::printf("%-44s tiled == untiled (T 1, T 32 expert-major, T 32 tensor cores; %llu FP16-inexact values either way)\n", label,
+    std::printf("%-44s tiled == untiled (T 1, T 32 expert-major, T 32 tensor cores and cuBLAS; %llu FP16-inexact values either way)\n", label,
                 static_cast<unsigned long long>(inexact_before));
 }
 
@@ -2008,6 +2024,84 @@ void test_workspace_queries() {
     std::printf("workspace queries refuse outside the domain\n");
 }
 
+// The prefill's cuBLAS forms (EngineOptions::prefill_cublas): loop_controller_blas against the FP64 oracle over 1030
+// columns (two tiles of the gain and forget products, the second partial), job 1 writing over its c; and
+// moe_route_sigmoid_topk_blas with its input norm: the normalized z the bits of rmsnorm_fp32, the experts the oracle's
+// and the weights within its bound, at a width that is not a multiple of cuBLAS's tiles.
+void test_blas_routes() {
+    const int h = 2304, rank = 64, cols = 1030;
+    std::vector<std::vector<float>> c(2), m(2), down(2), gain(2), forget(2);
+    std::vector<Buf> dc, dm, dout;
+    std::vector<ninfer::DeviceBuffer> wd, wg, wf;
+    dc.reserve(2), dm.reserve(2), dout.reserve(2);
+    for (int j = 0; j < 2; ++j) {
+        c[j] = randoms(h * cols, -1.0F - j, 1.0F + j), m[j] = randoms(h * cols);
+        down[j] = randoms(rank * 2 * h, -0.02F, 0.02F), gain[j] = randoms(h * rank, -0.1F, 0.1F), forget[j] = randoms(h * rank, -0.1F, 0.1F);
+        t::round_to_bf16(down[j]), t::round_to_bf16(gain[j]), t::round_to_bf16(forget[j]);
+        dc.emplace_back(c[j]), dm.emplace_back(m[j]), dout.emplace_back(static_cast<std::size_t>(h) * cols);
+        wd.push_back(t::to_device_bf16(down[j])), wg.push_back(t::to_device_bf16(gain[j])), wf.push_back(t::to_device_bf16(forget[j]));
+    }
+    std::vector<Tensor> tc, tm, tout, tdown, tgain, tforget;
+    for (int j = 0; j < 2; ++j) {
+        tc.push_back(dc[j].tensor({h, cols})), tm.push_back(dm[j].tensor({h, cols})), tout.push_back(dout[j].tensor({h, cols}));
+        tdown.emplace_back(wd[j].p, DType::BF16, std::initializer_list<std::int32_t>{2 * h, rank});
+        tgain.emplace_back(wg[j].p, DType::BF16, std::initializer_list<std::int32_t>{rank, h});
+        tforget.emplace_back(wf[j].p, DType::BF16, std::initializer_list<std::int32_t>{rank, h});
+    }
+    ninfer::ops::LoopControllerJob jobs[2];
+    for (int j = 0; j < 2; ++j) { jobs[j] = {&tc[j], &tm[j], &tdown[j], &tgain[j], &tforget[j], j == 1 ? &tc[j] : &tout[j]}; }
+    ninfer::DeviceArena control_arena(ninfer::ops::loop_controller_blas_workspace_bytes(h, rank, cols));
+    ninfer::ops::loop_controller_blas(jobs, 1e-6F, control_arena, nullptr);
+    for (int j = 0; j < 2; ++j) {
+        Vec want;
+        for (int col = 0; col < cols; ++col) {
+            const Vec vc(c[j].begin() + col * h, c[j].begin() + (col + 1) * h), vm(m[j].begin() + col * h, m[j].begin() + (col + 1) * h);
+            const Vec y = ref::control(vc, vm, widen(down[j]), widen(gain[j]), widen(forget[j]));
+            want.insert(want.end(), y.begin(), y.end());
+        }
+        compare("loop_controller_blas job " + std::to_string(j) + (j == 1 ? " (out = c), T 1030" : ", T 1030"), (j == 1 ? dc[j] : dout[j]).get(h * cols),
+                want, 2e-6);
+    }
+    {
+        // A column stride past cuBLAS's int leading dimension throws before any work (the layout itself is valid).
+        Tensor wide = tc[0];
+        wide.nb[1] = (static_cast<std::int64_t>(INT32_MAX) + 1) * 4;
+        ninfer::ops::LoopControllerJob job = jobs[0];
+        job.c = &wide;
+        bool threw = false;
+        try {
+            ninfer::ops::loop_controller_blas(std::span<const ninfer::ops::LoopControllerJob>(&job, 1), 1e-6F, control_arena, nullptr);
+        } catch (const std::invalid_argument&) { threw = true; }
+        if (!threw) { throw std::runtime_error("loop_controller_blas accepted a column stride past INT32_MAX"); }
+        std::printf("loop_controller_blas                         column stride past INT32_MAX rejected\n");
+    }
+
+    const int rows = 2304, experts = 128, k = 8, rcols = 333;
+    auto x = randoms(rows * rcols, -2, 2), g = randoms(rows, 0.5F, 1.5F), rt = randoms(experts * rows, -0.05F, 0.05F), bs = randoms(experts, -0.01F, 0.01F);
+    Buf dx(x), dg(g), drt(rt), dbs(bs), zn(static_cast<std::size_t>(rows) * rcols), zr(static_cast<std::size_t>(rows) * rcols),
+        ids(static_cast<std::size_t>(k * rcols)), w(static_cast<std::size_t>(k * rcols));
+    Tensor tzn = zn.tensor({rows, rcols}), tzr = zr.tensor({rows, rcols}), tg = dg.tensor({rows});
+    Tensor tid = ids.tensor({k, rcols}, DType::I32), tw = w.tensor({k, rcols});
+    ninfer::DeviceArena arena(ninfer::ops::moe_route_sigmoid_topk_blas_workspace_bytes(experts, rcols) + 4096);
+    const ninfer::ops::RouteInputNorm norm{&tg, 1e-6F, &tzn};
+    ninfer::ops::moe_route_sigmoid_topk_blas(dx.tensor({rows, rcols}), &norm, drt.tensor({rows, experts}), dbs.tensor({experts}), k, 8.0F, arena, tid, tw,
+                                             nullptr);
+    ninfer::ops::rmsnorm_fp32(dx.tensor({rows, rcols}), &tg, 1e-6F, tzr, nullptr);
+    const auto a = zn.get(rows * rcols), b = zr.get(rows * rcols);
+    check(std::memcmp(a.data(), b.data(), a.size() * 4) == 0, "moe_route_sigmoid_topk_blas: the normalized z is not rmsnorm_fp32's bits");
+    const auto got_ids = t::from_device<std::int32_t>(ids.b, k * rcols);
+    Vec want_w;
+    int differ = 0;
+    for (int col = 0; col < rcols; ++col) {
+        const auto route = ref::route(Vec(b.begin() + col * rows, b.begin() + (col + 1) * rows), widen(rt), widen(bs), k, 8.0);
+        for (int i = 0; i < k; ++i) { differ += route.ids[i] != got_ids[col * k + i] ? 1 : 0; }
+        want_w.insert(want_w.end(), route.weights.begin(), route.weights.end());
+    }
+    check(differ == 0, "moe_route_sigmoid_topk_blas: selected experts differ from the oracle (random scores have no tie within 1e-6)");
+    std::printf("%-44s experts %s (T %d)\n", "moe_route_sigmoid_topk_blas", differ == 0 ? "equal" : "DIFFER", rcols);
+    compare("moe_route_sigmoid_topk_blas weights", w.get(k * rcols), want_w, 2e-6);
+}
+
 int main() {
     if (t::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
@@ -2081,6 +2175,8 @@ int main() {
         if (const char* sweep = std::getenv("NINFER_INKLING2_OP_SWEEP"); sweep != nullptr && *sweep == '1') {
             for (const bool nvfp4 : {true, false}) { bench_experts(nvfp4, 1, {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 24, 32}); }
         }
+        // Last: it draws from the shared random sequence, which the tests above must see unchanged.
+        test_blas_routes();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
