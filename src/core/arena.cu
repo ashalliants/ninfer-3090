@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdio>
 #include <limits>
 #include <new>
@@ -45,6 +46,21 @@ void free_device(void*& ptr) noexcept {
     }
 }
 
+std::atomic<std::uint64_t>& live_device_bytes() noexcept {
+    static std::atomic<std::uint64_t> live{0};
+    return live;
+}
+
+void count_device(std::size_t& counted, std::size_t bytes) noexcept {
+    live_device_bytes().fetch_add(bytes, std::memory_order_relaxed);
+    counted = bytes;
+}
+
+void uncount_device(std::size_t& counted) noexcept {
+    live_device_bytes().fetch_sub(counted, std::memory_order_relaxed);
+    counted = 0;
+}
+
 void free_pinned(void*& ptr) noexcept {
     if (ptr != nullptr) {
         log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
@@ -53,6 +69,8 @@ void free_pinned(void*& ptr) noexcept {
 }
 
 } // namespace
+
+std::uint64_t device_bytes_live() noexcept { return live_device_bytes().load(std::memory_order_relaxed); }
 
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     if (bytes == 0) { return; }
@@ -63,24 +81,32 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
     p = ptr;
+    count_device(counted_, bytes);
 }
 
-DeviceBuffer::~DeviceBuffer() { free_device(p); }
+DeviceBuffer::~DeviceBuffer() {
+    free_device(p);
+    uncount_device(counted_);
+}
 
-DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(other.bytes) {
-    other.p     = nullptr;
-    other.bytes = 0;
+DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(other.bytes), counted_(other.counted_) {
+    other.p        = nullptr;
+    other.bytes    = 0;
+    other.counted_ = 0;
 }
 
 DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
     free_device(p);
-    p     = other.p;
-    bytes = other.bytes;
+    uncount_device(counted_);
+    p        = other.p;
+    bytes    = other.bytes;
+    counted_ = other.counted_;
 
-    other.p     = nullptr;
-    other.bytes = 0;
+    other.p        = nullptr;
+    other.bytes    = 0;
+    other.counted_ = 0;
     return *this;
 }
 
@@ -193,6 +219,7 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     owned_base_ = ptr;
     cap_        = capacity_bytes;
     off_        = 0;
+    count_device(owned_bytes_, capacity_bytes);
 }
 
 DeviceArena::DeviceArena(DeviceSpan storage)
@@ -204,12 +231,14 @@ DeviceArena::DeviceArena(DeviceSpan storage)
 
 DeviceArena::~DeviceArena() {
     if (owns_) { free_device(owned_base_); }
+    uncount_device(owned_bytes_);
 }
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
     : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
-      owns_(other.owns_), owned_base_(other.owned_base_), ranks_(std::move(other.ranks_)),
+      owns_(other.owns_), owned_base_(other.owned_base_), owned_bytes_(other.owned_bytes_), ranks_(std::move(other.ranks_)),
       active_rank_(other.active_rank_) {
+    other.owned_bytes_ = 0;
     other.base_        = nullptr;
     other.cap_         = 0;
     other.off_         = 0;
@@ -224,6 +253,9 @@ DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     if (this == &other) { return *this; }
 
     if (owns_) { free_device(owned_base_); }
+    uncount_device(owned_bytes_);
+    owned_bytes_       = other.owned_bytes_;
+    other.owned_bytes_ = 0;
     base_       = other.base_;
     cap_        = other.cap_;
     off_        = other.off_;

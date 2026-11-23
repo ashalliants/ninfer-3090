@@ -191,5 +191,33 @@ int main() {
     failures += expect_size(pinned.size(), 128, "pinned.size");
     std::memset(pinned.data(), 0x5a, pinned.size());
 
+    // device_bytes_live: the cudaMalloc sizes of the live owning buffers and arenas, through moves; borrowed arenas
+    // add nothing.
+    {
+        const std::uint64_t base = ninfer::device_bytes_live();
+        const auto live          = [&](std::uint64_t expected, const char* label) {
+            failures += expect_size(static_cast<std::size_t>(ninfer::device_bytes_live() - base), static_cast<std::size_t>(expected), label);
+        };
+        {
+            ninfer::DeviceBuffer a(1000);
+            live(1000, "live after a buffer");
+            ninfer::DeviceArena arena(4096);
+            live(5096, "live after an arena");
+            ninfer::DeviceBuffer moved(std::move(a));
+            live(5096, "live after moving a buffer");
+            ninfer::DeviceBuffer b(24);
+            b = std::move(moved); // frees b's 24 bytes, takes the 1000
+            live(5096, "live after move-assigning a buffer");
+            ninfer::DeviceArena other(std::move(arena));
+            live(5096, "live after moving an arena");
+            ninfer::DeviceArena small(64);
+            small = std::move(other); // frees small's 64 bytes, takes the 4096
+            live(5096, "live after move-assigning an arena");
+            ninfer::DeviceArena lent(ninfer::DeviceSpan{b.p, 512});
+            live(5096, "a borrowed arena adds nothing");
+        }
+        live(0, "live after every buffer is freed");
+    }
+
     return failures == 0 ? 0 : fail("arena test failed");
 }
