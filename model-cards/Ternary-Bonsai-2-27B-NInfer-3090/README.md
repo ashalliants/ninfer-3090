@@ -108,6 +108,8 @@ fork's 6-bit Qwen3.8-27B on the coding prompt decodes 48 tok/s plain and 195 wit
 
 **Context.** The full 262,144 tokens fit with `--kv-dtype rk4v4` (the Linux launcher's KV), with 11.2 GiB of the card still free, and 9.6 GiB free with DFlash2 on (2026-11-23).
 
+**Single stream with DFlash2 on chat prompts** (2026-11-23, Linux under WSL, 315 W limit): `ninfer-serve --kv-dtype rk4v4 --max-context 262144 --spec dflash2 --draft-tokens 7 --no-thinking`, the 12 greedy chats of 300 tokens the Inkling-2-Mini 3090 figures use: **234.5 tok/s** mean, from 138 (a short story) to 437 (a code answer), and 363.6 on an arithmetic prompt. After a 245,373-token document (every token computed, prefill 1,070 tok/s, TTFT 3 m 50 s) a 55-token answer decodes at 74.2 tok/s with DFlash2 (60.9 with MTP3, 3 drafts).
+
 **Memory.** Weights are 6.70 GiB on the device without drafter heads and 7.28 GiB with MTP, against
 14.6 GiB for the fork's 6-bit Qwen3.8-27B.
 

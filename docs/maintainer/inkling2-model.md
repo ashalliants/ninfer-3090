@@ -819,9 +819,17 @@ Measured on the RTX 3090 (2026-11-23, WSL, 315 W power limit, PCIe Gen4 x16, `ni
 
 The decode gain is the bytes: a token reads 8 experts of each of layers 20-23, 510 MB in BF16 and 263 MB in MXFP8.
 
-Long prompts at `--max-context 131072` (plain, chunk 1024; a summary of 128 tokens): 1,408 tok/s at 1,167 tokens
-(TTFT 0.83 s), 2,103 at 7,423 (3.5 s), 1,758 at 28,110 (16.0 s), 1,147 at 75,810 (66.1 s); decode after them 98.2,
-94.8, 83.2 and 60.3 tok/s. Batched decode: see "Batched decode".
+Long prompts, a summary of 128 tokens, `--no-prefix-reuse` so every token is computed (a first measurement with
+reuse on reported only the uncached tokens of each prompt and is withdrawn):
+
+| Configuration | Prompt tokens | TTFT | Prefill tok/s | Decode after, tok/s |
+|---|---|---|---|---|
+| FP16 rings, `--max-context 131072` (chunk 512) | 1,167 / 8,447 / 36,302 / 111,650 | 0.9 s / 5.1 s / 25.2 s / 1 m 43 s | 1,310 / 1,650 / 1,440 / 1,090 | 97.0 / 90.0 / 80.6 / 58.7 |
+| `--kv-dtype rk4v4`, `--max-context 262144` (chunk 2048) | 111,650 / 199,530 / 253,902 | 1 m 18 s / 3 m 13 s / 4 m 46 s | 1,424 / 1,030 / 887 | 69.5 / 56.0 / 49.9 |
+
+With `rk4v4` the full 262,144 fits plain (chunk 2048, 1,532 MiB free) and with DSpark and vision (drafter window
+32,768, the target's head, 444 MiB free); the 12 chats decode at 102.69 tok/s on it against 103.3-103.9 with FP16
+rings. Batched decode: see "Batched decode".
 
 With the room, the 3090 at `--max-context 65536 --vision` (chunk 2048) prefills 2,410 tok/s at 8,447 tokens (TTFT
 3.5 s) and 1,784 at 1,167 (0.65 s), and decodes the 12 chats at 103.30-103.32 tok/s plain against 103.46-103.54 with

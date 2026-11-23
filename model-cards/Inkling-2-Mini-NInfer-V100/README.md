@@ -212,8 +212,8 @@ over two runs:
 | Decode, plain | **104 tok/s** (103.3-103.9 mean over the 12 chats, at 64K and 131K context); 100.6 with the experts in BF16 |
 | Decode, DSpark | 103.5 mean over the 12 chats, 115.5 on a code prompt; 73-74 against plain's 98 on a short reply after a 1.2K-token prompt |
 | Prefill (65,536 context, vision on, chunk 2048) | **2,410 tok/s** at 8.4K tokens (TTFT 3.5 s); 1,784 at 1.2K (0.65 s) |
-| Largest context | 137,216 plain; 119,040 with DSpark; 107,264 with vision; 90,368 with both |
-| Prefill (131,072 context) | 2,103 tok/s at 7.4K; 1,758 at 28K (TTFT 16 s); 1,147 at 76K (66 s), then decode at 60 tok/s |
+| Largest context | 137,216 plain; 119,040 with DSpark; 107,264 with vision; 90,368 with both. With `--kv-dtype rk4v4` (lossy, opt-in, one request at a time): the full 262,144, plain or with DSpark and vision |
+| Long prompts (every token computed) | FP16 rings at 131,072: 1,650 tok/s at 8.4K, 1,440 at 36K (TTFT 25 s), 1,090 at 112K (1 m 43 s), then decode at 58.7 tok/s. `rk4v4` at 262,144: 1,424 at 112K (78 s, decode 69.5), 1,030 at 200K (3 m 13 s, decode 56.0), 887 at 254K (4 m 46 s, decode 49.9) |
 | Several requests (`--max-concurrency`, 8,192 context) | **282 tok/s** aggregate at 8, 228 at 4, 153 at 2; each request's tokens the same as alone |
 | Load | 75 s from a SATA SSD (300 MiB/s), the MXFP8 re-encode included |
 
