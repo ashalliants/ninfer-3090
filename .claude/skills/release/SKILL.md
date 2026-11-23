@@ -21,6 +21,10 @@ folder is under `$HOME`, so ccache's `base_dir` still applies (see `AGENTS.md`).
 `~/.cache/ninfer-release/` also holds the Vast `instance_id`, so only ever delete the version folder.
 Step 8 deletes it once the release is published.
 
+Files the session writes on the Windows side stay in the session scratchpad: the step 4 launch script,
+`.ps1` helpers, and the Windows zip's smoke-test folder. The scratchpad belongs to the session and is
+not in the WSL home folder. Anything created or unpacked *inside* WSL goes in `checks/`.
+
 ## 1. Pick the version
 
 1. `git fetch origin --tags`, then find the latest tag (`git tag --sort=-creatordate | head`) and read
@@ -142,7 +146,8 @@ commit to `~/.cache/ninfer-release/X.Y.Z/src`, configure with `-DCMAKE_CUDA_ARCH
 `posix_spawn: Resource temporarily unavailable`, use the `systemd-run --scope` recipe in the doc. Verify
 `ccache -s` hits rather than clearing the cache.
 
-Write the WSL steps to a script in the scratchpad and run it as `wsl.exe -u root -e systemd-run --scope
+Write the WSL steps to a script in the (Windows-side) scratchpad; inside it, send logs to
+`~/.cache/ninfer-release/X.Y.Z/checks/`, not `~`. Run it as `wsl.exe -u root -e systemd-run --scope
 --quiet --uid=<you> --gid=<you> -p TasksMax=infinity -- bash -l /mnt/c/.../script.sh`. From the Bash tool
 set `MSYS_NO_PATHCONV=1`, or Git Bash rewrites `/mnt/c/...` into `C:/Program Files/Git/mnt/c/...` and the
 launch fails instantly with exit 127 (it still looks "completed"; read the output). The build takes about
@@ -181,7 +186,9 @@ touches the instance in its own state file).
 Run the "Checks before publishing" list in the doc: `scripts/check-linux-scripts.sh`, checksums
 (inner and outer) for both archives, the Windows exes starting with a stripped `PATH` from an
 extracted copy, the Linux archive's `./ninfer-serve --help` and `./run.sh --help` from a fresh unpack,
-and `ldd` for new dynamic dependencies (update `docs/release-archive-linux.md` if they changed).
+and `ldd` for new dynamic dependencies (update `docs/release-archive-linux.md` if they changed). Do the
+Linux checks in `~/.cache/ninfer-release/X.Y.Z/checks/`. Unpack each archive into its own folder there
+(`checks/linux-sm86/`, `checks/linux-v100/`), and save each `ldd` list beside it (`checks/ldd-sm86.txt`).
 
 The real-card smoke test (default launcher profile serves a chat completion) needs free VRAM: ask the
 user whether the 3090 is free before running it. If they say no, do not skip silently: record it as
@@ -276,8 +283,10 @@ un.bat" qwen38-27b'
 - **Repackage after filling in Verification:** delete `dist/*X.Y.Z*` and the WSL export's `dist/*X.Y.Z*`,
   copy the final notes into the export, run both packagers, and re-check both checksums. The Windows zip
   hash changes, so do not reuse the first `SHA256SUMS`.
-- **Do not compare the Linux `ldd` list by eye.** Save the previous release's list and `diff` it, or say
-  in the report that it was not compared.
+- **Do not compare the Linux `ldd` list by eye.** `diff` it against the previous release's list, or say
+  in the report that it was not compared. The previous release's folder has been deleted by then, so
+  get its list from its published tarball: `gh release download <previous tag> -R ashalliants/ninfer-3090
+  -p '*linux*.tar.gz' -D ~/.cache/ninfer-release/X.Y.Z/checks/previous`, unpack it there and run `ldd`.
 
 
 ## Traps hit in v0.16.2
