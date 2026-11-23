@@ -337,6 +337,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.kv_cache = options.kv_layers.front();
         options.kv_layers.clear();
     }
+    // A mix keeps its base (the MTP layer's cache and the context-store binding) at INT8 G64, as
+    // the CLI and serve parsers set it, whatever kv_cache a direct caller left in place.
+    if (!options.kv_layers.empty()) { options.kv_cache = KvCacheStorage::Int8Group64; }
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;

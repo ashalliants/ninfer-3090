@@ -153,6 +153,24 @@ int check_automatic_normalization() {
         } catch (const std::invalid_argument&) { return true; }
         return false;
     };
+    // A per-layer mix keeps its base at INT8 G64 whatever kv_cache a direct caller left; a list
+    // whose layers agree is that plain cache.
+    for (const ninfer::KvCacheStorage left : {ninfer::KvCacheStorage::BFloat16,
+                                              ninfer::KvCacheStorage::RotatedLloyd4KeyInt4Value}) {
+        ninfer::EngineOptions mixed = options;
+        mixed.kv_cache              = left;
+        mixed.kv_layers = {ninfer::KvCacheStorage::RotatedLloyd4KeyInt4Value,
+                           ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64};
+        const ninfer::EngineOptions folded = normalize_engine_options(mixed);
+        failures += check(folded.kv_cache == ninfer::KvCacheStorage::Int8Group64 &&
+                              folded.kv_layers == mixed.kv_layers,
+                          "a mixed kv_layers list did not keep an INT8 G64 base");
+        mixed.kv_layers.assign(4, ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64);
+        const ninfer::EngineOptions uniform = normalize_engine_options(mixed);
+        failures += check(uniform.kv_cache == ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 &&
+                              uniform.kv_layers.empty(),
+                          "an all-equal kv_layers list did not fold to its format");
+    }
     failures += check(rejected([](ContextCacheOptions& cache) { cache.host_capacity_bytes = kGiB; }),
                       "automatic mode accepted an explicit Host context capacity");
     failures += check(rejected([](ContextCacheOptions& cache) {
