@@ -782,7 +782,8 @@ int main() {
         failures += check(last.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 && last.kv_layers.empty(),
                           "a later plain --kv-dtype did not replace a per-layer spec");
         for (const char* bad : {"fp8x16", "int8x0", "int8x", "x4", "int8x4,", "int8x4,,rk4v4x4", "int8x4y", "int8x2000",
-                                "nvfp4x8,int8x8", "rk4v4x8;int8x8"}) {
+                                "nvfp4x8,int8x8", "rk4v4x8;int8x8",
+                                "int8x18446744073709551632"}) {
             failures += check(refusal({"ninfer-serve", "model.ninfer", "--kv-dtype", bad}).find("per-layer --kv-dtype") !=
                                   std::string::npos,
                               "a malformed per-layer --kv-dtype was accepted");

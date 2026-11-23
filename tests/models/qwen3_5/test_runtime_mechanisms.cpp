@@ -197,10 +197,6 @@ void test_decoder_layout() {
     expect(mixed.mtp_kv && mixed.mtp_kv->layer_storage.empty() &&
                mixed.mtp_kv->payload_bytes() == int8.mtp_kv->payload_bytes(),
            "a per-layer cache keeps the MTP layer at kv_storage");
-    expect(q36::decoder_kv_storages(ninfer::KvCacheStorage::Int8Group64, mixed_spec.text_layer_storage) ==
-               std::vector<ninfer::KvCacheStorage>{ninfer::KvCacheStorage::Int8Group64,
-                                                   ninfer::KvCacheStorage::RotatedLloyd4KeyInt4Value},
-           "decoder_kv_storages lists each storage once, kv_storage first");
     const auto refuses = [](q36::DecoderStateSpec spec) {
         ninfer::LayoutBuilder builder;
         try {

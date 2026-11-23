@@ -463,10 +463,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                         *attention, first, last, prefill));
                     lora_scratch(layout, 3, config.hidden_size, last);
                     (void)workspace::text_attention_results(layout, config, last);
-                    // A per-layer cache plans the largest of its storages' workspaces.
+                    // A per-layer cache plans the largest of its text layers' workspaces; the
+                    // MTP layer's attention (base storage) is sized with the MTP rounds below.
+                    const std::vector<KvCacheStorage> text_storages =
+                        plan.kv_layers.empty() ? std::vector<KvCacheStorage>{plan.kv_storage}
+                                               : target_kv_storages(plan.kv_layers);
                     std::size_t attention_bytes = 0;
-                    for (const KvCacheStorage storage :
-                         qwen3_5::decoder_kv_storages(plan.kv_storage, plan.kv_layers)) {
+                    for (const KvCacheStorage storage : text_storages) {
                         attention_bytes = std::max(
                             attention_bytes,
                             ops::causal_softmax_attention_workspace_capacity_bytes(

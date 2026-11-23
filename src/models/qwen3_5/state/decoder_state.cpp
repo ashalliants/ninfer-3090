@@ -198,15 +198,6 @@ KvCacheStorage PagedKVCache::layer_storage(std::uint32_t layer) const {
     return layer_storage_.empty() ? storage_ : layer_storage_[layer];
 }
 
-std::vector<KvCacheStorage> decoder_kv_storages(KvCacheStorage kv_storage,
-                                                std::span<const KvCacheStorage> text_layer_storage) {
-    std::vector<KvCacheStorage> out{kv_storage};
-    for (const KvCacheStorage storage : text_layer_storage) {
-        if (std::find(out.begin(), out.end(), storage) == out.end()) { out.push_back(storage); }
-    }
-    return out;
-}
-
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
     const PagedKVLayerView direct = layer_view(layer, nullptr);
     return PagedKVBatchLayerView{

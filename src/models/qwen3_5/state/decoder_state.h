@@ -115,10 +115,6 @@ private:
     std::vector<KvCacheStorage> layer_storage_;
 };
 
-// Every storage a cache of this spec holds: kv_storage first, then each other one its text layers
-// hold, without repeats. Workspace and graph planning size and route for all of them.
-[[nodiscard]] std::vector<KvCacheStorage> decoder_kv_storages(KvCacheStorage kv_storage,
-                                                             std::span<const KvCacheStorage> text_layer_storage);
 
 struct DecoderStateLayout {
     PagedKVCacheLayout text_kv;
