@@ -45,6 +45,10 @@ so it is a third build, from the same commit as the other two:
 - Verify the same way as the Linux archive (inner and outer checksums, `ldd`, `./ninfer-serve --help`), then
   run `./run-v100.sh qwen38-27b` on a real V100 and serve one chat completion. The notes say so when that was
   not done before publishing.
+- **Size.** v0.19.0's V100 tarball was 2,125,147,854 bytes, 22 MB under GitHub's 2 GiB asset limit (the `sm_70` server
+  carries more kernels than the 3090 one). Check it after packaging; if it crosses, split it or drop a binary.
+- `package-release.sh`'s arch check once failed a good tree because `grep -q` closed the pipe early under `pipefail`;
+  it now captures `cuobjdump` output first.
 
 ### A default expert state (model releases)
 

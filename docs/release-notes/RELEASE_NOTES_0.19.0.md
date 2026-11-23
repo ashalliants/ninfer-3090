@@ -83,7 +83,13 @@ Many Volta (`sm_70`) routes moved off emulated Ampere instructions onto the V100
 
 Tests: this release builds only the three products (`ninfer`, `ninfer-serve`, `ninfer_bench`); the full test suite and the real-model tests were not run for the release itself. The changes in it were each tested in their own PRs.
 
-(Filled in after the smoke tests; see the release page.)
+What was checked, on the RTX 3090 build machine (Windows 11, and Ubuntu 24.04 under WSL), before publishing:
+
+- **Windows zip:** every file matches its inner `SHA256SUMS.txt`, and the zip matches `SHA256SUMS-v0.19.0-windows.txt`. `ninfer.exe` and `ninfer-serve.exe` start from an extracted copy with only Windows on `PATH` (the cuBLAS DLLs ship in the zip). Its default launcher, `run.bat qwen38-27b`, loaded Qwen3.8-27B and answered a chat completion on the RTX 3090.
+- **Linux RTX 3090 archive:** inner and outer checksums match, `./ninfer-serve --help` runs from a fresh unpack, and `run.sh qwen38-27b` loaded the model under WSL and answered a chat completion on the RTX 3090. No dynamic library is missing; it needs the libraries listed in its README.
+- **Linux Tesla V100 archive: built and checked, not yet run on a V100.** Inner and outer checksums match, the server holds `sm_70` code and no `sm_86` code, `--version` and `--help` run, `run-v100.sh` finds the server beside it, and its dynamic libraries are the same as the 3090 archive's. Serving a model on a V100 from this archive was **not** done before this release was published; the V100 figures above come from source builds of master. If `./run-v100.sh qwen38-27b` from the archive does not start on your card, please open an issue.
+- **The version string:** the Windows executables report `0.19.0-rtx3090+<commit>-dirty` (a build from the working tree with an untracked scratch file); the Linux ones, built from a clean export, report `0.19.0-rtx3090`.
+- The Linux archives' `ldd` lists were not diffed against v0.18.0's.
 
 ## Install and upgrade
 
