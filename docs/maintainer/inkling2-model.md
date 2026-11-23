@@ -1275,6 +1275,23 @@ it least, never the output:
 
 The startup log's `prefill |` note says what was chosen (chunk, workspace, drafter head, drafter window).
 
+Every build of the programs is checked for residency. Under the Windows WDDM sysmem fallback (Windows and WSL) a
+`cudaMalloc` past free device memory succeeds in system memory instead of failing, so a context too large for the
+card used to start and then read part of its KV rings over PCIe: on an RTX 3090, `--max-context 262144` started and
+decoded at 69 tok/s against 99. Startup now compares each build's growth in `device_bytes_live()` (every
+`DeviceBuffer` and owning `DeviceArena`, `core/arena.h`) with the drop in free device memory (`spill_shortfall`,
+32 MiB tolerance, read twice), after a device synchronize so an earlier attempt's releases have landed. The driver
+spills only once device memory runs out, so a spill also needs free memory under 64 MiB after the build: a shortfall
+with memory still free is a release landing during the build, not a spill (one such, 60 MiB with 2.4 GiB free,
+refused a fit that started). A spilled build does not fit: the fit tries the next attempt, and the last one refuses
+to start, naming the spilled MiB. On Linux an oversized `cudaMalloc` fails, as before.
+
+`--fit-context MIN` treats `--max-context` as a ceiling. With one slot it halves the context (multiples of 1,024)
+with the drafter at its cheapest form and the narrowest chunk, keeping the 256 MiB spare, then runs the attempts
+above at the context found. On the RTX 3090 (24 GiB, about 1.5 GiB taken by the desktop), plain text fits 17,408
+positions with 240 MiB free; DSpark and vision do not fit beside the 21.3 GiB of resident weights at any context
+with the spare kept.
+
 Other memory the stack frees or reserves:
 
 - The drafter's layer matrices are bound in pinned host memory: the drafter only reads them once, into its own split
@@ -1403,8 +1420,10 @@ stream (`Inkling2Core::copy_stream_`) beside the rest of the prompt and the firs
 - `release_stream()` waits for a copy in flight before the programs and their pinned memory are freed, so unloading
   the model (the router's swap between models destroys the engine) returns the pinned memory with the rest.
 - Startup sizes the pinned memory (N x 163 MiB with `--max-concurrency N`, where the drafter is off; plus the
-  drafter's with N = 1) and refuses to start when the host cannot pin it with 1 GiB of RAM to spare or
-  `RLIMIT_MEMLOCK` is lower, naming the sizes. With DSpark a refusal moves the fit to a narrower drafter window first.
+  drafter's with N = 1) and refuses to start when the host cannot pin it with 1 GiB of RAM to spare, naming the
+  sizes. With DSpark a refusal moves the fit to a narrower drafter window first. `RLIMIT_MEMLOCK` is not checked:
+  CUDA's pinned allocations do not count against it (under WSL's 64 MiB default `cudaHostAlloc` pins 1 GiB), and
+  the refusal it caused stopped every default start under WSL. A pin that really fails throws where it is made.
   Batched decode keeps the synchronous `save()`.
 
 Measured through `ninfer-serve` in the production configuration (262,144, DSpark, vision, both adapters, chunk

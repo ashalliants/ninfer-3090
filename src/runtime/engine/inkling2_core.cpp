@@ -6,6 +6,7 @@
 #include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/vram_budget.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
 #include "models/inkling2/program/adapters.h"
@@ -291,7 +292,7 @@ void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink
             throw std::invalid_argument("--dspark-window: 0 (the whole context) or at least the drafter's sliding window (" +
                                         std::to_string(model_->dspark_config()->sliding_window) + ")");
         }
-        programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, static_cast<std::int32_t>(options_.max_context), draft_chunk, stream_,
+        programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, limits.max_context, draft_chunk, stream_,
                                                                   dense ? &dense->head() : nullptr, limits.kv_fp16,
                                                                   static_cast<std::int32_t>(window), drafter_head_copy_, programs_->text.lent());
         const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
@@ -302,30 +303,27 @@ void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink
     }
     if (vision != nullptr) { programs_->vision = std::make_unique<ink::VisionEncoder>(*model_, stream_); }
     // The prefix-reuse snapshots live in pinned host memory (no device memory): one per slot, or one with the
-    // drafter's beside it. Refused up front when the host cannot pin them. The text snapshots' size is the same at
+    // drafter's beside it. Refused up front when the host lacks the memory. The text snapshots' size is the same at
     // every chunk and context (invalid_argument ends the fit); the drafter's follows its window, so with a drafter the
     // fit goes on to a narrower one (runtime_error), and the last attempt reports it.
+    // RLIMIT_MEMLOCK is not checked: CUDA's pinned allocations do not count against it (cudaHostAlloc pins 1 GiB under
+    // WSL's 64 MiB default), and a pin that really fails throws from PinnedHostBuffer below.
     if (options_.context_cache.enabled) {
         const std::size_t text_bytes = programs_->text.snapshot_bytes();
         const std::size_t draft_bytes = programs_->drafter && slots_ == 1 ? programs_->drafter->snapshot_bytes() : 0;
         const std::size_t pinned = static_cast<std::size_t>(slots_) * text_bytes + draft_bytes;
         const HostMemorySnapshot host = host_memory_snapshot();
         constexpr std::size_t kHostSpare = 1ULL << 30; // left to the OS and the rest of the process
-        const bool locked_out = host.lock_limit.has_value() && *host.lock_limit < pinned;
-        if (host.available_physical < pinned + kHostSpare || locked_out) {
+        if (host.available_physical < pinned + kHostSpare) {
             const auto refuse = [&](const std::string& why) {
                 const std::size_t text_only = static_cast<std::size_t>(slots_) * text_bytes;
-                if (draft_bytes > 0 && host.available_physical >= text_only + kHostSpare &&
-                    (!host.lock_limit.has_value() || *host.lock_limit >= text_only)) {
-                    throw std::runtime_error(why);
-                }
+                if (draft_bytes > 0 && host.available_physical >= text_only + kHostSpare) { throw std::runtime_error(why); }
                 throw std::invalid_argument(why);
             };
             refuse("inkling2: the prefix-reuse snapshots need " + std::to_string(pinned >> 20) + " MiB of pinned host memory (" +
                    std::to_string(slots_) + " x " + std::to_string(text_bytes >> 20) + " MiB" +
                    (draft_bytes > 0 ? " + the drafter's " + std::to_string(draft_bytes >> 20) + " MiB" : std::string()) + "), and " +
-                   (locked_out ? "RLIMIT_MEMLOCK allows " + std::to_string(*host.lock_limit >> 20) + " MiB"
-                               : std::to_string(host.available_physical >> 20) + " MiB is available (1 GiB kept free)") +
+                   std::to_string(host.available_physical >> 20) + " MiB is available (1 GiB kept free)" +
                    "; lower --max-concurrency or pass --no-prefix-reuse");
         }
         snapshot_host_bytes_ = pinned;
@@ -555,15 +553,18 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         }
         // The widest chunk whose programs fit beside max_context (or --prefill-chunk's alone).
         std::vector<std::int32_t> chunks;
-        if (!options_.prefill_chunk_auto) {
-            chunks.push_back(static_cast<std::int32_t>(std::min<std::uint32_t>(options_.prefill_chunk, options_.max_context)));
-        } else {
-            for (const std::int32_t c : kChunks) {
-                if (static_cast<std::uint32_t>(c) <= options_.max_context || c == kChunks[std::size(kChunks) - 1]) {
-                    chunks.push_back(std::min<std::int32_t>(c, static_cast<std::int32_t>(options_.max_context)));
+        const auto make_chunks = [&] {
+            chunks.clear();
+            if (!options_.prefill_chunk_auto) {
+                chunks.push_back(static_cast<std::int32_t>(std::min<std::uint32_t>(options_.prefill_chunk, options_.max_context)));
+            } else {
+                for (const std::int32_t c : kChunks) {
+                    if (static_cast<std::uint32_t>(c) <= options_.max_context || c == kChunks[std::size(kChunks) - 1]) {
+                        chunks.push_back(std::min<std::int32_t>(c, static_cast<std::int32_t>(options_.max_context)));
+                    }
                 }
             }
-        }
+        };
         // Each chunk first with the drafter at its best, then giving up what costs it least: its Q8 copy of the head
         // (492 MB; the drafts read the target's BF16 head, a slower draft), then (--dspark-window auto) the whole
         // context for the last 32768 or 16384 positions (fewer drafts may be accepted). Never the output.
@@ -575,27 +576,62 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         const std::uint32_t asked = options_.speculative.dspark_window;
         const bool auto_window    = asked == SpeculativeOptions::kDSparkWindowAuto;
         std::vector<Attempt> attempts;
-        for (const std::int32_t c : chunks) {
-            attempts.push_back({c, true, auto_window ? 0U : asked});
-            if (!dspark) { continue; }
-            if (options_.dense_q8 == DenseQ8::Off) { attempts.push_back({c, false, auto_window ? 0U : asked}); }
-            const bool copy = options_.dense_q8 != DenseQ8::Off; // with a Q8 head of the target's the drafter reads it
-            if (auto_window) {
-                for (const std::uint32_t w : {32768U, 16384U}) {
-                    if (w < options_.max_context) { attempts.push_back({c, copy, w}); }
+        const auto make_attempts = [&] {
+            attempts.clear();
+            for (const std::int32_t c : chunks) {
+                attempts.push_back({c, true, auto_window ? 0U : asked});
+                if (!dspark) { continue; }
+                if (options_.dense_q8 == DenseQ8::Off) { attempts.push_back({c, false, auto_window ? 0U : asked}); }
+                const bool copy = options_.dense_q8 != DenseQ8::Off; // with a Q8 head of the target's the drafter reads it
+                if (auto_window) {
+                    for (const std::uint32_t w : {32768U, 16384U}) {
+                        if (w < options_.max_context) { attempts.push_back({c, copy, w}); }
+                    }
                 }
             }
-        }
+        };
+        make_chunks();
+        make_attempts();
+        // Builds the programs and checks they are resident: under the Windows WDDM sysmem fallback (Windows and WSL) a
+        // cudaMalloc past the free device memory succeeds in system memory instead of failing, and the step's device
+        // free memory drops by less than it allocated (spill_shortfall). Such a build does not fit: its KV rings or
+        // workspace would be read over PCIe. The driver spills only once device memory runs out, so a spill also leaves
+        // free memory at about nothing (kSpilledFree); a shortfall with memory still free is a release landing during the
+        // build (an earlier attempt's), not a spill. `spare` also requires kStartupSpare left free.
+        constexpr std::size_t kSpilledFree = 64U << 20;
+        const auto build_resident = [&](bool with_drafter, bool spare) {
+            std::size_t free_before = 0, free_bytes = 0, total_bytes = 0;
+            check_cuda(cudaDeviceSynchronize(), "device synchronize"); // earlier attempts' releases land first
+            check_cuda(cudaMemGetInfo(&free_before, &total_bytes), "memory info");
+            const std::uint64_t live_before = device_bytes_live();
+            build_programs(limits, dense, vision, with_drafter);
+            check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
+            const std::uint64_t grown = device_bytes_live() - live_before;
+            if (spill_shortfall(free_before, free_bytes, grown) != 0 && free_bytes < kSpilledFree) {
+                // A second reading, since another program can change free device memory during the build.
+                check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
+                if (const std::uint64_t spilled = spill_shortfall(free_before, free_bytes, grown); spilled != 0 && free_bytes < kSpilledFree) {
+                    throw std::runtime_error("inkling2: at --max-context " + std::to_string(limits.max_context) + " the driver placed " +
+                                             std::to_string(spilled >> 20) + " MiB of the KV rings and workspace in system memory "
+                                             "(the sysmem fallback): lower --max-context, or pass --fit-context MIN to start at the "
+                                             "largest context that fits");
+                }
+            }
+            if (spare && free_bytes < kStartupSpare) { throw std::runtime_error("inkling2: under the startup spare"); }
+        };
         // Several slots: the widest chunk at max_context per slot, else the narrowest chunk at the largest context per
-        // slot (a multiple of kFitStep) that fits, found by halving: the request ceiling follows it.
+        // slot (a multiple of kFitStep) that fits, found by halving: the request ceiling follows it. One slot with
+        // --fit-context: the same search with the drafter at its cheapest (the last attempt), then the attempts at the
+        // context found.
         const auto fits = [&](std::int32_t chunk, std::uint32_t context) {
             chunk_            = std::min<std::int32_t>(chunk, static_cast<std::int32_t>(context));
             limits.max_context = static_cast<std::int32_t>(context);
+            if (dspark) {
+                drafter_head_copy_ = options_.dense_q8 != DenseQ8::Off;
+                drafter_window_    = auto_window ? (16384U < context ? 16384U : 0U) : asked;
+            }
             try {
-                build_programs(limits, dense, vision, false);
-                std::size_t free_bytes = 0, total_bytes = 0;
-                check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
-                if (free_bytes < kStartupSpare) { throw std::runtime_error("inkling2: under the startup spare"); }
+                build_resident(dspark, true);
                 return true;
             } catch (const std::invalid_argument&) {
                 throw;
@@ -606,10 +642,9 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                 return false;
             }
         };
-        if (slots_ > 1) {
+        if (slots_ > 1 || options_.fit_context_floor != 0) {
             std::size_t total_bytes = 0;
             check_cuda(cudaMemGetInfo(&free_after_weights_, &total_bytes), "memory info");
-            attempts.clear();
             bool built = false;
             for (const std::int32_t c : chunks) {
                 if (fits(c, options_.max_context)) {
@@ -617,17 +652,20 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                     break;
                 }
             }
+            const std::string who = slots_ > 1 ? "--max-concurrency " + std::to_string(slots_) + ": " : std::string();
+            // One slot: --fit-context's contract, a multiple of kFitContextStepTokens (1024). Several slots: kFitStep.
+            const std::uint32_t step = slots_ > 1 ? static_cast<std::uint32_t>(kFitStep) : kFitContextStepTokens;
             if (!built) {
                 // fit_context_floor bounds the search from below: a context under it is refused, not started.
-                const std::uint32_t floor_steps = (options_.fit_context_floor + kFitStep - 1) / kFitStep;
-                // In kFitStep units: lo fits (0: none known), hi does not, or is past max_context. hi rounds up, so with a
+                const std::uint32_t floor_steps = (options_.fit_context_floor + step - 1) / step;
+                // In `step` units: lo fits (0: none known), hi does not, or is past max_context. hi rounds up, so with a
                 // max_context off the step the largest multiple under it is still a candidate (only max_context itself
                 // was tried above).
-                std::uint32_t lo = 0, hi = (options_.max_context + kFitStep - 1) / kFitStep;
+                std::uint32_t lo = 0, hi = (options_.max_context + step - 1) / step;
                 if (floor_steps > 0) {
-                    if (floor_steps >= hi || !fits(chunks.back(), floor_steps * kFitStep)) {
-                        throw std::runtime_error("inkling2: --max-concurrency " + std::to_string(slots_) + ": the context floor of " +
-                                                 std::to_string(options_.fit_context_floor) + " positions per slot does not fit on the device");
+                    if (floor_steps >= hi || !fits(chunks.back(), floor_steps * step)) {
+                        throw std::runtime_error("inkling2: " + who + "the context floor of " + std::to_string(options_.fit_context_floor) +
+                                                 " positions" + (slots_ > 1 ? " per slot" : "") + " does not fit on the device");
                     }
                     dense = std::move(programs_->dense);
                     programs_.reset();
@@ -635,7 +673,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                 }
                 while (hi > lo + 1) {
                     const std::uint32_t mid = lo + (hi - lo) / 2;
-                    if (fits(chunks.back(), mid * kFitStep)) {
+                    if (fits(chunks.back(), mid * step)) {
                         dense = std::move(programs_->dense);
                         programs_.reset();
                         lo = mid;
@@ -643,13 +681,23 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                         hi = mid;
                     }
                 }
-                if (lo == 0 || !fits(chunks.back(), lo * kFitStep)) {
-                    throw std::runtime_error("inkling2: --max-concurrency " + std::to_string(slots_) + ": not even " +
-                                             std::to_string(kFitStep) + " positions per slot fit on the device");
+                if (lo == 0 || !fits(chunks.back(), lo * step)) {
+                    throw std::runtime_error("inkling2: " + who + "not even " + std::to_string(step) + " positions" +
+                                             (slots_ > 1 ? " per slot" : "") + " fit on the device");
                 }
-                options_.max_context = lo * kFitStep;
+                options_.max_context = lo * step;
             }
             frontend_->set_max_context(options_.max_context);
+            if (slots_ > 1) {
+                attempts.clear(); // built: the programs of the last fit are kept
+            } else {
+                // The context is chosen; the attempts below pick the chunk and the drafter's form at it.
+                dense = std::move(programs_->dense);
+                programs_.reset();
+                limits.max_context = static_cast<std::int32_t>(options_.max_context);
+                make_chunks();
+                make_attempts();
+            }
         }
         for (std::size_t attempt = 0; attempt < attempts.size(); ++attempt) {
             const bool last = attempt + 1 == attempts.size();
@@ -657,10 +705,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
             drafter_head_copy_ = attempts[attempt].head_copy;
             drafter_window_    = attempts[attempt].window;
             try {
-                build_programs(limits, dense, vision, dspark);
-                std::size_t free_bytes = 0, total_bytes = 0;
-                check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
-                if (free_bytes < kStartupSpare && !last) { throw std::runtime_error("inkling2: under the startup spare"); }
+                build_resident(dspark, !last);
                 break;
             } catch (const std::invalid_argument&) {
                 throw;
@@ -710,6 +755,10 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     for (const auto& graft : grafts) {
         load_.notes.push_back("graft " + graft.name + " | per-visit ablation of the post-attention and post-MLP writes over " +
                               std::to_string(graft.visits) + " visits | opt-in (\"graft\": \"" + graft.name + "\")");
+    }
+    if (slots_ == 1 && options_.max_context < requested_context_) {
+        load_.notes.push_back("context | " + std::to_string(options_.max_context) + " positions (fitted to the device; asked " +
+                              std::to_string(requested_context_) + ")");
     }
     if (slots_ > 1) {
         load_.notes.push_back("batched decode | " + std::to_string(slots_) + " slots of " + std::to_string(options_.max_context) +

@@ -40,7 +40,13 @@ public:
 
 private:
     void require_range(std::size_t byte_offset, std::size_t count, const char* operation) const;
+    std::size_t counted_ = 0; // the bytes this buffer added to device_bytes_live()
 };
+
+// The device bytes currently held by every DeviceBuffer and owning DeviceArena of the process (their cudaMalloc
+// sizes). A startup fit compares a step's growth in it with the drop in free device memory to catch allocations the
+// driver placed in system memory (spill_shortfall in core/vram_budget.h).
+[[nodiscard]] std::uint64_t device_bytes_live() noexcept;
 
 class DeviceArena {
 public:
@@ -125,6 +131,7 @@ private:
     // arena while a borrowed rank is active frees storage this arena does not own and leaks the
     // rank-0 allocation it does.
     void* owned_base_ = nullptr;
+    std::size_t owned_bytes_ = 0; // owned_base_'s size, counted in device_bytes_live()
 
     // Empty until a second rank is attached, so the single-device path carries no extra state and
     // no extra work.
