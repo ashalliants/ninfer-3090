@@ -11,7 +11,7 @@
 #             trees produces the same command and hits the same entry. Without it every tree has
 #             its own, unshared entries. In a git checkout it is the main checkout (which holds
 #             every linked worktree); otherwise it is $HOME, where WSL builds live as `git archive`
-#             snapshots (~/ninfer-rel-*), none of which has a .git to find the main checkout from.
+#             snapshots (~/.cache/ninfer-release/X.Y.Z/src), none of which has a .git to find the main checkout from.
 #             A checkout on /mnt/c (a Windows worktree seen from WSL) is not built from WSL and
 #             does not decide the base. Override with --base DIR.
 #   hash_dir  false. The working directory is not hashed (it only matters for debug info).
