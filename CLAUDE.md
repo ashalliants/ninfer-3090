@@ -30,6 +30,37 @@ How to report the numbers:
   claims). Never extrapolate, round up, or carry a number across cards or builds.
 - Remove "not supported yet" and limitation wording that the change made false.
 
+## Build only what you need
+
+A full CUDA build sends hundreds of kernels through `ptxas`, at 1-3 minutes each. It loads the
+machine for an hour while other agents are timing runs. On 2026-11-24 a review-fix agent built the
+whole `ninfer_tests` aggregate for a change to two host headers. The host-only tree builds the same
+tests in minutes.
+
+- **Host-side changes:** runtime, engine, scheduler, serve, API, tools or their tests. Build the
+  host-only tree, as CI's `host-tests` job does, and run its tests. No `nvcc` is involved:
+  ```
+  cmake -S . -B build-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DNINFER_HOST_ONLY=ON -DBUILD_TESTING=ON
+  cmake --build build-host --parallel 8
+  ctest --test-dir build-host --output-on-failure
+  ```
+- **Kernel or model changes:** build the named targets you will run, such as `ninfer-serve`,
+  `ninfer_bench` or one test executable (`ninja -C <tree> ninfer_<area>_test`). Never build `all` or
+  `ninfer_tests` for these. Build the aggregate only when the change touches code that everything
+  links (`src/core`, `include/ninfer/types.h`, shared op routing, CMake), or for a release.
+- **Put the build tree inside your worktree**, as `<worktree>/build-<name>`. ccache shares entries
+  between worktrees only when the build tree sits at the same place relative to the sources
+  (`cmake/CompilerCache.cmake`). A tree elsewhere, such as `/model-data/scratch/...`, misses every
+  CUDA object.
+- **Let CMake set the compiler launcher.** Don't pass `-DCMAKE_*_COMPILER_LAUNCHER=ccache`: a bare
+  launcher bypasses the settings that make worktrees share. `scripts/v100_build.sh` leaves it to
+  CMake.
+- **Check the cache after the first build of a new worktree.** Run `ccache -s`: a tree at a commit
+  that was already built should mostly hit. A run of CUDA misses means something above is wrong;
+  fix that rather than waiting it out.
+- **Don't compile while another agent is timing on the GPU.** Check `ps` for `ninfer-serve` or
+  `ninfer_bench` first: a big compile raises the load and skews their numbers.
+
 ## GPU lock (one RTX 3090, many sessions)
 
 Several sessions and agents often work on this machine at once, and they share a single RTX 3090.

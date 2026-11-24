@@ -9,7 +9,9 @@
 #     never hit. CCACHE_BASEDIR rewrites absolute paths under it to be relative to the build
 #     directory; every tree has the same <tree>/build-ninja beside <tree>/src layout, so identical
 #     sources then produce identical commands. The base is the main checkout (the parent of git's
-#     common directory), which contains every worktree under .claude/worktrees/.
+#     common directory), which contains every worktree under .claude/worktrees/. A worktree that
+#     sits beside the main checkout instead (~/ninfer-<name>) widens the base to the deepest
+#     directory holding both. The build tree must be inside the worktree for this to share.
 #   * CCACHE_NOHASHDIR keeps the working directory out of the hash (it only matters for debug info,
 #     which Release builds do not emit).
 #
@@ -76,6 +78,25 @@ if(NOT _ninfer_ccache_base)
       RESULT_VARIABLE _ninfer_git_status)
     if(_ninfer_git_status EQUAL 0 AND _ninfer_git_common)
       get_filename_component(_ninfer_ccache_base "${_ninfer_git_common}/.." ABSOLUTE)
+      # A worktree beside the main checkout rather than inside it (~/ninfer-<name> next to the
+      # clone, as on the V100 host) is not under that base, so its paths would stay absolute and
+      # it would share nothing. Use the deepest directory holding both trees instead.
+      get_filename_component(_ninfer_tree "${CMAKE_SOURCE_DIR}" ABSOLUTE)
+      while(_ninfer_ccache_base AND NOT _ninfer_tree STREQUAL _ninfer_ccache_base)
+        string(FIND "${_ninfer_tree}/" "${_ninfer_ccache_base}/" _ninfer_prefix_at)
+        if(_ninfer_prefix_at EQUAL 0)
+          break()
+        endif()
+        get_filename_component(_ninfer_parent "${_ninfer_ccache_base}" DIRECTORY)
+        if(_ninfer_parent STREQUAL _ninfer_ccache_base)
+          set(_ninfer_ccache_base "")  # reached the filesystem root: no shared base
+        else()
+          set(_ninfer_ccache_base "${_ninfer_parent}")
+        endif()
+      endwhile()
+      unset(_ninfer_tree)
+      unset(_ninfer_parent)
+      unset(_ninfer_prefix_at)
     endif()
   endif()
 endif()

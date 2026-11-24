@@ -306,7 +306,11 @@ scripts/setup-ccache.sh           # Linux/WSL: configures an installed ccache (a
 - **Sharing across worktrees works through `base_dir`**: ccache rewrites absolute paths under
   the main checkout (`C:\ninfer-fork\ninfer-3090`, found from git's common directory) to be relative,
   and every tree has the same `<tree>\build-ninja` beside `<tree>\src`, so the same source hits the
-  same entry in any worktree. A worktree outside that directory (e.g. `C:\nb106`) does not share.
+  same entry in any worktree. A worktree beside the main checkout rather than inside it (the V100
+  host's `~/ninfer-<name>` next to the clone) widens the base to the deepest directory holding both,
+  so it shares too; one with no common directory below the drive root (e.g. `C:\nb106`) does not.
+  The build tree must sit inside the worktree, and the launcher must be the one CMake sets (a bare
+  `-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache` skips the sharing settings).
   Files that include the shared vcpkg headers (FFmpeg) resolve those paths differently per tree and
   may still miss.
 - **WSL has its own cache** (`~/.cache/ccache`; Linux objects cannot be shared with Windows ones).
