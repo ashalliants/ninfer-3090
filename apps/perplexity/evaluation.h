@@ -151,10 +151,11 @@ struct KldChunk {
 inline constexpr double kKldWriteFloor = -20.0;
 class KldBaseWriter {
 public:
-    // The base's first `chunks` chunks of tokens. Rows go to a temporary sibling of `path`
-    // (`path` + ".partial"), which finish() renames onto `path`; a writer destroyed without a
-    // successful finish() removes it, so a failed run never replaces an existing file. Refuses a
-    // `path` that names `tokens_from.path` (the base a run compares against).
+    // The base's first `chunks` chunks of tokens. Rows go to an exclusively created temporary
+    // sibling of `path` with a random name (`path` + ".partial-<hex>"), which finish() renames onto
+    // `path`; a writer destroyed without a successful finish() removes it, so a failed run never
+    // replaces an existing file and concurrent writers never share one. Refuses a `path` that
+    // names `tokens_from.path` (the base a run compares against).
     KldBaseWriter(std::filesystem::path path, const KldBase& tokens_from, int chunks);
     ~KldBaseWriter();
     KldBaseWriter(const KldBaseWriter&)            = delete;

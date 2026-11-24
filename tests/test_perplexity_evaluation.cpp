@@ -431,16 +431,25 @@ int check_kld_writer() {
     }
     failures += require(short_refused, "a base with missing rows is refused at finish");
 
-    // A failed or abandoned write leaves an existing destination untouched and no partial file.
+    // A failed or abandoned write leaves an existing destination untouched and no partial file;
+    // two writers to one destination at once each have their own partial file.
     const auto size_before = std::filesystem::file_size(file.path);
+    const auto partials    = [&] {
+        int n = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(file.path.parent_path())) {
+            const std::string name = entry.path().filename().string();
+            if (name.rfind(file.path.filename().string() + ".partial-", 0) == 0) { ++n; }
+        }
+        return n;
+    };
     {
-        ninfer::perplexity::KldBaseWriter writer(file.path, from_tokens, 2);
-        writer.add_row(logits[0]);
+        ninfer::perplexity::KldBaseWriter first(file.path, from_tokens, 2);
+        ninfer::perplexity::KldBaseWriter second(file.path, from_tokens, 2);
+        first.add_row(logits[0]);
+        second.add_row(logits[1]);
+        failures += require(partials() == 2, "concurrent writers each get their own partial file");
     }
-    std::filesystem::path partial = file.path;
-    partial += ".partial";
-    failures += require(std::filesystem::file_size(file.path) == size_before &&
-                            !std::filesystem::exists(partial),
+    failures += require(std::filesystem::file_size(file.path) == size_before && partials() == 0,
                         "an unfinished write keeps the old file and removes its partial file");
     failures += require(ninfer::perplexity::read_kld_base(file.path).n_chunk == 2,
                         "the old base still reads after an unfinished write");

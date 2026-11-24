@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -360,10 +361,21 @@ KldBaseWriter::KldBaseWriter(std::filesystem::path path, const KldBase& tokens_f
         std::filesystem::equivalent(path_, tokens_from.path, ec)) {
         kld_fail(path_, "--kld-write names the base this run reads; write to another file");
     }
-    partial_ = path_;
-    partial_ += ".partial";
-    file_ = std::fopen(partial_.string().c_str(), "wb");
-    if (file_ == nullptr) { kld_fail(partial_, "cannot create KL-divergence base"); }
+    // A temporary sibling with a random name, created exclusively ("x": fails if it exists), so
+    // concurrent writers to one destination never share it; this writer removes only its own.
+    std::random_device entropy;
+    for (int attempt = 0; attempt < 16 && file_ == nullptr; ++attempt) {
+        char suffix[32];
+        std::snprintf(suffix, sizeof suffix, ".partial-%08x%08x", entropy(), entropy());
+        partial_ = path_;
+        partial_ += suffix;
+        file_ = std::fopen(partial_.string().c_str(), "wbx");
+        if (file_ == nullptr && !std::filesystem::exists(partial_, ec)) { break; }
+    }
+    if (file_ == nullptr) {
+        partial_.clear();
+        kld_fail(path_, "cannot create a temporary file beside the KL-divergence base");
+    }
 }
 
 void KldBaseWriter::add_row(std::span<const float> logits) {
@@ -419,7 +431,7 @@ void KldBaseWriter::add_row(std::span<const float> logits) {
 
 KldBaseWriter::~KldBaseWriter() {
     if (file_ != nullptr) { std::fclose(file_); }
-    if (!finished_) {
+    if (!finished_ && !partial_.empty()) {
         std::error_code ec;
         std::filesystem::remove(partial_, ec);
     }
