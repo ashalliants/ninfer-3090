@@ -106,9 +106,9 @@ sha256sum --check SHA256SUMS
 - **OS:** Windows. The `run.bat qwen38-flash-next` launcher is the supported way to serve it.
 - **Tesla V100 32 GB (Linux, built from source):** the same file serves its full 262,144-token
   context on a V100 through `scripts/run-v100.sh`. Decode with up to seven MTP drafts and the reduced
-  draft vocabulary (2026-11-23, 200 W, 300 greedy tokens, warm cache): **123.3 tok/s** on code, 100.3
-  on a thinking prompt, 80.5 story, 78.8 Chinese, and **71.8 French, down from 88.7** with three drafts
-  and the full head: the list covers French poorly. `--mtp-draft-vocab off` turns it off. The output
+  draft vocabulary (2026-11-24, 200 W, 300 greedy tokens, warm cache): **124.7 tok/s** on code, 101.0
+  on a thinking prompt, 81.3 story, 79.6 Chinese, and **72.1 French, down from 88.7** with three drafts
+  and the full head (2026-11-23): the list covers French poorly. `--mtp-draft-vocab off` turns it off. The output
   is the same either way; the conditions and ranges are in the
   [V100 guide](https://github.com/ashalliants/ninfer-3090/blob/master/docs/tesla-v100.md#qwen38-flash-next).
 

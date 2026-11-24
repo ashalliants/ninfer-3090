@@ -15,13 +15,13 @@ Each release ships a prebuilt V100 archive for Linux, `ninfer-v100-linux-x64-<ve
 
 All figures were measured on one V100-PCIE-32GB, connected over an OCuLink PCIe Gen3 x4 eGPU link
 (3.3 GB/s host-to-device), on a Linux host with 59 GiB of RAM, with a 250 W power limit
-(2026-11-16 to 2026-11-18), except Flash-Next's MTP decode, re-measured at 200 W on 2026-11-23.
+(2026-11-16 to 2026-11-18), except Flash-Next's MTP decode, re-measured at 200 W on 2026-11-24.
 Decode is greedy with MTP speculation, as `run-v100.sh` serves it (three drafts; seven for Flash-Next).
 
 | | Qwen3.8-27B | Qwen3.8-Flash-Next |
 |---|---:|---:|
 | **Context** | 262,144 tokens | **262,144 tokens** (`run-v100.sh` default) |
-| **Decode**, one stream, MTP | **76-86 tok/s** (MTP3) | **123 tok/s** on code, 100 thinking, 79-81 story and Chinese, 72 French (MTP7 + draft vocabulary, warm cache, 2026-11-23, 200 W) |
+| **Decode**, one stream, MTP | **76-86 tok/s** (MTP3) | **124.7 tok/s** on code, 101 thinking, 80-81 story and Chinese, 72 French (MTP7 + draft vocabulary, warm cache, 2026-11-24, 200 W) |
 | **Decode**, plain (250 W) | 42 tok/s | 53 tok/s |
 | **Prefill**, ~4K-token prompt | **~1,020 tok/s** | **~990 tok/s** (3,798 tokens in 3.8 s) |
 | **Prefill**, long prompts | | 38K tokens in 38.4 s (~1,000 tok/s) |
@@ -242,6 +242,24 @@ prefills fastest); the mixes are for when KV bytes are short. See
 [the README](../README.md#per-layer-mixes---kv-dtype-rk4v4x12int8x4-opt-in).
 
 ### Qwen3.8-Flash-Next
+
+**2026-11-24: the hyper-connection mixer's collapse kernel is cheaper on the V100**, with
+the same output bit for bit. It runs 110 times in each MTP round, so every round is about 0.3 ms
+shorter. Measured in A B B A order against master on the same box (200 W, no thermal throttling,
+300 tokens at temperature 0, warm second request; tok/s, means of the two runs):
+
+| Flags | Build | Story | Code | Chinese | French | Thinking | Thinking, budget 150 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| The router's (graft, `--presence-penalty 1.0`) | before (master) | 80.7 | 123.2 | 78.9 | 71.7 | 100.0 | 105.6 |
+| | **after** | **81.3** | **124.7** | **79.6** | 72.1 | 101.0 | 104.9 |
+| Without the graft and presence penalty (Lapilli's settings) | before (master) | 84.8 | 118.7 | 82.4 | 76.6 | 109.9 | 115.7 |
+| | **after** | **85.8** | **119.7** | **83.0** | 77.5 | 109.3 | 117.0 |
+
+Both builds produced the same text in every run (md5 of each answer). Story, code and Chinese
+moved up 0.7-1.2% in both configurations; French and the two thinking requests vary by up to 4 tok/s
+between runs of the same binary, more than the change. Master here is `63762a40`, whose Flash-Next
+code is the same as the change's base. How the kernel changed and what else was tried is in
+[volta-port.md](maintainer/volta-port.md).
 
 Decode with a warm expert cache (2026-11-23, **200 W** power limit, no thermal throttling sampled
 during any run). `run-v100.sh` now drafts up to seven tokens a round with the reduced MTP draft head

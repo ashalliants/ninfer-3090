@@ -285,6 +285,34 @@ are unchanged. The per-column work was the larger cost at verify widths:
 Bench pair at T = 1 / 4: 43.3 / 75.4 -> 41.2 / 60.9 us, bit-identical at T = 1-16. MTP3 decode
 72.4 -> 74.0 tok/s.
 
+The up kernel (`hc_up_collapse`) then grew ~3.2 us per verified column, against ~2.4 for the down
+kernel. Removing parts of it in the bench showed where (none of these variants is exact): the
+float4 reads of m from shared memory (~1 us a column: lane l's chunk is 32 bytes from lane l + 1's,
+a two-way bank conflict), and the per-column tail, four warp butterflies and lane 0's four sigmoids
+with an IEEE division each, issued while the other 31 lanes wait. On sm_70 (`kUpScatter`) m is
+stored in two planes as `Rn` is; the four butterflies are one reduce-scatter (at offset 16 each half
+of the warp keeps two streams, at 8 each quarter keeps one), which adds the same pairs of values, so
+each stream's sum has the butterfly's bits; and lanes 0, 8, 16 and 24 take the four sigmoids at once
+before lane 0 collapses them in the same order. Bitwise identical to the previous kernel at
+T = 1-16 with and without injects (checked against a copy of it). Bench up kernel at T = 1 / 4 / 8:
+16.6 / 26.6 / 39.2 -> 16.0 / 25.0 / 33.4 us; in the model, 27.2 -> 24.3 us a call over the code
+request's 110 calls a round (-0.32 ms a round). Flash-Next decode, ABBA at 200 W (router flags, tok/s
+story / code / Chinese / French / thinking): 80.7 / 123.2 / 78.9 / 71.7 / 100.0 -> 81.3 / 124.7 /
+79.6 / 72.1 / 101.0, same text.
+
+What did not help, all exact:
+- two W_down rows per warp in the down kernel (half the `Rn` reads per product, half as many CTAs
+  re-staging the residual, one CTA per SM): 4-14% faster in the bench, but 22.9 -> 26.4 us a call
+  in the model. Every one-CTA-per-SM shape measured lost in the model (8 columns a pass: 39 us);
+- the up kernel's weights decoded once instead of per column, or two columns a step: both spill
+  under the 64-register bound that two 512-thread CTAs per SM leave.
+
+Two other levers were measured and left alone. The draft head's 106,056 IQ4_XS rows are ~144 MB a
+step and take ~190 us, about 760 GB/s, already at the memory bound. And capping the window by
+measured verify cost would not pay on code: from the per-position acceptance of the code request,
+the rounds that offer a fifth to seventh draft accept most of them, and dropping those positions
+loses about as many tokens as the verify time it saves.
+
 MTP rounds with `--mtp-joint-acceptance` drafted `--draft-tokens` (3) steps every round, ~1.2 ms a
 step here, then verified the prefix the joint rule kept: over 96 rounds of the bench story, position
 2 was offered 46 times and position 3 only 10. `--mtp-staged-drafts` drafts one step at a time and
