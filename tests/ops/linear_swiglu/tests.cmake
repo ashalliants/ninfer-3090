@@ -34,3 +34,11 @@ ninfer_add_op_test(ninfer_linear_swiglu_q4a8_int_test
 ninfer_add_op_test(ninfer_w4_cublas_prefill_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_w4_cublas_prefill.cpp"
   LIBRARIES ninfer_ops)
+
+# sm_70: the int8-activation streaming GEMV forced on (see tests/ops/linear/tests.cmake).
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  add_test(NAME ninfer_linear_swiglu_q4_a16_stream_a8_test
+    COMMAND ninfer_tests ninfer_linear_swiglu_q4_a16_test)
+  set_tests_properties(ninfer_linear_swiglu_q4_a16_stream_a8_test PROPERTIES
+    ENVIRONMENT "NINFER_STREAM_DP4A=1" SKIP_RETURN_CODE 77)
+endif()

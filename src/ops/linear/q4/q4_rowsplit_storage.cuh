@@ -137,6 +137,19 @@ struct Q4StreamFormat {
         }
     }
 
+    // dp4a form (ops/linear/common/stream_dp4a.cuh): code n ^ 8 is the weight plus 8, so the
+    // even and odd nibbles of word W, masked into bytes, are dp4a operands with bias 8.
+    static constexpr bool kDp4a     = true;
+    static constexpr int kDp4aBias  = 8;
+    template <int W>
+    __device__ static __forceinline__ void dp4a_word(const Slice& slice, std::uint32_t& even,
+                                                     std::uint32_t& odd) {
+        const std::uint32_t words[4] = {slice.codes.x, slice.codes.y, slice.codes.z,
+                                        slice.codes.w};
+        even = (words[W] ^ 0x88888888u) & 0x0f0f0f0fu;
+        odd  = ((words[W] >> 4) ^ 0x08080808u) & 0x0f0f0f0fu;
+    }
+
     // Tensor-core form (ops/linear/common/stream_hmma.cuh). A step is kHmmaGroups groups of one
     // row: their code bytes, read by lane pairs, and their scales.
     static constexpr bool kHmma      = true;

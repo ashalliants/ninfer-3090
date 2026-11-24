@@ -15,14 +15,15 @@ Each release ships a prebuilt V100 archive for Linux, `ninfer-v100-linux-x64-<ve
 
 All figures were measured on one V100-PCIE-32GB, connected over an OCuLink PCIe Gen3 x4 eGPU link
 (3.3 GB/s host-to-device), on a Linux host with 59 GiB of RAM, with a 250 W power limit
-(2026-11-16 to 2026-11-18), except Flash-Next's MTP decode, re-measured at 200 W on 2026-11-24.
+(2026-11-16 to 2026-11-18), except Flash-Next's MTP decode and the 27B's speculative decode, re-measured
+at 200 W on 2026-11-24.
 Decode is greedy with MTP speculation, as `run-v100.sh` serves it (three drafts; seven for Flash-Next).
 
 | | Qwen3.8-27B | Qwen3.8-Flash-Next |
 |---|---:|---:|
 | **Context** | 262,144 tokens | **262,144 tokens** (`run-v100.sh` default) |
-| **Decode**, one stream, MTP | **76-86 tok/s** (MTP3) | **124.7 tok/s** on code, 101 thinking, 80-81 story and Chinese, 72 French (MTP7 + draft vocabulary, warm cache, 2026-11-24, 200 W) |
-| **Decode**, plain (250 W) | 42 tok/s | 53 tok/s |
+| **Decode**, one stream, MTP | **110 tok/s** on code, 104 thinking, 77-81 story, Chinese and French (MTP3, 2026-11-24, 200 W) | **124.7 tok/s** on code, 101 thinking, 80-81 story and Chinese, 72 French (MTP7 + draft vocabulary, warm cache, 2026-11-24, 200 W) |
+| **Decode**, plain | 45 tok/s (200 W) | 53 tok/s (250 W) |
 | **Prefill**, ~4K-token prompt | **~1,020 tok/s** | **~990 tok/s** (3,798 tokens in 3.8 s) |
 | **Prefill**, long prompts | | 38K tokens in 38.4 s (~1,000 tok/s) |
 
@@ -98,7 +99,7 @@ These are the model defaults it sets:
 | `NINFER_CPU_VERIFY_MISSES=on` | Flash-Next | During decode, experts that miss the cache are computed on CPU threads beside the GPU. A cold cache decodes at 68-80 instead of 48-63 tok/s |
 | `NINFER_PARTIAL_RAM_RESIDENCY=on` | Flash-Next UD-IQ3_XXS | Pins only the experts the VRAM cache does not hold (`--partial-ram-residency`), so the 42 GiB bank fits; no images, context 32,768. `off` pins every expert (about 50 GiB) and restores images and the 262,144-token context |
 | `NINFER_HOT_EMBEDDING_ROWS=8192` | Flash-Next | Only the common embedding rows stay in VRAM, freeing room for 216 more cached experts |
-| `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV, which is faster than DFlash2 on this card (76 against 66 tok/s on code) |
+| `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV: on this card it ties DFlash2 (`--draft-tokens 7`) on code (110 tok/s) and beats it on prose, Chinese, French and thinking; DFlash2 wins on long structured output (146 against 123 tok/s) |
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
 on, so the 27B's wide prefill GEMMs run on the tensor cores through cuBLAS instead of emulated integer
@@ -195,37 +196,66 @@ NINFER_DEFAULT_THINKING_BUDGET=2048 scripts/run-v100.sh qwen38-27b
 
 ### Qwen3.8-27B
 
-Decode, one stream, greedy, INT8 KV:
+Decode, one stream, through `ninfer-serve` with the router's flags (`--gdn-state-fp16
+--prefill-cublas`, INT8 KV, vision overlay), greedy unless noted, 2026-11-24, **200 W** power limit,
+ABBA against master (`2a1bf0353`), no thermal throttling. The two repeats with `--verify-a8` agreed within
+0.1 tok/s (the adaptive DFlash2 legs aside, whose window choice varies), master's within 0.9:
 
-| | tok/s |
-|---|---:|
-| Plain | 42.2 |
-| MTP3, server, story prompt | 76.1 |
-| MTP3, `ninfer_bench -pg 2048,256` | 86.3 |
-| DFlash2 (`--draft-tokens 7`) | 67.6 |
+| Prompt | MTP3 | DFlash2 K7 | DFlash2 K7 adaptive | master MTP3 |
+|---|---:|---:|---:|---:|
+| code | **110.1** | **110.8** | 110.7-110.8 | 81.2-82.1 |
+| think | **104.1** | 102.5 | 102.3-102.5 | 77.2-77.9 |
+| story | **77.0** | 52.5 | 55.1-59.8 | 57.0-57.7 |
+| Chinese | **81.4** | 32.4 | 39.7 | 57.2-57.8 |
+| French | **80.7** | 55.8 | 56.4 | 57.2-57.6 |
+| conversation (T 0.6) | **91.5** | 75.2 | 73.7 | 65.9-66.1 |
+| structured JSON | 122.6 | **146.5** | 146.4 | 92.3-92.5 |
+| prose (T 0.6) | **80.5** | 56.6 | 58.2-59.3 | 58.0-58.1 |
+| conversation, greedy | **89.5** | 71.8 | 76.1-81.4 | 68.5-68.6 |
+| plain decode (no speculation) | 45.0 | | | 42.7-43.0 |
+| two requests at once (story + code, 256 tokens each), total | **122.0-122.8** | | | 74.0-74.2 |
+
+Master's DFlash2 K7 on the same prompts: 72.9 code, 59.6 think, 32.1 story, 97.3 structured.
+`ninfer_bench -pg 2048,256` (bench corpus, INT8 KV, 93-95% acceptance, same ABBA): MTP3 **118.9**
+(master 88.0), DFlash2 K7 141.9 (93.2), plain 43.8 (41.9-42.0). The
+prompts are the five 300-token ones (code, think, story, Chinese, French) and Lapilli's basalt-bench
+fixtures (seed 7). Deeper MTP windows pay only on code and structured output now: MTP5 117.4 code and
+148.0 structured, MTP7 158.1 structured, but every other prompt is slower, so MTP3 stays the default.
+
+What changed is `--verify-a8`, on by default in an `sm_70` build: the Q4/Q5/Q6 linears at 1-8 tokens
+round their activations to int8 per 32 values and run `dp4a`, so a verify round costs about the same
+as a plain step's GEMVs at any width (`--no-verify-a8` turns it off). It is lossy at the noise floor:
+on a decode-path KLD gate against the FP32 kernels (17 chunks of 512 tokens from four held-out
+domains), KLD 7.2e-4 to 7.8e-4 at one, four and eight tokens, and 98.9-99.2% the same top-1 token;
+master's own verify reordering measures 3.8e-4 and 99.4%. Greedy text therefore differs from master
+at near-ties (the code and structured outputs above are byte-identical to master's). Details in
+[volta-port.md](maintainer/volta-port.md#decode).
 
 The weights alone take 17.4 ms per token to read at the card's measured 879 GB/s, so plain decode
 can reach at most about 57 tok/s; speculation gets past that ceiling. Prefill runs its GEMMs on the
 tensor cores through cuBLAS, and prompt attention through FP16 flash attention. 1,150 / 2,186 /
 4,392-token prompts prefill at 868 / 959 / 1,020 tok/s.
 
-Decode against context length, MTP3, INT8 KV, `ninfer-serve` with the `run-v100.sh` flags, 256 greedy
-tokens on an exact-hit repeat of a checkpointed prompt, one request at a time (2026-11-23, **200 W**
-power limit, three repeats each, range under 0.5%):
+Decode against context length, MTP3, the same server flags, 256 greedy tokens (`ignore_eos`) on
+exact-hit repeats of a checkpointed prompt (Project Gutenberg text from the PG-19 corpus plus a
+question), one request at a time (2026-11-24, 200 W, ABBA against master, three repeats each, range
+under 0.3%):
 
-| Context | Decode |
-|---:|---:|
-| 4,170 | 57.9 tok/s |
-| 40,259 | 47.9 tok/s |
-| 162,152 | 25.0 tok/s |
+| Context | Decode | master | Per MTP round | master |
+|---:|---:|---:|---:|---:|
+| 4,215 | **75.7 tok/s** | 57.3-57.4 | 33.0 ms | 43.5 ms |
+| 42,663 | **52.8 tok/s** | 46.5-46.6 | 51.4 ms | 61.1 ms |
+| 172,487 | 20.9 tok/s | 21.6 | 127.1 ms | 136.3 ms |
 
-Attention over the 16 full-attention layers' KV is what slows long-context decode. Staging the next K/V
-tile in registers (sm_70 only) raised the 40K figure from 46.8 and the 162K figure from 23.5 tok/s, with
-byte-identical output.
+Attention over the 16 full-attention layers' KV is what slows long-context decode, so the verify
+GEMVs' saving is a smaller share there. At 172K a round is 7% cheaper, but this text's continuation
+accepted fewer drafts than master's (158 of 289 against 168 of 261), so tok/s came out 3% lower;
+acceptance depends on the text, not the context. (The previous figures, 57.9 / 47.9 / 25.0 tok/s at
+4,170 / 40,259 / 162,152 tokens on 2026-11-23, used a different prompt.)
 
 **Per-layer KV mixes** (`--kv-dtype rk4v4x12,int8x4` and the like, opt-in, lossy). Same server
 flags, only `--kv-dtype` varied, 200 W, interleaved legs (2026-11-23; the paired legs agreed within
-0.1%). Perplexity is the held-out corpus at a 65,536-token context; ΔNLL is the paired difference
+0.1%). These ran before `--verify-a8`, so their decode columns are master's. Perplexity is the held-out corpus at a 65,536-token context; ΔNLL is the paired difference
 from `int8` in millinats (se over 6 domains):
 
 | KV | Bytes/token | ΔNLL vs `int8` | Decode 4K / 40K / 162K | Prefill 40K / 162K |

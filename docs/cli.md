@@ -233,6 +233,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--mtp-experts-q4` | transcode the 35B-A3B's MTP draft-layer experts to Q4/Q6 at load; rejected on the dense 27B | off |
 | `--gdn-state-fp16` | FP16 recurrent GDN state, halving each state image | off |
 | `--mlp-a8-decode` | integer-activation MLP at decode | off |
+| `--verify-a8`, `--no-verify-a8` | `sm_70` (V100) only, Qwen3.5-family models: the Q4/Q5/Q6 linears at 1-8 tokens (plain decode, the MTP and DFlash verify forwards, the LM head) round their activations to int8 per 32 values and run `dp4a`, so a verify round costs about the weight stream at any width. Lossy at the noise floor: on Qwen3.8-27B, KLD 7.2e-4 against the FP32 decode path and 98.9-99.2% same top-1. Greedy text differs from `--no-verify-a8` at near-ties, and speculative output can still part from plain decoding's, as it does without the flag. `--no-verify-a8` returns those calls to the FP32 kernels; elsewhere the flag is inert. See [tesla-v100.md](tesla-v100.md#qwen38-27b) | **on** in an `sm_70` build; off (inert) elsewhere |
 | `--numeric-tripwire [--numeric-tripwire-limit F\|inf]` | debugging aid: a few small probes in every decode round look for NaN, infinity and values beyond the limit (default `65504`, the FP16 maximum; `inf` reports only NaN and infinity) and log the first sighting as one warning line, naming where it was seen, without stopping generation. Single device, Qwen3.5 family; see [numeric tripwire](maintainer/quality-trade-experiments.md#numeric-tripwire----numeric-tripwire) | off, and then free |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-residency resident\|overlay` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from free KV pages, or the evictable text weight tail when those fall short (no resident Vision cost; needs CUDA VMM). Inkling-2: the tower stays pinned and is copied into the text workspace for each image (about 0.2 s an image; it saves memory only at a prefill chunk of 512 or more), see [the Inkling-2 notes](maintainer/inkling2-model.md#context-with-dspark-and-vision) | `resident` |
@@ -257,7 +258,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--print-token-ids` | include generated token IDs in diagnostics | off |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | diagnostic verbosity on stderr | `info` |
 
-The `--lm-head-*`, `--embedding-*`, `--mtp-experts-q4`, `--gdn-state-fp16` and `--mlp-a8-decode`
+The `--lm-head-*`, `--embedding-*`, `--mtp-experts-q4`, `--gdn-state-fp16`, `--mlp-a8-decode` and `--verify-a8`
 flags are speed- or memory-for-quality trades. The measured cost of each is in
 [quality trades](maintainer/quality-trade-experiments.md).
 

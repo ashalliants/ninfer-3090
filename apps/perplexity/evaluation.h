@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -113,6 +114,7 @@ struct ScoringSourceFlags {
     bool stride        = false;
     bool chunks        = false;
     bool decode_window = false;
+    bool kld_write     = false;
 };
 
 // Throws std::invalid_argument for a combination ninfer-perplexity refuses.
@@ -134,5 +136,39 @@ struct KldChunk {
 
 // The base row of target `position` in [n_ctx/2 + 1, n_ctx). Throws std::out_of_range otherwise.
 [[nodiscard]] int kld_row(const KldBase& base, std::int64_t position);
+
+// A base over `tokens` cut into whole chunks of n_ctx (the tail that does not fill one is dropped),
+// with no rows of its own: --text with --kld-write. Throws std::invalid_argument when not even one
+// chunk fits.
+[[nodiscard]] KldBase kld_base_from_tokens(std::span<const std::int32_t> tokens,
+                                           std::uint32_t n_ctx);
+
+// Writes a base in the layout above from a run's own logits (--kld-write), so a later run can be
+// compared with this one: a build against itself with a numerics change off and on. Rows must
+// arrive in base order (chunk by chunk, positions ascending); n_vocab is the first row's length.
+// Each row is stored as llama.cpp stores one: log-softmax in double, then 16-bit quantized
+// between its maximum and max(minimum, kKldWriteFloor).
+inline constexpr double kKldWriteFloor = -20.0;
+class KldBaseWriter {
+public:
+    // The base's first `chunks` chunks of tokens.
+    KldBaseWriter(std::filesystem::path path, const KldBase& tokens_from, int chunks);
+    ~KldBaseWriter();
+    KldBaseWriter(const KldBaseWriter&)            = delete;
+    KldBaseWriter& operator=(const KldBaseWriter&) = delete;
+    void add_row(std::span<const float> logits);
+    // Checks the row count against the header and closes the file. Throws std::runtime_error.
+    void finish();
+
+private:
+    std::filesystem::path path_;
+    std::uint32_t n_ctx_ = 0;
+    std::int32_t n_vocab_ = 0;
+    std::uint64_t rows_   = 0;
+    std::vector<std::int32_t> tokens_;
+    std::vector<std::uint16_t> slots_;
+    std::vector<double> logprobs_;
+    std::FILE* file_ = nullptr;
+};
 
 } // namespace ninfer::perplexity

@@ -5,6 +5,7 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -295,8 +296,14 @@ void check_source_flags(const ScoringSourceFlags& flags) {
         throw std::invalid_argument("exactly one of --corpus, --text and --kld-base is required");
     }
     if (flags.quick && !flags.corpus) { throw std::invalid_argument("--quick requires --corpus"); }
-    if ((flags.chunks || flags.decode_window) && !flags.kld_base) {
-        throw std::invalid_argument("--chunks and --decode-window require --kld-base");
+    if (flags.kld_write && !flags.kld_base && !flags.text) {
+        throw std::invalid_argument("--kld-write requires --kld-base or --text");
+    }
+    if ((flags.chunks || flags.decode_window) && !flags.kld_base && !flags.kld_write) {
+        throw std::invalid_argument("--chunks and --decode-window require --kld-base or --kld-write");
+    }
+    if (flags.kld_write && flags.text && flags.stride) {
+        throw std::invalid_argument("--kld-write with --text cuts chunks of --context: drop --stride");
     }
     if (flags.kld_base && (flags.context || flags.stride)) {
         throw std::invalid_argument(
@@ -324,6 +331,96 @@ KldChunk kld_chunk(const KldBase& base, int chunk) {
                       base.tokens.begin() + static_cast<std::ptrdiff_t>(begin + base.n_ctx));
     out.first_target = base.n_ctx / 2U + 1U;
     return out;
+}
+
+KldBase kld_base_from_tokens(std::span<const std::int32_t> tokens, std::uint32_t n_ctx) {
+    if (n_ctx < 4 || n_ctx > (1U << 24)) {
+        throw std::invalid_argument("--context must be 4 .. 2^24 for a KL-divergence base");
+    }
+    const std::size_t chunks = tokens.size() / n_ctx;
+    if (chunks == 0 || chunks > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("the text holds " + std::to_string(tokens.size()) +
+                                    " tokens, fewer than one chunk of --context " +
+                                    std::to_string(n_ctx));
+    }
+    KldBase base;
+    base.n_ctx   = n_ctx;
+    base.n_chunk = static_cast<std::int32_t>(chunks);
+    base.tokens.assign(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(chunks * n_ctx));
+    return base;
+}
+
+KldBaseWriter::KldBaseWriter(std::filesystem::path path, const KldBase& tokens_from, int chunks)
+    : path_(std::move(path)), n_ctx_(tokens_from.n_ctx),
+      tokens_(tokens_from.tokens.begin(),
+              tokens_from.tokens.begin() + static_cast<std::ptrdiff_t>(
+                                               static_cast<std::size_t>(chunks) * n_ctx_)) {
+    file_ = std::fopen(path_.string().c_str(), "wb");
+    if (file_ == nullptr) { kld_fail(path_, "cannot create KL-divergence base"); }
+}
+
+void KldBaseWriter::add_row(std::span<const float> logits) {
+    if (logits.empty()) { kld_fail(path_, "--kld-write got an empty logits row"); }
+    if (n_vocab_ == 0) {
+        n_vocab_ = static_cast<std::int32_t>(logits.size());
+        // The header needs n_vocab, so it is written with the first row.
+        std::array<char, kKldHeaderBytes> header{};
+        std::copy(kKldMagic.begin(), kKldMagic.end(), header.begin());
+        const std::int32_t chunks = static_cast<std::int32_t>(tokens_.size() / n_ctx_);
+        std::memcpy(header.data() + 8, &n_ctx_, 4);
+        std::memcpy(header.data() + 12, &n_vocab_, 4);
+        std::memcpy(header.data() + 16, &chunks, 4);
+        if (std::fwrite(header.data(), 1, header.size(), file_) != header.size() ||
+            std::fwrite(tokens_.data(), 4, tokens_.size(), file_) != tokens_.size()) {
+            kld_fail(path_, "write to KL-divergence base failed");
+        }
+        slots_.assign(static_cast<std::size_t>(kld_row_u16(n_vocab_)), 0);
+        logprobs_.resize(static_cast<std::size_t>(n_vocab_));
+    }
+    if (logits.size() != static_cast<std::size_t>(n_vocab_)) {
+        kld_fail(path_, "--kld-write rows differ in vocabulary size");
+    }
+    double max_logit = -std::numeric_limits<double>::infinity();
+    for (const float v : logits) {
+        if (std::isnan(v)) { kld_fail(path_, "--kld-write got a NaN logit"); }
+        max_logit = std::max(max_logit, static_cast<double>(v));
+    }
+    if (!std::isfinite(max_logit)) { kld_fail(path_, "--kld-write row has no finite maximum"); }
+    double sum = 0.0;
+    for (const float v : logits) { sum += std::exp(static_cast<double>(v) - max_logit); }
+    const double lse = max_logit + std::log(sum);
+    double lo        = 0.0;
+    double hi        = -std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+        logprobs_[i] = static_cast<double>(logits[i]) - lse;
+        lo           = std::min(lo, logprobs_[i]);
+        hi           = std::max(hi, logprobs_[i]);
+    }
+    const float min_lp = static_cast<float>(std::max(lo, kKldWriteFloor));
+    const float scale  = std::max(static_cast<float>((hi - min_lp) / 65535.0), 1e-30F);
+    std::memcpy(slots_.data(), &scale, 4);
+    std::memcpy(slots_.data() + 2, &min_lp, 4);
+    for (std::size_t i = 0; i < logits.size(); ++i) {
+        const double q = std::nearbyint((logprobs_[i] - min_lp) / scale);
+        slots_[4 + i]  = static_cast<std::uint16_t>(std::clamp(q, 0.0, 65535.0));
+    }
+    if (std::fwrite(slots_.data(), 2, slots_.size(), file_) != slots_.size()) {
+        kld_fail(path_, "write to KL-divergence base failed");
+    }
+    ++rows_;
+}
+
+KldBaseWriter::~KldBaseWriter() {
+    if (file_ != nullptr) { std::fclose(file_); }
+}
+
+void KldBaseWriter::finish() {
+    const std::uint64_t expected =
+        static_cast<std::uint64_t>(tokens_.size() / n_ctx_) * kld_rows_per_chunk(n_ctx_);
+    const bool closed = std::fclose(file_) == 0;
+    file_             = nullptr;
+    if (!closed) { kld_fail(path_, "write to KL-divergence base failed"); }
+    if (rows_ != expected) { kld_fail(path_, "--kld-write got fewer rows than its chunks hold"); }
 }
 
 int kld_row(const KldBase& base, std::int64_t position) {

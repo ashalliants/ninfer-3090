@@ -183,6 +183,24 @@ struct Q5StreamFormat {
         }
     }
 
+    // dp4a form (ops/linear/common/stream_dp4a.cuh): n - 16 high = m - 16 with m = n + 16 (1 -
+    // high) in [0, 31]. The inverted high bits of word W are spread to bit 4i (weight i), then
+    // land on bit 4 of each byte beside the masked nibbles.
+    static constexpr bool kDp4a    = true;
+    static constexpr int kDp4aBias = 16;
+    template <int W>
+    __device__ static __forceinline__ void dp4a_word(const Slice& slice, std::uint32_t& even,
+                                                     std::uint32_t& odd) {
+        const std::uint32_t words[4] = {slice.codes.x, slice.codes.y, slice.codes.z,
+                                        slice.codes.w};
+        std::uint32_t h = ~(slice.high >> (8 * W)) & 0xffu;
+        h               = (h | (h << 12)) & 0x000f000fu;
+        h               = (h | (h << 6)) & 0x03030303u;
+        h               = (h | (h << 3)) & 0x11111111u; // bit i -> bit 4i
+        even = (words[W] & 0x0f0f0f0fu) | ((h << 4) & 0xf0f0f0f0u);
+        odd  = ((words[W] >> 4) & 0x0f0f0f0fu) | (h & 0xf0f0f0f0u);
+    }
+
     // Tensor-core form (ops/linear/common/stream_hmma.cuh): n - 16 high = m - 16 with
     // m = n + 16 (1 - high) in [0, 31], so the inverted high bit becomes bit 4 of each byte
     // before the same FP16 magic as Q4, with 1040 subtracted.

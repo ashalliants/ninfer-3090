@@ -348,6 +348,24 @@ exercise was not the instruction swap but deleting a redundant copy of the stage
 That reading applies to the other small-T kernels too -- they share the shape and the staging
 pattern -- and is the reason a cp.async ring lost at every width here.
 
+## `--verify-a8` -- int8 activations at decode and verify widths on `sm_70` (default there)
+
+The one trade here that is on by default, and only in a V100 (`sm_70`) build, where the FP32 SIMT
+streaming GEMV made an MTP3 verify round cost about twice a plain step's GEMVs. With it the Q4/Q5/Q6
+linears at 1-8 tokens round each 32-value activation slice to int8 (absmax / 127) and run `dp4a`
+(`ops/linear/common/stream_dp4a.cuh`). Qwen3.8-27B, decode-path KLD against the FP32 kernels at
+T = 1 (`ninfer-perplexity --kld-write` / `--kld-base`, 17 x 512 tokens, four held-out domains,
+INT8 KV, `--gdn-state-fp16`; 2026-11-24):
+
+| | KLD mean | same top-1 | PPL |
+|---|---:|---:|---:|
+| FP32 kernels, T = 8 (the existing verify reordering) | 3.8e-4 | 99.42% | 3.6116 |
+| `--verify-a8`, T = 1 / 4 / 8 | 7.2e-4 / 7.2e-4 / 7.8e-4 | 98.87 / 98.89 / 99.19% | 3.6134 / 3.6156 / 3.6106 |
+
+Base PPL 3.6102. Speed: MTP3 82 -> 110 tok/s on code, plain 43 -> 45 (200 W;
+[tesla-v100.md](../tesla-v100.md#qwen38-27b)). `--no-verify-a8` restores the FP32 kernels and
+master's exact output. The flag is inert on other targets.
+
 ## `--no-prefill-a8` -- the escape hatch for the integer prefill routes
 
 The odd one out: this is the only flag here that turns a trade *off*. The integer-activation

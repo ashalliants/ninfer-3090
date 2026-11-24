@@ -206,8 +206,11 @@ int compare_output(std::string_view label, const std::vector<double>& actual,
         return 1;
     }
 
+    const ReductionCriterion criterion = activation_compute == ActivationCompute::A16
+                                             ? with_stream_a8_allowance(tolerance_for(activation_compute))
+                                             : tolerance_for(activation_compute);
     return verify_reduction(label, actual, std::span<const double>(reference, actual.size()),
-                            tolerance_for(activation_compute));
+                            criterion);
 }
 
 int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& device,

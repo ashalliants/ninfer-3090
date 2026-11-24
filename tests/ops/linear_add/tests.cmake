@@ -40,4 +40,10 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     set_tests_properties(${test}_hmma PROPERTIES
       ENVIRONMENT "NINFER_STREAM_HMMA_Q5=1" SKIP_RETURN_CODE 77)
   endforeach()
+  # The int8-activation streaming GEMV forced on (see tests/ops/linear/tests.cmake).
+  foreach(test ninfer_linear_add_q4_a16_test ninfer_linear_add_q5_a16_test)
+    add_test(NAME ${test}_stream_a8 COMMAND ninfer_tests ${test})
+    set_tests_properties(${test}_stream_a8 PROPERTIES
+      ENVIRONMENT "NINFER_STREAM_DP4A=1" SKIP_RETURN_CODE 77)
+  endforeach()
 endif()

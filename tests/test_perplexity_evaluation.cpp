@@ -360,6 +360,76 @@ int check_scoring_source_flags() {
     failures += require(refused({.kld_base = true, .context = true}) &&
                             refused({.kld_base = true, .stride = true}),
                         "--kld-base takes its context from the file, not --context/--stride");
+    failures += require(!refused({.kld_base = true, .kld_write = true}) &&
+                            !refused({.text = true, .context = true, .decode_window = true,
+                                      .kld_write = true}),
+                        "--kld-write follows --kld-base or cuts --text into --context chunks");
+    failures += require(refused({.corpus = true, .kld_write = true}) &&
+                            refused({.text = true, .stride = true, .kld_write = true}),
+                        "--kld-write needs --kld-base or --text, and takes no --stride");
+    return failures;
+}
+
+// --kld-write: a base cut from tokens, written from logits, reads back as their log-softmax.
+int check_kld_writer() {
+    constexpr std::uint32_t n_ctx = 8;
+    constexpr int rows_per_chunk  = n_ctx - 1 - n_ctx / 2; // 3
+    std::vector<std::int32_t> tokens;
+    for (int i = 0; i < 19; ++i) { tokens.push_back(3 * i); } // two whole chunks and a tail
+    const auto from_tokens = ninfer::perplexity::kld_base_from_tokens(tokens, n_ctx);
+    int failures           = 0;
+    failures += require(from_tokens.n_chunk == 2 && from_tokens.tokens.size() == 16 &&
+                            from_tokens.n_ctx == n_ctx,
+                        "a base from tokens keeps whole chunks only");
+    failures += require(throws_invalid([&] {
+                            return ninfer::perplexity::kld_base_from_tokens(
+                                std::vector<std::int32_t>(7, 1), n_ctx);
+                        }),
+                        "fewer tokens than one chunk are refused");
+
+    TempFile file("writer");
+    std::vector<std::vector<float>> logits;
+    {
+        ninfer::perplexity::KldBaseWriter writer(file.path, from_tokens, 2);
+        for (int r = 0; r < 2 * rows_per_chunk; ++r) {
+            std::vector<float> row{0.5F * r, -1.0F, 3.0F - r, -40.0F, 2.25F};
+            writer.add_row(row);
+            logits.push_back(std::move(row));
+        }
+        writer.finish();
+    }
+    const auto base = ninfer::perplexity::read_kld_base(file.path);
+    failures += require(base.n_ctx == n_ctx && base.n_vocab == 5 && base.n_chunk == 2 &&
+                            std::equal(base.tokens.begin(), base.tokens.end(),
+                                       from_tokens.tokens.begin()),
+                        "the written header and tokens read back");
+    double worst = 0.0;
+    for (int r = 0; r < 2 * rows_per_chunk; ++r) {
+        const auto lp = ninfer::perplexity::kld_base_logprobs(base, r / rows_per_chunk,
+                                                              r % rows_per_chunk);
+        double max_logit = -1e30;
+        for (const float v : logits[r]) { max_logit = std::max(max_logit, static_cast<double>(v)); }
+        double sum = 0.0;
+        for (const float v : logits[r]) { sum += std::exp(v - max_logit); }
+        const double lse = max_logit + std::log(sum);
+        for (std::size_t v = 0; v < 5; ++v) {
+            const double want = std::max(static_cast<double>(logits[r][v]) - lse,
+                                         ninfer::perplexity::kKldWriteFloor);
+            worst = std::max(worst, std::abs(lp[v] - want));
+        }
+    }
+    failures += require(worst < 1e-3, "written rows read back as the log-softmax (floored)");
+
+    TempFile short_file("writer_short");
+    bool short_refused = false;
+    {
+        ninfer::perplexity::KldBaseWriter writer(short_file.path, from_tokens, 1);
+        writer.add_row(logits[0]);
+        try {
+            writer.finish();
+        } catch (const std::runtime_error&) { short_refused = true; }
+    }
+    failures += require(short_refused, "a base with missing rows is refused at finish");
     return failures;
 }
 
@@ -423,6 +493,7 @@ int check_kld_chunks() {
 
 int main() {
     int failures = 0;
+    failures += check_kld_writer();
     failures += check_partition(2, 4096, 2048);
     failures += check_partition(4096, 4096, 2048);
     failures += check_partition(4097, 4096, 2048);

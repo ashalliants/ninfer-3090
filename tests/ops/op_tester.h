@@ -379,6 +379,27 @@ inline int verify_pointwise(std::string_view label, std::span<const double> got,
     return 1;
 }
 
+// sm_70's int8-activation streaming GEMV (ops/linear/common/stream_dp4a.cuh) computes an A16 call
+// of 1-8 tokens on activations rounded to int8 per 32 values. The `_stream_a8` test variants run
+// the A16 conformance suites with it forced (NINFER_STREAM_DP4A=1), and their A16 criteria widen
+// to this allowance: relative L2 2e-2 and 2.5e-2 of the largest reference value per element. The
+// route measured at most 5.9e-3 and 6.9e-3 over the Q4/Q5/Q6 linear and linear_add suites, and
+// 9.9e-3 and 1.2e-2 through SwiGLU, which amplifies its inputs' error (2026-11-24); the A8 routes'
+// allowance is 4e-2.
+inline bool stream_a8_forced() {
+    static const bool forced = [] {
+        const char* v = std::getenv("NINFER_STREAM_DP4A");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return forced;
+}
+
+inline ReductionCriterion with_stream_a8_allowance(ReductionCriterion criterion) {
+    if (!stream_a8_forced()) return criterion;
+    return {std::max(criterion.relative_l2, 2.0e-2), criterion.gross_absolute,
+            std::max(criterion.gross_relative_to_max_reference, 2.5e-2)};
+}
+
 inline int verify_reduction(std::string_view label, std::span<const double> got,
                             std::span<const double> ref, const ReductionCriterion& criterion) {
     if (got.empty() || got.size() != ref.size()) {

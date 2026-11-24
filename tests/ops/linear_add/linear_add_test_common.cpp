@@ -216,7 +216,7 @@ OutputRead read_output(const void* device, std::int32_t n, std::int32_t t,
 
 int compare_output(std::string_view label, std::span<const double> actual,
                    std::span<const double> reference) {
-    return verify_reduction(label, actual, reference, kLinearAddA16Tolerance);
+    return verify_reduction(label, actual, reference, with_stream_a8_allowance(kLinearAddA16Tolerance));
 }
 
 int verify_preserved(const test::GuardedDeviceBuffer& device,

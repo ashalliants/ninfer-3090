@@ -208,7 +208,10 @@ OutputRead read_output(const void* device, std::int32_t n, std::int32_t t,
 
 int compare_output(std::string_view label, std::span<const double> actual,
                    std::span<const double> reference, ActivationCompute activation_compute) {
-    return verify_reduction(label, actual, reference, tolerance_for(activation_compute));
+    const ReductionCriterion criterion = activation_compute == ActivationCompute::A16
+                                             ? with_stream_a8_allowance(tolerance_for(activation_compute))
+                                             : tolerance_for(activation_compute);
+    return verify_reduction(label, actual, reference, criterion);
 }
 
 } // namespace

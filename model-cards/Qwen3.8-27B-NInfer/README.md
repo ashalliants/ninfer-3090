@@ -215,6 +215,19 @@ The artifact supports:
 - the NInfer CLI;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages serving.
 
+## Speed on a Tesla V100 (ashalliants/ninfer-3090)
+
+The [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090) fork also runs this
+artifact on a Tesla V100-PCIE-32GB (`sm_70`). There, one stream decodes at **110 tok/s** on a code
+prompt with MTP3 (`--spec mtp --draft-tokens 3 --lm-head-draft`), 104 on a thinking prompt and 77-81
+on story, Chinese and French prompts; 146 tok/s on long structured JSON with DFlash2
+(`--draft-tokens 7`); 45 tok/s plain; and 122 tok/s in total for two requests at once (MTP3). Those
+figures are `ninfer-serve` with INT8 KV and `--gdn-state-fp16`, greedy, a 200 W power limit,
+2026-11-24. They use the fork's default `--verify-a8` on that card, which runs the decode and
+verify linears on int8 activations: KLD 7.2e-4 to 7.8e-4 against the FP32 decode path and 98.9-99.2%
+the same top-1 token (`--no-verify-a8` turns it off). Conditions and the full prompt table are in
+[docs/tesla-v100.md](https://github.com/ashalliants/ninfer-3090/blob/master/docs/tesla-v100.md#qwen38-27b).
+
 ## Evaluation
 
 The artifact was evaluated through NInfer's OpenAI-compatible serving route with thinking enabled,

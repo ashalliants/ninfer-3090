@@ -212,6 +212,7 @@ ninfer::EngineOptions engine_options_for(const ninfer::bench::BenchOptions& opti
     engine_options.speculative                       = options.speculative;
     engine_options.use_cuda_graph                    = options.use_cuda_graph;
     engine_options.prefill_a8                        = options.prefill_a8;
+    engine_options.verify_a8                         = options.verify_a8;
     engine_options.prefill_cublas                    = options.prefill_cublas;
     engine_options.prefill_cublas_projections        = options.prefill_cublas_projections;
     return engine_options;
