@@ -75,6 +75,13 @@ own command line contains `<string>`, so `pgrep -f` always finds at least the lo
 loop never exits. On 2026-11-24, nine such loops were left behind on the V100 host, the oldest after
 19 hours. Each finished agent left one or more polling forever, and they had to be killed by hand.
 
+- **What the rule covers:** a wait typed into a shell, where `<string>` is part of the waiting
+  process's own command line. That includes `bash -c '... pgrep -f "<string>" ...'` from a tool call
+  or an `ssh host '<loop>'`. A loop inside a script file doesn't match itself, because its command
+  line is `bash <script>.sh`. So the bounded check after a kill in
+  `scripts/multi-gpu-testing/bench-concurrency.sh` (`pgrep -f "$SERVE"`, at most 20 tries) is fine.
+  So is a one-off look at what is running, such as `docs/maintainer/release-process.md`'s
+  `pgrep -fa "ninja|cmake|package"` check: you read the list, you don't loop on its exit code.
 - When the harness can tell you a backgrounded command has finished (a background task that
   notifies on exit), use that rather than a polling loop.
 - When you need a pattern because there's no PID, match the program, not the whole command line:
