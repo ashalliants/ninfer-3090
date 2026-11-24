@@ -45,6 +45,37 @@ void ggml_mmvq_launch(const std::uint8_t* w, const __nv_bfloat16* x, __nv_bfloat
     if (!launched) { throw std::invalid_argument("ggml mmvq: K has no compiled instance"); }
 }
 
+// The staged route compiles in sm_70 builds only, for the K of the Flash-Next output (6144) and
+// input (2560) projections, every format but the affine K-quants. K = 640 (the shared expert's down
+// projection) measured slower staged, so it keeps the plain route.
+template <QType F>
+bool ggml_mmvq_staged_launch(const std::uint8_t* w, const __nv_bfloat16* x, unsigned char* staged,
+                             __nv_bfloat16* out, std::int32_t n, std::int32_t k, std::int32_t t, bool residual,
+                             cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    if constexpr (!ggml::kAffine<F>) {
+        if (t < 2 || t > kGgmlDecodeMaxTokens) { return false; }
+        const auto run = [&]<int K>() {
+            if (residual) {
+                ggml::launch_mmvq_staged_k<F, K, true>(w, x, staged, out, n, t, stream);
+            } else {
+                ggml::launch_mmvq_staged_k<F, K, false>(w, x, staged, out, n, t, stream);
+            }
+            return true;
+        };
+        if constexpr (ggml_k_registered(F, 6144)) {
+            if (k == 6144) { return run.template operator()<6144>(); }
+        }
+        if constexpr (ggml_k_registered(F, 2560)) {
+            if (k == 2560) { return run.template operator()<2560>(); }
+        }
+    }
+#else
+    (void)w, (void)x, (void)staged, (void)out, (void)n, (void)k, (void)t, (void)residual, (void)stream;
+#endif
+    return false;
+}
+
 template <QType F>
 void ggml_mmq_launch(const std::uint8_t* w, const std::int8_t* xq, const float* xd,
                      __nv_bfloat16* out, std::int32_t n, std::int32_t k, std::int32_t t,
@@ -65,6 +96,9 @@ void ggml_mmq_launch(const std::uint8_t* w, const std::int8_t* xq, const float* 
     template void ninfer::ops::detail::ggml_mmvq_launch<F>(                                     \
         const std::uint8_t*, const __nv_bfloat16*, __nv_bfloat16*, std::int32_t, std::int32_t,  \
         std::int32_t, bool, cudaStream_t);                                                      \
+    template bool ninfer::ops::detail::ggml_mmvq_staged_launch<F>(                              \
+        const std::uint8_t*, const __nv_bfloat16*, unsigned char*, __nv_bfloat16*, std::int32_t, \
+        std::int32_t, std::int32_t, bool, cudaStream_t);                                        \
     template void ninfer::ops::detail::ggml_mmq_launch<F>(                                      \
         const std::uint8_t*, const std::int8_t*, const float*, __nv_bfloat16*, std::int32_t,    \
         std::int32_t, std::int32_t, bool, cudaStream_t)

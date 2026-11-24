@@ -43,7 +43,17 @@ DFlash2 K7 146.5 on structured JSON (97.3); plain decode 45.0 (42.7-43.0); two r
 kernels, 98.9-99.2% the same top-1. The RTX 3090 does not build the kernel and is unchanged. Details:
 [tesla-v100.md](tesla-v100.md#qwen38-27b).
 
-## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next hyper-connection collapse (2026-11-24)
+## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next staged GGML verify GEMV (2026-11-24)
+
+Flash-Next's GGML dense linears cast their 2-8 verify columns to int8 once per call instead of once
+in every CTA (`sm_70` only, the same output bit for bit; `NINFER_GGML_STAGED=0` turns it off). With
+the router's flags (200 W, greedy, 300 tokens, warm cache, A B B A against the route off) decode is
+**126.7 tok/s on code** (124.6 before), 81.9 story (81.2), 80.4 Chinese (79.5), 72.8 French (72.2) and
+103.4 thinking (100.9); French and thinking vary between runs by more than the change. Without the
+graft and presence penalty: 121.7 code (119.7), 86.4 story (85.6), 83.7 Chinese (83.0). The RTX 3090
+does not compile the route. Details: [tesla-v100.md](tesla-v100.md#qwen38-flash-next).
+
+## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next hyper-connection collapse (2026-11-24, superseded above)
 
 The hyper-connection mixer's up-collapse kernel is cheaper on the V100 (`sm_70` only, the same output
 bit for bit): each MTP round is about 0.3 ms shorter. With the router's flags (200 W, greedy, 300 tokens,

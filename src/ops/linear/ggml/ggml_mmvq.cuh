@@ -52,10 +52,21 @@ constexpr std::size_t mmvq_shared_bytes() {
 // The body runs as CTA `cta` of `ctas` persistent CTAs over one matrix: ggml_mmvq_kernel gives it
 // the whole grid, ggml_mmvq_pair_kernel splits the grid between two matrices of one input. A row's
 // arithmetic does not depend on the CTA that computes it.
-template <QType F, int K, int T, bool Residual, class Out = __nv_bfloat16>
+//
+// Direct (the staged route, sm_70): ggml_q81_stage_kernel has already cast x once into global memory
+// in the shared-memory layout above (`staged`: the codes, then the scales), so the body skips the
+// cast and reads the codes and scales from there (they stay in L1) instead of from shared memory.
+// Every CTA of the plain route casts all of x itself: 240 CTAs repeating T * K casts was about half
+// of the kernel's growth with T. The cast and every row's arithmetic are the plain route's, so the
+// bits are too. Affine formats (Q4_K, Q5_K) also need the group sums, which the stage does not keep.
+template <QType F, int K, int T, bool Residual, class Out = __nv_bfloat16, int Threads = kMmvqThreads,
+          bool Direct = false>
 __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ x,
-                                          Out* __restrict__ out, int n, int cta, int ctas, unsigned char* smem) {
+                                          Out* __restrict__ out, int n, int cta, int ctas, unsigned char* smem,
+                                          const unsigned char* __restrict__ staged = nullptr) {
     static_assert(std::is_same_v<Out, __nv_bfloat16> || (std::is_same_v<Out, float> && !Residual));
+    static_assert(!(Direct && kAffine<F>), "the staged route keeps no group sums");
+    constexpr int kWarps      = Threads / 32;
     using Fmt                 = Format<F>;
     constexpr int kSubs       = K / kSubValues;
     constexpr int kLanes      = mmvq_lanes_per_row(kSubs);
@@ -66,15 +77,18 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
 
     auto* xq_s   = reinterpret_cast<std::int8_t*>(smem);
     auto* xd_s   = reinterpret_cast<float*>(smem + static_cast<std::size_t>(T) * K);
-    auto* grid_s = reinterpret_cast<std::uint32_t*>(smem + static_cast<std::size_t>(T) * K +
-                                                    static_cast<std::size_t>(T) * kSubs * 4);
+    auto* grid_s = reinterpret_cast<std::uint32_t*>(
+        Direct ? smem : smem + static_cast<std::size_t>(T) * K + static_cast<std::size_t>(T) * kSubs * 4);
+    // Where the compute loop reads the cast x: the CTA's shared copy, or the staged one.
+    const std::int8_t* xq_r = Direct ? reinterpret_cast<const std::int8_t*>(staged) : xq_s;
+    const float* xd_r       = Direct ? reinterpret_cast<const float*>(staged + static_cast<std::size_t>(T) * K) : xd_s;
 
     const int lane     = static_cast<int>(threadIdx.x) & 31;
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
     const int sub_lane = lane % kLanes;
     const int groups   = n / kRowsWarp;
-    const int stride   = ctas * kMmvqWarps;
-    int rg             = cta * kMmvqWarps + warp;
+    const int stride   = ctas * kWarps;
+    int rg             = cta * kWarps + warp;
 
     Tables tables;
     load_tables<F>(tables, grid_s);
@@ -95,12 +109,12 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
 #pragma unroll
             for (int i = 0; i < kSubsLane; ++i) Fmt::decode(wrow, sub_lane + kLanes * i, tables, sb[i]);
         }
-        if (first) {
+        if (first && !Direct) {
             // The Q8_1 cast: four lanes per 32-value group (eight values each), eight groups per
             // warp. The loop is warp-uniform because the cast's shuffles need every lane.
             constexpr int kCastLanes = 4;
             const int part           = lane % kCastLanes;
-            for (int base = warp * (32 / kCastLanes); base < T * kSubs; base += kMmvqThreads / kCastLanes) {
+            for (int base = warp * (32 / kCastLanes); base < T * kSubs; base += Threads / kCastLanes) {
                 const int g     = base + lane / kCastLanes;
                 const bool real = g < T * kSubs;
                 const int t     = real ? g / kSubs : 0;
@@ -139,7 +153,7 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
                 }
             }
             __syncthreads();
-        } else {
+        } else if (!first) {
             // The previous group: reduce and store while this pass's loads are in flight.
 #pragma unroll
             for (int offset = kLanes / 2; offset > 0; offset >>= 1) {
@@ -169,9 +183,9 @@ __device__ __forceinline__ void mmvq_body(const std::uint8_t* __restrict__ w, co
             const int s = sub_lane + kLanes * i;
 #pragma unroll
             for (int t = 0; t < T; ++t) {
-                const int4 a   = *reinterpret_cast<const int4*>(xq_s + t * K + 16 * s);
-                const int4 b   = *reinterpret_cast<const int4*>(xq_s + t * K + K / 2 + 16 * s);
-                const float xd = xd_s[t * kSubs + s];
+                const int4 a   = *reinterpret_cast<const int4*>(xq_r + t * K + 16 * s);
+                const int4 b   = *reinterpret_cast<const int4*>(xq_r + t * K + K / 2 + 16 * s);
+                const float xd = xd_r[t * kSubs + s];
                 int lo         = __dp4a(sb[i].v[0], a.x, 0);
                 lo             = __dp4a(sb[i].v[1], a.y, lo);
                 lo             = __dp4a(sb[i].v[2], a.z, lo);
@@ -318,6 +332,107 @@ void launch_mmvq_k(const std::uint8_t* w, const __nv_bfloat16* x, Out* out, int 
     default: break;
     }
     throw std::invalid_argument("ggml mmvq: T must be in [1, 8]");
+}
+
+// The staged route (sm_70, 2 <= T <= 8; mmvq_body's Direct): one small kernel casts x once into
+// `staged` (ggml_mmvq_staged_bytes), then the GEMV reads it. K >= 4096 (the 2560 x 6144 output
+// projections) runs 512 threads in one CTA per SM, which leaves each warp two rows; smaller K keeps
+// the plain route's 256 x 3. On the V100 (200 W, L2-cold weights, chained calls), IQ4_XS 2560 x 6144
+// at T = 2 / 4 / 8: 24.8 / 36.7 / 51.9 us plain, 20.4 / 24.0 / 30.7 staged (both kernels together).
+template <int K, int T>
+constexpr std::size_t mmvq_staged_bytes() {
+    return static_cast<std::size_t>(T) * K + static_cast<std::size_t>(T) * (K / 32) * 4;
+}
+
+inline constexpr int kMmvqStageThreads = 256;
+
+// The plain route's cast, one 32-value group per four lanes, into the shared-memory layout.
+template <int K, int T>
+__global__ void __launch_bounds__(kMmvqStageThreads)
+    ggml_q81_stage_kernel(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ staged) {
+    constexpr int kSubs      = K / kSubValues;
+    constexpr int kCastLanes = 4;
+    auto* xq                 = reinterpret_cast<std::int8_t*>(staged);
+    auto* xd                 = reinterpret_cast<float*>(staged + static_cast<std::size_t>(T) * K);
+    const int lane           = static_cast<int>(threadIdx.x) & 31;
+    const int part           = lane % kCastLanes;
+    const int g              = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kCastLanes;
+    const bool real          = g < T * kSubs;
+    const int t              = real ? g / kSubs : 0;
+    const int gi             = real ? g - t * kSubs : 0;
+    float value[32 / kCastLanes];
+    const uint4 raw = real ? *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * K + kSubValues * gi +
+                                                             8 * part)
+                           : make_uint4(0, 0, 0, 0);
+    const std::uint32_t bits[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        value[2 * i]     = __uint_as_float(bits[i] << 16);
+        value[2 * i + 1] = __uint_as_float(bits[i] & 0xFFFF0000U);
+    }
+    int words[8 / kCastLanes];
+    const float d = quantize_q8_1_part<kCastLanes>(value, words);
+    if (real) {
+        *reinterpret_cast<int2*>(xq + t * K + (part < 2 ? 0 : K / 2) + 16 * gi + 8 * (part & 1)) =
+            make_int2(words[0], words[1]);
+        if (part == 0) { xd[g] = d; }
+    }
+}
+
+template <int K>
+inline constexpr int kMmvqStagedThreads = K >= 4096 ? 512 : kMmvqThreads;
+template <int K>
+inline constexpr int kMmvqStagedMinBlocks = K >= 4096 ? 1 : kMmvqMinBlocks;
+
+template <QType F, int K, int T, bool Residual>
+__global__ void __launch_bounds__(kMmvqStagedThreads<K>, kMmvqStagedMinBlocks<K>)
+    ggml_mmvq_staged_kernel(const std::uint8_t* __restrict__ w, const unsigned char* __restrict__ staged,
+                            __nv_bfloat16* __restrict__ out, int n) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    mmvq_body<F, K, T, Residual, __nv_bfloat16, kMmvqStagedThreads<K>, true>(
+        w, nullptr, out, n, static_cast<int>(blockIdx.x), static_cast<int>(gridDim.x), smem, staged);
+}
+
+template <QType F, int K, int T, bool Residual>
+void launch_mmvq_staged_instance(const std::uint8_t* w, const __nv_bfloat16* x, unsigned char* staged,
+                                 __nv_bfloat16* out, int n, cudaStream_t stream) {
+    constexpr int kThreads        = kMmvqStagedThreads<K>;
+    constexpr std::size_t kShared = kNeedsIq3sGrid<F> ? 512 * 4 : 0;
+    constexpr int kRowsCta        = kThreads / 32 * (32 / mmvq_lanes_per_row(K / kSubValues));
+    static const int resident = [] {
+        int device = 0;
+        int sms    = 0;
+        int per_sm = 0;
+        mmvq_check(cudaGetDevice(&device), "device");
+        mmvq_check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device), "SMs");
+        mmvq_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, ggml_mmvq_staged_kernel<F, K, T, Residual>,
+                                                                 kThreads, kShared),
+                   "occupancy");
+        return sms * (per_sm > 0 ? per_sm : 1);
+    }();
+    constexpr int kStageCtas = (T * (K / kSubValues) * 4 + kMmvqStageThreads - 1) / kMmvqStageThreads;
+    ggml_q81_stage_kernel<K, T><<<kStageCtas, kMmvqStageThreads, 0, stream>>>(x, staged);
+    mmvq_check(cudaGetLastError(), "stage launch");
+    const int ctas_needed = (n + kRowsCta - 1) / kRowsCta;
+    const int grid        = ctas_needed < resident ? ctas_needed : resident;
+    ggml_mmvq_staged_kernel<F, K, T, Residual><<<grid, kThreads, kShared, stream>>>(w, staged, out, n);
+    mmvq_check(cudaGetLastError(), "staged launch");
+}
+
+template <QType F, int K, bool Residual>
+void launch_mmvq_staged_k(const std::uint8_t* w, const __nv_bfloat16* x, unsigned char* staged,
+                          __nv_bfloat16* out, int n, int t, cudaStream_t stream) {
+    switch (t) {
+    case 2: return launch_mmvq_staged_instance<F, K, 2, Residual>(w, x, staged, out, n, stream);
+    case 3: return launch_mmvq_staged_instance<F, K, 3, Residual>(w, x, staged, out, n, stream);
+    case 4: return launch_mmvq_staged_instance<F, K, 4, Residual>(w, x, staged, out, n, stream);
+    case 5: return launch_mmvq_staged_instance<F, K, 5, Residual>(w, x, staged, out, n, stream);
+    case 6: return launch_mmvq_staged_instance<F, K, 6, Residual>(w, x, staged, out, n, stream);
+    case 7: return launch_mmvq_staged_instance<F, K, 7, Residual>(w, x, staged, out, n, stream);
+    case 8: return launch_mmvq_staged_instance<F, K, 8, Residual>(w, x, staged, out, n, stream);
+    default: break;
+    }
+    throw std::invalid_argument("ggml mmvq staged: T must be in [2, 8]");
 }
 
 } // namespace ninfer::ops::ggml

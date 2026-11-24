@@ -22,7 +22,7 @@ Decode is greedy with MTP speculation, as `run-v100.sh` serves it (three drafts;
 | | Qwen3.8-27B | Qwen3.8-Flash-Next |
 |---|---:|---:|
 | **Context** | 262,144 tokens | **262,144 tokens** (`run-v100.sh` default) |
-| **Decode**, one stream, MTP | **110 tok/s** on code, 104 thinking, 77-81 story, Chinese and French (MTP3, 2026-11-24, 200 W) | **124.7 tok/s** on code, 101 thinking, 80-81 story and Chinese, 72 French (MTP7 + draft vocabulary, warm cache, 2026-11-24, 200 W) |
+| **Decode**, one stream, MTP | **110 tok/s** on code, 104 thinking, 77-81 story, Chinese and French (MTP3, 2026-11-24, 200 W) | **126.7 tok/s** on code, 102-105 thinking, 80-82 story and Chinese, 73 French (MTP7 + draft vocabulary, warm cache, 2026-11-24, 200 W) |
 | **Decode**, plain | 45 tok/s (200 W) | 53 tok/s (250 W) |
 | **Prefill**, ~4K-token prompt | **~1,020 tok/s** | **~990 tok/s** (3,798 tokens in 3.8 s) |
 | **Prefill**, long prompts | | 38K tokens in 38.4 s (~1,000 tok/s) |
@@ -102,6 +102,7 @@ These are the model defaults it sets:
 | `NINFER_PARTIAL_RAM_RESIDENCY=on` | Flash-Next UD-IQ3_XXS | Pins only the experts the VRAM cache does not hold (`--partial-ram-residency`), so the 42 GiB bank fits; no images, context 32,768. `off` pins every expert (about 50 GiB) and restores images and the 262,144-token context |
 | `NINFER_HOT_EMBEDDING_ROWS=8192` | Flash-Next | Only the common embedding rows stay in VRAM, freeing room for 216 more cached experts |
 | `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV: on this card it beats DFlash2 (`--draft-tokens 7`) on story, Chinese, French and sampled prose (77-81 tok/s); DFlash2 wins on code (136 against 110 tok/s), thinking (125 against 104) and long structured output (177 against 123) |
+| `NINFER_GGML_STAGED=0` | Flash-Next | Returns the GGML dense linears' verify GEMVs (2-8 columns) to the kernel that casts the input in every CTA, instead of the default staged route that casts it once per call: the same output, about 2% slower decode on code |
 | `NINFER_DRAFT_A8=0` | 27B, DFlash2 | Runs the DFlash2 drafter's linears on its A16 kernels instead of the default int8-activation `dp4a` route: about 9 ms slower per K = 7 round, the same acceptance on most measured prompts |
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
@@ -289,6 +290,31 @@ prefills fastest); the mixes are for when KV bytes are short. See
 [the README](../README.md#per-layer-mixes---kv-dtype-rk4v4x12int8x4-opt-in).
 
 ### Qwen3.8-Flash-Next
+
+**2026-11-24: the dense verify GEMVs cast their input once (staged GGML route)**, with the same
+output bit for bit. Flash-Next's dense linears are GGML blocks (IQ4_XS, IQ3_S, Q6_K) on a `dp4a` GEMV
+over int8 activations, and every one of its 240 CTAs used to round all T columns of the input to int8
+itself. In a V100 build a small kernel now does that once per call and the GEMV reads the result; the
+2560 x 6144 output projections also run one 512-thread CTA per SM. An IQ4_XS output projection at
+4 / 8 columns takes 24.0 / 30.7 us instead of 36.7 / 51.9. Measured in A B B A order against
+`NINFER_GGML_STAGED=0` (master's kernels) on the same build (200 W, no thermal throttling, 300 tokens
+at temperature 0, warm second request; tok/s, means of the two runs; tokens per verify round =
+output tokens / (output tokens - accepted drafts)):
+
+| Flags | Build | Story | Code | Chinese | French | Thinking | Thinking, budget 150 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| The router's (graft, `--presence-penalty 1.0`) | before | 81.2 | 124.6 | 79.5 | 72.2 | 100.9 | 106.2 |
+| | **after** | **81.9** | **126.7** | **80.4** | 72.8 | 103.4 | 104.8 |
+| | tokens per round | 1.91 | 3.90 | 1.88 | 1.78 | 3.03 | 2.61 |
+| Without the graft and presence penalty (Lapilli's settings) | before | 85.6 | 119.7 | 83.0 | 75.0 | 110.9 | 115.8 |
+| | **after** | **86.4** | **121.7** | **83.7** | 77.9 | 112.6 | 118.4 |
+| | tokens per round | 2.00 | 3.49 | 1.95 | 1.89 | 3.41 | 2.91 |
+
+Every run produced master's text (md5 of each answer) and the same accepted drafts. Code is 1.6-1.7%
+faster in both configurations and story and Chinese about 1%; French and the thinking requests move
+by up to 4 tok/s between runs of the same binary, more than the change (the router's budget-150
+request read 104.8 in both "after" runs and 105.9-106.4 before). `NINFER_GGML_STAGED=0` turns the
+route off. Details: [volta-port.md](maintainer/volta-port.md#decode-qwen38-flash-next).
 
 **2026-11-24: the hyper-connection mixer's collapse kernel is cheaper on the V100**, with
 the same output bit for bit. It runs 110 times in each MTP round, so every round is about 0.3 ms
