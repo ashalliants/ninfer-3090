@@ -17,7 +17,17 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
-## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next MTP draft vocabulary (2026-11-23)
+## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next hyper-connection collapse (2026-11-24)
+
+The hyper-connection mixer's up-collapse kernel is cheaper on the V100 (`sm_70` only, the same output
+bit for bit): each MTP round is about 0.3 ms shorter. With the router's flags (200 W, greedy, 300 tokens,
+warm cache, A B B A against master) decode is **124.7 tok/s on code** (123.2 before), 81.3 story (80.7),
+79.6 Chinese (78.9), 72.1 French (71.7) and 101.0 thinking (100.0); French and thinking vary between
+runs by more than the change. Without the graft and presence penalty: 119.7 code (118.7), 85.8 story
+(84.8), 83.0 Chinese (82.4). The RTX 3090 keeps the previous kernel. Details:
+[tesla-v100.md](tesla-v100.md#qwen38-flash-next).
+
+## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next MTP draft vocabulary (2026-11-23, superseded above)
 
 On the V100 (200 W, x4 eGPU), `run-v100.sh` now serves Flash-Next with up to seven MTP drafts and a
 reduced draft head (`--mtp-draft-vocab`: jesdga's Basalt token list, downloaded at install, 106,056 of
