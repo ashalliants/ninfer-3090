@@ -254,7 +254,7 @@ public:
         std::ostringstream out;
         const char* names[] = {"Bind",   "Restore",     "Prefill", "Decode",  "PauseStart",
                                "PauseDone", "Finish",   "Abort",   "EnableLossy", "Scout",
-                               "ScoutEnd"};
+                               "ScoutEnd", "Reclaim"};
         for (const Event& event : events()) {
             out << "  " << names[static_cast<int>(event.kind)] << " lane=" << event.lane
                 << " req=" << event.request << " tokens=" << event.tokens << " cap=" << event.cap
@@ -697,6 +697,42 @@ void test_the_fit_answer_is_not_asked_without_the_flag() {
     require(finished(long_result) && finished(short_result), "a request did not finish\n" + rig.dump());
     require(rig.core().runtime_stats().admission_fit_deferrals == 0,
             "the fit check ran with the flag off");
+}
+
+// A full context cache holds a newcomer's admission for several reclaim steps (one demotion each,
+// through the cache's ordinary reclaim). Each step changes the cache and asks for another admission
+// check; the admission keeps its decision and returns, so the resident decodes a round between
+// steps instead of standing still until the newcomer is in. Back to back, steps that each took
+// seconds on a full Host tier held decode at 0 tok/s for minutes.
+void test_admission_reclaim_steps_let_a_resident_decode_between_them() {
+    constexpr std::size_t kSteps = 6;
+    Rig rig({.chunk = 256, .lanes = 2});
+    auto resident = rig.run(1, 100, 400);
+    require(rig.wait_for([&] { return !rig.events_of(1, Event::Kind::Decode).empty(); }),
+            "the resident did not start decoding\n" + rig.dump());
+    rig.program().set_admission_reclaim_steps(kSteps);
+    auto newcomer = rig.run(2, 100, 3);
+    require(finished(newcomer) && finished(resident), "a request did not finish\n" + rig.dump());
+    const auto events = rig.events();
+    std::vector<std::size_t> steps;
+    std::optional<std::size_t> bind;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind == Event::Kind::Reclaim) { steps.push_back(i); }
+        if (events[i].kind == Event::Kind::Bind && events[i].request == 2) { bind = i; }
+    }
+    require(steps.size() == kSteps,
+            "the newcomer's shortage did not take its reclaim steps\n" + rig.dump());
+    require(bind && *bind > steps.back(),
+            "the newcomer bound before its shortage was reclaimed\n" + rig.dump());
+    for (std::size_t k = 1; k < steps.size(); ++k) {
+        require(std::any_of(events.begin() + static_cast<std::ptrdiff_t>(steps[k - 1]),
+                            events.begin() + static_cast<std::ptrdiff_t>(steps[k]),
+                            [](const Event& event) {
+                                return event.kind == Event::Kind::Decode && event.request == 1;
+                            }),
+                "two reclaim steps ran back to back while a resident was ready to decode\n" +
+                    rig.dump());
+    }
 }
 
 // --admission-affinity on the real worker loop with nothing held on the device (the fake keeps no
@@ -2529,6 +2565,8 @@ int main() {
     run("a long newcomer does not displace a long prefill",
         test_a_long_newcomer_does_not_displace_a_long_prefill);
     run("a prefill with little left is not paused", test_a_prefill_with_little_left_is_not_paused);
+    run("admission reclaim steps let a resident decode between them",
+        test_admission_reclaim_steps_let_a_resident_decode_between_them);
     run("affinity without a held prefix keeps FIFO",
         test_affinity_without_a_held_prefix_keeps_fifo);
     run("backlog gauge tracks queued and resident prefill",

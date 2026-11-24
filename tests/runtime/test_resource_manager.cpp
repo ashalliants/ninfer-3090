@@ -2602,6 +2602,7 @@ ScaleOutcome run_scale(std::size_t residents, std::size_t demotable, bool memoiz
     constexpr std::size_t block = 16;
     Fixture f(residents * block + 8);
     f.cache.set_candidate_memo(memoize);
+    f.cache.set_reclaim_pricing_work_cap(UINT64_MAX / 8); // price every plan: this measures the memo
     std::uint32_t next_token = 1;
     for (std::size_t i = 0; i < residents; ++i) {
         const auto key = tokens(6 + static_cast<std::uint32_t>(i % 5), next_token);
@@ -2650,6 +2651,165 @@ void test_candidate_memo_cuts_victim_selection_work() {
                     "the memo no longer cuts recovery-loss queries by two fifths at 160 checkpoints");
         }
     }
+}
+
+// A saturated, fragmented Host tier at the size of the hosted workload: `residents` cached entries
+// each hold one small block, 100 bytes apart with a free hole between neighbours, and `demotable`
+// device checkpoints each need a destination run of 250 bytes. No single release frees such a run,
+// so the placement search keeps adding victims and the greedy loop runs for most of the entries.
+// This is the shape that pegged the Engine thread at one core with the GPU idle (a reclaim that
+// took seconds, repeated for every request): the work one reclaim does must stay linear-ish in the
+// number of entries, not grow with entries x plans x search rounds.
+struct SaturatedOutcome {
+    ninfer::runtime::ReclaimProgress progress;
+    std::uint64_t run_simulations;
+    std::uint64_t host_bytes_released_calls;
+    std::uint64_t recovery_loss_calls;
+    double seconds;
+};
+
+SaturatedOutcome run_saturated_fragmented(std::size_t residents, std::size_t demotable) {
+    Fixture f(residents * 100 + 100);
+    auto& program    = f.program;
+    program.run_unit = 250;
+    std::uint32_t next_token = 1;
+    for (std::size_t i = 0; i < residents; ++i) {
+        // Distinct keys of varied length so the entries rank differently from their position.
+        const auto key = tokens(6 + static_cast<std::uint32_t>((i * 7) % 11), next_token);
+        next_token += 40;
+        const auto handle = program.add(key, {program.host_block_at(100 * i + 25, 50)});
+        program.contents[handle.index].device_state = false;
+        program.contents[handle.index].main_pages   = 0;
+        f.publish(handle);
+    }
+    for (std::size_t j = 0; j < demotable; ++j) {
+        const auto key = tokens(6 + static_cast<std::uint32_t>(j % 5), next_token);
+        next_token += 40;
+        const auto handle = program.add(key);
+        program.contents[handle.index].demotion_bytes = 250;
+        f.publish(handle);
+    }
+    program.run_simulations             = 0;
+    program.host_bytes_released_calls   = 0;
+    program.recovery_loss_calls         = 0;
+    const auto begin    = std::chrono::steady_clock::now();
+    const auto progress = f.cache.reclaim(program, {.state_slots = 1});
+    const auto end      = std::chrono::steady_clock::now();
+    return {progress, program.run_simulations, program.host_bytes_released_calls,
+            program.recovery_loss_calls, std::chrono::duration<double>(end - begin).count()};
+}
+
+void test_saturated_host_reclaim_work_stays_bounded() {
+    SaturatedOutcome previous{};
+    for (const auto [residents, demotable] : {std::pair{65, 8}, std::pair{130, 16}, std::pair{260, 32}}) {
+        const auto out = run_saturated_fragmented(residents, demotable);
+        std::cout << "saturated reclaim " << residents << " entries / " << demotable
+                  << " plans: sims=" << out.run_simulations
+                  << " host_bytes_released=" << out.host_bytes_released_calls
+                  << " recovery_loss=" << out.recovery_loss_calls << " seconds=" << out.seconds
+                  << std::endl;
+        require(out.progress != ninfer::runtime::ReclaimProgress::Blocked,
+                "a saturated reclaim made no progress");
+        if (residents == 260) {
+            // Measured 18,701 and 23,761 before the pricing cap (kMaxReclaimPricingWork): one step
+            // then took seconds on the real engine and held every lane still.
+            require(out.host_bytes_released_calls <= 8000 && out.recovery_loss_calls <= 8000,
+                    "a saturated reclaim step priced more than its work cap allows");
+            // Doubling the cache must not double (let alone square) the work of one step.
+            require(out.host_bytes_released_calls <= 2 * previous.host_bytes_released_calls &&
+                        out.recovery_loss_calls <= 2 * previous.recovery_loss_calls,
+                    "a reclaim step's work grows with the cache instead of staying capped");
+        }
+        previous = out;
+    }
+}
+
+// A Host tier full of `residents` tiny, nearly worthless entries (one or two tokens of history
+// each, ten bytes) and `demotable` long device checkpoints (about 2,000 tokens) that need `bytes`
+// of Host each: preserving one is worth evicting bytes / 10 of the tiny entries. The greedy victim
+// search adds one victim per round and every round prices each remaining entry; at 260 entries
+// and 1,500 bytes a single demotion's search prices about 28,000 unions on its own, before any
+// other plan is looked at. `cheap_first` makes the first plan priced a long checkpoint that needs
+// only one entry's worth of Host bytes.
+struct DeepSearchOutcome {
+    ninfer::runtime::ReclaimProgress progress;
+    std::uint64_t host_bytes_released_calls;
+    std::vector<Handle> demoted;
+    std::vector<Handle> released;
+    std::optional<Handle> cheap;
+};
+
+DeepSearchOutcome run_deep_host_search(std::size_t residents, std::size_t demotable,
+                                       std::size_t bytes, bool cheap_first,
+                                       bool releases_blocked) {
+    Fixture f(residents * 10);
+    auto& program            = f.program;
+    std::uint32_t next_token = 1;
+    for (std::size_t i = 0; i < residents; ++i) {
+        const auto key = tokens(1 + static_cast<std::uint32_t>(i % 2), next_token);
+        next_token += 40;
+        const auto handle = program.add(key, {program.host_block(10)});
+        program.contents[handle.index].device_state = false;
+        program.contents[handle.index].main_pages   = 0;
+        f.publish(handle);
+    }
+    std::optional<Handle> cheap;
+    for (std::size_t j = 0; j < demotable; ++j) {
+        const auto key = tokens(2000 + static_cast<std::uint32_t>(j), next_token);
+        next_token += 4000;
+        const auto handle = program.add(key);
+        const bool is_cheap = cheap_first && j == 0; // plans are priced in publication order
+        program.contents[handle.index].demotion_bytes  = is_cheap ? 10 : bytes;
+        program.contents[handle.index].release_blocked = releases_blocked;
+        if (is_cheap) { cheap = handle; }
+        f.publish(handle);
+    }
+    program.host_bytes_released_calls = 0;
+    const auto progress = f.cache.reclaim(program, {.state_slots = 1});
+    return {progress, program.host_bytes_released_calls, program.demoted, program.released, cheap};
+}
+
+// The pricing cap holds inside one Host victim search, not only between plans: once a step has an
+// action, a plan whose search would run long is left for the next step part way through.
+void test_reclaim_pricing_cap_stops_a_long_search_once_an_action_is_found() {
+    const auto out = run_deep_host_search(260, 8, 1500, true, false);
+    std::cout << "deep search after an action: host_bytes_released="
+              << out.host_bytes_released_calls << std::endl;
+    require(out.progress != ninfer::runtime::ReclaimProgress::Blocked,
+            "a reclaim with a cheap demotion in hand made no progress");
+    require(out.demoted.size() == 1 && out.demoted.front() == *out.cheap,
+            "the cheap demotion found before the cap was not the one taken");
+    // Measured 2,613. The cap checked only between plans let the next plan's search run to its end
+    // (about 28,000 unions, 193,642 calls with every plan priced).
+    require(out.host_bytes_released_calls <= 4000,
+            "a Host victim search ran past the pricing cap with an action already in hand");
+}
+
+// With no action yet a search runs to four times the cap and then stops; the step falls back on
+// releasing a checkpoint rather than holding the Engine thread for the whole search.
+void test_reclaim_pricing_cap_bounds_the_first_search() {
+    const auto out = run_deep_host_search(260, 8, 1500, false, false);
+    std::cout << "deep first search: host_bytes_released=" << out.host_bytes_released_calls
+              << std::endl;
+    require(out.progress == ninfer::runtime::ReclaimProgress::Changed,
+            "a capped reclaim with releases available made no progress");
+    require(out.demoted.empty() && out.released.size() == 1,
+            "a reclaim whose demotion searches ran past the cap did not fall back on a release");
+    // Measured 4,891; 55,948 when the first plan's search (and its revalidation) ran to its end.
+    require(out.host_bytes_released_calls <= 6500,
+            "the first Host victim search of a reclaim step ran past four times the pricing cap");
+}
+
+// The cap never turns progress into Blocked: when the bounded pricing finds nothing to do (here no
+// checkpoint may be released, and the only demotion's search, about 5,000 unions, is cut at four
+// times the cap), the step prices again in full and takes the demotion the uncapped search finds.
+void test_reclaim_pricing_cap_never_costs_progress() {
+    const auto out = run_deep_host_search(100, 1, 900, false, true);
+    require(out.progress != ninfer::runtime::ReclaimProgress::Blocked,
+            "the pricing cap reported Blocked although a full search finds a demotion");
+    require(out.demoted.size() == 1, "the full pricing pass did not take the demotion it found");
+    require(out.released.size() == 90,
+            "the full pricing pass did not evict the victims its demotion needs");
 }
 
 // What a randomized scenario decided: every reclaim's outcome and the Host victims it would pick.
@@ -2927,6 +3087,10 @@ int main() {
         test_progress_anchor_retirement_keeps_whatever_was_used();
         test_held_progress_anchor_is_retired_when_the_hold_ends();
         test_candidate_memo_cuts_victim_selection_work();
+        test_saturated_host_reclaim_work_stays_bounded();
+        test_reclaim_pricing_cap_stops_a_long_search_once_an_action_is_found();
+        test_reclaim_pricing_cap_bounds_the_first_search();
+        test_reclaim_pricing_cap_never_costs_progress();
         test_candidate_memo_changes_no_decision();
         test_pinned_shared_prefix_survives_reclaim_and_cache_clear();
         test_demotion_competes_with_its_actual_host_recovery_loss();
