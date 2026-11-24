@@ -25,6 +25,11 @@
 // A format opts in with `kDp4a = true`, `kDp4aBias` (the code bias: value = code - bias) and
 // `dp4a_word<W>(slice, even, odd)`: the biased codes of k offsets 8W + 0, 2, 4, 6 in the bytes of
 // `even` and of 8W + 1, 3, 5, 7 in those of `odd`.
+//
+// The same kernel serves a speculative drafter's Q8 and Q4 linears (stream_draft_dp4a.cuh, through
+// launch_stream_dp4a_rows, inside a ScopedDraftA8 only). A format whose form is for the drafter
+// alone sets `kDp4aDrafterOnly` (Q8): the verify route above never takes it, so the target's Q8
+// linears keep their A16 kernels whatever --verify-a8 says.
 
 #include "core/device.h"
 #include "ops/common/math.h"
@@ -55,6 +60,13 @@ inline bool stream_dp4a_enabled(cudaStream_t stream) {
 
 template <class Format>
 concept StreamDp4aFormat = requires { requires Format::kDp4a; };
+
+// A format whose dp4a form serves only drafters (`kDp4aDrafterOnly`, the Q8 drafter weights:
+// stream_draft_dp4a.cuh) never takes the verify route, which would otherwise also move the Q8
+// linears of whatever else shares a registered stream.
+template <class Format>
+concept StreamDp4aVerifyFormat =
+    StreamDp4aFormat<Format> && !requires { requires Format::kDp4aDrafterOnly; };
 
 inline constexpr int kStreamDp4aMaxCols = 8;
 
@@ -307,17 +319,17 @@ void stream_dp4a_kernel(const __nv_bfloat16* __restrict__ x, std::int64_t x_stri
     }
 }
 
-// Launches the dp4a streaming GEMV if it is enabled, the format has the form and the shape fits;
-// returns false otherwise (the caller falls back to the other streaming GEMVs).
+// Launches the dp4a streaming GEMV if the format has the form and the shape fits, whatever the
+// stream's setting; returns false otherwise. The verify route (try_launch_stream_dp4a_rows) and
+// the drafter route (stream_draft_dp4a.cuh) each decide whether a call takes it.
 template <class Format, int Rows, int Cols, class Sink>
-bool try_launch_stream_dp4a_rows(const __nv_bfloat16* x, std::int64_t x_stride,
-                                 const typename Format::Planes& planes, Sink sink,
-                                 std::int32_t items, std::int32_t row_offset, std::int32_t k,
-                                 std::int32_t padded_k, cudaStream_t stream) {
+bool launch_stream_dp4a_rows(const __nv_bfloat16* x, std::int64_t x_stride,
+                             const typename Format::Planes& planes, Sink sink, std::int32_t items,
+                             std::int32_t row_offset, std::int32_t k, std::int32_t padded_k,
+                             cudaStream_t stream) {
     if constexpr (!kStreamDp4aCompiled || !StreamDp4aFormat<Format> || Cols > kStreamDp4aMaxCols) {
         return false;
     } else {
-        if (!stream_dp4a_enabled(stream)) return false;
         if (k % 256 != 0 || x_stride % 8 != 0) return false;
 
         const std::int32_t chunk_k = stream_dp4a_chunk_k(k);
@@ -372,6 +384,23 @@ bool try_launch_stream_dp4a_rows(const __nv_bfloat16* x, std::int64_t x_stride,
         } else {
             return launch.template operator()<16, 1>();
         }
+    }
+}
+
+// Launches the dp4a streaming GEMV if the stream takes the verify route (stream_a8.h), the format
+// serves it and the shape fits; returns false otherwise (the caller falls back to the other
+// streaming GEMVs).
+template <class Format, int Rows, int Cols, class Sink>
+bool try_launch_stream_dp4a_rows(const __nv_bfloat16* x, std::int64_t x_stride,
+                                 const typename Format::Planes& planes, Sink sink,
+                                 std::int32_t items, std::int32_t row_offset, std::int32_t k,
+                                 std::int32_t padded_k, cudaStream_t stream) {
+    if constexpr (!kStreamDp4aCompiled || !StreamDp4aVerifyFormat<Format>) {
+        return false;
+    } else {
+        if (!stream_dp4a_enabled(stream)) return false;
+        return launch_stream_dp4a_rows<Format, Rows, Cols>(x, x_stride, planes, sink, items,
+                                                           row_offset, k, padded_k, stream);
     }
 }
 

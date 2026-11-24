@@ -307,6 +307,22 @@ target state and continuation metadata. Their coverage must agree. These rules a
 [context scheduling](resource-scheduling-and-context-cache.md) and
 [ReplaySSM](replayssm-gdn.md).
 
+## Drafter arithmetic on sm_70
+
+The drafter's numbers decide only which tokens the target is asked to verify, so they may trade
+exactness for speed where the target's may not. (Greedy text can still change at a near-tie when the
+accept pattern changes, because the target's verify arithmetic depends on the round's width; see
+[volta-port.md](volta-port.md#decode).) `propose_dflash2_batch` holds an
+`ops::ScopedDraftA8` ([`draft_a8.h`](../../src/ops/linear/common/draft_a8.h)) around the DFlash2
+forward. Inside it, on an `sm_70` build, the Q8 attention input, SwiGLU and conv-add projections and
+the Q4 proposal head's top-k round their activations to int8 per 32 values and run the `dp4a`
+streaming GEMV ([`stream_draft_dp4a.cuh`](../../src/ops/linear/common/stream_draft_dp4a.cuh)) instead
+of `mma.sync` kernels that Volta emulates. That makes a K = 7 round about 9 ms shorter on the 27B with
+unchanged acceptance on the measured prompts. `NINFER_DRAFT_A8=0` keeps the A16 kernels. The scope is
+a host thread-local read at launch time, so graphs captured inside it keep the choice, and no target
+or MTP linear sees it. Measurements are in
+[volta-port.md](volta-port.md#decode).
+
 ## Execution flow
 
 ```mermaid

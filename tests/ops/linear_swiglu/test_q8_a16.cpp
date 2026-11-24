@@ -1,5 +1,7 @@
+#include "ops/linear/common/draft_a8.h"
 #include "core/weight.h"
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
+#include "ops/op_tester.h"
 
 #include <array>
 #include <exception>
@@ -24,6 +26,7 @@ int main() {
     using namespace ninfer;
     using namespace ninfer::test::linear_swiglu;
 
+    const ninfer::ops::ScopedDraftA8 draft_a8(ninfer::test::draft_a8_forced());
     try {
         // One public numerical case begins each materially distinct Q8 implementation interval;
         // selected endpoints exercise exact-T and predicated tails without inspecting selectors.

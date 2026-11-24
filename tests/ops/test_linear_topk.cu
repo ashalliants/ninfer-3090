@@ -1,3 +1,4 @@
+#include "ops/linear/common/draft_a8.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 
@@ -274,7 +275,8 @@ int verify_invocation(const char* profile, std::int32_t columns, const Tensor& i
         }
     }
     failures += verify_reduction(std::string(profile) + " U=" + std::to_string(columns) + " scores",
-                                 actual_scores, reference_scores, kA16ScoreCriterion);
+                                 actual_scores, reference_scores,
+                                 with_stream_a8_allowance(kA16ScoreCriterion));
     return failures;
 }
 
@@ -504,6 +506,7 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    const ninfer::ops::ScopedDraftA8 draft_a8(ninfer::test::draft_a8_forced());
     try {
         const std::vector<std::uint16_t> host_hidden = make_hidden();
         DeviceBuffer hidden(host_hidden.size() * sizeof(std::uint16_t));

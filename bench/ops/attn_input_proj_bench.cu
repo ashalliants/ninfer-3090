@@ -1,6 +1,7 @@
 // Public-Op benchmark for every registered Attention input-projection contract.
 // Production dispatch is owned exclusively by attn_input_proj().
 
+#include "ops/linear/common/draft_a8.h"
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 
@@ -470,6 +471,9 @@ bool selected(Format configured, Format candidate) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // As the DFlash2 drafter calls these Ops: inside a ScopedDraftA8, so sm_70 builds measure the
+    // int8 route and NINFER_DRAFT_A8=0 the A16 one (ops/linear/common/draft_a8.h).
+    const ninfer::ops::ScopedDraftA8 draft_a8;
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {

@@ -1,3 +1,4 @@
+#include "ops/linear/common/draft_a8.h"
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/weight_input.h"
@@ -47,7 +48,7 @@ int verify_output(std::string_view label, const GuardedBf16Tensor& output,
         gather_rows(output.values(), output_rows, 0, output_rows, tokens, sample_count);
     const std::vector<double> expected = projection_oracle(
         weight, weight_row_offset, output_rows, activation, hidden, tokens, sample_count);
-    failures += compare(label, actual, expected, criterion);
+    failures += compare(label, actual, expected, with_stream_a8_allowance(criterion));
     return failures;
 }
 
@@ -714,6 +715,7 @@ int main(int argc, char** argv) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    const ninfer::ops::ScopedDraftA8 draft_a8(ninfer::test::draft_a8_forced());
 
     int failures = 0;
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }

@@ -1,3 +1,4 @@
+#include "ops/linear/common/draft_a8.h"
 #include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "core/decode_graph.h"
@@ -263,7 +264,7 @@ int run_profile(std::int32_t input_rows, QType qtype) {
                     " graph=" + std::to_string(replay);
                 failures += verify_reduction(
                     label, gather_actual(residual_device.data(), width, batch_size), expected,
-                    kCriterion);
+                    with_stream_a8_allowance(kCriterion));
                 failures += residual_device.verify_guards(label);
                 failures += scratch.verify_guards(label + " workspace");
                 if (workspace.used() != 0 || workspace.peak_used() != exact) {
@@ -290,6 +291,7 @@ int main() {
             std::cout << "SKIP: no usable CUDA device\n";
             return 77;
         }
+        const ninfer::ops::ScopedDraftA8 draft_a8(ninfer::test::draft_a8_forced());
         const int failures =
             run_profile(4096, QType::Q8_G32_FP16) + run_profile(17408, QType::Q8_G32_FP16) +
             run_profile(4096, QType::Q4_G64_FP16) + run_profile(17408, QType::Q4_G64_FP16) +

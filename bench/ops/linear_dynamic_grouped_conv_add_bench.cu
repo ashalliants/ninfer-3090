@@ -1,3 +1,4 @@
+#include "ops/linear/common/draft_a8.h"
 #include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
@@ -144,6 +145,9 @@ int main(int argc, char** argv) {
         std::printf("SKIP: no usable CUDA device\n");
         return 0;
     }
+    // As the DFlash2 drafter calls these Ops: inside a ScopedDraftA8, so sm_70 builds measure the
+    // int8 route and NINFER_DRAFT_A8=0 the A16 one (ops/linear/common/draft_a8.h).
+    const ninfer::ops::ScopedDraftA8 draft_a8;
     try {
         const Options options = parse_args(argc, argv);
         bench::L2FlushBuffer flush(options.flush_bytes);

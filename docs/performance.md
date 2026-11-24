@@ -17,6 +17,21 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Qwen3.8-27B DFlash2 drafter on int8 activations (2026-11-24)
+
+In a V100 build the DFlash2 block drafter's own linears (the Q8 attention input, SwiGLU, output and
+down projections at eight columns, and the Q4 proposal head's top-k) run on int8 activations with
+`dp4a` instead of `mma.sync` kernels emulated on Volta: about 9 ms less per K = 7 round. With the
+router's flags, `--draft-tokens 7 --ngram-draft-tokens 15` (200 W, greedy, ABBA against
+`NINFER_DRAFT_A8=0`): **135.5-135.7 tok/s on code** (110.5-111.3 before), 125.0-125.2 thinking
+(102.3-103.0), 176.9-177.0 structured JSON (146.3-146.6), 60.6-60.7 story (52.5-52.8), 68.3 French
+(55.6-56.0); with `--adaptive-draft-tokens 3` 51.2 Chinese (39.7) and 72.9-73.0 French (56.4). The
+target still verifies every draft; acceptance is unchanged on those prompts and greedy text identical
+on code, thinking, Chinese, French and structured output at K = 7 (story and one long reply part at a
+near-tie, as switching DFlash2's window policy on master does).
+MTP3 does not use it and is unchanged. The RTX 3090 does not build the kernel. Details:
+[tesla-v100.md](tesla-v100.md#qwen38-27b).
+
 ## Tesla V100 (`sm_70`): Qwen3.8-27B verify on int8 activations (2026-11-24)
 
 `--verify-a8`, the default in a V100 build, runs the 27B's Q4/Q5/Q6 linears at 1-8 tokens on int8
