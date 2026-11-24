@@ -383,6 +383,20 @@ void invalid_directories() {
     bad([](Json& root) { root["components"]["text"]["resources"]["tokenizer.json"] = "q5"; });
     rejects([] { (void)parse_json("{\"a\":{\"x\":1,\"x\":2}}", "duplicate"); },
             "duplicate JSON key accepted");
+    rejects([] { (void)parse_json("{\"x\":1,\"x\":2}", "duplicate"); },
+            "top-level duplicate JSON key accepted");
+    rejects([] { (void)parse_json("{\"a\":[{\"x\":1},{\"y\":1,\"y\":2}]}", "duplicate"); },
+            "duplicate JSON key inside an array accepted");
+    rejects([] { (void)parse_json("{\"a\":1", "truncated"); }, "truncated JSON accepted");
+    {
+        // The same key in sibling or nested objects is not a duplicate, and the SAX handler must
+        // build exactly the tree Json::parse does, for every value type.
+        const std::string text =
+            R"({"a":{"x":1},"b":{"x":[1,-2,3.5,"s",true,null,{"x":{}},[]]},"c":18446744073709551615})";
+        if (parse_json(text, "same") != Json::parse(text)) {
+            throw std::runtime_error("parse_json built a different tree than Json::parse");
+        }
+    }
     fixture.write();
     {
         std::fstream file(fixture.entry, std::ios::binary | std::ios::in | std::ios::out);
