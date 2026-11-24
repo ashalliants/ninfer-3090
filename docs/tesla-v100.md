@@ -101,7 +101,8 @@ These are the model defaults it sets:
 | `NINFER_CPU_VERIFY_MISSES=on` | Flash-Next | During decode, experts that miss the cache are computed on CPU threads beside the GPU. A cold cache decodes at 68-80 instead of 48-63 tok/s |
 | `NINFER_PARTIAL_RAM_RESIDENCY=on` | Flash-Next UD-IQ3_XXS | Pins only the experts the VRAM cache does not hold (`--partial-ram-residency`), so the 42 GiB bank fits; no images, context 32,768. `off` pins every expert (about 50 GiB) and restores images and the 262,144-token context |
 | `NINFER_HOT_EMBEDDING_ROWS=8192` | Flash-Next | Only the common embedding rows stay in VRAM, freeing room for 216 more cached experts |
-| `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV: on this card it ties DFlash2 (`--draft-tokens 7`) on code (110 tok/s) and beats it on prose, Chinese, French and thinking; DFlash2 wins on long structured output (146 against 123 tok/s) |
+| `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV: on this card it beats DFlash2 (`--draft-tokens 7`) on story, Chinese, French and sampled prose (77-81 tok/s); DFlash2 wins on code (136 against 110 tok/s), thinking (125 against 104) and long structured output (177 against 123) |
+| `NINFER_DRAFT_A8=0` | 27B, DFlash2 | Runs the DFlash2 drafter's linears on its A16 kernels instead of the default int8-activation `dp4a` route: about 9 ms slower per K = 7 round, the same acceptance on most measured prompts |
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
 on, so the 27B's wide prefill GEMMs run on the tensor cores through cuBLAS instead of emulated integer
@@ -200,37 +201,51 @@ NINFER_DEFAULT_THINKING_BUDGET=2048 scripts/run-v100.sh qwen38-27b
 
 Decode, one stream, through `ninfer-serve` with the router's flags (`--gdn-state-fp16
 --prefill-cublas`, INT8 KV, vision overlay), greedy unless noted, 2026-11-24, **200 W** power limit,
-ABBA against master (`2a1bf0353`), no thermal throttling. The two repeats with `--verify-a8` agreed within
-0.1 tok/s (the adaptive DFlash2 legs aside, whose window choice varies), master's within 0.9:
+no thermal throttling. DFlash2 runs `--draft-tokens 7 --ngram-draft-tokens 15`, plus
+`--adaptive-draft-tokens 3` where marked. The current columns are ABBA against the same build with
+`NINFER_DRAFT_A8=0` (the drafter on master's kernels); repeats agreed within 0.2 tok/s:
 
-| Prompt | MTP3 | DFlash2 K7 | DFlash2 K7 adaptive | master MTP3 |
-|---|---:|---:|---:|---:|
-| code | **110.1** | **110.8** | 110.7-110.8 | 81.2-82.1 |
-| think | **104.1** | 102.5 | 102.3-102.5 | 77.2-77.9 |
-| story | **77.0** | 52.5 | 55.1-59.8 | 57.0-57.7 |
-| Chinese | **81.4** | 32.4 | 39.7 | 57.2-57.8 |
-| French | **80.7** | 55.8 | 56.4 | 57.2-57.6 |
-| conversation (T 0.6) | **91.5** | 75.2 | 73.7 | 65.9-66.1 |
-| structured JSON | 122.6 | **146.5** | 146.4 | 92.3-92.5 |
-| prose (T 0.6) | **80.5** | 56.6 | 58.2-59.3 | 58.0-58.1 |
-| conversation, greedy | **89.5** | 71.8 | 76.1-81.4 | 68.5-68.6 |
-| plain decode (no speculation) | 45.0 | | | 42.7-43.0 |
-| two requests at once (story + code, 256 tokens each), total | **122.0-122.8** | | | 74.0-74.2 |
+| Prompt | MTP3 | DFlash2 K7 | DFlash2 K7 adaptive | DFlash2 K7 before | MTP3 before `--verify-a8` |
+|---|---:|---:|---:|---:|---:|
+| code | 110.0-110.1 | **135.5-135.7** | 135.4-135.6 | 110.5-111.3 | 81.2-82.1 |
+| think | 104.0 | **125.0-125.2** | 125.1-125.2 | 102.3-103.0 | 77.2-77.9 |
+| story | **76.9** | 60.6-60.7 | 60.7 | 52.5-52.8 | 57.0-57.7 |
+| Chinese | **81.3-81.4** | 39.7 | 51.2 | 32.4-32.6 | 57.2-57.8 |
+| French | **80.6** | 68.3 | 72.9-73.0 | 55.6-56.0 | 57.2-57.6 |
+| conversation (T 0.6) | **91.4-91.5** | 85.7 | 81.3-81.4 | 75.0-75.3 | 65.9-66.1 |
+| structured JSON | 122.5 | **176.9-177.0** | 176.6 | 146.3-146.6 | 92.3-92.5 |
+| prose (T 0.6) | **80.4** | 69.5 | 77.3-77.4 | 56.5 | 58.0-58.1 |
+| conversation, greedy | 89.4 | 90.4 | **91.3** | 71.7-71.8 | 68.5-68.6 |
+| plain decode (no speculation) | 45.0 | | | | 42.7-43.0 |
+| two requests at once (story + code, 256 tokens each), total | **122.0-122.8** | | | | 74.0-74.2 |
 
-Master's DFlash2 K7 on the same prompts: 72.9 code, 59.6 think, 32.1 story, 97.3 structured.
-`ninfer_bench -pg 2048,256` (bench corpus, INT8 KV, 93-95% acceptance, same ABBA): MTP3 **118.9**
-(master 88.0), DFlash2 K7 141.9 (93.2), plain 43.8 (41.9-42.0). The
-prompts are the five 300-token ones (code, think, story, Chinese, French) and Lapilli's basalt-bench
-fixtures (seed 7). Deeper MTP windows pay only on code and structured output now: MTP5 117.4 code and
-148.0 structured, MTP7 158.1 structured, but every other prompt is slower, so MTP3 stays the default.
+So DFlash2 K7 is the fastest setting on code, thinking and structured output, and MTP3 on story,
+Chinese, French and sampled prose and conversation. The prompts are the five 300-token ones (code,
+think, story, Chinese, French) and Lapilli's basalt-bench fixtures (seed 7). The plain, two-request
+and `MTP3 before` figures are from the `--verify-a8` change (ABBA against master `2a1bf0353`).
+`ninfer_bench -pg 2048,256` (bench corpus, INT8 KV, 93-95% acceptance): MTP3 **118.9** (88.0 before
+`--verify-a8`), DFlash2 K7 141.9 (93.2), plain 43.8 (41.9-42.0). Deeper MTP windows pay only on code
+and structured output: MTP5 117.4 code and 148.0 structured, MTP7 158.1 structured, but every other
+prompt is slower, so MTP3 stays the default.
 
-What changed is `--verify-a8`, on by default in an `sm_70` build: the Q4/Q5/Q6 linears at 1-8 tokens
+DFlash2's gain is its drafter: in an `sm_70` build the block drafter's own linears (the Q8 attention
+input, SwiGLU, output and down projections at eight columns, and the Q4 proposal head) round their
+activations to int8 per 32 values and run `dp4a` instead of emulated `mma.sync` kernels, about 9 ms
+less per K = 7 round. The target still verifies every draft: acceptance on most prompts above is
+unchanged at K = 7 (code 246 of 371 drafts with and without it), and greedy text is identical on
+code, thinking, Chinese, French and structured output. Story and a long reply part at a near-tie, as
+they also do on master between DFlash2 window settings, because a verify round's arithmetic depends
+on its width. `NINFER_DRAFT_A8=0` turns it off. Details in
+[volta-port.md](maintainer/volta-port.md#decode).
+
+The target's own speed-up behind the MTP3 and plain columns is `--verify-a8`, on by default in an
+`sm_70` build: the Q4/Q5/Q6 linears at 1-8 tokens
 round their activations to int8 per 32 values and run `dp4a`, so a verify round costs about the same
 as a plain step's GEMVs at any width (`--no-verify-a8` turns it off). It is lossy at the noise floor:
 on a decode-path KLD gate against the FP32 kernels (17 chunks of 512 tokens from four held-out
 domains), KLD 7.2e-4 to 7.8e-4 at one, four and eight tokens, and 98.9-99.2% the same top-1 token;
 master's own verify reordering measures 3.8e-4 and 99.4%. Greedy text therefore differs from master
-at near-ties (the code and structured outputs above are byte-identical to master's). Details in
+at near-ties (MTP3's code and structured outputs above are byte-identical to master's). Details in
 [volta-port.md](maintainer/volta-port.md#decode).
 
 The weights alone take 17.4 ms per token to read at the card's measured 879 GB/s, so plain decode

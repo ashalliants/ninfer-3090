@@ -6,6 +6,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
+#include "ops/linear/common/draft_a8.h"
 #include "models/qwen3_5/execution/lora.h"
 #include "models/qwen3_5/execution/numeric_tripwire.h"
 #include "ninfer/ops/argmax.h"
@@ -287,6 +288,9 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                 "DFlash2: fused norm/RoPE requires epsilon=1e-6 and theta=1e7");
         }
 
+        // The drafter's own linears on int8 activations where that is the faster route (sm_70 by
+        // default; NINFER_DRAFT_A8=0 turns it off): the target still verifies every draft.
+        const ops::ScopedDraftA8 draft_a8;
         const int width                = k + 1;
         const int columns              = width * batch;
         const int mask_columns         = k * batch;

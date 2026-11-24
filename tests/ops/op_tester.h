@@ -394,8 +394,20 @@ inline bool stream_a8_forced() {
     return forced;
 }
 
+// The drafter route (ops/linear/common/draft_a8.h) runs DFlash2's Q8 attention input, SwiGLU and
+// conv-add projections and its Q4 proposal top-k on the same int8-activation kernel. The
+// `_draft_a8` variants (sm_70 builds) run those Ops' suites inside a ScopedDraftA8
+// (NINFER_TEST_DRAFT_A8=1, opened by each suite's main) at the same allowance.
+inline bool draft_a8_forced() {
+    static const bool forced = [] {
+        const char* v = std::getenv("NINFER_TEST_DRAFT_A8");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return forced;
+}
+
 inline ReductionCriterion with_stream_a8_allowance(ReductionCriterion criterion) {
-    if (!stream_a8_forced()) return criterion;
+    if (!stream_a8_forced() && !draft_a8_forced()) return criterion;
     return {std::max(criterion.relative_l2, 2.0e-2), criterion.gross_absolute,
             std::max(criterion.gross_relative_to_max_reference, 2.5e-2)};
 }

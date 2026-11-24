@@ -886,6 +886,90 @@ of DRAM bandwidth in `ncu`). 32-warp CTAs, two CTAs per SM and a three-deep load
 measured slower. Lapilli's own FP16 variant of its `dense_mmvq` beats its `dp4a` form only from five
 columns on NVFP4 weights, and not on its 8-bit ones until 15 columns. It was not kept.
 
+**The DFlash2 drafter on int8 activations (`NINFER_DRAFT_A8`, on by default in an `sm_70` build).**
+With the verify GEMVs flat, the 27B's DFlash2 K = 7 round spent ~14 ms of its ~80 ms (master
+`63762a40`) in the block drafter itself, which runs every linear at the block width of eight
+columns: per layer (x5) the Q8 SwiGLU gate/up on `q8_a16_sliced_k_mma`, an `mma.sync` kernel written
+for `sm_80` and emulated on Volta (1.43 ms, about 6x its weight stream), and the Q8 attention input,
+output and down projections on the SIMT streaming GEMV (one FFMA per weight per token); then the Q4
+proposal head's top-k on `q4_ksplit_mma`, also emulated (3.2 ms). The target verifies every draft,
+so the drafter's numbers decide which tokens are proposed, not which are emitted, and may trade
+exactness for speed where the target's linears may not.
+
+`propose_dflash2_batch` holds an `ops::ScopedDraftA8` (`ops/linear/common/draft_a8.h`, a
+thread-local flag read at launch time, so captured graphs keep it) and the four drafter Ops route
+to `stream_dp4a.cuh`'s kernel inside it (`ops/linear/common/stream_draft_dp4a.cuh`): the Q8 attention
+input (`q8_dflash2_attn_input.cu`), the Q8 SwiGLU pairs (`q8_dflash2_linear_swiglu.cu`, gate and up
+rows as one item), the Q8 conv-add projections (`q8_dynamic_grouped_conv_add_materialized.cu`) and
+the Q4 proposal head (`linear_topk/q4.cu`, writing the K-split producers' keys so the same merge
+reduces them). The Q8 codes are signed int8 already, so `Q8StreamFormat::dp4a_word` is two byte
+permutes with no bias. Q8's form is marked `kDp4aDrafterOnly`: the verify route (`--verify-a8`) does
+not take it, so the MTP layer, the vision tower, Inkling-2-Mini and every other Q8 linear keep their
+kernels. `NINFER_DRAFT_A8=0` turns the route off, and the drafter then runs exactly master's kernels.
+Outside `sm_70` builds the kernel is not compiled and the scope changes nothing.
+
+Microbenchmark, cold L2, us per call (`ninfer_benches` with `NINFER_DRAFT_A8=0` / default, 200 W).
+The FP16 tensor-core column is a standalone `mma.m8n8k4` GEMV over the same row-split codes (FP16
+weights times the group scale through one HFMA2 per pair, FP32 accumulation, eight tokens, best of
+four launch shapes), without the SwiGLU pairing or the top-k epilogue, so it is a lower bound for
+that form:
+
+| Drafter Op (shape, width) | before | int8 `dp4a` | FP16 `mma.m8n8k4` |
+|---|---:|---:|---:|
+| SwiGLU gate/up, Q8 34816 x 5120, T = 8 | 1,440 | **247** | 329 |
+| SwiGLU gate/up, T = 4 | 1,513 | **234** | 329 |
+| attention input, Q8 6144 x 5120, T = 8 | 105 | **60** | 98 |
+| output projection + conv add, Q8 5120 x 4096, W = 8 | 71 | **44** | 58 |
+| down projection + conv add, Q8 5120 x 17408, W = 8 | 230 | **156** | 209 |
+| proposal head top-k, Q4 131072 x 5120, 7 columns | 3,338 | **598** | 1,678 |
+
+`dp4a` wins every shape. For Q8 it needs no weight decode at all; the tensor-core form still pays
+the codes' conversion to FP16 (one permute and one HFMA2 per two weights) and, at eight columns, is
+latency-bound rather than at the weight stream (329 us is 576 GB/s against `dp4a`'s 769). Per
+round that is about 9.4 ms less drafter time at K = 7 (5 x 1.34 ms in the layers, 2.7 ms in the
+head). Two-lane rounds (16 columns) run the route as two passes and still gain: at T = 16 the
+SwiGLU takes 489 against 1,422 us, the attention input 119 against 214, the down and output
+projections 306 / 84 against 466 / 140, and the 14-column head 1,174 against 5,942. Wider calls
+(the top-k past 16 columns, the attention input past 16 tokens) keep their old kernels, measured
+equal. The code request below confirms the per-round saving end to end (the same 371 drafts in ~53 rounds, 0.48 s
+less, 9.1 ms a round).
+
+Serve legs, ABBA in one session (`NINFER_DRAFT_A8=0` / on / on / `=0`), the router's flags, INT8 KV,
+`--ngram-draft-tokens 15`, 200 W, no thermal throttling, tok/s:
+
+| Prompt | DFlash2 K7 before | DFlash2 K7 | K7 adaptive 3 before | K7 adaptive 3 |
+|---|---:|---:|---:|---:|
+| code | 110.5-111.3 | **135.5-135.7** | 110.4-110.6 | 135.4-135.6 |
+| think | 102.3-103.0 | **125.0-125.2** | 102.3-102.4 | 125.1-125.2 |
+| story | 52.5-52.8 | 60.6-60.7 | 55.1-56.5 | 60.7 |
+| Chinese | 32.4-32.6 | 39.7 | 39.7 | 51.2 |
+| French | 55.6-56.0 | 68.3 | 56.4 | 72.9-73.0 |
+| conversation (T 0.6) | 75.0-75.3 | 85.7 | 64.2-73.6 | 81.3-81.4 |
+| structured JSON | 146.3-146.6 | **176.9-177.0** | 146.3-146.4 | 176.6 |
+| prose (T 0.6) | 56.5 | 69.5 | 59.3-60.0 | 77.3-77.4 |
+| conversation, greedy | 71.7-71.8 | 90.4 | 75.2-76.1 | 91.3 |
+
+Acceptance is unchanged on most prompts: code 246/371, Chinese 118/1,248, French 194/726, thinking
+242/399 and structured 6,318/6,392 drafts accepted at K = 7 with and without the route, and the
+greedy text of those five prompts is byte-identical. Story (187/775 before, 180/816 after) and the
+greedy conversation part from the text without the route, after 127 and 2,408 characters ("a man
+who had spent" against "the lighthouse keeper, who had spent"). That is the target's verify
+arithmetic, not the drafter's: a token's logits depend on how many columns its round carries
+(attention and the GDN recurrence by width, as above), so a different accept pattern can flip a
+near-tie. The drafter route is not needed to see it: without it, K = 7 and K = 7 with
+`--adaptive-draft-tokens 3` (the same kernels, a different window policy) give the same text on 2
+of 6 greedy prompts, and plain decoding matches K = 7 on 1 of 6. With the window policy fixed, the
+route keeps the text on 4 of 6 at K = 7 and 2 of 6 adaptive (code and thinking identical in every
+mode). MTP3 does not use the route and is unchanged (the same text on all nine prompts, the same
+speed within 0.1 tok/s).
+
+K = 8 does not pay on this card: nine verify columns pass the int8 verify GEMV's eight, and one
+leg with the route ran 33-116 tok/s (code 77.4, structured 115.7); with `--adaptive-draft-tokens 3`
+it ran code 113.0, structured 117.8, story 70.8, Chinese 53.7, French 74.8, prose 76.2. Per prompt
+the fastest setting measured is DFlash2 K = 7 for code (135.7), thinking (125.2) and structured
+output (177.0), K = 7 adaptive for the long greedy conversation (91.3), and MTP3 for story,
+Chinese, French and sampled prose and conversation (76.9-91.5).
+
 ## Next, in order
 
 1. Run the full op suites (`scripts/v100_validate.sh --tests`); the linear, input-projection,
@@ -895,8 +979,9 @@ columns on NVFP4 weights, and not on its 8-bit ones until 15 columns. It was not
 3. Verify widths past 8 tokens: the int8 streaming GEMV (above) holds 1..8 tokens at the weight
    stream, so MTP up to seven drafts and DFlash2 up to K = 7 verify at about a plain step's GEMV
    cost; wider DFlash2 windows (12-16 columns) and two-lane DFlash2 rounds still reach the tile GEMM. A
-   16-column form (Lapilli's `dense_mmvq` runs 16) would let deeper drafting pay. The DFlash2
-   drafter's own Q8 sliced-K and Q4 K-split `mma` routes are the next cost in its rounds.
+   16-column form (Lapilli's `dense_mmvq` runs 16) would let deeper drafting pay; it would also
+   serve two-lane DFlash2 drafting, which runs the drafter route above as two passes of eight
+   columns over the same weights.
 4. Kernel count: a plain decode step is ~700 kernels, and each short GEMV loses ~8 us to fill and
    drain between dependent kernels (Volta has no programmatic dependent launch), ~1-2 ms a token.
    Fusing the norms and small element-wise steps into their neighbours is the remaining decode

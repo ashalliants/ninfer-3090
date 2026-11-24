@@ -6,6 +6,7 @@
 #include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/common/stream_draft_dp4a.cuh"
 #include <cuda_bf16.h>
 #include <array>
 #include <algorithm>
@@ -51,6 +52,10 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
                                                 Q8ScaleAccess::Shared, Activation>;
     const int columns = x.ne[1];
     LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), kRows};
+    if (try_launch_q8_draft_dp4a(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{},
+                                 stream)) {
+        return;
+    }
     const dim3 grid(kRows / 16, (columns + TileColumns - 1) / TileColumns);
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, TileColumns, false>,

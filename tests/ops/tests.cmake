@@ -394,3 +394,17 @@ ninfer_add_op_test(ninfer_vit_fp32_ops_test
 ninfer_add_op_test(ninfer_inkling2_adapters_ops_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling2_adapters_ops.cpp"
   LIBRARIES ninfer_ops)
+
+# sm_70: DFlash2's drafter Ops on the int8-activation route (ops/linear/common/draft_a8.h), each
+# suite inside a ScopedDraftA8 at the stream_a8 allowance (tests/ops/op_tester.h).
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  foreach(suite linear_topk linear_dynamic_grouped_conv_add linear_swiglu_q8_a16)
+    add_test(NAME ninfer_${suite}_draft_a8_test COMMAND ninfer_tests ninfer_${suite}_test)
+    set_tests_properties(ninfer_${suite}_draft_a8_test PROPERTIES
+      ENVIRONMENT "NINFER_TEST_DRAFT_A8=1" SKIP_RETURN_CODE 77)
+  endforeach()
+  add_test(NAME ninfer_attn_input_proj_draft_a8_test
+    COMMAND ninfer_tests ninfer_attn_input_proj_test --dflash2-only)
+  set_tests_properties(ninfer_attn_input_proj_draft_a8_test PROPERTIES
+    ENVIRONMENT "NINFER_TEST_DRAFT_A8=1" SKIP_RETURN_CODE 77)
+endif()

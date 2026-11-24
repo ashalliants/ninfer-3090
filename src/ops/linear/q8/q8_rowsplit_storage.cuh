@@ -68,6 +68,22 @@ struct Q8StreamFormat {
         stream_decode_bytes4(words[2 * W] ^ 0x80808080u, c, f);
         stream_decode_bytes4(words[2 * W + 1] ^ 0x80808080u, c, f + 4);
     }
+
+    // dp4a form (ops/linear/common/stream_dp4a.cuh): the codes are signed int8 already, so word W's
+    // even and odd k (8W + 0, 2, 4, 6 and 8W + 1, 3, 5, 7) are two byte permutes, with no bias.
+    // Drafter-only: a speculative drafter's Q8 linears take it inside a ScopedDraftA8
+    // (stream_draft_dp4a.cuh); the verify route (EngineOptions::verify_a8) leaves Q8 on A16.
+    static constexpr bool kDp4a            = true;
+    static constexpr bool kDp4aDrafterOnly = true;
+    static constexpr int kDp4aBias         = 0;
+    template <int W>
+    __device__ static __forceinline__ void dp4a_word(const Slice& slice, std::uint32_t& even,
+                                                     std::uint32_t& odd) {
+        const std::uint32_t words[8] = {slice.lo.x, slice.lo.y, slice.lo.z, slice.lo.w,
+                                        slice.hi.x, slice.hi.y, slice.hi.z, slice.hi.w};
+        even = __byte_perm(words[2 * W], words[2 * W + 1], 0x6420);
+        odd  = __byte_perm(words[2 * W], words[2 * W + 1], 0x7531);
+    }
 };
 
 struct Q8ScalarDecodeAtom {

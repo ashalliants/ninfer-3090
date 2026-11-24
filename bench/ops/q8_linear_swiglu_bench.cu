@@ -1,5 +1,6 @@
 // Complete public-Op benchmark for the registered Q8 LinearSwiGLU profiles.
 
+#include "ops/linear/common/draft_a8.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear_swiglu.h"
 
@@ -168,6 +169,9 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // As the DFlash2 drafter calls these Ops: inside a ScopedDraftA8, so sm_70 builds measure the
+    // int8 route and NINFER_DRAFT_A8=0 the A16 one (ops/linear/common/draft_a8.h).
+    const ninfer::ops::ScopedDraftA8 draft_a8;
     try {
         const Options options  = parse_options(argc, argv);
         const Problem& problem = options.problem == kDFlash2.name ? kDFlash2 : kCompanion;
