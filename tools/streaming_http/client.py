@@ -5,11 +5,17 @@ from __future__ import annotations
 import http.client
 import socket
 import ssl
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping
 from urllib.parse import urlsplit
+
+
+# Winsock errors a local cancel leaves behind (see PreparedExchange.cancel): WSAENOTSOCK, because the
+# socket handle was closed under the blocked read, and WSAECONNABORTED, the local stack aborting it.
+_LOCAL_ABORT_WINERRORS = frozenset({10038, 10053})
 
 
 class HttpClientError(RuntimeError):
@@ -123,6 +129,17 @@ class PreparedExchange:
                     self._shutdown = True
                 except OSError:
                     pass
+                if sys.platform == "win32":
+                    # On Windows shutdown() does not wake a thread blocked reading the socket (it
+                    # stays blocked until the peer acts), and close() is deferred while
+                    # http.client's makefile() reader holds the socket.  Closing the handle itself
+                    # does wake it, with WSAENOTSOCK.  detach() leaves the original object (and any
+                    # reader on it) with no handle; a new socket object takes the handle and closes it.
+                    try:
+                        socket.socket(fileno=transport.detach()).close()
+                        self._shutdown = True
+                    except OSError:
+                        pass
         return self._cancel_ns
 
     def execute(
@@ -192,9 +209,10 @@ class PreparedExchange:
                 cancel_ns = self._cancel_ns
                 shutdown = self._shutdown
             result.cancel_requested = cancel_requested
-            # Local shutdown can interrupt sending with EPIPE or reading with EOF. Timeouts,
-            # resets, malformed responses and other socket failures remain failures even when
-            # a concurrent caller has also requested cancellation.
+            # Local shutdown can interrupt sending with EPIPE or reading with EOF, and on Windows
+            # (where cancel() closes the handle) with a Winsock abort. Timeouts, resets,
+            # malformed responses and other socket failures remain failures even when a
+            # concurrent caller has also requested cancellation.
             shutdown_error = (
                 shutdown and cancel_ns is not None and cancel_ns <= result.ended_ns
                 and (
@@ -202,6 +220,8 @@ class PreparedExchange:
                     or (response is None and isinstance(error, http.client.RemoteDisconnected))
                     or (response is not None and isinstance(error, http.client.IncompleteRead))
                     or isinstance(error, ssl.SSLEOFError)
+                    or (isinstance(error, OSError)
+                        and getattr(error, "winerror", None) in _LOCAL_ABORT_WINERRORS)
                 )
             )
             result.cancelled = shutdown_error
