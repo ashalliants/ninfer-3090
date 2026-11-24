@@ -93,23 +93,84 @@ const Component& Directory::component(std::string_view name) const {
     return found->second;
 }
 
-Json parse_json(std::string_view text, std::string_view label) {
-    std::vector<std::unordered_set<std::string>> member_stack;
-    const auto callback = [&](int, Json::parse_event_t event, Json& parsed) {
-        if (event == Json::parse_event_t::object_start) {
-            member_stack.emplace_back();
-        } else if (event == Json::parse_event_t::key) {
-            const auto& key = parsed.get_ref<const std::string&>();
-            if (!member_stack.back().insert(key).second) {
-                throw ArtifactError(std::string(label) + ": duplicate JSON member " + key);
-            }
-        } else if (event == Json::parse_event_t::object_end) {
-            member_stack.pop_back();
-        }
+namespace {
+
+// Builds the same tree as Json::parse and refuses a duplicate member. The check used to be a
+// Json::parse callback, but nlohmann switches to a much slower tree builder when given one: the
+// 8 MB directory of a 35B artifact took 18 s to parse, on every open of the file. A SAX handler
+// reaches the same result in milliseconds.
+class UniqueKeyDomParser {
+public:
+    UniqueKeyDomParser(Json& root, std::string_view label) : root_(root), label_(label) {}
+
+    bool null() { return store(Json(nullptr)); }
+    bool boolean(bool value) { return store(Json(value)); }
+    bool number_integer(Json::number_integer_t value) { return store(Json(value)); }
+    bool number_unsigned(Json::number_unsigned_t value) { return store(Json(value)); }
+    bool number_float(Json::number_float_t value, const std::string&) { return store(Json(value)); }
+    bool string(std::string& value) { return store(Json(std::move(value))); }
+    bool binary(Json::binary_t& value) { return store(Json::binary(std::move(value))); }
+
+    bool start_object(std::size_t) {
+        open(Json::object());
+        members_.emplace_back();
         return true;
-    };
+    }
+    bool key(std::string& name) {
+        if (!members_.back().insert(name).second) {
+            throw ArtifactError(std::string(label_) + ": duplicate JSON member " + name);
+        }
+        key_ = std::move(name);
+        return true;
+    }
+    bool end_object() {
+        members_.pop_back();
+        open_.pop_back();
+        return true;
+    }
+    bool start_array(std::size_t) {
+        open(Json::array());
+        return true;
+    }
+    bool end_array() {
+        open_.pop_back();
+        return true;
+    }
+    bool parse_error(std::size_t, const std::string&, const Json::exception& error) { throw error; }
+
+private:
+    // Where the next value goes: the root, a new array element, or the member named by key_.
+    Json& slot() {
+        if (open_.empty()) { return root_; }
+        Json& parent = *open_.back();
+        if (parent.is_array()) { return parent.emplace_back(nullptr); }
+        return parent[key_];
+    }
+    bool store(Json value) {
+        slot() = std::move(value);
+        return true;
+    }
+    void open(Json container) {
+        Json& target = slot();
+        target       = std::move(container);
+        open_.push_back(&target);
+    }
+
+    Json& root_;
+    std::string_view label_;
+    std::string key_;
+    std::vector<Json*> open_;
+    std::vector<std::unordered_set<std::string>> members_;
+};
+
+} // namespace
+
+Json parse_json(std::string_view text, std::string_view label) {
     try {
-        return Json::parse(text.begin(), text.end(), callback);
+        Json root;
+        UniqueKeyDomParser handler(root, label);
+        Json::sax_parse(text.begin(), text.end(), &handler);
+        return root;
     } catch (const Json::exception& error) {
         throw ArtifactError(std::string(label) + ": " + error.what());
     }

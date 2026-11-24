@@ -898,6 +898,8 @@ set "SERVER_LOG=%TEMP%\ninfer-run-%RANDOM%%RANDOM%.log"
 "%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %USER_GRAFT_ARGS% %LORA_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% %EXTRA_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
 findstr /c:"not enough free GPU memory" "%SERVER_LOG%" >nul 2>&1
 if not errorlevel 1 goto :memory_advice
+findstr /c:"requested Engine runtime reservation requires" "%SERVER_LOG%" >nul 2>&1
+if not errorlevel 1 goto :reservation_advice
 if not "%HOST_RETRY%"=="1" goto :server_done
 if "%HOST_CONTEXT_MIB%"=="0" goto :server_done
 findstr /c:"cudaMallocHost failed" "%SERVER_LOG%" >nul 2>&1
@@ -917,6 +919,20 @@ echo.
 echo %TITLE% could not start: the graphics card does not have enough free memory, even for a
 echo reduced context. Close other programs that use the GPU (games, video, other AI tools)
 echo and run this again. `nvidia-smi` lists what is using it.
+
+goto :server_done
+
+:reservation_advice
+rem A fixed context was demanded and the card could not hold it beside the weights. NINFER_CONTEXT and
+rem NINFER_FALLBACK=off each turn the fit off (see FIT above), so the advice names both rather than
+rem guessing which was set. Say what to change.
+echo.
+echo %TITLE% could not start: the context this run asked for does not fit the free graphics card memory
+echo next to the model at this concurrency. NINFER_CONTEXT and NINFER_FALLBACK=off each turn off the
+echo automatic fit. Any of these will work:
+echo   - remove NINFER_CONTEXT and NINFER_FALLBACK, so the server picks the largest context that fits and says which
+echo   - lower NINFER_CONCURRENCY (each lane reserves memory), or lower NINFER_CONTEXT
+echo   - close other programs that use the GPU; `nvidia-smi` lists what is using it.
 
 :server_done
 rem The pipe hides the server's own exit status, so report failure from what it logged.
