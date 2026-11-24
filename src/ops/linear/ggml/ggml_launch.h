@@ -8,6 +8,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -23,6 +24,21 @@ void ggml_mmvq_launch(const std::uint8_t* w, const __nv_bfloat16* x, __nv_bfloat
 // The opt-in int8 tensor-core decode route (ggml_mma_decode.cuh, LinearPolicy::AllowA8GgmlDecodeMma),
 // 1 <= t <= kGgmlDecodeMaxTokens: the same Q8_1 cast in shared memory, then mma.sync s8 tiles of 16
 // rows by 8 columns in ggml_mma_emulation.h's fixed order. w is 16-byte aligned and n % 16 == 0.
+// The staged decode route (sm_70 builds; ggml_mmvq.cuh, mmvq_body's Direct): x cast once into
+// `staged` (ggml_mmvq_staged_bytes(k, t) bytes, 16-byte aligned), then the GEMV reads it. Returns
+// false, launching nothing, when the build, the format or K does not take it; the caller then runs
+// ggml_mmvq_launch, which gives the same bits.
+template <QType F>
+bool ggml_mmvq_staged_launch(const std::uint8_t* w, const __nv_bfloat16* x, unsigned char* staged,
+                             __nv_bfloat16* out, std::int32_t n, std::int32_t k, std::int32_t t, bool residual,
+                             cudaStream_t stream);
+
+// The staging bytes of one staged call: T * K codes, then T * K / 32 FP32 scales.
+inline std::size_t ggml_mmvq_staged_bytes(std::int32_t k, std::int32_t t) {
+    return static_cast<std::size_t>(t) * static_cast<std::size_t>(k) +
+           static_cast<std::size_t>(t) * static_cast<std::size_t>(k / 32) * 4;
+}
+
 template <QType F>
 void ggml_mma_decode_launch(const std::uint8_t* w, const __nv_bfloat16* x, __nv_bfloat16* out,
                             std::int32_t n, std::int32_t k, std::int32_t t, bool residual,

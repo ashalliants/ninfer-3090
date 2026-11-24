@@ -41,6 +41,7 @@
 #include "core/weight.h"
 #include "ops/ggml_blocks_decode.h"
 #include "ops/ggml_linear_emulation.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/ggml/ggml_launch.h"
 #include "ops/linear/ggml/ggml_mma_emulation.h"
 #include "ops/linear/common/sm70_tensor_core.h"
@@ -333,7 +334,9 @@ int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
         const std::size_t capacity =
             add ? ops::linear_add_workspace_capacity_bytes(format, n, k, policy, t, t)
                 : ops::linear_workspace_capacity_bytes(format, n, k, policy, t, t);
-        if ((t <= ops::detail::kGgmlDecodeMaxTokens) != (capacity == 0)) {
+        // The decode route needs only the staged route's staging (zero where it does not run).
+        const bool decode = t <= ops::detail::kGgmlDecodeMaxTokens;
+        if (decode ? capacity != ops::detail::ggml_decode_staging_bytes(format, k, t) : capacity == 0) {
             std::cerr << label << " T=" << t << ": unexpected workspace " << capacity << '\n';
             ++failures;
         }
@@ -350,6 +353,26 @@ int run_problem(QType format, std::int32_t n, std::int32_t k, bool add) {
         }
         cuda_check(cudaDeviceSynchronize(), "linear");
         const auto got_bits = download_bf16(d_out.p, static_cast<std::size_t>(n) * t);
+        if (decode && capacity != 0) {
+            // The staged route ran: a workspace without room for its staging keeps the plain
+            // kernel, which must give the same bits.
+            DeviceArena small(256);
+            if (add) {
+                d_out.copy_from_host(residual.data(), static_cast<std::size_t>(n) * t * 2);
+                ops::linear_add(x, weight, out, policy, small, nullptr);
+            } else {
+                cuda_check(cudaMemset(d_out.p, 0xFF, static_cast<std::size_t>(n) * t * 2), "poison");
+                ops::linear(x, weight, out, policy, small, nullptr);
+            }
+            cuda_check(cudaDeviceSynchronize(), "linear (plain)");
+            const auto plain = download_bf16(d_out.p, static_cast<std::size_t>(n) * t);
+            std::size_t differ = 0;
+            for (std::size_t i = 0; i < plain.size(); ++i) differ += plain[i] != got_bits[i];
+            if (differ != 0) {
+                std::cerr << label << " T=" << t << ": staged and plain routes differ in " << differ << " outputs\n";
+                ++failures;
+            }
+        }
         std::vector<double> got(got_bits.size());
         for (std::size_t i = 0; i < got.size(); ++i) got[i] = bf16_to_f32(got_bits[i]);
         if (tensor_cores && t >= ops::detail::kSm70TensorCoreMinTokens) {

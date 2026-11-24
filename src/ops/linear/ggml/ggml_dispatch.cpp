@@ -9,6 +9,8 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -59,6 +61,20 @@ void validate_weight(const Weight& w) {
     }
 }
 
+// The staged decode route (ggml_launch.h): on by default in sm_70 builds, where it is compiled;
+// NINFER_GGML_STAGED=0 keeps the plain kernels (same bits; for A/B runs). Read once.
+bool staged_route_enabled() {
+#if defined(NINFER_SM70)
+    static const bool enabled = [] {
+        const char* v = std::getenv("NINFER_GGML_STAGED");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 template <QType F>
 void run(const Tensor& x, const Weight& w, Tensor& out, bool residual, bool decode_mma, WorkspaceArena* workspace,
          cudaStream_t stream) {
@@ -76,6 +92,15 @@ void run(const Tensor& x, const Weight& w, Tensor& out, bool residual, bool deco
             }
             ggml_mma_decode_launch<F>(codes, xb, ob, w.n, w.k, t, residual, stream);
             return;
+        }
+        if (t >= 2 && workspace != nullptr && staged_route_enabled()) {
+            // The staging comes from the call's workspace; a call without room keeps the plain route.
+            const std::size_t need = ggml_mmvq_staged_bytes(w.k, t);
+            if (workspace->capacity() - workspace->used() >= need + 256) {
+                auto scope   = workspace->scope();
+                auto* staged = static_cast<unsigned char*>(workspace->alloc_bytes(need, 256).data);
+                if (ggml_mmvq_staged_launch<F>(codes, xb, staged, ob, w.n, w.k, t, residual, stream)) { return; }
+            }
         }
         ggml_mmvq_launch<F>(codes, xb, ob, w.n, w.k, t, residual, stream);
         return;
@@ -105,6 +130,16 @@ void ggml_require_registered(QType format, std::int32_t n, std::int32_t k, bool 
     }
 }
 
+std::size_t ggml_decode_staging_bytes(QType format, std::int32_t k, std::int32_t max_tokens) {
+    const bool affine = format == QType::GGML_Q4_K || format == QType::GGML_Q5_K;
+    if (!staged_route_enabled() || affine || max_tokens < 2 || max_tokens > kGgmlDecodeMaxTokens ||
+        (k != 6144 && k != 2560)) {
+        return 0;
+    }
+    // The call's allocation and the alignment slack of the arena it comes from.
+    return (ggml_mmvq_staged_bytes(k, max_tokens) + 255) / 256 * 256 + 256;
+}
+
 std::size_t ggml_linear_workspace_capacity_bytes(QType format, std::int32_t n, std::int32_t k,
                                                  bool linear_add, std::int32_t min_tokens,
                                                  std::int32_t max_tokens) {
@@ -114,7 +149,7 @@ std::size_t ggml_linear_workspace_capacity_bytes(QType format, std::int32_t n, s
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("ggml linear workspace: invalid token interval");
     }
-    if (max_tokens <= kGgmlDecodeMaxTokens) { return 0; }
+    if (max_tokens <= kGgmlDecodeMaxTokens) { return ggml_decode_staging_bytes(format, k, max_tokens); }
     WorkspaceLayoutBuilder layout;
     (void)allocate_q81(layout, k, max_tokens);
     // The sm_70 tensor-core route's staging when it is on (the widest call needs the most).

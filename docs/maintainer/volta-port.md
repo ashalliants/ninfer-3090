@@ -340,6 +340,32 @@ self-distilled MTP dense, converted and run here, was slower (code 115 against 1
 are byte-identical; its UD-IQ2_XS target (IQ4_NL down projections in 26 layers) generates different
 text, which the drafter predicts better.
 
+**Staged GGML verify GEMV (2026-11-24).** Flash-Next's dense linears (GDN and attention input and
+output projections, shared expert) are GGML blocks on `ggml_mmvq`, which was already a `dp4a` GEMV
+on Q8_1 activations: #600's int8 idea was there, and the verify columns still cost about 1 ms a
+round each. Profiled on the code request, the main stream's `ggml_mmvq` kernels took 6.3 ms of a
+round at about four columns (none of it overlapped), about three times the weight stream. A harness
+(L2-cold weights, chained calls) split the IQ4_XS 2560 x 6144 output projection's 36.6 us at T = 4:
+without the activation cast it took 22.2 us, the cast alone 16.9. Each of the 240 persistent CTAs
+casts all T x K inputs (two IEEE divisions per 32-value group), so the cast grows with T and repeats
+240 times. On sm_70 `ggml_q81_stage_kernel` now casts x once into the call's workspace in the
+shared-memory layout, and `ggml_mmvq_staged_kernel` (`mmvq_body`'s `Direct` form) reads it through
+L1 instead of staging it; the output projections (K = 6144) run one 512-thread CTA per SM, two rows a
+warp. Same cast, same per-row order: bit-identical, checked at T = 1-8 with and without the residual
+for IQ4_XS, IQ3_S and Q6_K. Harness at T = 2 / 4 / 8 (us, plain -> staged): IQ4_XS output
+24.8 / 36.7 / 51.9 -> 20.4 / 24.0 / 30.7, IQ3_S 28.0 / 39.7 / 55.2 -> 23.2 / 26.3 / 33.9, Q6_K
+46.2 / 56.7 / 80.5 -> 36.2 / 35.7 / 44.9; the K = 2560 attention query 29.7 / 38.0 / 55.5 ->
+30.0 / 35.2 / 50.8. Flash-Next decode, ABBA at 200 W against `NINFER_GGML_STAGED=0` (router flags,
+story / code / Chinese / French / thinking): 81.2 / 124.6 / 79.5 / 72.2 / 100.9 -> 81.9 / 126.7 /
+80.4 / 72.8 / 103.4, master's text in every run.
+
+What did not pay, all exact: two or four rows a warp sharing each activation load (spills, up to 3x
+slower); batching the cast's loads ahead of the arithmetic (slower); one CTA per SM without the stage
+kernel (the output projection 38.6 -> 27.7 us at T = 4, but the K = 2560 and 640 shapes lost); the
+staged route at K = 640 (the shared expert's down projection: 8.1 -> 10.2 us at T = 4, so it keeps
+the plain kernel). The pair kernels (GDN qkv + z, shared-expert gate + up) keep the plain route:
+`linear_pair` takes no workspace, and the stage gained them only 1-3 us.
+
 Working with the 3.3 GB/s eGPU link (Flash-Next, measured 2026-11-17):
 - In steady decode the link costs almost nothing: the expert cache hits 99.6-100% and
   `stage_kernel` is ~5 us a call. The link matters for prefill and for refilling the cache.
