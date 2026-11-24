@@ -819,9 +819,11 @@ status="${PIPESTATUS[0]}"
 set -e
 if (( status != 0 )) && grep -q 'not enough free GPU memory' "$server_log"; then
   memory_advice
-elif (( status != 0 )) && grep -q 'runtime reservation requires' "$server_log"; then
+elif (( status != 0 )) && grep -q 'requested Engine runtime reservation requires' "$server_log"; then
   # The caller chose the context (NINFER_CONTEXT turns the fit off), so it was a demand the card
-  # could not meet beside the weights.
+  # could not meet beside the weights. Only the "requested ..." message means that: automatic
+  # sizing fails with "minimum Engine runtime reservation requires ...", which is not the caller's
+  # choice and needs different advice (free GPU memory), so it is matched by the full wording.
   printf '\nThe context you asked for does not fit the free GPU memory next to the model at this concurrency.\n'
   printf 'Any of these will work:\n'
   printf '  - unset NINFER_CONTEXT, so the server picks the largest context that fits and says which\n'

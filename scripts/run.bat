@@ -898,7 +898,7 @@ set "SERVER_LOG=%TEMP%\ninfer-run-%RANDOM%%RANDOM%.log"
 "%SERVER%" "%MODEL%" --host %HOST% --port %PORT% --config "%PROFILE_FILE%" %PROFILE_ARGS% %NGRAM_VOLUME_ARGS% %STORE_ARGS% %GRAFT_ARGS% %USER_GRAFT_ARGS% %LORA_ARGS% %CHAT_TEMPLATE_ARGS% %ALLOWED_HOST_ARGS% %EXTRA_ARGS% 2>&1 | powershell -NoProfile -Command "$input | ForEach-Object { $_; Add-Content -LiteralPath '%SERVER_LOG%' -Value $_ -Encoding Ascii }"
 findstr /c:"not enough free GPU memory" "%SERVER_LOG%" >nul 2>&1
 if not errorlevel 1 goto :memory_advice
-findstr /c:"runtime reservation requires" "%SERVER_LOG%" >nul 2>&1
+findstr /c:"requested Engine runtime reservation requires" "%SERVER_LOG%" >nul 2>&1
 if not errorlevel 1 goto :reservation_advice
 if not "%HOST_RETRY%"=="1" goto :server_done
 if "%HOST_CONTEXT_MIB%"=="0" goto :server_done

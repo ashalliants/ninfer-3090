@@ -642,6 +642,24 @@ expect_eq 'a GPU memory refusal fails' "$ladder_status" '1'
   exit 1
 }
 
+# A context the caller chose that does not fit says what to change. The automatic path's
+# "minimum ... reservation" failure uses similar words but is not the caller's choice, so it must not
+# get that advice.
+attempts 0 NINFER_TEST_FAILURE='FATAL server failed during startup | requested Engine runtime reservation requires 2443684608 bytes, but only 2004676608 bytes are available for runtime capacity'
+[[ "$ladder_out" == *'does not fit the free GPU memory'* && "$ladder_out" == *'unset NINFER_CONTEXT'* ]] || {
+  printf 'run.sh gave no advice on a requested-context refusal:
+%s
+' "$ladder_out" >&2
+  exit 1
+}
+attempts 0 NINFER_TEST_FAILURE='FATAL server failed during startup | minimum Engine runtime reservation requires 2443684608 bytes in addition to 1073741824 bytes of automatic headroom, but only 2004676608 bytes are available'
+[[ "$ladder_out" != *'unset NINFER_CONTEXT'* ]] || {
+  printf 'run.sh blamed NINFER_CONTEXT for an automatic-sizing failure:
+%s
+' "$ladder_out" >&2
+  exit 1
+}
+
 # NINFER_CHAT_TEMPLATE plays no part in the retry, but it must still ride along on every attempt --
 # a value set once should not silently drop off a later one.
 attempts 2048 NINFER_CHAT_TEMPLATE="$tmp/custom.jinja"
