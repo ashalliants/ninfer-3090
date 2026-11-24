@@ -1,6 +1,7 @@
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/resources.h"
 
+#include "models/qwen3_5/frontend/bundled_templates.h"
 #include "models/qwen3_5/frontend/chat_template.h"
 #include "models/qwen3_5/frontend/digest.h"
 #include "models/qwen3_5/frontend/media_cache.h"
@@ -3666,6 +3667,35 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
 
 // DeepSeek-V4's template has no ChatML markers: a thinking turn ends "<｜Assistant｜><think>" and the
 // model continues inside its reasoning, so the prompt must say so (the output is then split at </think>).
+int test_stock_template_is_replaced_by_the_bundled_one() {
+    int failures = 0;
+    const std::string stock_tail =
+        "{%- if message.role == \"system\" %}{%- if not loop.first %}"
+        "{{- raise_exception('System message must be at the beginning.') }}{%- endif %}";
+    const auto bundled_38 =
+        ninfer::models::qwen3_5::bundled_template_for_stock("reasoning_effort " + stock_tail);
+    failures += check(bundled_38 && *bundled_38 == reasoning_effort_template_source(),
+                      "a stock Qwen3.8 template is replaced by the bundled Qwen3.8 one");
+    const auto bundled_36 = ninfer::models::qwen3_5::bundled_template_for_stock(stock_tail);
+    failures += check(bundled_36 && *bundled_36 == thinking_toggle_template_source(),
+                      "a stock Qwen3.6 template is replaced by the bundled Qwen3.6 one");
+    failures += check(!ninfer::models::qwen3_5::bundled_template_for_stock(
+                          reasoning_effort_template_source()),
+                      "the bundled template is kept as it is");
+    failures += check(!ninfer::models::qwen3_5::bundled_template_for_stock("{{ messages }}"),
+                      "an unrelated template is kept as it is");
+    const auto compiled = fi::CompiledChatTemplate::resolve(*bundled_38);
+    std::vector<fi::ChatMessage> messages{chat_message(ninfer::ChatRole::User, "hi"),
+                                          chat_message(ninfer::ChatRole::System, "late rule"),
+                                          chat_message(ninfer::ChatRole::User, "again")};
+    fi::ChatRenderOptions options;
+    options.add_generation_prompt = true;
+    failures += check(compiled.render(messages, options).text.find("late rule") !=
+                          std::string::npos,
+                      "the bundled template renders a system message after the first turn");
+    return failures;
+}
+
 int test_deepseek_style_template_starts_in_reasoning() {
     const std::string source =
         "{%- set thinking = enable_thinking if enable_thinking is defined else true -%}"
@@ -4044,6 +4074,7 @@ int main() {
     failures += test_media_preparation_cancellation();
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
+    failures += test_stock_template_is_replaced_by_the_bundled_one();
     failures += test_deepseek_style_template_starts_in_reasoning();
     return failures == 0 ? 0 : 1;
 }

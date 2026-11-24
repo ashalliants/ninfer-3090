@@ -385,8 +385,8 @@ ChatTurn parse_system_value(const Json& value, const char* param, std::size_t fi
     if (first_block > value.size()) { throw std::logic_error("system block offset is invalid"); }
     for (std::size_t index = first_block; index < value.size(); ++index) {
         const Json& block = value[index];
-        if (require_block_type(block, param) != "text") {
-            bad_request("only text system blocks are supported", param,
+        if (const std::string type = require_block_type(block, param); type != "text") {
+            bad_request("only text system blocks are supported, got a '" + type + "' block", param,
                         "content_block_not_supported");
         }
         system.content.push_back(
