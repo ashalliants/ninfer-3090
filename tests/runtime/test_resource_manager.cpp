@@ -2602,6 +2602,7 @@ ScaleOutcome run_scale(std::size_t residents, std::size_t demotable, bool memoiz
     constexpr std::size_t block = 16;
     Fixture f(residents * block + 8);
     f.cache.set_candidate_memo(memoize);
+    f.cache.set_reclaim_pricing_work_cap(UINT64_MAX / 8); // price every plan: this measures the memo
     std::uint32_t next_token = 1;
     for (std::size_t i = 0; i < residents; ++i) {
         const auto key = tokens(6 + static_cast<std::uint32_t>(i % 5), next_token);
@@ -2649,6 +2650,77 @@ void test_candidate_memo_cuts_victim_selection_work() {
             require(memo.recovery_loss_calls * 5 <= plain.recovery_loss_calls * 3,
                     "the memo no longer cuts recovery-loss queries by two fifths at 160 checkpoints");
         }
+    }
+}
+
+// A saturated, fragmented Host tier at the size of the hosted workload: `residents` cached entries
+// each hold one small block, 100 bytes apart with a free hole between neighbours, and `demotable`
+// device checkpoints each need a destination run of 250 bytes. No single release frees such a run,
+// so the placement search keeps adding victims and the greedy loop runs for most of the entries.
+// This is the shape that pegged the Engine thread at one core with the GPU idle (a reclaim that
+// took seconds, repeated for every request): the work one reclaim does must stay linear-ish in the
+// number of entries, not grow with entries x plans x search rounds.
+struct SaturatedOutcome {
+    ninfer::runtime::ReclaimProgress progress;
+    std::uint64_t run_simulations;
+    std::uint64_t host_bytes_released_calls;
+    std::uint64_t recovery_loss_calls;
+    double seconds;
+};
+
+SaturatedOutcome run_saturated_fragmented(std::size_t residents, std::size_t demotable) {
+    Fixture f(residents * 100 + 100);
+    auto& program    = f.program;
+    program.run_unit = 250;
+    std::uint32_t next_token = 1;
+    for (std::size_t i = 0; i < residents; ++i) {
+        // Distinct keys of varied length so the entries rank differently from their position.
+        const auto key = tokens(6 + static_cast<std::uint32_t>((i * 7) % 11), next_token);
+        next_token += 40;
+        const auto handle = program.add(key, {program.host_block_at(100 * i + 25, 50)});
+        program.contents[handle.index].device_state = false;
+        program.contents[handle.index].main_pages   = 0;
+        f.publish(handle);
+    }
+    for (std::size_t j = 0; j < demotable; ++j) {
+        const auto key = tokens(6 + static_cast<std::uint32_t>(j % 5), next_token);
+        next_token += 40;
+        const auto handle = program.add(key);
+        program.contents[handle.index].demotion_bytes = 250;
+        f.publish(handle);
+    }
+    program.run_simulations             = 0;
+    program.host_bytes_released_calls   = 0;
+    program.recovery_loss_calls         = 0;
+    const auto begin    = std::chrono::steady_clock::now();
+    const auto progress = f.cache.reclaim(program, {.state_slots = 1});
+    const auto end      = std::chrono::steady_clock::now();
+    return {progress, program.run_simulations, program.host_bytes_released_calls,
+            program.recovery_loss_calls, std::chrono::duration<double>(end - begin).count()};
+}
+
+void test_saturated_host_reclaim_work_stays_bounded() {
+    SaturatedOutcome previous{};
+    for (const auto [residents, demotable] : {std::pair{65, 8}, std::pair{130, 16}, std::pair{260, 32}}) {
+        const auto out = run_saturated_fragmented(residents, demotable);
+        std::cout << "saturated reclaim " << residents << " entries / " << demotable
+                  << " plans: sims=" << out.run_simulations
+                  << " host_bytes_released=" << out.host_bytes_released_calls
+                  << " recovery_loss=" << out.recovery_loss_calls << " seconds=" << out.seconds
+                  << std::endl;
+        require(out.progress != ninfer::runtime::ReclaimProgress::Blocked,
+                "a saturated reclaim made no progress");
+        if (residents == 260) {
+            // Measured 18,701 and 23,761 before the pricing cap (kMaxReclaimPricingWork): one step
+            // then took seconds on the real engine and held every lane still.
+            require(out.host_bytes_released_calls <= 8000 && out.recovery_loss_calls <= 8000,
+                    "a saturated reclaim step priced more than its work cap allows");
+            // Doubling the cache must not double (let alone square) the work of one step.
+            require(out.host_bytes_released_calls <= 2 * previous.host_bytes_released_calls &&
+                        out.recovery_loss_calls <= 2 * previous.recovery_loss_calls,
+                    "a reclaim step's work grows with the cache instead of staying capped");
+        }
+        previous = out;
     }
 }
 
@@ -2927,6 +2999,7 @@ int main() {
         test_progress_anchor_retirement_keeps_whatever_was_used();
         test_held_progress_anchor_is_retired_when_the_hold_ends();
         test_candidate_memo_cuts_victim_selection_work();
+        test_saturated_host_reclaim_work_stays_bounded();
         test_candidate_memo_changes_no_decision();
         test_pinned_shared_prefix_survives_reclaim_and_cache_clear();
         test_demotion_competes_with_its_actual_host_recovery_loss();

@@ -3234,6 +3234,17 @@ private:
                                 &decision.reclaim,
                                 restoring ? std::optional(request->id) : std::nullopt)) {
                         if (instance_.program->has_context_transaction()) { return true; }
+                        // One eviction step at a full Host tier costs far more than a decode
+                        // round, and a request that needs several of them used to run them all
+                        // back to back, so every resident lane stood still until it was admitted
+                        // (decode at 0 tok/s for minutes with the GPU idle). The step changed
+                        // the cache and asked for another admission check; the decision (and its
+                        // reclaim cursor) is kept, so return and let the resident lanes run
+                        // their round before the next step.
+                        if (!resident_empty() &&
+                            admission_check_pending_.load(std::memory_order_acquire)) {
+                            return true;
+                        }
                         continue;
                     }
                     // Another waiting reference may be the only obstacle to a Move.

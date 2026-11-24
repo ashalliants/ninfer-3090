@@ -663,6 +663,8 @@ public:
     // Victim selection reuses each candidate's facts across the plans of one reclaim. The tests turn
     // this off to prove the answers are identical either way; production never does.
     void set_candidate_memo(bool enabled) noexcept { candidate_memo_ = enabled; }
+    // The tests that measure what the memo saves need every plan priced, so they lift the cap.
+    void set_reclaim_pricing_work_cap(std::uint64_t cap) noexcept { pricing_work_cap_ = cap; }
 
     [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
                                           std::span<const Handle> excluded = {}) {
@@ -728,6 +730,13 @@ public:
         for (auto& plan : plans.demotions) {
             const auto units = useful(plan.released, shortage);
             if (!units) { continue; }
+            // Bound the step's pricing (see kMaxReclaimPricingWork). Plans are in cache order, so
+            // the ones left out are the least preferred victims' neighbours, and the next step
+            // plans again.
+            if (evaluation.work >= pricing_work_cap_ &&
+                (!actions.empty() || evaluation.work >= 4 * pricing_work_cap_)) {
+                break;
+            }
             auto facts = action_facts(program, plan.sources, cursor, evaluation);
             if (!admits(program, plan.sources, facts, cursor.admission, cursor, evaluation, true)) {
                 continue;
@@ -1467,6 +1476,10 @@ private:
         const NativeReclaimPlan* native = nullptr;
         std::optional<std::vector<Handle>> retained;
         std::deque<CandidateMemo> candidates; // stable references while the deque grows
+        // Candidate unions the Host victim search has priced so far in this reclaim step. Each
+        // costs time linear in the checkpoint count on the Engine thread, so the step bounds the
+        // total (kMaxReclaimPricingWork).
+        std::uint64_t work = 0;
     };
 
     // Each entry holds a copy of its source set, and the greedy loop offers a new union for every
@@ -1475,6 +1488,17 @@ private:
     static constexpr std::size_t kMaxCandidateMemos = 1024;
     // Opening picks a blocked placement search retries from (see host_victims_in_order).
     static constexpr std::size_t kMaxOpeningRetries = 4;
+    // Candidate unions one reclaim step prices across all its demotion plans. Every plan runs its
+    // own Host victim search, and a search over N checkpoints prices up to N unions per round for
+    // up to N rounds, each costing O(N): with a full Host tier of a few hundred checkpoints and
+    // dozens of plans one step took seconds, and an admission that needed several steps held every
+    // resident lane still for minutes (decode at 0 tok/s, GPU idle). Once a step has priced this
+    // many unions and has an action to take, the remaining plans are left for the next step, which
+    // plans afresh against the cache this step changed; with no action yet, pricing goes on to four
+    // times the cap before giving up on demotions (releases are still offered). The cut is
+    // deterministic (a count, not a clock) and loses no data: an unpriced plan is simply not
+    // chosen this step.
+    static constexpr std::uint64_t kMaxReclaimPricingWork = 1024;
 
     [[nodiscard]] static CandidateMemo* candidate_memo(Evaluation& evaluation,
                                                        std::span<const Handle> sources) {
@@ -1920,6 +1944,7 @@ private:
                     for (const auto handle : remaining[i].sources) {
                         if (!contains(combined, handle)) { combined.push_back(handle); }
                     }
+                    ++evaluation.work;
                     // The same candidate comes up for every plan of one reclaim: what it frees and its
                     // facts are computed once per evaluation. Only the cheap facts stay cached (the
                     // survivor list is rebuilt per use), so the cache does not grow with the square of
@@ -2132,6 +2157,7 @@ private:
     Durability durability_;
     PrefixIndex<Model> index_;
     bool candidate_memo_ = true;
+    std::uint64_t pricing_work_cap_ = kMaxReclaimPricingWork;
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;
     std::vector<WaitingSource> waiting_;
