@@ -923,12 +923,14 @@ echo and run this again. `nvidia-smi` lists what is using it.
 goto :server_done
 
 :reservation_advice
-rem The context was chosen by the caller (NINFER_CONTEXT turns the fit off), so the server took it as
-rem a demand and the card could not hold it beside the weights. Say what to change.
+rem A fixed context was demanded and the card could not hold it beside the weights. NINFER_CONTEXT and
+rem NINFER_FALLBACK=off each turn the fit off (see FIT above), so the advice names both rather than
+rem guessing which was set. Say what to change.
 echo.
-echo %TITLE% could not start: the context you asked for does not fit the free graphics card memory
-echo next to the model at this concurrency. Any of these will work:
-echo   - remove NINFER_CONTEXT, so the server picks the largest context that fits and says which
+echo %TITLE% could not start: the context this run asked for does not fit the free graphics card memory
+echo next to the model at this concurrency. NINFER_CONTEXT and NINFER_FALLBACK=off each turn off the
+echo automatic fit. Any of these will work:
+echo   - remove NINFER_CONTEXT and NINFER_FALLBACK, so the server picks the largest context that fits and says which
 echo   - lower NINFER_CONCURRENCY (each lane reserves memory), or lower NINFER_CONTEXT
 echo   - close other programs that use the GPU; `nvidia-smi` lists what is using it.
 

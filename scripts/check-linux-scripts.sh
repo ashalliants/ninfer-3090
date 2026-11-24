@@ -646,17 +646,14 @@ expect_eq 'a GPU memory refusal fails' "$ladder_status" '1'
 # "minimum ... reservation" failure uses similar words but is not the caller's choice, so it must not
 # get that advice.
 attempts 0 NINFER_TEST_FAILURE='FATAL server failed during startup | requested Engine runtime reservation requires 2443684608 bytes, but only 2004676608 bytes are available for runtime capacity'
-[[ "$ladder_out" == *'does not fit the free GPU memory'* && "$ladder_out" == *'unset NINFER_CONTEXT'* ]] || {
-  printf 'run.sh gave no advice on a requested-context refusal:
-%s
-' "$ladder_out" >&2
+[[ "$ladder_out" == *'does not fit the free GPU memory'* && "$ladder_out" == *'unset NINFER_CONTEXT'* &&
+   "$ladder_out" == *'NINFER_KV_CAPACITY'* && "$ladder_out" == *'NINFER_FALLBACK'* ]] || {
+  printf 'run.sh gave no advice on a requested-context refusal:\n%s\n' "$ladder_out" >&2
   exit 1
 }
 attempts 0 NINFER_TEST_FAILURE='FATAL server failed during startup | minimum Engine runtime reservation requires 2443684608 bytes in addition to 1073741824 bytes of automatic headroom, but only 2004676608 bytes are available'
 [[ "$ladder_out" != *'unset NINFER_CONTEXT'* ]] || {
-  printf 'run.sh blamed NINFER_CONTEXT for an automatic-sizing failure:
-%s
-' "$ladder_out" >&2
+  printf 'run.sh blamed NINFER_CONTEXT for an automatic-sizing failure:\n%s\n' "$ladder_out" >&2
   exit 1
 }
 

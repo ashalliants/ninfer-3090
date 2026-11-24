@@ -820,14 +820,16 @@ set -e
 if (( status != 0 )) && grep -q 'not enough free GPU memory' "$server_log"; then
   memory_advice
 elif (( status != 0 )) && grep -q 'requested Engine runtime reservation requires' "$server_log"; then
-  # The caller chose the context (NINFER_CONTEXT turns the fit off), so it was a demand the card
-  # could not meet beside the weights. Only the "requested ..." message means that: automatic
-  # sizing fails with "minimum Engine runtime reservation requires ...", which is not the caller's
-  # choice and needs different advice (free GPU memory), so it is matched by the full wording.
-  printf '\nThe context you asked for does not fit the free GPU memory next to the model at this concurrency.\n'
-  printf 'Any of these will work:\n'
-  printf '  - unset NINFER_CONTEXT, so the server picks the largest context that fits and says which\n'
-  printf '  - lower NINFER_CONCURRENCY (each lane reserves memory), or lower NINFER_CONTEXT\n'
+  # A fixed context or KV pool was demanded and the card could not hold it beside the weights.
+  # NINFER_CONTEXT, NINFER_KV_CAPACITY and NINFER_FALLBACK=off each turn the fit off (see FIT above),
+  # so the advice names all of them rather than guessing which one was set. Only the "requested ..."
+  # message means this: automatic sizing fails with "minimum Engine runtime reservation requires ...",
+  # which is not a demand and needs different advice (free GPU memory), so it is matched by the
+  # full wording.
+  printf '\nThe context or KV pool this run asked for does not fit the free GPU memory next to the model at this concurrency.\n'
+  printf 'NINFER_CONTEXT, NINFER_KV_CAPACITY and NINFER_FALLBACK=off each turn off the automatic fit. Any of these will work:\n'
+  printf '  - unset NINFER_CONTEXT, NINFER_KV_CAPACITY and NINFER_FALLBACK, so the server picks the largest context that fits and says which\n'
+  printf '  - lower NINFER_CONCURRENCY (each lane reserves memory), or lower the context or KV pool you set\n'
   printf '  - close other programs that use the GPU; `nvidia-smi` lists what is using it.\n'
 elif (( status != 0 && host_retry && HOST_CONTEXT_MIB > 0 )) &&
      grep -q 'cudaMallocHost failed' "$server_log"; then
