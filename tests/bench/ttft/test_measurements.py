@@ -540,7 +540,7 @@ def test_raw_payload_media_is_deduplicated_and_reconstructable(tmp_path):
     raw = tmp_path / "sample-001.json"
     _write(raw, {"requests": [handle.as_record(freeze_input=True),
                              handle.as_record(freeze_input=True)]})
-    records = json.loads(raw.read_text())["requests"]
+    records = json.loads(raw.read_text(encoding="utf-8"))["requests"]
     first = records[0]["request_payload"]["messages"][0]["content"][0]["image_url"]["url"]
     second = records[1]["request_payload"]["messages"][0]["content"][0]["image_url"]["url"]
     assert first == second

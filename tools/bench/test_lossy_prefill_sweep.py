@@ -132,7 +132,7 @@ def test_commands():
     cmd = sweep.server_command("ninfer-serve m.ninfer --kv-dtype rk4v4", 18130, Path("/tmp/rl.jsonl"), select["params"])
     check(cmd[:4] == ["ninfer-serve", "m.ninfer", "--kv-dtype", "rk4v4"], cmd)
     joined = " ".join(cmd)
-    for fragment in ("--port 18130", "--request-log-jsonl /tmp/rl.jsonl", "--lossy-prefill-min-tokens 30000",
+    for fragment in ("--port 18130", f"--request-log-jsonl {Path('/tmp/rl.jsonl')}", "--lossy-prefill-min-tokens 30000",
                      "--lossy-prefill-filter-layer 11", "--lossy-prefill-keep 0.3", "--lossy-prefill-block 128"):
         check(fragment in joined, f"{fragment} in {joined}")
     check(cmd[-1] == "--lossy-prefill-scout-a4" and "--lossy-prefill-strategy" not in cmd, "a4 switch, no strategy flag for select")
@@ -284,7 +284,7 @@ def test_lossy_evidence():
 def test_agent_command_passes_repo_and_failure_inputs():
     cmd = sweep.agent_replay_command(port=1, out=Path("o"), request_log=Path("l"), sessions=26, seed=7,
                                      repo=Path("/r"), commit="abc")
-    check(cmd[cmd.index("--repo") + 1] == "/r" and cmd[cmd.index("--commit") + 1] == "abc"
+    check(cmd[cmd.index("--repo") + 1] == str(Path("/r")) and cmd[cmd.index("--commit") + 1] == "abc"
           and cmd[cmd.index("--sessions") + 1] == "26", cmd)
     args = sweep.parse_args(["--from-json", "x.jsonl"])
     check(args.agent_sessions == 26 and args.greedy_chars == 330_000, "defaults sized for the gate / ~100K tokens")

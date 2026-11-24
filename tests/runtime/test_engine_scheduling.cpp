@@ -7,6 +7,7 @@
 
 #include "runtime/fake_engine.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -20,6 +21,12 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
+#endif
 
 namespace {
 
@@ -427,6 +434,18 @@ std::vector<std::size_t> decode_rounds_between_steps(const Rig& rig, std::uint64
     return gaps;
 }
 
+// The wall time of one fake decode round, as this host delivers it. The Program sleeps 1 ms per round,
+// which takes about 1.06 ms on Linux and about 1.8 ms on Windows even with a 1 ms timer period, so a
+// scenario that owes decode a number of milliseconds has to turn that into rounds with this.
+double decode_round_ms() {
+    constexpr int kSamples = 40;
+    const auto start       = Clock::now();
+    for (int sample = 0; sample < kSamples; ++sample) {
+        std::this_thread::sleep_for(std::chrono::microseconds(1000));
+    }
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count() / kSamples;
+}
+
 void test_decode_share_gives_the_stream_a_burst_per_step() {
     // A 1024-token step "takes" 112 ms; at 50% the Engine owes decode 112 ms, a 1 ms round at a time.
     // The debt follows the worker's wall clock (as the decode repayment does), so the fake step
@@ -440,9 +459,12 @@ void test_decode_share_gives_the_stream_a_burst_per_step() {
     (void)prompt.get();
     const auto gaps = decode_rounds_between_steps(shared, 2);
     require(gaps.size() == 3, "expected four prefill steps\n" + shared.dump());
+    // At least 60 ms of decode between steps (54% of the 112 ms owed), whatever the round length.
+    const auto needed = std::max<std::size_t>(1, static_cast<std::size_t>(60.0 / decode_round_ms()));
     for (const std::size_t rounds : gaps) {
-        require(rounds >= 60, "a 50% share ran only " + std::to_string(rounds) +
-                                   " decode rounds between steps\n" + shared.dump());
+        require(rounds >= needed, "a 50% share ran only " + std::to_string(rounds) +
+                                      " decode rounds between steps, fewer than the " +
+                                      std::to_string(needed) + " that 60 ms takes\n" + shared.dump());
     }
     require(shared.core().runtime_stats().deferred_prefill_turns > 150,
             "deferred turns were not counted");
@@ -2527,6 +2549,15 @@ void test_a_token_outside_the_vocabulary_ends_only_its_request() {
 }
 
 int main() {
+#ifdef _WIN32
+    // The fake Program sleeps 1 ms per decode step and the scenarios budget seconds of wall time on
+    // that. Windows' default timer tick is 15.6 ms, so a 1 ms sleep takes 15.5 ms, a 3,000-token
+    // request needs 47 s instead of 3 s, and the 30 s waits time out. Ask for 1 ms for this process.
+    struct TimerResolution {
+        TimerResolution() { timeBeginPeriod(1); }
+        ~TimerResolution() { timeEndPeriod(1); }
+    } timer_resolution;
+#endif
     int failures = 0;
     const auto run = [&](const char* name, void (*test)()) {
         try {
