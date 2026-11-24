@@ -84,11 +84,12 @@ root="$(cd -- "$script_dir/.." && pwd)"
 model_key="${1:-}"
 
 if [[ -z "${NINFER_SERVER:-}" ]]; then
-  # scripts/v100_build.sh's tree: BUILD_DIR, else its default $HOME/build-v100; then build-v100/
-  # beside or above the checkout, and a rented box's /workspace.
+  # scripts/v100_build.sh's tree: BUILD_DIR, else its default build-v100/ inside the checkout; then
+  # ~/build-v100 (that script's old default), build-v100/ above the checkout, and a rented box's
+  # /workspace.
   # The release archive keeps ninfer-serve in the same directory as this script.
-  for candidate in "$script_dir/ninfer-serve" ${BUILD_DIR:+"$BUILD_DIR/apps/ninfer-serve"} "$HOME/build-v100/apps/ninfer-serve" \
-                   "$root/build-v100/apps/ninfer-serve" "$root/../build-v100/apps/ninfer-serve" \
+  for candidate in "$script_dir/ninfer-serve" ${BUILD_DIR:+"$BUILD_DIR/apps/ninfer-serve"} "$root/build-v100/apps/ninfer-serve" \
+                   "$HOME/build-v100/apps/ninfer-serve" "$root/../build-v100/apps/ninfer-serve" \
                    "/workspace/build-v100/apps/ninfer-serve"; do
     if [[ -x "$candidate" ]]; then
       NINFER_SERVER="$(cd -- "$(dirname -- "$candidate")" && pwd)/ninfer-serve"
@@ -96,8 +97,8 @@ if [[ -z "${NINFER_SERVER:-}" ]]; then
     fi
   done
   if [[ -z "${NINFER_SERVER:-}" ]]; then
-    printf 'No sm_70 ninfer-serve found (looked in $BUILD_DIR, ~/build-v100, build-v100/ beside and\n' >&2
-    printf 'above the checkout, and /workspace/build-v100/). Build one with scripts/v100_build.sh, or\n' >&2
+    printf 'No sm_70 ninfer-serve found (looked in $BUILD_DIR, build-v100/ in the checkout, ~/build-v100,\n' >&2
+    printf 'build-v100/ above the checkout, and /workspace/build-v100/). Build one with scripts/v100_build.sh, or\n' >&2
     printf 'set NINFER_SERVER (or BUILD_DIR).\n' >&2
     exit 1
   fi

@@ -1173,7 +1173,8 @@ run_graft HF_TOKEN=t NINFER_GRAFTS=off >/dev/null || graft_fail 'NINFER_GRAFTS=o
 [[ ! -s "$GRAFT_LOG" && ! -e "$gdir" ]] || graft_fail 'NINFER_GRAFTS=off still fetched'
 
 # scripts/run-v100.sh finds the server scripts/v100_build.sh built: in BUILD_DIR when it is set,
-# else in that script's default, $HOME/build-v100, wherever the checkout is.
+# else in that script's default, build-v100/ in the checkout (not created here), then the old
+# default $HOME/build-v100, wherever the checkout is.
 v100_fail() { printf 'run-v100.sh: %s\n' "$1" >&2; exit 1; }
 for layout in build-dir home; do
   v100_home="$tmp/v100-$layout-home"; v100_tree="$tmp/v100-$layout-tree"
