@@ -65,10 +65,12 @@ rows marked 200 W, re-measured 2026-11-23 (prefill 2026-11-24); the
 ## Build
 
 ```bash
-BUILD_DIR=$HOME/build-v100 scripts/v100_build.sh ninfer ninfer-serve
+scripts/v100_build.sh ninfer ninfer-serve
 ```
 
-`scripts/v100_build.sh` configures with `-DCMAKE_CUDA_ARCHITECTURES=70`, uses ccache, and limits
+`scripts/v100_build.sh` builds in `build-v100/` inside the checkout (set `BUILD_DIR` to move it).
+Each worktree gets its own tree, and ccache shares objects between them. It configures with
+`-DCMAKE_CUDA_ARCHITECTURES=70`, uses ccache, and limits
 parallel compile jobs to fit the host's RAM. One `nvcc` job can peak at 1.5-2 GiB. Set
 `NINFER_BUILD_TESTS=1` to configure the tests as well.
 

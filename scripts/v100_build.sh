@@ -3,7 +3,8 @@
 # installed (scripts/setup-ccache.sh installs and configures it; the build works without it).
 # Usage: scripts/v100_build.sh [ninja targets...]   (default: ninfer ninfer-serve)
 #   NINFER_BUILD_TESTS=1   also configure the tests (target ninfer_tests builds all of them)
-#   BUILD_DIR              build tree (default $HOME/build-v100, where scripts/run-v100.sh looks)
+#   BUILD_DIR              build tree (default build-v100/ inside this checkout, where scripts/run-v100.sh
+#                          looks first; each worktree gets its own tree, which ccache sharing needs)
 #   JOBS                   parallel compile jobs (default: min(cores, RAM GiB / 2); one nvcc job
 #                          peaks at 1.5-2 GiB, and an OOM-killed container cannot be restarted)
 # CUDA 12.8 is the newest toolkit that still compiles for Volta (13.0 dropped sm_70); it warns that
@@ -11,18 +12,20 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD="${BUILD_DIR:-$HOME/build-v100}"
+BUILD="${BUILD_DIR:-$SRC/build-v100}"
 
-# ccache, when installed, with the user's own cache and configuration (CCACHE_DIR and the size
-# come from scripts/setup-ccache.sh's settings, or ccache's per-user default).
-launcher=()
+# ccache, when installed. cmake/CompilerCache.cmake sets the compiler launchers itself, with the
+# settings that let worktrees share entries (CCACHE_BASEDIR, CCACHE_NOHASHDIR, and ignoring the
+# per-tree -Xcompiler=-ffile-prefix-map option). Passing a bare `ccache` launcher here bypassed
+# those, so every worktree's CUDA objects missed. A tree configured by the old script keeps the
+# cached bare launcher; the -U options below clear it.
+have_ccache=0
 if command -v ccache >/dev/null; then
+  have_ccache=1
   # nvcc output is only cacheable when the compiler hash is stable and sloppiness covers
   # the timestamps nvcc embeds in temporary file names.
   export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-time_macros,include_file_mtime,include_file_ctime}"
   export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-content}"
-  launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
 else
   echo "ccache not found: building without it (scripts/setup-ccache.sh installs it)." >&2
 fi
@@ -33,7 +36,7 @@ testing=OFF
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES=70 \
-  ${launcher[@]+"${launcher[@]}"} \
+  -U CMAKE_C_COMPILER_LAUNCHER -U CMAKE_CXX_COMPILER_LAUNCHER -U CMAKE_CUDA_COMPILER_LAUNCHER \
   -DNINFER_BUILD_APPS=ON -DBUILD_TESTING="$testing"
 
 if [ -z "${JOBS:-}" ]; then
@@ -44,4 +47,4 @@ fi
 
 if [ "$#" -eq 0 ]; then set -- ninfer ninfer-serve; fi
 ninja -C "$BUILD" -j "$JOBS" "$@"
-if [ "${#launcher[@]}" -gt 0 ]; then ccache -s | head -12; fi
+if [ "$have_ccache" = 1 ]; then ccache -s | head -12; fi
