@@ -2070,9 +2070,11 @@ MemorySummary Inkling2Core::memory_summary() const {
     m.requested_max_context = requested_context_;
     m.kv_capacity           = options_.max_context * static_cast<std::uint32_t>(slots_); // slots_ rings of max_context
     // The weights on the device: the artifact's device backing (its allocations, alignment included; h2d_bytes is
-    // the payload transferred) and any --dense-q8 re-encoding kept beside it.
+    // the payload transferred), the MXFP8 expert banks and the BF16 banks' row exponents made at load, and any
+    // --dense-q8 re-encoding kept beside it.
     const std::size_t weights = static_cast<std::size_t>(model_->storage_stats().device_capacity_bytes) +
-                                static_cast<std::size_t>(model_->mxfp8_expert_bytes()) + (programs_->dense ? programs_->dense->bytes() : 0);
+                                static_cast<std::size_t>(model_->mxfp8_expert_bytes()) + static_cast<std::size_t>(model_->bank_exponent_bytes()) +
+                                (programs_->dense ? programs_->dense->bytes() : 0);
     m.weights = {.capacity_bytes = weights, .used_bytes = weights, .peak_used_bytes = weights};
     m.available_after_weights_bytes = free_after_weights_;
     return m;

@@ -105,6 +105,12 @@ public:
         for (const DeviceBuffer& b : mxfp8_banks_) { n += b.bytes; }
         return n;
     }
+    // The device bytes of the BF16 banks' row exponents (SituExpertBank::row_exponents), beside storage_stats().
+    [[nodiscard]] std::uint64_t bank_exponent_bytes() const noexcept {
+        std::uint64_t n = 0;
+        for (const DeviceBuffer& b : bank_exponents_) { n += b.bytes; }
+        return n;
+    }
     // What the MXFP8 re-encode read from the artifact, uploaded (through `staging_bytes` of pinned staging) and took,
     // beside storage_stats(), which covers only the materialized weights. Zero when the experts are BF16.
     struct Mxfp8LoadStats {
