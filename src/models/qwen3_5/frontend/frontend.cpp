@@ -1,5 +1,6 @@
 #include "models/qwen3_5/frontend/frontend.h"
 
+#include "models/qwen3_5/frontend/bundled_templates.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
@@ -223,7 +224,12 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
         tokens["additional_special_tokens"] = config["additional_special_tokens"];
     std::string source(resources.chat_template_jinja);
     std::string name = "artifact:chat_template.jinja";
-    if (!override_path.empty()) {
+    if (override_path.empty()) {
+        if (auto bundled = bundled_template_for_stock(source)) {
+            source = std::move(*bundled);
+            name   = "bundled:chat_template.jinja (artifact carries the stock Qwen template)";
+        }
+    } else {
         name = override_path.string();
         std::ifstream file(override_path, std::ios::binary | std::ios::ate);
         if (!file) throw std::invalid_argument("cannot read chat template: " + name);

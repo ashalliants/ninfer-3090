@@ -1609,7 +1609,12 @@ does not match the model-held endpoint and can reuse only an earlier exact check
 Generated token segmentation can also differ from re-encoding the same text, limiting prefix reuse.
 
 `--chat-template FILE` selects a local Jinja template; by default, the server uses the template
-stored in the artifact. See the [CLI guide](cli.md#text-input) for an example.
+stored in the artifact. See the [CLI guide](cli.md#text-input) for an example. An artifact that
+still carries the unmodified Qwen3.6 or Qwen3.8 template (one converted without
+`--resource chat_template.jinja=...`) is detected at startup and served with the bundled NInfer
+template of that family instead. The stock template rejects a system message that is not first
+(`System message must be at the beginning.`); the bundled one renders it in place. The choice is
+made once per server, so cached prefixes are unaffected. `--chat-template FILE` still wins.
 
 Clients send a wider effort vocabulary than the maintained Qwen templates accept (`low`, `medium`,
 `xhigh`). This fork collapses `minimal` onto `low` and `high`/`max` onto `xhigh` before rendering,
