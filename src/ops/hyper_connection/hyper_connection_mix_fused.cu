@@ -25,7 +25,9 @@
 // inject = 2 sigmoid(z[rank + s] / S)), computes the S rows (s*H + d) of W_up against m (per
 // lane, each of its chunks' eight products in k order added to that stream's sum in chunk order,
 // then a warp butterfly per stream), and lane 0 writes x[d] = bf16((1/S) * sum_s sigmoid(u_s) * Rn_s) with Rn_s
-// formed in FP32 from R, inv and w.
+// formed in FP32 from R, inv and w. On Volta (kUpScatter) m is stored in two planes, the four
+// butterflies are one reduce-scatter of the same pairs and the four sigmoids run on four lanes;
+// the bits are the plain kernel's.
 //
 // No intermediate is rounded to BF16: Rn, z, m and u stay FP32. Each column is computed
 // independently in a fixed order, so a column's result does not depend on how many columns share
@@ -58,7 +60,7 @@ constexpr int kStreams     = 4;
 constexpr int kHidden      = 2560;
 constexpr int kChunks      = kHidden / 256; // a lane's 8-weight chunks per stream slice
 constexpr int kMaxRank     = 512;
-// Rows of W_down per CTA (a row per warp). Volta: 10, so Flash-Next's 324 rows x 4 streams make 132
+// Rows of W_down per CTA (a row per warp). Volta: 9, so Flash-Next's 324 rows x 4 streams make 144
 // CTAs, one wave on 80 SMs at two per SM (8 made 164, a second wave of 4). The sums of squares
 // are always taken by the first kSumThreads threads, so their order does not depend on kDownRows.
 #if defined(NINFER_SM70)
@@ -72,6 +74,16 @@ constexpr int kPassColumns = 4; // 40 KiB of Rn: two CTAs per SM
 constexpr int kUpFeatures  = 16; // features d per CTA (a d per warp)
 constexpr int kUpThreads   = kUpFeatures * 32;
 constexpr int kUpMinBlocks = 2; // 160 CTAs in one wave on 82 SMs
+// K1b's Volta form (hc_up_collapse_kernel, Scatter). There the column loop is bound by instruction
+// issue and shared-memory reads: per column, the four butterflies, lane 0's four sigmoids (an
+// IEEE division each) and the lanes' two-way bank-conflicted float4 reads of m. Measured in the
+// model on the V100 (Flash-Next code request, 110 calls a round): 27.2 -> 24.3 us a call, 0.32 ms a
+// round. Elsewhere the plain form, not measured.
+#if defined(NINFER_SM70)
+constexpr bool kUpScatter = true;
+#else
+constexpr bool kUpScatter = false;
+#endif
 constexpr std::size_t kDownSharedBytes =
     static_cast<std::size_t>(kPassColumns) * kHidden * sizeof(float);
 
@@ -324,10 +336,23 @@ __global__ __launch_bounds__(kDownThreads, 2) void hc_down_partials_kernel(
     }
 }
 
+// Where value k of a column sits in K1b's shared m. With Planes, as K1a's rn_slot: the first four
+// values of every 8-value chunk in one plane and the last four in the other (rank / 2 apart, a
+// multiple of 4), so a warp's float4 reads of its lanes' chunks are 16 bytes apart instead of 32.
+template <bool Planes>
+__device__ __forceinline__ int m_slot(int k, int rank) {
+    if constexpr (Planes) {
+        return (k & 4 ? rank / 2 : 0) + (k >> 3) * 4 + (k & 3);
+    } else {
+        (void)rank;
+        return k;
+    }
+}
+
 // A warp's S rows (s*H + d) of W_up hold S * rank / 8 chunks of 8 weights; lane l owns chunks
 // l, l + 32, ... of that list (chunk j is stream j / (rank / 8), weights 8 (j % (rank / 8)) on), so
 // a lane carries at most PerLane of them and, for rank 320, no lane idles.
-template <class Codec, int PerLane>
+template <class Codec, int PerLane, bool Scatter>
 __global__ __launch_bounds__(kUpThreads, kUpMinBlocks) void hc_up_collapse_kernel(
     const float* __restrict__ partial, const float* __restrict__ inv_in,
     const bf16* __restrict__ residual, const float* __restrict__ norm_weight,
@@ -378,7 +403,7 @@ __global__ __launch_bounds__(kUpThreads, kUpMinBlocks) void hc_up_collapse_kerne
         }
         const float v = z * inv_streams;
         if (k < rank) {
-            m[t * rank + k] = v * sigmoidf(v);
+            m[t * rank + m_slot<Scatter>(k, rank)] = v * sigmoidf(v);
         } else if (inject != nullptr && blockIdx.x == 0) {
             inject[static_cast<std::int64_t>(t) * kStreams + (k - rank)] = 2.0F * sigmoidf(v);
         }
@@ -413,8 +438,8 @@ __global__ __launch_bounds__(kUpThreads, kUpMinBlocks) void hc_up_collapse_kerne
             if (j < total) {
                 const int s    = static_cast<int>(__umulhi(static_cast<unsigned>(j), magic));
                 const int k    = (j - s * chunks) * 8;
-                const float4 a = *reinterpret_cast<const float4*>(mt + k);
-                const float4 b = *reinterpret_cast<const float4*>(mt + k + 4);
+                const float4 a = *reinterpret_cast<const float4*>(mt + m_slot<Scatter>(k, rank));
+                const float4 b = *reinterpret_cast<const float4*>(mt + m_slot<Scatter>(k + 4, rank));
                 float wv[8];
                 Codec::decode(chunk[i], wv);
                 float p = wv[0] * a.x;
@@ -431,16 +456,46 @@ __global__ __launch_bounds__(kUpThreads, kUpMinBlocks) void hc_up_collapse_kerne
                 }
             }
         }
+        if constexpr (Scatter) {
+            // The four butterflies as one reduce-scatter: at offset 16 each half keeps two streams'
+            // sums, at 8 each quarter keeps one, then 4, 2 and 1. Every sum adds the same two values
+            // the butterfly did (lane l's and lane l ^ o's of the same stream), so each stream's total
+            // has the butterfly's bits; lane 8 s holds stream s's. Those four lanes take the sigmoids
+            // at once, and lane 0 collapses them in the same order.
+            const int half = (lane >> 4) & 1, quarter = (lane >> 3) & 1;
+            const float send0 = half ? acc[0] : acc[2], send1 = half ? acc[1] : acc[3];
+            const float keep0 = half ? acc[2] : acc[0], keep1 = half ? acc[3] : acc[1];
+            const float pair0 = keep0 + __shfl_xor_sync(0xFFFFFFFFU, send0, 16);
+            const float pair1 = keep1 + __shfl_xor_sync(0xFFFFFFFFU, send1, 16);
+            const float send  = quarter ? pair0 : pair1;
+            float total_s     = (quarter ? pair1 : pair0) + __shfl_xor_sync(0xFFFFFFFFU, send, 8);
+            total_s += __shfl_xor_sync(0xFFFFFFFFU, total_s, 4);
+            total_s += __shfl_xor_sync(0xFFFFFFFFU, total_s, 2);
+            total_s += __shfl_xor_sync(0xFFFFFFFFU, total_s, 1);
+            const float gate = (lane & 7) == 0 ? sigmoidf(total_s) : 0.0F;
+            float gates[kStreams], rn[kStreams];
 #pragma unroll
-        for (int s = 0; s < kStreams; ++s) { acc[s] = warp_sum(acc[s]); }
-        float rn[kStreams];
+            for (int s = 0; s < kStreams; ++s) { gates[s] = __shfl_sync(0xFFFFFFFFU, gate, 8 * s); }
 #pragma unroll
-        for (int s = 0; s < kStreams; ++s) { rn[s] = __shfl_sync(0xFFFFFFFFU, lane_rn, s + 4 * (t % 8)); }
-        if (lane == 0) {
-            float sum = 0.0F;
+            for (int s = 0; s < kStreams; ++s) { rn[s] = __shfl_sync(0xFFFFFFFFU, lane_rn, s + 4 * (t % 8)); }
+            if (lane == 0) {
+                float sum = 0.0F;
 #pragma unroll
-            for (int s = 0; s < kStreams; ++s) { sum += sigmoidf(acc[s]) * rn[s]; }
-            x[static_cast<std::int64_t>(t) * kHidden + d] = __float2bfloat16_rn(sum * inv_streams);
+                for (int s = 0; s < kStreams; ++s) { sum += gates[s] * rn[s]; }
+                x[static_cast<std::int64_t>(t) * kHidden + d] = __float2bfloat16_rn(sum * inv_streams);
+            }
+        } else {
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) { acc[s] = warp_sum(acc[s]); }
+            float rn[kStreams];
+#pragma unroll
+            for (int s = 0; s < kStreams; ++s) { rn[s] = __shfl_sync(0xFFFFFFFFU, lane_rn, s + 4 * (t % 8)); }
+            if (lane == 0) {
+                float sum = 0.0F;
+#pragma unroll
+                for (int s = 0; s < kStreams; ++s) { sum += sigmoidf(acc[s]) * rn[s]; }
+                x[static_cast<std::int64_t>(t) * kHidden + d] = __float2bfloat16_rn(sum * inv_streams);
+            }
         }
     }
 }
@@ -449,7 +504,7 @@ template <class Codec, int PerLane>
 void launch_up(const float* partial, const float* inv, const bf16* residual,
                const float* norm_weight, typename Codec::Params up, int rank, int down_rows,
                int columns, float* inject, bf16* x, cudaStream_t stream) {
-    hc_up_collapse_kernel<Codec, PerLane>
+    hc_up_collapse_kernel<Codec, PerLane, kUpScatter>
         <<<(kHidden + kUpFeatures - 1) / kUpFeatures, kUpThreads, 0, stream>>>(
             partial, inv, residual, norm_weight, up, rank, down_rows, columns, inject, x);
 }
