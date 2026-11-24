@@ -363,10 +363,11 @@ Put each kind of file here instead:
 
 - **Build trees** go inside the checkout or worktree whose source they compile: `<tree>/build-linux`,
   `<tree>/build-v100` and so on. `build-*/` is gitignored, the tree is removed together with its
-  worktree, and ccache still shares, because worktrees live under the main checkout (its `base_dir`).
-  A tree in `~` outlives its worktree and nobody can tell what it was built from.
-  `scripts/v100_build.sh` defaults to `$HOME/build-v100` for users on a V100 box, so pass
-  `BUILD_DIR=<tree>/build-v100` (`scripts/run-v100.sh` also looks for `build-v100/` inside the checkout).
+  worktree, and ccache still shares, because the base covers every worktree (the main checkout, or
+  the directory holding both when worktrees sit beside it). A tree in `~` outlives its worktree,
+  nobody can tell what it was built from, and it misses the cache.
+  `scripts/v100_build.sh` defaults to `<tree>/build-v100`, and `scripts/run-v100.sh` looks there
+  first. Set `BUILD_DIR` only to override that deliberately.
 - **One-off scripts, logs, patches, commit and PR message files** go in `<tree>/tmp/` (gitignored) or the
   session's scratchpad, never loose in `~` or the repository root. Delete them before the session
   ends; anything worth keeping belongs in the repo (a test, a tool under `tools/`, a doc).
