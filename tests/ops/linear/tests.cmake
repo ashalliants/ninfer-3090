@@ -39,6 +39,13 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   endforeach()
 endif()
 
+# The per-stream verify_a8 switch (ops/linear/common/stream_a8.h): two engines keep their own
+# settings. Host only.
+ninfer_add_test(ninfer_stream_a8_registration_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_stream_a8.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_stream_a8_registration_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_op_test(ninfer_linear_t2_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t2_a16.cpp"
   LIBRARIES ninfer_linear_test_support)

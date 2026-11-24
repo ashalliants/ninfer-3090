@@ -41,15 +41,17 @@
 
 namespace ninfer::ops::detail {
 
-// Compiled into sm_70 builds only; whether a call takes it is the engine's choice
-// (EngineOptions::verify_a8 through ops::set_stream_a8_activations, stream_a8.h).
+// Compiled into sm_70 builds only; whether a call takes it is the engine's choice, per stream
+// (EngineOptions::verify_a8 through ops::StreamA8Registration, stream_a8.h).
 #if defined(NINFER_SM70)
 inline constexpr bool kStreamDp4aCompiled = true;
 #else
 inline constexpr bool kStreamDp4aCompiled = false;
 #endif
 
-inline bool stream_dp4a_enabled() { return ninfer::ops::stream_a8_activations(); }
+inline bool stream_dp4a_enabled(cudaStream_t stream) {
+    return ninfer::ops::stream_a8_activations(stream);
+}
 
 template <class Format>
 concept StreamDp4aFormat = requires { requires Format::kDp4a; };
@@ -315,7 +317,7 @@ bool try_launch_stream_dp4a_rows(const __nv_bfloat16* x, std::int64_t x_stride,
     if constexpr (!kStreamDp4aCompiled || !StreamDp4aFormat<Format> || Cols > kStreamDp4aMaxCols) {
         return false;
     } else {
-        if (!stream_dp4a_enabled()) return false;
+        if (!stream_dp4a_enabled(stream)) return false;
         if (k % 256 != 0 || x_stride % 8 != 0) return false;
 
         const std::int32_t chunk_k = stream_dp4a_chunk_k(k);

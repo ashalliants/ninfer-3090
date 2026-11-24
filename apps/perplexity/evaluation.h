@@ -151,17 +151,23 @@ struct KldChunk {
 inline constexpr double kKldWriteFloor = -20.0;
 class KldBaseWriter {
 public:
-    // The base's first `chunks` chunks of tokens.
+    // The base's first `chunks` chunks of tokens. Rows go to a temporary sibling of `path`
+    // (`path` + ".partial"), which finish() renames onto `path`; a writer destroyed without a
+    // successful finish() removes it, so a failed run never replaces an existing file. Refuses a
+    // `path` that names `tokens_from.path` (the base a run compares against).
     KldBaseWriter(std::filesystem::path path, const KldBase& tokens_from, int chunks);
     ~KldBaseWriter();
     KldBaseWriter(const KldBaseWriter&)            = delete;
     KldBaseWriter& operator=(const KldBaseWriter&) = delete;
     void add_row(std::span<const float> logits);
-    // Checks the row count against the header and closes the file. Throws std::runtime_error.
+    // Checks the row count against the header, closes the file and renames it onto the
+    // destination. Throws std::runtime_error.
     void finish();
 
 private:
     std::filesystem::path path_;
+    std::filesystem::path partial_;
+    bool finished_ = false;
     std::uint32_t n_ctx_ = 0;
     std::int32_t n_vocab_ = 0;
     std::uint64_t rows_   = 0;

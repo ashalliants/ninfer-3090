@@ -430,6 +430,28 @@ int check_kld_writer() {
         } catch (const std::runtime_error&) { short_refused = true; }
     }
     failures += require(short_refused, "a base with missing rows is refused at finish");
+
+    // A failed or abandoned write leaves an existing destination untouched and no partial file.
+    const auto size_before = std::filesystem::file_size(file.path);
+    {
+        ninfer::perplexity::KldBaseWriter writer(file.path, from_tokens, 2);
+        writer.add_row(logits[0]);
+    }
+    std::filesystem::path partial = file.path;
+    partial += ".partial";
+    failures += require(std::filesystem::file_size(file.path) == size_before &&
+                            !std::filesystem::exists(partial),
+                        "an unfinished write keeps the old file and removes its partial file");
+    failures += require(ninfer::perplexity::read_kld_base(file.path).n_chunk == 2,
+                        "the old base still reads after an unfinished write");
+
+    // Writing onto the base a run compares against is refused before anything is touched.
+    bool alias_refused = false;
+    try {
+        ninfer::perplexity::KldBaseWriter writer(file.path, base, 2);
+    } catch (const std::runtime_error&) { alias_refused = true; }
+    failures += require(alias_refused && std::filesystem::file_size(file.path) == size_before,
+                        "--kld-write onto the --kld-base file is refused");
     return failures;
 }
 

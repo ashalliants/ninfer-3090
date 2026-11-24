@@ -355,8 +355,15 @@ KldBaseWriter::KldBaseWriter(std::filesystem::path path, const KldBase& tokens_f
       tokens_(tokens_from.tokens.begin(),
               tokens_from.tokens.begin() + static_cast<std::ptrdiff_t>(
                                                static_cast<std::size_t>(chunks) * n_ctx_)) {
-    file_ = std::fopen(path_.string().c_str(), "wb");
-    if (file_ == nullptr) { kld_fail(path_, "cannot create KL-divergence base"); }
+    std::error_code ec;
+    if (!tokens_from.path.empty() && std::filesystem::exists(path_, ec) &&
+        std::filesystem::equivalent(path_, tokens_from.path, ec)) {
+        kld_fail(path_, "--kld-write names the base this run reads; write to another file");
+    }
+    partial_ = path_;
+    partial_ += ".partial";
+    file_ = std::fopen(partial_.string().c_str(), "wb");
+    if (file_ == nullptr) { kld_fail(partial_, "cannot create KL-divergence base"); }
 }
 
 void KldBaseWriter::add_row(std::span<const float> logits) {
@@ -412,15 +419,28 @@ void KldBaseWriter::add_row(std::span<const float> logits) {
 
 KldBaseWriter::~KldBaseWriter() {
     if (file_ != nullptr) { std::fclose(file_); }
+    if (!finished_) {
+        std::error_code ec;
+        std::filesystem::remove(partial_, ec);
+    }
 }
 
 void KldBaseWriter::finish() {
+    if (file_ == nullptr) { kld_fail(path_, "--kld-write finished twice"); }
     const std::uint64_t expected =
         static_cast<std::uint64_t>(tokens_.size() / n_ctx_) * kld_rows_per_chunk(n_ctx_);
     const bool closed = std::fclose(file_) == 0;
     file_             = nullptr;
     if (!closed) { kld_fail(path_, "write to KL-divergence base failed"); }
     if (rows_ != expected) { kld_fail(path_, "--kld-write got fewer rows than its chunks hold"); }
+    std::error_code ec;
+    std::filesystem::rename(partial_, path_, ec);
+    if (ec) {
+        const std::string what =
+            "cannot move the written KL-divergence base into place: " + ec.message();
+        kld_fail(path_, what.c_str());
+    }
+    finished_ = true;
 }
 
 int kld_row(const KldBase& base, std::int64_t position) {

@@ -869,11 +869,12 @@ tokens from four held-out domains, INT8 KV, FP16 GDN state; base = the FP32 kern
 
 That is about twice the FP32 reordering floor and a fifth of the Inkling FP16 tensor-core prefill
 (about 4e-3), so it is the default. `--no-verify-a8` (or `NINFER_STREAM_DP4A=0`) restores the FP32
-kernels; `NINFER_STREAM_DP4A=1` forces the route for op tests and A/B runs. The engine sets it for
-the Qwen3.5 family only (`runtime/engine/model_instance.cpp`), through a process-wide switch
-(`ops/linear/common/stream_a8.h`) that is off for any other caller, so the op suites keep testing
-the A16 kernels; their `_stream_a8` variants run with it forced, at a widened allowance
-(`with_stream_a8_allowance` in `tests/ops/op_tester.h`).
+kernels; `NINFER_STREAM_DP4A=1` forces the route for op tests and A/B runs. The choice is per CUDA
+stream (`ops/linear/common/stream_a8.h`): a Qwen3.5-family model instance registers its ranks'
+streams with its own `verify_a8` for its lifetime (`runtime/engine/model_instance.cpp`), so two
+engines in one server keep their own settings, and a launch on any unregistered stream (other
+models, the op suites) keeps the A16 kernels. The op suites' `_stream_a8` variants run with the
+route forced, at a widened allowance (`with_stream_a8_allowance` in `tests/ops/op_tester.h`).
 
 An FP16 tensor-core form (`mma.m8n8k4`, exact FP16 weight integers, the activation scaled per token
 into [2^14, 2^15), FP32 accumulation per 64-weight group) was built first and measured slower than

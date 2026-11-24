@@ -22,6 +22,7 @@ set(NINFER_CPU_ONLY_TESTS
   ninfer_bench_support_test
   ninfer_chat_templates_test
   ninfer_chunked_reservation_test
+  ninfer_stream_a8_registration_test
   ninfer_cli_options_test
   ninfer_context_cost_measure_test
   ninfer_context_cost_test

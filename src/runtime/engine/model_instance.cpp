@@ -10,7 +10,6 @@
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/lossy_options.h"
 #include "models/qwen3_5/measurement.h"
-#include "ops/linear/common/stream_a8.h"
 #include "runtime/engine/host_cache.h"
 #include "runtime/engine/inkling2_core.h"
 #include "runtime/engine/validate_options.h"
@@ -630,10 +629,6 @@ ResidencyTransition ModelInstance::resume(DeviceContext& device, DeviceSnapshot&
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
     validate_engine_options(options);
     validate_flash_next_options_unused(options);
-    // The Qwen3.5 family's Q4/Q5/Q6 linears at decode and verify widths take the int8-activation
-    // route on sm_70 when the option is on. The switch is process-wide: in a multi-model server
-    // the most recently constructed Qwen3.5-family model's setting applies to every model.
-    ops::set_stream_a8_activations(options.verify_a8);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     // Shared so a suspendable model can keep its files open and upload the weights again on resume.
@@ -666,6 +661,16 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     device.synchronize();
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+    {
+        // Before the Program exists, so its captured graphs see the setting. Every stream of
+        // every rank: the forward forks onto the side streams during capture.
+        std::vector<cudaStream_t> streams;
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            const RankContext& r = device.rank(rank);
+            streams.insert(streams.end(), {r.stream, r.transfer_stream, r.vision_stream});
+        }
+        instance->stream_a8 = ops::StreamA8Registration(std::move(streams), options.verify_a8);
+    }
     frontend.complete();
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     // Overlay Vision: size the encode window and pin the borrowable weight tail's mirror before
