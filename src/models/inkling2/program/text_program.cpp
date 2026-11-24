@@ -114,7 +114,14 @@ std::size_t forward_bytes(const TextConfig& c, std::int32_t cols, std::int32_t l
                                                          blas ? ops::moe_route_sigmoid_topk_blas_workspace_bytes(i32(c.experts), cols)
                                                               : ops::moe_route_sigmoid_topk_workspace_bytes(i32(c.experts), cols),
                                                          control(1)});
-    const std::size_t experts  = tc.experts && wide ? ops::moe_situ_experts_tc_workspace_bytes(bank, entries, cols, false, blas ? tc.blas_experts : 0)
+    // With BF16 banks (expert_format BF16) the other layers are NVFP4 records: the larger of the two routes.
+    ops::SituExpertBank records = bank;
+    records.format              = QType::GGML_REC_NVFP4_NVFP4;
+    const std::size_t experts_tc =
+        expert_format == QType::BF16 ? std::max(ops::moe_situ_experts_tc_workspace_bytes(bank, entries, cols, false, blas ? tc.bank_experts : 0),
+                                                ops::moe_situ_experts_tc_workspace_bytes(records, entries, cols, false, blas ? tc.blas_experts : 0))
+                                     : ops::moe_situ_experts_tc_workspace_bytes(bank, entries, cols, false, blas ? tc.blas_experts : 0);
+    const std::size_t experts  = tc.experts && wide ? experts_tc
                                                     : padded(top_k * t * c.moe_intermediate * 4) + padded(top_k * t * h * 4) + padded((1 + top_k * t) * 4);
     const std::size_t moe      = routed + std::max(route, top_k * col + (saving ? col : 0) + experts);
     // The output: its mix and norm, the head's BF16 input and the logits (the head is the widest weight a tensor-core
@@ -939,8 +946,9 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
     // combine); the combined y is written out only when the convolution inputs are being saved.
     Tensor entries = workspace_.alloc(DType::FP32, {h, top_k * cols});
     if (limits_.prefill_tc.experts && cols >= kTensorCoreMinColumns) {
-        ops::moe_situ_experts_tc(model_.expert_bank(p), zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_,
-                                 blas_wide(cols) ? limits_.prefill_tc.blas_experts : 0);
+        const ops::SituExpertBank& bank = model_.expert_bank(p);
+        const std::int32_t split = !blas_wide(cols) ? 0 : bank.format == QType::BF16 ? limits_.prefill_tc.bank_experts : limits_.prefill_tc.blas_experts;
+        ops::moe_situ_experts_tc(bank, zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_, split);
     } else {
         ops::moe_situ_experts(model_.expert_bank(p), zn, ids, nullptr, c.gate_softcap, c.up_softcap, workspace_, entries, stream_);
     }

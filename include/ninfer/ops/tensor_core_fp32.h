@@ -44,6 +44,9 @@ void projection_tc_fp32(std::span<const Tensor* const> inputs, std::span<const T
  *   whole call (situ is at most gate_cap up_cap in magnitude); the down kernel scatters each entry's column.
  *   BF16 banks: each expert's rows in FP16 under a power of two per row, cuBLAS FP32-accumulating GEMMs, the
  *   activation under a power of two per entry.
+ *   BF16 banks with blas_min_entries > 0 and row_exponents set: the NVFP4 banks' kernels and hot-expert split, the
+ *   kernels decoding each row (BF16 or MXFP8) into FP16 under its exponent, the same FP16 values the cuBLAS route
+ *   multiplies, and the activation under the kernels' one power of two; the hot experts take the cuBLAS route above.
  *   NVFP4 banks with blas_min_entries > 0: an expert with at least that many entries in the call is decoded whole
  *   into FP16 (exact, as above) and multiplied by cuBLAS (FP32 accumulate) in batches of up to
  *   kExpertsBlasBatch entries, its inputs and activation scaled as the kernels scale them; the other experts take
@@ -58,6 +61,13 @@ void projection_tc_fp32(std::span<const Tensor* const> inputs, std::span<const T
  * Execution: stream-ordered; syncs the stream; not graph capturable.
  */
 inline constexpr int kExpertsBlasBatch = 1024;
+
+/// The BF16 banks' row exponents (SituExpertBank::row_exponents): one per row, per expert its 2I gate/up rows then its
+/// H down rows, E (2I + H) in all; each is the e that moe_situ_experts_tc's BF16 route scales the row by (absmax 2^e in
+/// [2^14, 2^15), 0 for an all-zero row). Reads the bank in either form (the same values, so the same exponents);
+/// asynchronous on `stream`.
+[[nodiscard]] std::int64_t situ_bank_row_exponent_count(const SituExpertBank& bank);
+void situ_bank_row_exponents(const SituExpertBank& bank, std::int16_t* out, cudaStream_t stream);
 [[nodiscard]] std::size_t moe_situ_experts_tc_workspace_bytes(const SituExpertBank& bank, std::int64_t entries, std::int64_t columns = 0,
                                                               bool combined = true, int blas_min_entries = 0);
 void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor* weights, float gate_cap,

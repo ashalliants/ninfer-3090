@@ -7,6 +7,7 @@
 #include "artifact/views.h"
 #include "core/arena.h"
 #include "core/startup.h"
+#include "ninfer/ops/tensor_core_fp32.h"
 
 #include <cuda_runtime.h>
 
@@ -496,6 +497,15 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, DeviceContext&
                               .seconds       = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()};
         phase.complete(read, total);
     }
+    // The BF16 banks' row exponents (either form), for the tensor-core prefill's expert kernels: 2 bytes a row.
+    for (ops::SituExpertBank& bank : model->banks_) {
+        if (bank.format != QType::BF16 || (!bank.mxfp8() && (bank.gate_up == nullptr || bank.down == nullptr))) { continue; }
+        DeviceBuffer exponents(static_cast<std::uint64_t>(ops::situ_bank_row_exponent_count(bank)) * sizeof(std::int16_t));
+        ops::situ_bank_row_exponents(bank, static_cast<std::int16_t*>(exponents.p), nullptr);
+        bank.row_exponents = static_cast<const std::int16_t*>(exponents.p);
+        model->bank_exponents_.push_back(std::move(exponents));
+    }
+    if (cudaStreamSynchronize(nullptr) != cudaSuccess) { throw std::runtime_error("inkling2: the BF16 banks' row exponents failed"); }
     if (dspark) {
         check_dspark_formats(model->bound_, dspark_weights, model->weights_);
         for (const DSparkLayerWeights& l : dspark_weights.layers) {

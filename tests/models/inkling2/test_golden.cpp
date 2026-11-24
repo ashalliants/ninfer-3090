@@ -675,6 +675,8 @@ int main() {
             parts.blas      = list.find("blas") != std::string::npos; // the controllers and router scores on cuBLAS
             // NINFER_INKLING2_BLAS_EXPERTS=N (with blas): NVFP4 experts with N or more entries on cuBLAS.
             if (const char* n = std::getenv("NINFER_INKLING2_BLAS_EXPERTS"); n != nullptr) { parts.blas_experts = std::atoi(n); }
+            // NINFER_INKLING2_BANK_EXPERTS=N (with blas): the BF16 banks' experts with fewer than N entries on the kernels.
+            if (const char* n = std::getenv("NINFER_INKLING2_BANK_EXPERTS"); n != nullptr) { parts.bank_experts = std::atoi(n); }
             return parts;
         };
         if (const char* pf_ids = std::getenv("NINFER_INKLING2_PREFILL_BENCH"); pf_ids != nullptr) {

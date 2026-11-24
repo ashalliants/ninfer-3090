@@ -9,6 +9,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 #include <mutex>
 #include <stdexcept>
@@ -112,6 +113,33 @@ mxfp8_rows_to_f16(const std::uint8_t* __restrict__ codes, const std::uint8_t* __
     const int e = scale_exponent(block_max(m, red));
     for (int i = threadIdx.x; i < n; i += kThreads) { out[i] = __float2half_rn(ldexpf(mx_value(row[i], rs[i / 32]), e)); }
     if (inverse != nullptr && threadIdx.x == 0) { inverse[blockIdx.x] = ldexpf(1.0F, -e); }
+}
+
+// One block per row R of a BF16 bank (per expert its 2I gate/up rows, then its H down rows; BF16 or MXFP8): the
+// exponent e bf16_rows_to_f16 and mxfp8_rows_to_f16 scale that row by (absmax 2^e in [2^14, 2^15)).
+__global__ void __launch_bounds__(kThreads)
+bank_row_exponents(const __nv_bfloat16* __restrict__ gate_up, const __nv_bfloat16* __restrict__ down, const std::uint8_t* __restrict__ mx_gate_up,
+                   const std::uint8_t* __restrict__ mx_gate_up_scales, const std::uint8_t* __restrict__ mx_down,
+                   const std::uint8_t* __restrict__ mx_down_scales, int hidden, int inter, std::int16_t* __restrict__ out) {
+    __shared__ float red[kThreads / 32];
+    const std::int64_t R = blockIdx.x;
+    const int per = 2 * inter + hidden;
+    const std::int64_t x = R / per;
+    const int local = static_cast<int>(R % per);
+    const bool gu = local < 2 * inter;
+    const int n = gu ? hidden : inter;
+    const std::int64_t row = gu ? x * 2 * inter + local : x * hidden + (local - 2 * inter);
+    float m = 0.0F;
+    if (mx_gate_up != nullptr) {
+        const std::uint8_t* codes  = (gu ? mx_gate_up : mx_down) + row * n;
+        const std::uint8_t* scales = (gu ? mx_gate_up_scales : mx_down_scales) + row * (n / 32);
+        for (int i = threadIdx.x; i < n; i += kThreads) { m = fmaxf(m, fabsf(mx_value(codes[i], scales[i / 32]))); }
+    } else {
+        const __nv_bfloat16* src = (gu ? gate_up : down) + row * n;
+        for (int i = threadIdx.x; i < n; i += kThreads) { m = fmaxf(m, fabsf(__bfloat162float(src[i]))); }
+    }
+    const int e = scale_exponent(block_max(m, red));
+    if (threadIdx.x == 0) { out[R] = static_cast<std::int16_t>(e); }
 }
 
 // out[r, t] *= row_inverse[r] col_inverse[t] for rows [0, rows) of each column (column stride ld).
@@ -253,7 +281,18 @@ struct ExpertTile {
     int expert, start, count; // entries [start, start + count) of the grouped order, all of `expert`
 };
 
+// The weight formats expert_gemm_kernel decodes: NVFP4 records, or a BF16 bank's rows (BF16, or their MXFP8 form)
+// under each row's power of two (SituExpertBank::row_exponents), as bf16_rows_to_f16 and mxfp8_rows_to_f16 scale them.
+enum class ExpertFormat { Nvfp4, Bf16, Mxfp8 };
+
 struct ExpertGemmArgs {
+    // BF16 banks: the matrix (gate_up [E 2I, H] or down [E H, I], row-major), its MXFP8 scales [rows, k / 32], and
+    // the rows' exponents: row R of expert x at row_exponents[x exp_stride + exp_offset + R].
+    const __nv_bfloat16* bf16;
+    const std::uint8_t* mx_codes;
+    const std::uint8_t* mx_scales;
+    const std::int16_t* row_exponents;
+    int bank_rows, exp_stride, exp_offset;
     const std::uint8_t* records;
     std::uint64_t stride, first, second, row_bytes; // gate/up: rows from first (gate) and second (up); down: first
     int k;                                          // the reduced dimension (H for gate/up, I for down)
@@ -281,7 +320,53 @@ __device__ __forceinline__ unsigned nvfp4_pair(unsigned a, unsigned b, float sca
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
-template <bool GateUp>
+// 2^e as two floats whose product is exact (|e| up to 2 * 127): v * lo * hi is ldexpf(v, e) for every v whose
+// result is not below FP32's normal range, and those round to a signed zero in FP16 either way.
+struct Pow2 {
+    float lo, hi;
+};
+__device__ __forceinline__ Pow2 pow2_parts(int e) {
+    const int lo = e / 2, hi = e - lo;
+    return {__int_as_float((lo + 127) << 23), __int_as_float((hi + 127) << 23)};
+}
+
+// A row's 32 BF16 values (four 16-byte words) times 2^e into FP16, as 16 words of pairs.
+__device__ __forceinline__ void bf16_words_to_f16(const uint4 (&w)[4], Pow2 p, unsigned* dst) {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const unsigned v[4] = {w[q].x, w[q].y, w[q].z, w[q].w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float lo = __uint_as_float(v[j] << 16) * p.lo * p.hi, hi = __uint_as_float(v[j] & 0xFFFF0000U) * p.lo * p.hi;
+            const __half2 h = __floats2half2_rn(lo, hi);
+            dst[4 * q + j]  = *reinterpret_cast<const unsigned*>(&h);
+        }
+    }
+}
+
+// An MXFP8 block of 32 codes (two 16-byte words) under E8M0 scale s, times 2^e, into FP16: mx_value(code, s) 2^e,
+// one multiply (the code's FP16 bits are its value times 2^-8).
+__device__ __forceinline__ void mxfp8_words_to_f16(const uint4 (&w)[4], unsigned s, int e, unsigned* dst) {
+    const int ex = max(static_cast<int>(s) - 119 + e, -126); // below -126 the value rounds to zero in FP16 anyway
+    const float m = __int_as_float((ex + 127) << 23);
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+        const unsigned v[4] = {w[q].x, w[q].y, w[q].z, w[q].w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+#pragma unroll
+            for (int b = 0; b < 4; b += 2) {
+                const unsigned c0 = (v[j] >> (8 * b)) & 0xFF, c1 = (v[j] >> (8 * b + 8)) & 0xFF;
+                const float f0 = __half2float(__ushort_as_half(static_cast<unsigned short>(((c0 & 0x80U) << 8) | ((c0 & 0x7FU) << 7)))) * m;
+                const float f1 = __half2float(__ushort_as_half(static_cast<unsigned short>(((c1 & 0x80U) << 8) | ((c1 & 0x7FU) << 7)))) * m;
+                const __half2 h = __floats2half2_rn(f0, f1);
+                dst[8 * q + 2 * j + b / 2] = *reinterpret_cast<const unsigned*>(&h);
+            }
+        }
+    }
+}
+
+template <bool GateUp, ExpertFormat Fmt = ExpertFormat::Nvfp4>
 __global__ void __launch_bounds__(kEThreads) expert_gemm_kernel(ExpertGemmArgs a) {
     namespace wm = nvcuda::wmma;
     constexpr int kInBytes = (kEM + kEN) * kELd * 2, kOutBytes = kEM * kECLd * 4;
@@ -307,6 +392,24 @@ __global__ void __launch_bounds__(kEThreads) expert_gemm_kernel(ExpertGemmArgs a
         matrix = rec + a.first;
     }
     row = matrix + static_cast<std::uint64_t>(r) * a.row_bytes;
+    // BF16 banks: the row of the expert's matrix (gate/up: the gate rows, then the up rows), its exponent and data.
+    int bank_row = r, row_e = 0;
+    const __nv_bfloat16* brow = nullptr;
+    const std::uint8_t* mrow  = nullptr;
+    const std::uint8_t* mscl  = nullptr;
+    Pow2 row_p{1.0F, 1.0F};
+    if constexpr (Fmt != ExpertFormat::Nvfp4) {
+        if constexpr (GateUp) { bank_row = lr < kEM / 2 ? r : a.inter + r; }
+        const std::int64_t g_row = static_cast<std::int64_t>(tile.expert) * a.bank_rows + bank_row;
+        row_e = a.row_exponents[static_cast<std::int64_t>(tile.expert) * a.exp_stride + a.exp_offset + bank_row];
+        row_p = pow2_parts(row_e);
+        if constexpr (Fmt == ExpertFormat::Bf16) {
+            brow = a.bf16 + g_row * a.k;
+        } else {
+            mrow = a.mx_codes + g_row * a.k;
+            mscl = a.mx_scales + g_row * (a.k / 32);
+        }
+    }
     wm::fragment<wm::accumulator, 16, 16, 16, float> acc[2][kNF];
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -317,6 +420,7 @@ __global__ void __launch_bounds__(kEThreads) expert_gemm_kernel(ExpertGemmArgs a
     // sub-blocks' codes of this thread) and kBLoads 16-byte chunks of the entries' inputs.
     constexpr int kBLoads = kEN * (kEK / 8) / kEThreads;
     unsigned scales = 0, codes[4];
+    uint4 wv[4]; // BF16 banks: this thread's 32 values (BF16: four words; MXFP8: two words of codes, scale in `scales`)
     uint4 bx[kBLoads];
     // The x row of each entry this thread loads (by column with x_top_k: the same values as an entry-major copy).
     std::int64_t xrow[kBLoads];
@@ -326,11 +430,21 @@ __global__ void __launch_bounds__(kEThreads) expert_gemm_kernel(ExpertGemmArgs a
         xrow[q] = n >= tile.count ? 0 : a.x_top_k > 0 ? a.order[e] / a.x_top_k : e;
     }
     const auto load = [&](int k0) {
-        const std::uint8_t* blk = a.tiled ? matrix + nvfp4_tiled_block(r, k0 / kEK, a.k / kEK, a.group_rows, a.run_rows) * kNvfp4Bytes
-                                          : row + static_cast<std::uint64_t>(k0 / kEK) * kNvfp4Bytes;
-        scales = *reinterpret_cast<const unsigned*>(blk);
+        if constexpr (Fmt == ExpertFormat::Nvfp4) {
+            const std::uint8_t* blk = a.tiled ? matrix + nvfp4_tiled_block(r, k0 / kEK, a.k / kEK, a.group_rows, a.run_rows) * kNvfp4Bytes
+                                              : row + static_cast<std::uint64_t>(k0 / kEK) * kNvfp4Bytes;
+            scales = *reinterpret_cast<const unsigned*>(blk);
 #pragma unroll
-        for (int w = 0; w < 4; ++w) { codes[w] = reinterpret_cast<const unsigned*>(blk + 4)[4 * half_id + w]; }
+            for (int w = 0; w < 4; ++w) { codes[w] = reinterpret_cast<const unsigned*>(blk + 4)[4 * half_id + w]; }
+        } else if constexpr (Fmt == ExpertFormat::Bf16) {
+            const uint4* src = reinterpret_cast<const uint4*>(brow + k0 + 32 * half_id);
+#pragma unroll
+            for (int w = 0; w < 4; ++w) { wv[w] = __ldg(src + w); }
+        } else {
+            const uint4* src = reinterpret_cast<const uint4*>(mrow + k0 + 32 * half_id);
+            wv[0] = __ldg(src), wv[1] = __ldg(src + 1);
+            scales = __ldg(mscl + k0 / 32 + half_id);
+        }
 #pragma unroll
         for (int q = 0; q < kBLoads; ++q) {
             const int i = tid + q * kEThreads, n = i / (kEK / 8), c = (i % (kEK / 8)) * 8;
@@ -340,17 +454,23 @@ __global__ void __launch_bounds__(kEThreads) expert_gemm_kernel(ExpertGemmArgs a
     };
     load(0);
     for (int k0 = 0; k0 < a.k; k0 += kEK) {
+        if constexpr (Fmt == ExpertFormat::Nvfp4) {
 #pragma unroll
-        for (int ls = 0; ls < 2; ++ls) { // A: sub-blocks 2 half_id and 2 half_id + 1 of the row's block
-            const int sub = 2 * half_id + ls;
-            const float sc = ue4m3_half((scales >> (8 * sub)) & 0xFF);
-            unsigned* dst = reinterpret_cast<unsigned*>(&A[lr][16 * sub]);
+            for (int ls = 0; ls < 2; ++ls) { // A: sub-blocks 2 half_id and 2 half_id + 1 of the row's block
+                const int sub = 2 * half_id + ls;
+                const float sc = ue4m3_half((scales >> (8 * sub)) & 0xFF);
+                unsigned* dst = reinterpret_cast<unsigned*>(&A[lr][16 * sub]);
 #pragma unroll
-            for (int j = 0; j < 8; j += 2) {
-                const unsigned b0 = (codes[2 * ls + j / 4] >> (8 * (j % 4))) & 0xFF, b1 = (codes[2 * ls + j / 4] >> (8 * (j % 4 + 1))) & 0xFF;
-                dst[j / 2]     = nvfp4_pair(b0, b1, sc);
-                dst[4 + j / 2] = nvfp4_pair(b0 >> 4, b1 >> 4, sc);
+                for (int j = 0; j < 8; j += 2) {
+                    const unsigned b0 = (codes[2 * ls + j / 4] >> (8 * (j % 4))) & 0xFF, b1 = (codes[2 * ls + j / 4] >> (8 * (j % 4 + 1))) & 0xFF;
+                    dst[j / 2]     = nvfp4_pair(b0, b1, sc);
+                    dst[4 + j / 2] = nvfp4_pair(b0 >> 4, b1 >> 4, sc);
+                }
             }
+        } else if constexpr (Fmt == ExpertFormat::Bf16) { // A: values 32 half_id .. + 32 of the row
+            bf16_words_to_f16(wv, row_p, reinterpret_cast<unsigned*>(&A[lr][32 * half_id]));
+        } else {
+            mxfp8_words_to_f16(wv, scales, row_e, reinterpret_cast<unsigned*>(&A[lr][32 * half_id]));
         }
 #pragma unroll
         for (int q = 0; q < kBLoads; ++q) { // B: [kEN entries][64 values], zero past the tile's entries
@@ -393,7 +513,12 @@ __global__ void __launch_bounds__(kEThreads) expert_gemm_kernel(ExpertGemmArgs a
                 if (n0 + n >= tile.count) { continue; }
                 const int e = tile.start + n0 + n;
                 const float s = se * a.x_inverse[a.x_top_k > 0 ? a.order[e] / a.x_top_k : e];
-                const float g = C[r][n] * s, u = C[kEM / 2 + r][n] * s;
+                float g = C[r][n], u = C[kEM / 2 + r][n];
+                if constexpr (Fmt != ExpertFormat::Nvfp4) { // the rows' inverses, as situ_cols applies them
+                    const std::int16_t* re = a.row_exponents + static_cast<std::int64_t>(tile.expert) * a.exp_stride + a.exp_offset;
+                    g *= ldexpf(1.0F, -re[blockIdx.x * (kEM / 2) + r]), u *= ldexpf(1.0F, -re[a.inter + blockIdx.x * (kEM / 2) + r]);
+                }
+                g *= s, u *= s;
                 const float v = situ(g, u, a.gate_cap, a.up_cap) * a.act_scale;
                 a.act[static_cast<std::int64_t>(tile.start + n0 + n) * a.inter + blockIdx.x * (kEM / 2) + r] = __float2half_rn(v);
             }
@@ -401,7 +526,11 @@ __global__ void __launch_bounds__(kEThreads) expert_gemm_kernel(ExpertGemmArgs a
             for (int i = tid; i < kEM * (kEN / 2); i += kEThreads) {
                 const int r = i & (kEM - 1), n = i / kEM;
                 if (n0 + n >= tile.count) { continue; }
-                a.y[static_cast<std::int64_t>(a.order[tile.start + n0 + n]) * a.hidden + blockIdx.x * kEM + r] = C[r][n] * a.x_scale_inverse * se;
+                float v = C[r][n];
+                if constexpr (Fmt != ExpertFormat::Nvfp4) {
+                    v *= ldexpf(1.0F, -a.row_exponents[static_cast<std::int64_t>(tile.expert) * a.exp_stride + a.exp_offset + blockIdx.x * kEM + r]);
+                }
+                a.y[static_cast<std::int64_t>(a.order[tile.start + n0 + n]) * a.hidden + blockIdx.x * kEM + r] = v * a.x_scale_inverse * se;
             }
         }
         __syncthreads();
@@ -565,6 +694,26 @@ void blas_sgemm_tn(int m, int n, int k, const float* a, int lda, const float* b,
 
 } // namespace detail
 
+std::int64_t situ_bank_row_exponent_count(const SituExpertBank& bank) {
+    return static_cast<std::int64_t>(bank.experts) * (2 * static_cast<std::int64_t>(bank.intermediate) + bank.hidden);
+}
+
+void situ_bank_row_exponents(const SituExpertBank& bank, std::int16_t* out, cudaStream_t stream) {
+    const char* op = "situ_bank_row_exponents";
+    require(bank.format == QType::BF16 && bank.experts > 0 && bank.hidden > 0 && bank.intermediate > 0 && out != nullptr, op,
+            "a BF16 bank (or its MXFP8 form) and an output");
+    require(bank.mxfp8() ? bank.mx_gate_up_scales != nullptr && bank.mx_down != nullptr && bank.mx_down_scales != nullptr && bank.hidden % 32 == 0 &&
+                               bank.intermediate % 32 == 0
+                         : bank.gate_up != nullptr && bank.down != nullptr,
+            op, "the bank's arrays are missing");
+    const std::int64_t rows = situ_bank_row_exponent_count(bank);
+    require(rows <= INT32_MAX, op, "too many rows");
+    bank_row_exponents<<<static_cast<unsigned>(rows), kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(bank.gate_up), static_cast<const __nv_bfloat16*>(bank.down), bank.mx_gate_up, bank.mx_gate_up_scales,
+        bank.mx_down, bank.mx_down_scales, bank.hidden, bank.intermediate, out);
+    check_launch(op);
+}
+
 std::uint64_t bf16_fp16_inexact(const Tensor& w, cudaStream_t stream) {
     const char* op = "bf16_fp16_inexact";
     require(w.dtype == DType::BF16 && w.is_contiguous(), op, "w must be contiguous BF16 [K, N]");
@@ -586,14 +735,15 @@ std::size_t moe_situ_experts_tc_workspace_bytes(const SituExpertBank& bank, std:
     // The columns, which bound one expert's entries (a column's ids are distinct): unknown, at most the entries.
     const std::size_t m = columns > 0 && columns < entries ? static_cast<std::size_t>(columns) : n;
     const std::size_t tiles = n / kEN + static_cast<std::size_t>(bank.experts) + 1;
-    // x16 (one row per column, or the BF16 banks' route's one expert's entries) and its inverses, the order, the tiles, y
-    // (combined), and the NVFP4 route's act16; the BF16 banks' route instead takes the decoded rows and one expert's
-    // GEMM results.
+    // x16 (one row per column, or the BF16 banks' route's one expert's entries) and its inverses, the order, the tiles and
+    // y (combined); the BF16 banks' cuBLAS route takes the decoded rows and one expert's GEMM results.
     const std::size_t common = aligned(h * m * 2) + aligned(n * 4) + aligned(n * 4) + aligned(tiles * sizeof(ExpertTile)) + (combined ? aligned(h * n * 4) : 0);
     const std::size_t route = bank.format == QType::BF16 ? aligned(2 * i * h * 2) + aligned(2 * i * 4) + aligned(h * i * 2) + aligned(h * 4) +
                                                                aligned(2 * i * m * 4) + aligned(i * m * 4) + aligned(i * m * 2) + aligned(m * 4) +
                                                                aligned(h * m * 4) + kCublasWorkspaceBytes
-                                                         : aligned(i * n * 2);
+                                                         : 0;
+    // The kernels' activation (FP16, one column per entry); its bytes are free again once the down kernel has run.
+    const std::size_t act = aligned(i * n * 2);
     // A hot NVFP4 expert's decoded gate/up and down rows, and one batch's gathered inputs, gate/up results, activation
     // and down results.
     const std::size_t batch = std::min<std::size_t>(m, kExpertsBlasBatch);
@@ -601,7 +751,13 @@ std::size_t moe_situ_experts_tc_workspace_bytes(const SituExpertBank& bank, std:
                                   ? aligned(2 * i * h * 2) + aligned(h * i * 2) + aligned(h * batch * 2) + aligned(2 * i * batch * 4) +
                                         aligned(i * batch * 2) + aligned(h * batch * 4) + kCublasWorkspaceBytes
                                   : 0;
-    return common + route + hot + 26 * 256;
+    // After the kernels (NVFP4 banks, or BF16 banks with blas_min_entries > 0) the hot experts' buffers reuse the
+    // activation's bytes; the BF16 banks' hot experts also take their own inputs and per-entry inverses beside the one
+    // row per column the kernels read. BF16 banks without the kernels take only the cuBLAS route.
+    if (bank.format == QType::BF16) {
+        return common + (blas_min_entries > 0 ? std::max(act, route + aligned(h * m * 2) + aligned(n * 4)) : route) + 30 * 256;
+    }
+    return common + std::max(act, hot) + 30 * 256;
 }
 
 void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tensor& ids, const Tensor* weights, float gate_cap, float up_cap,
@@ -639,8 +795,14 @@ void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tens
         std::vector<int> next(offsets.begin(), offsets.end() - 1);
         for (std::int64_t i = 0; i < n; ++i) { order[static_cast<std::size_t>(next[host_ids[i]]++)] = static_cast<int>(i); }
     }
-    // An NVFP4 expert with at least blas_min_entries entries takes cuBLAS (hot); the kernels' tiles cover the others.
-    const auto hot = [&](int e) { return g.nvfp4 && blas_min_entries > 0 && counts[static_cast<std::size_t>(e)] >= blas_min_entries; };
+    // The tensor-core kernels take NVFP4 banks, and BF16 banks (either form) when blas_min_entries > 0 and the bank has
+    // its row exponents; other BF16 banks take cuBLAS for every expert. With blas_min_entries > 0 an expert with at
+    // least that many entries takes cuBLAS (hot); the kernels' tiles cover the others.
+    const bool bank_kernels = !g.nvfp4 && blas_min_entries > 0 && bank.row_exponents != nullptr;
+    const bool kernels      = g.nvfp4 || bank_kernels;
+    require(!bank_kernels || (hidden % kEM == 0 && inter % kEK == 0 && hidden % kEK == 0), op,
+            "the BF16 banks' kernels need H a multiple of 128 and I of 64");
+    const auto hot = [&](int e) { return kernels && blas_min_entries > 0 && counts[static_cast<std::size_t>(e)] >= blas_min_entries; };
     std::vector<ExpertTile> tiles;
     for (int e = 0; e < bank.experts; ++e) {
         if (hot(e)) { continue; }
@@ -653,8 +815,8 @@ void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tens
     // reads its column's), the BF16 banks' route one expert's entries at a time (each GEMM reads them from the start).
     // Every entry of a column gets the same values either way.
     const std::size_t most = static_cast<std::size_t>(std::max(1, *std::max_element(counts.begin(), counts.end())));
-    auto* x16 = static_cast<__half*>(take(static_cast<std::size_t>(hidden) * (g.nvfp4 ? static_cast<std::size_t>(cols) : most) * 2));
-    auto* x_inv = static_cast<float*>(take((g.nvfp4 ? static_cast<std::size_t>(cols) : static_cast<std::size_t>(n)) * 4));
+    auto* x16 = static_cast<__half*>(take(static_cast<std::size_t>(hidden) * (kernels ? static_cast<std::size_t>(cols) : most) * 2));
+    auto* x_inv = static_cast<float*>(take((kernels ? static_cast<std::size_t>(cols) : static_cast<std::size_t>(n)) * 4));
     auto* d_order = static_cast<int*>(take(n * 4));
     auto* d_tiles = static_cast<ExpertTile*>(take(std::max<std::size_t>(tiles.size(), 1) * sizeof(ExpertTile)));
     float* y = weights != nullptr ? static_cast<float*>(take(static_cast<std::size_t>(hidden) * n * 4)) : static_cast<float*>(out.data);
@@ -662,7 +824,68 @@ void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tens
         (!tiles.empty() && cudaMemcpyAsync(d_tiles, tiles.data(), tiles.size() * sizeof(ExpertTile), cudaMemcpyHostToDevice, stream) != cudaSuccess)) {
         throw std::runtime_error(std::string(op) + ": the order upload failed");
     }
-    if (g.nvfp4) {
+    // The BF16 banks' cuBLAS route, one expert at a time: its rows in FP16 under each row's power of two, its entries'
+    // inputs gathered (xe, inverses xe_inv per entry), the activation under a power of two per entry.
+    struct BankBlas {
+        __half *w_gu = nullptr, *w_d = nullptr, *a16 = nullptr, *xe = nullptr;
+        float *w_gu_inv = nullptr, *w_d_inv = nullptr, *c1 = nullptr, *act = nullptr, *a_inv = nullptr, *c2 = nullptr, *xe_inv = nullptr;
+    } bb;
+    const auto bank_blas = [&](int e) {
+        const float one = 1.0F, zero = 0.0F;
+        if (bb.w_gu == nullptr) { // the first expert: the operands, once for the call
+            bb.w_gu     = static_cast<__half*>(take(static_cast<std::size_t>(2) * inter * hidden * 2));
+            bb.w_gu_inv = static_cast<float*>(take(static_cast<std::size_t>(2) * inter * 4));
+            bb.w_d      = static_cast<__half*>(take(static_cast<std::size_t>(hidden) * inter * 2));
+            bb.w_d_inv  = static_cast<float*>(take(static_cast<std::size_t>(hidden) * 4));
+            // One expert's results at a time (each GEMM writes from the start): sized by the most entries of one expert.
+            bb.c1    = static_cast<float*>(take(static_cast<std::size_t>(2) * inter * most * 4));
+            bb.act   = static_cast<float*>(take(static_cast<std::size_t>(inter) * most * 4));
+            bb.a16   = static_cast<__half*>(take(static_cast<std::size_t>(inter) * most * 2));
+            bb.a_inv = static_cast<float*>(take(most * 4));
+            bb.c2    = static_cast<float*>(take(static_cast<std::size_t>(hidden) * most * 4));
+            if (kernels) { // x16 and x_inv hold one row per column for the kernels: the entries' own copies
+                bb.xe     = static_cast<__half*>(take(static_cast<std::size_t>(hidden) * most * 2));
+                bb.xe_inv = static_cast<float*>(take(static_cast<std::size_t>(n) * 4));
+            } else {
+                bb.xe = x16, bb.xe_inv = x_inv;
+            }
+            void* blas_ws = take(kCublasWorkspaceBytes);
+            cublasHandle_t hb = handle();
+            check_blas(cublasSetStream(hb, stream), "cublasSetStream");
+            check_blas(cublasSetWorkspace(hb, blas_ws, kCublasWorkspaceBytes), "cublasSetWorkspace");
+        }
+        cublasHandle_t hb = handle();
+        const int ne = counts[e], at = offsets[e];
+        if (bank.mxfp8()) {
+            const std::int64_t gu_rows = static_cast<std::int64_t>(e) * 2 * inter, dn_rows = static_cast<std::int64_t>(e) * hidden;
+            mxfp8_rows_to_f16<<<2 * inter, kThreads, 0, stream>>>(bank.mx_gate_up + gu_rows * hidden, bank.mx_gate_up_scales + gu_rows * (hidden / 32),
+                                                                  hidden, bb.w_gu, bb.w_gu_inv);
+            mxfp8_rows_to_f16<<<hidden, kThreads, 0, stream>>>(bank.mx_down + dn_rows * inter, bank.mx_down_scales + dn_rows * (inter / 32), inter,
+                                                               bb.w_d, bb.w_d_inv);
+        } else {
+            const auto* gu = static_cast<const __nv_bfloat16*>(bank.gate_up) + static_cast<std::int64_t>(e) * 2 * inter * hidden;
+            const auto* dn = static_cast<const __nv_bfloat16*>(bank.down) + static_cast<std::int64_t>(e) * hidden * inter;
+            bf16_rows_to_f16<<<2 * inter, kThreads, 0, stream>>>(gu, hidden, hidden, bb.w_gu, bb.w_gu_inv, nullptr);
+            bf16_rows_to_f16<<<hidden, kThreads, 0, stream>>>(dn, inter, inter, bb.w_d, bb.w_d_inv, nullptr);
+        }
+        check_launch(op);
+        fp32_cols_to_f16<true><<<ne, kThreads, 0, stream>>>(static_cast<const float*>(z.data), zs, d_order + at, top_k, hidden, bb.xe, nullptr,
+                                                             bb.xe_inv + at);
+        check_blas(cublasGemmEx(hb, CUBLAS_OP_T, CUBLAS_OP_N, 2 * inter, ne, hidden, &one, bb.w_gu, CUDA_R_16F, hidden, bb.xe, CUDA_R_16F, hidden, &zero,
+                                bb.c1, CUDA_R_32F, 2 * inter, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                   "cublasGemmEx gate_up");
+        situ_cols<<<ne, kThreads, 0, stream>>>(bb.c1, inter, bb.w_gu_inv, bb.xe_inv + at, bank.gate_up_scale != nullptr ? bank.gate_up_scale + e : nullptr,
+                                               gate_cap, up_cap, bb.act);
+        fp32_cols_to_f16<false><<<ne, kThreads, 0, stream>>>(bb.act, inter, nullptr, 1, inter, bb.a16, nullptr, bb.a_inv);
+        check_launch(op);
+        check_blas(cublasGemmEx(hb, CUBLAS_OP_T, CUBLAS_OP_N, hidden, ne, inter, &one, bb.w_d, CUDA_R_16F, inter, bb.a16, CUDA_R_16F, inter, &zero, bb.c2,
+                                CUDA_R_32F, hidden, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                   "cublasGemmEx down");
+        down_cols<<<ne, kThreads, 0, stream>>>(bb.c2, hidden, bb.w_d_inv, bb.a_inv, bank.down_scale != nullptr ? bank.down_scale + e : nullptr, d_order + at,
+                                               y);
+        check_launch(op);
+    };
+    if (kernels) {
         fp32_cols_to_f16<false><<<static_cast<unsigned>(cols), kThreads, 0, stream>>>(static_cast<const float*>(z.data), zs, nullptr, 1, hidden, x16,
                                                                                        nullptr, x_inv);
         check_launch(op);
@@ -670,26 +893,59 @@ void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tens
         int act_exp = 0;
         (void)frexpf(gate_cap * up_cap, &act_exp); // gate_cap up_cap < 2^act_exp
         const float act_scale = ldexpf(1.0F, 15 - act_exp), act_inverse = ldexpf(1.0F, act_exp - 15);
-        auto* act = static_cast<__half*>(take(static_cast<std::size_t>(inter) * n * 2));
-        ExpertGemmArgs a{};
-        a.records = bank.records, a.stride = g.stride, a.tiles = d_tiles;
-        a.inter = inter, a.gate_cap = gate_cap, a.up_cap = up_cap, a.act_scale = act_scale, a.act = act;
-        a.hidden = hidden, a.order = d_order, a.y = y;
-        if (!tiles.empty()) {
-            a.tiled = bank.tiled;
-            a.first = 0, a.second = g.up_offset, a.row_bytes = g.gate_row_bytes, a.k = hidden;
-            a.group_rows = kNvfp4GateGroupRows, a.run_rows = nvfp4_rows_per_run(hidden / kNvfp4Values);
-            a.x = x16, a.x_inverse = x_inv, a.x_top_k = top_k, a.scale_e = bank.gate_up_scale;
-            expert_gemm_kernel<true><<<dim3(inter / (kEM / 2), static_cast<unsigned>(tiles.size())), kEThreads, 0, stream>>>(a);
-            check_launch(op);
-            a.first = g.down_offset, a.second = 0, a.row_bytes = g.down_row_bytes, a.k = inter;
-            a.group_rows = kNvfp4DownGroupRows, a.run_rows = nvfp4_rows_per_run(inter / kNvfp4Values);
-            a.x = act, a.x_inverse = nullptr, a.x_top_k = 0, a.x_scale_inverse = act_inverse, a.scale_e = bank.down_scale;
-            expert_gemm_kernel<false><<<dim3(hidden / kEM, static_cast<unsigned>(tiles.size())), kEThreads, 0, stream>>>(a);
-            check_launch(op);
+        // The activation lives only between the gate/up and down kernels: its scope ends before the hot experts take
+        // their buffers, which reuse its bytes (the same stream orders them after the down kernel).
+        {
+            const auto act_scope = workspace.scope();
+            auto* act = static_cast<__half*>(take(static_cast<std::size_t>(inter) * n * 2));
+            ExpertGemmArgs a{};
+            a.records = bank.records, a.stride = g.stride, a.tiles = d_tiles;
+            a.inter = inter, a.gate_cap = gate_cap, a.up_cap = up_cap, a.act_scale = act_scale, a.act = act;
+            a.hidden = hidden, a.order = d_order, a.y = y;
+            if (!tiles.empty() && g.nvfp4) {
+                a.tiled = bank.tiled;
+                a.first = 0, a.second = g.up_offset, a.row_bytes = g.gate_row_bytes, a.k = hidden;
+                a.group_rows = kNvfp4GateGroupRows, a.run_rows = nvfp4_rows_per_run(hidden / kNvfp4Values);
+                a.x = x16, a.x_inverse = x_inv, a.x_top_k = top_k, a.scale_e = bank.gate_up_scale;
+                expert_gemm_kernel<true><<<dim3(inter / (kEM / 2), static_cast<unsigned>(tiles.size())), kEThreads, 0, stream>>>(a);
+                check_launch(op);
+                a.first = g.down_offset, a.second = 0, a.row_bytes = g.down_row_bytes, a.k = inter;
+                a.group_rows = kNvfp4DownGroupRows, a.run_rows = nvfp4_rows_per_run(inter / kNvfp4Values);
+                a.x = act, a.x_inverse = nullptr, a.x_top_k = 0, a.x_scale_inverse = act_inverse, a.scale_e = bank.down_scale;
+                expert_gemm_kernel<false><<<dim3(hidden / kEM, static_cast<unsigned>(tiles.size())), kEThreads, 0, stream>>>(a);
+                check_launch(op);
+            }
+            if (!tiles.empty() && bank_kernels) { // the BF16 banks' rows, decoded as the cuBLAS route decodes them
+                a.bf16 = static_cast<const __nv_bfloat16*>(bank.gate_up), a.mx_codes = bank.mx_gate_up, a.mx_scales = bank.mx_gate_up_scales;
+                a.row_exponents = bank.row_exponents, a.exp_stride = 2 * inter + hidden;
+                a.bank_rows = 2 * inter, a.exp_offset = 0, a.k = hidden;
+                a.x = x16, a.x_inverse = x_inv, a.x_top_k = top_k, a.scale_e = bank.gate_up_scale;
+                const dim3 gu_grid(inter / (kEM / 2), static_cast<unsigned>(tiles.size())), dn_grid(hidden / kEM, static_cast<unsigned>(tiles.size()));
+                if (bank.mxfp8()) {
+                    expert_gemm_kernel<true, ExpertFormat::Mxfp8><<<gu_grid, kEThreads, 0, stream>>>(a);
+                } else {
+                    expert_gemm_kernel<true, ExpertFormat::Bf16><<<gu_grid, kEThreads, 0, stream>>>(a);
+                }
+                check_launch(op);
+                a.bf16 = static_cast<const __nv_bfloat16*>(bank.down), a.mx_codes = bank.mx_down, a.mx_scales = bank.mx_down_scales;
+                a.bank_rows = hidden, a.exp_offset = 2 * inter, a.k = inter;
+                a.x = act, a.x_inverse = nullptr, a.x_top_k = 0, a.x_scale_inverse = act_inverse, a.scale_e = bank.down_scale;
+                if (bank.mxfp8()) {
+                    expert_gemm_kernel<false, ExpertFormat::Mxfp8><<<dn_grid, kEThreads, 0, stream>>>(a);
+                } else {
+                    expert_gemm_kernel<false, ExpertFormat::Bf16><<<dn_grid, kEThreads, 0, stream>>>(a);
+                }
+                check_launch(op);
+            }
+        }
+        // The BF16 banks' hot experts: the cuBLAS route.
+        if (bank_kernels) {
+            for (int e = 0; e < bank.experts; ++e) {
+                if (hot(e)) { bank_blas(e); }
+            }
         }
         // The hot experts: decoded whole, then cuBLAS in batches of up to kExpertsBlasBatch entries, scaled as above.
-        if (blas_min_entries > 0) {
+        if (g.nvfp4 && blas_min_entries > 0) {
             __half* w_gu = nullptr;
             __half* w_d  = nullptr;
             __half* xg   = nullptr;
@@ -740,51 +996,8 @@ void moe_situ_experts_tc(const SituExpertBank& bank, const Tensor& z, const Tens
             }
         }
     } else {
-        auto* w_gu = static_cast<__half*>(take(static_cast<std::size_t>(2) * inter * hidden * 2));
-        auto* w_gu_inv = static_cast<float*>(take(static_cast<std::size_t>(2) * inter * 4));
-        auto* w_d = static_cast<__half*>(take(static_cast<std::size_t>(hidden) * inter * 2));
-        auto* w_d_inv = static_cast<float*>(take(static_cast<std::size_t>(hidden) * 4));
-        // One expert's results at a time (each GEMM writes from the start): sized by the most entries of one expert.
-        auto* c1 = static_cast<float*>(take(static_cast<std::size_t>(2) * inter * most * 4));
-        auto* act = static_cast<float*>(take(static_cast<std::size_t>(inter) * most * 4));
-        auto* a16 = static_cast<__half*>(take(static_cast<std::size_t>(inter) * most * 2));
-        auto* a_inv = static_cast<float*>(take(most * 4));
-        auto* c2 = static_cast<float*>(take(static_cast<std::size_t>(hidden) * most * 4));
-        void* blas_ws = take(kCublasWorkspaceBytes);
-        cublasHandle_t hb = handle();
-        check_blas(cublasSetStream(hb, stream), "cublasSetStream");
-        check_blas(cublasSetWorkspace(hb, blas_ws, kCublasWorkspaceBytes), "cublasSetWorkspace");
-        const float one = 1.0F, zero = 0.0F;
         for (int e = 0; e < bank.experts; ++e) {
-            const int ne = counts[e], at = offsets[e];
-            if (ne == 0) { continue; }
-            if (bank.mxfp8()) {
-                const std::int64_t gu_rows = static_cast<std::int64_t>(e) * 2 * inter, dn_rows = static_cast<std::int64_t>(e) * hidden;
-                mxfp8_rows_to_f16<<<2 * inter, kThreads, 0, stream>>>(bank.mx_gate_up + gu_rows * hidden, bank.mx_gate_up_scales + gu_rows * (hidden / 32),
-                                                                      hidden, w_gu, w_gu_inv);
-                mxfp8_rows_to_f16<<<hidden, kThreads, 0, stream>>>(bank.mx_down + dn_rows * inter, bank.mx_down_scales + dn_rows * (inter / 32), inter,
-                                                                   w_d, w_d_inv);
-            } else {
-                const auto* gu = static_cast<const __nv_bfloat16*>(bank.gate_up) + static_cast<std::int64_t>(e) * 2 * inter * hidden;
-                const auto* dn = static_cast<const __nv_bfloat16*>(bank.down) + static_cast<std::int64_t>(e) * hidden * inter;
-                bf16_rows_to_f16<<<2 * inter, kThreads, 0, stream>>>(gu, hidden, hidden, w_gu, w_gu_inv, nullptr);
-                bf16_rows_to_f16<<<hidden, kThreads, 0, stream>>>(dn, inter, inter, w_d, w_d_inv, nullptr);
-            }
-            check_launch(op);
-            fp32_cols_to_f16<true><<<ne, kThreads, 0, stream>>>(static_cast<const float*>(z.data), zs, d_order + at, top_k, hidden, x16, nullptr, x_inv + at);
-            const __half* xe = x16;
-            check_blas(cublasGemmEx(hb, CUBLAS_OP_T, CUBLAS_OP_N, 2 * inter, ne, hidden, &one, w_gu, CUDA_R_16F, hidden, xe, CUDA_R_16F, hidden, &zero, c1,
-                                    CUDA_R_32F, 2 * inter, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                       "cublasGemmEx gate_up");
-            situ_cols<<<ne, kThreads, 0, stream>>>(c1, inter, w_gu_inv, x_inv + at, bank.gate_up_scale != nullptr ? bank.gate_up_scale + e : nullptr,
-                                                   gate_cap, up_cap, act);
-            fp32_cols_to_f16<false><<<ne, kThreads, 0, stream>>>(act, inter, nullptr, 1, inter, a16, nullptr, a_inv);
-            check_launch(op);
-            check_blas(cublasGemmEx(hb, CUBLAS_OP_T, CUBLAS_OP_N, hidden, ne, inter, &one, w_d, CUDA_R_16F, inter, a16, CUDA_R_16F, inter, &zero, c2,
-                                    CUDA_R_32F, hidden, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                       "cublasGemmEx down");
-            down_cols<<<ne, kThreads, 0, stream>>>(c2, hidden, w_d_inv, a_inv, bank.down_scale != nullptr ? bank.down_scale + e : nullptr, d_order + at, y);
-            check_launch(op);
+            if (counts[static_cast<std::size_t>(e)] > 0) { bank_blas(e); }
         }
     }
     if (weights != nullptr) {

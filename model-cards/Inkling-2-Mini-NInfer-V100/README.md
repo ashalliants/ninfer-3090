@@ -45,8 +45,8 @@ needs NInfer's executables. It runs on one **Tesla V100 32 GB** (`sm_70`, Linux,
   the same tokens plain sampling draws under the same seed. Unsloth's DSpark notes for llama.cpp say its greedy
   output with the drafter "is not guaranteed to be bit identical to a run without it".
 - **Fast on a V100.** At 200 W: 94.3 tok/s with DSpark and 78.0 plain over 12 chats at the full 262,144-token
-  context with images and INT8 KV (120.7 on maths at 250 W), and 2,687 tok/s prefill at 8K with `--prefill-chunk 8192`
-  (2,069 at the default chunk; 2,032 with DSpark and images at the full 262,144-token context). The other published V100 port (Csavoldi's, onto Lapilli)
+  context with images and INT8 KV (120.7 on maths at 250 W), and 2,727 tok/s prefill at 8K with `--prefill-chunk 8192`
+  (2,170 at the default chunk; 2,125 with DSpark and images at the full 262,144-token context). The other published V100 port (Csavoldi's, onto Lapilli)
   reports 69 tok/s without a drafter and 850 tok/s prompt reading, on a different machine and prompts
   ([report](https://github.com/chris83-dev/lapilli-v100/blob/f9b7dd093a9ff018bc68f177f81a1d27d3ffec91/docs/community/inkling2-mini.md)).
 
@@ -167,8 +167,9 @@ fits. On Windows, `scripts\download-model.bat inkling2-mini` downloads and verif
 
 Measured through `ninfer-serve` built from NInfer master `dad1623b`, on a V100 at its 250 W power limit (peak
 draw 236 W) over a PCIe Gen3 x4 eGPU link (OCuLink, 3.3 GB/s), with the default FP16 KV and tensor-core prefill, at the server's default 8,192-token context unless a row says
-otherwise. Rows marked 200 W were re-measured on 2026-11-23 at a 200 W limit (master `dc867300` for decode; the
-prefill rows with `--prefill-cublas`, the default of a V100 build since that change). `gpu_guard.sh` reported no thermal throttle and no power capping in any run used here. Each row gives the best
+otherwise. Rows marked 200 W were re-measured at a 200 W limit: decode on 2026-11-23 (master `dc867300`), prefill on
+2026-11-24 with `--prefill-cublas` (the default of a V100 build), layers 20-23's experts on the tensor-core kernels,
+real-text prompts and ABBA legs against those experts on cuBLAS. `gpu_guard.sh` reported no thermal throttle in any run used here (at 200 W the limit itself caps power during part of each prefill run, as intended). Each row gives the best
 clean run first, then the typical range across repeated or ABBA legs.
 
 | | Best measured | Conditions | Typical range |
@@ -179,9 +180,9 @@ clean run first, then the typical range across repeated or ABBA legs.
 | **Decode, DSpark, sampled** | **83.5 tok/s** | the same 12 chats at temperature 0.8, top-p 0.95, seeded | 83.4-83.5; plain sampled 74.9 |
 | **Decode, plain** | **78.8 tok/s** | the 12 chats, greedy | 78.2-78.8 |
 | **Batched decode, aggregate** | **198.2 tok/s** | `--max-concurrency 8`, 8 greedy chats of 256 tokens at once, prefill included | 196.8-198.2 at N = 8 (26.4 tok/s each); 170.5 at N = 4, 121.8 at N = 2 |
-| **Prefill** (200 W) | **2,687 tok/s** | 7,974-token prompt, TTFT 2.97 s, `--max-context 131072 --prefill-chunk 8192` | 2,648-2,687 over ABBA legs; 2,195 at 34,674 and 1,563 at 100,074 tokens. Chunk 4096: 2,360-2,394 at 8K, 2,004 at 34K, 1,459 at 100K |
-| **Prefill, default chunk** (200 W) | **2,069 tok/s** | 7,974-token prompt, TTFT 3.85 s, `--max-context 131072` (chunk 2048, picked by the engine) | 2,052-2,069; 1,797-1,810 at 1,074 (0.59 s), 1,763 at 34,674 (19.7 s), 1,298 at 100,074 (77.1 s). With `--no-prefill-cublas`: 1,885-1,893, 1,703-1,719, 1,644, 1,226 |
-| **Prefill at 262,144** (200 W) | **2,032 tok/s** | 7,974-token prompt, TTFT 3.92 s, `--max-context 262144 --spec dspark --vision`, the default chunk 2048 | 2,015-2,032; 1,771-1,779 at 1,074 (0.60 s), 1,734 at 34,674 (20.0 s), 1,284 at 100,074 (77.9 s). With `--no-prefill-cublas`: 1,854-1,860, 1,680-1,694, 1,613, 1,212. A wider chunk does not fit here with FP16 KV; with `--kv-dtype int8` chunk 4096 and 8192 fit |
+| **Prefill** (200 W) | **2,727 tok/s** | 7,974-token prompt, TTFT 2.92 s, `--max-context 131072 --prefill-chunk 8192` | 2,682-2,727 over ABBA legs (2,657-2,694 with layers 20-23's experts on cuBLAS); 2,227 at 34,674 and 1,577 at 100,074 tokens. Chunk 4096 (2026-11-23, before the layers 20-23 change): 2,360-2,394 at 8K, 2,004 at 34K, 1,459 at 100K |
+| **Prefill, default chunk** (200 W) | **2,170 tok/s** | 7,974-token prompt, TTFT 3.68 s, `--max-context 131072` (chunk 2048, picked by the engine) | 2,153-2,170; 1,954-1,962 at 1,074 (0.55 s), 1,839 at 34,674 (18.9 s), 1,339 at 100,074 (74.8 s). With layers 20-23's experts on cuBLAS: 2,052-2,071, 1,799-1,807, 1,764, 1,300. With `--no-prefill-cublas` (2026-11-23): 1,885-1,893, 1,703-1,719, 1,644, 1,226 |
+| **Prefill at 262,144** (200 W) | **2,125 tok/s** | 7,974-token prompt, TTFT 3.75 s, `--max-context 262144 --spec dspark --vision`, the default chunk 2048 | 2,114-2,125; 1,922-1,930 at 1,074 (0.56 s), 1,809 at 34,674 (19.2 s), 1,324 at 100,074 (75.6 s). With layers 20-23's experts on cuBLAS: 2,017-2,033, 1,771-1,779, 1,734, 1,285. With `--no-prefill-cublas` (2026-11-23): 1,854-1,860, 1,680-1,694, 1,613, 1,212. A wider chunk does not fit here with FP16 KV; with `--kv-dtype int8` chunk 4096 and 8192 fit |
 | **Second turn of a chat** (200 W) | **TTFT 1.03 s** | 7,988-token prompt, 6,144 positions resumed from the first turn's snapshot, same server, 262,144 with DSpark, vision and INT8 KV, chunk 2048 | 3.93 s cold; 1.77 s at chunk 4096 (4,096 reused), 3.04 s at 8192 (none reused). At 250 W: 1.51 s against 21.4 s at 34,699 tokens; the same output as cold |
 | **Decode at long context** | **91.2 tok/s** | DSpark, 128 tokens after a 7,979-token prompt (summarize it) | DSpark 84.9-91.2 at 8K and 88.0-89.8 at 10K; plain 71.5 at 8K and 48.1 at 100K (DSpark 47.4-48.0 there) |
 | **Image prompt** | **TTFT 375 ms** | 230-token prompt (llama.cpp's 640 x 488 `test-1.jpeg`, correctly described), vision encode and prefill, `--vision --spec dspark` at 262,144 | 375-398 ms (382-425 at 131,072); then 100-105 tok/s decode |

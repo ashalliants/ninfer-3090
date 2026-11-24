@@ -80,10 +80,11 @@ struct ProgramLimits {
     // tensor-core part, but it belongs to the same lossy prefill).
     // blas_experts (with blas and experts): an NVFP4 expert with at least this many entries in a forward runs on
     // cuBLAS over its rows decoded to FP16 (ops::moe_situ_experts_tc's blas_min_entries); 0 keeps every expert on the
-    // kernels.
+    // kernels. bank_experts (with blas and experts): the same split for the BF16 banks (layers 20-23, either form):
+    // their experts with fewer entries run on the kernels, the others on cuBLAS; 0 keeps every one on cuBLAS.
     struct TensorCoreParts {
         bool dense = false, experts = false, attention = false, blas = false;
-        std::int32_t blas_experts = 0;
+        std::int32_t blas_experts = 0, bank_experts = 0;
         [[nodiscard]] bool any() const { return dense || experts || attention; }
         [[nodiscard]] static TensorCoreParts all() { return {true, true, true}; }
     } prefill_tc;

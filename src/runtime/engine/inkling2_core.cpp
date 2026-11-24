@@ -57,6 +57,9 @@ constexpr std::size_t kStartupSpare = 256U << 20;
 // decoded rows (ProgramLimits::TensorCoreParts::blas_experts): measured best on a V100 of 256 / 384 / 512 / 768 / 1024
 // at chunks 2048 and 4096 (docs/maintainer/inkling2-model.md, "Tensor-core prefill").
 constexpr std::int32_t kBlasExpertsMin = 512;
+// The same split for the BF16 banks' experts (layers 20-23, either form; ProgramLimits::TensorCoreParts::bank_experts):
+// fewer entries run on the tensor-core kernels over the rows, the others on cuBLAS.
+constexpr std::int32_t kBankExpertsMin = 512;
 // With several slots, a context that does not fit is lowered in steps of this many positions per slot.
 constexpr std::int32_t kFitStep = 256;
 
@@ -546,6 +549,11 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
             if (const char* n = std::getenv("NINFER_INKLING2_BLAS_EXPERTS"); n != nullptr && *n != '\0' && options_.prefill_cublas) {
                 limits.prefill_tc.blas_experts = std::atoi(n);
                 load_.notes.push_back(std::string("experimental | NINFER_INKLING2_BLAS_EXPERTS ") + n + " (measuring only)");
+            }
+            limits.prefill_tc.bank_experts = options_.prefill_cublas ? kBankExpertsMin : 0;
+            if (const char* n = std::getenv("NINFER_INKLING2_BANK_EXPERTS"); n != nullptr && *n != '\0' && options_.prefill_cublas) {
+                limits.prefill_tc.bank_experts = std::atoi(n);
+                load_.notes.push_back(std::string("experimental | NINFER_INKLING2_BANK_EXPERTS ") + n + " (measuring only)");
             }
         }
         limits.slots = slots_;
@@ -2062,9 +2070,11 @@ MemorySummary Inkling2Core::memory_summary() const {
     m.requested_max_context = requested_context_;
     m.kv_capacity           = options_.max_context * static_cast<std::uint32_t>(slots_); // slots_ rings of max_context
     // The weights on the device: the artifact's device backing (its allocations, alignment included; h2d_bytes is
-    // the payload transferred) and any --dense-q8 re-encoding kept beside it.
+    // the payload transferred), the MXFP8 expert banks and the BF16 banks' row exponents made at load, and any
+    // --dense-q8 re-encoding kept beside it.
     const std::size_t weights = static_cast<std::size_t>(model_->storage_stats().device_capacity_bytes) +
-                                static_cast<std::size_t>(model_->mxfp8_expert_bytes()) + (programs_->dense ? programs_->dense->bytes() : 0);
+                                static_cast<std::size_t>(model_->mxfp8_expert_bytes()) + static_cast<std::size_t>(model_->bank_exponent_bytes()) +
+                                (programs_->dense ? programs_->dense->bytes() : 0);
     m.weights = {.capacity_bytes = weights, .used_bytes = weights, .peak_used_bytes = weights};
     m.available_after_weights_bytes = free_after_weights_;
     return m;
