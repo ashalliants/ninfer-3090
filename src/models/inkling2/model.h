@@ -153,6 +153,7 @@ private:
     std::vector<BoundWeight> bound_;
     std::vector<ops::SituExpertBank> banks_;
     std::vector<DeviceBuffer> mxfp8_banks_; // one per MXFP8 layer: its four arrays
+    std::vector<DeviceBuffer> bank_exponents_; // one per BF16-bank layer: SituExpertBank::row_exponents
     Mxfp8LoadStats mxfp8_load_;
     void tile_expert_records();
 };

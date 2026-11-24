@@ -57,6 +57,9 @@ constexpr std::size_t kStartupSpare = 256U << 20;
 // decoded rows (ProgramLimits::TensorCoreParts::blas_experts): measured best on a V100 of 256 / 384 / 512 / 768 / 1024
 // at chunks 2048 and 4096 (docs/maintainer/inkling2-model.md, "Tensor-core prefill").
 constexpr std::int32_t kBlasExpertsMin = 512;
+// The same split for the BF16 banks' experts (layers 20-23, either form; ProgramLimits::TensorCoreParts::bank_experts):
+// fewer entries run on the tensor-core kernels over the rows, the others on cuBLAS.
+constexpr std::int32_t kBankExpertsMin = 512;
 // With several slots, a context that does not fit is lowered in steps of this many positions per slot.
 constexpr std::int32_t kFitStep = 256;
 
@@ -546,6 +549,11 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
             if (const char* n = std::getenv("NINFER_INKLING2_BLAS_EXPERTS"); n != nullptr && *n != '\0' && options_.prefill_cublas) {
                 limits.prefill_tc.blas_experts = std::atoi(n);
                 load_.notes.push_back(std::string("experimental | NINFER_INKLING2_BLAS_EXPERTS ") + n + " (measuring only)");
+            }
+            limits.prefill_tc.bank_experts = options_.prefill_cublas ? kBankExpertsMin : 0;
+            if (const char* n = std::getenv("NINFER_INKLING2_BANK_EXPERTS"); n != nullptr && *n != '\0' && options_.prefill_cublas) {
+                limits.prefill_tc.bank_experts = std::atoi(n);
+                load_.notes.push_back(std::string("experimental | NINFER_INKLING2_BANK_EXPERTS ") + n + " (measuring only)");
             }
         }
         limits.slots = slots_;

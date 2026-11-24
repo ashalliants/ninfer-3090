@@ -1443,6 +1443,26 @@ void test_experts(bool nvfp4, int h, int inter, int experts, const std::string& 
             for (std::size_t i = 0; i < blas_got.size(); ++i) { blas_scaled[i] = static_cast<float>(blas_got[i] / scale); }
             compare(label + " (cuBLAS experts)", blas_scaled, scaled, 3e-3);
             compare(label + " (cuBLAS experts against the kernels)", blas_scaled, tc_ref, 2e-4);
+        } else if (h % 128 == 0 && inter % 64 == 0) {
+            // The BF16 banks' kernels (row exponents set, blas_min_entries past every expert's count), and the split with
+            // the cuBLAS route (blas_min_entries 2: the experts with two or more entries on cuBLAS). The same FP16 rows as
+            // the cuBLAS route; the activation under one power of two instead of one per entry.
+            ninfer::DeviceBuffer exps(static_cast<std::size_t>(ninfer::ops::situ_bank_row_exponent_count(bank)) * 2);
+            ninfer::ops::situ_bank_row_exponents(bank, static_cast<std::int16_t*>(exps.p), nullptr);
+            auto kb = bank;
+            kb.row_exponents = static_cast<const std::int16_t*>(exps.p);
+            Vec blas_ref(tc_scaled.begin(), tc_scaled.end());
+            for (const int split : {1 << 20, 2}) {
+                ninfer::DeviceArena k_arena(ninfer::ops::moe_situ_experts_tc_workspace_bytes(kb, entries, 0, true, split) + 4096);
+                ninfer::ops::moe_situ_experts_tc(kb, dz.tensor({h, cols}), Tensor(did.p, DType::I32, {k, cols}), &tw, 4.0F, 25.0F, k_arena, ttc,
+                                                 nullptr, split);
+                const std::vector<float> k_got = tc_out.get(h * cols);
+                std::vector<float> k_scaled(k_got.size());
+                for (std::size_t i = 0; i < k_got.size(); ++i) { k_scaled[i] = static_cast<float>(k_got[i] / scale); }
+                const std::string what = split == 2 ? " (kernels and cuBLAS split at 2)" : " (BF16 kernels)";
+                compare(label + what, k_scaled, scaled, 3e-3);
+                compare(label + what + " against cuBLAS", k_scaled, blas_ref, 1e-3);
+            }
         }
     }
     if (cols > 2) {
@@ -1707,6 +1727,21 @@ void test_mxfp8_experts(int h, int inter, int experts, const char* label) {
                 ninfer::ops::moe_situ_experts_tc(b, z.tensor({h, cols}), tid, &tw, 4.0F, 25.0F, arena, tout, nullptr);
                 outs.push_back(out.get(static_cast<std::size_t>(h) * cols));
             }
+            if (cols > 1 && h % 128 == 0 && inter % 64 == 0) { // the kernels over the rows, and split with cuBLAS at 9 entries
+                ninfer::DeviceBuffer exps(static_cast<std::size_t>(ninfer::ops::situ_bank_row_exponent_count(b)) * 2);
+                ninfer::ops::situ_bank_row_exponents(b, static_cast<std::int16_t*>(exps.p), nullptr);
+                std::vector<std::int16_t> host_exps(static_cast<std::size_t>(ninfer::ops::situ_bank_row_exponent_count(b)));
+                check(cudaMemcpy(host_exps.data(), exps.p, host_exps.size() * 2, cudaMemcpyDeviceToHost) == cudaSuccess, "exponents");
+                std::vector<float> as_float(host_exps.begin(), host_exps.end());
+                outs.push_back(as_float);
+                auto kb = b;
+                kb.row_exponents = static_cast<const std::int16_t*>(exps.p);
+                for (const int split : {1 << 20, 9}) {
+                    ninfer::DeviceArena k_arena(ninfer::ops::moe_situ_experts_tc_workspace_bytes(kb, std::int64_t(k) * cols, 0, true, split) + 4096);
+                    ninfer::ops::moe_situ_experts_tc(kb, z.tensor({h, cols}), tid, &tw, 4.0F, 25.0F, k_arena, tout, nullptr, split);
+                    outs.push_back(out.get(static_cast<std::size_t>(h) * cols));
+                }
+            }
         }
         check(cudaDeviceSynchronize() == cudaSuccess, std::string(label) + ": experts");
         return outs;
@@ -1719,7 +1754,7 @@ void test_mxfp8_experts(int h, int inter, int experts, const char* label) {
         if (!same) { first_diff = i; }
     }
     check(same, std::string(label) + ": MXFP8 differs from BF16 (result " + std::to_string(first_diff) + ")");
-    std::printf("%-44s MXFP8 == BF16 bit for bit (T 1, 2, 9, 32; per entry, expert-major, tensor cores)\n", label);
+    std::printf("%-44s MXFP8 == BF16 bit for bit (T 1, 2, 9, 32; per entry, expert-major, tensor cores, row exponents, row kernels)\n", label);
 }
 
 // NINFER_INKLING2_OP_BENCH=1: decode-shaped timing (T = 1, top 8 of 32 resident experts at the model's shape, each

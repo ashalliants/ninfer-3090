@@ -80,6 +80,9 @@ struct SituExpertBank {
     const std::uint8_t* mx_gate_up_scales = nullptr; // E8M0 [H / 32, 2I, E]
     const std::uint8_t* mx_down           = nullptr; // MXFP8 codes [I, H, E]
     const std::uint8_t* mx_down_scales    = nullptr; // E8M0 [I / 32, H, E]
+    // BF16 banks (either form): each row's FP16 scale exponent (situ_bank_row_exponents), per expert its 2I gate/up
+    // rows then its H down rows. moe_situ_experts_tc's tensor-core kernels need it; null keeps them off.
+    const std::int16_t* row_exponents = nullptr;
     std::int32_t experts = 0, hidden = 0, intermediate = 0;
     bool tiled = false; // NVFP4: the records are in the tiled order of nvfp4_tile_records
 

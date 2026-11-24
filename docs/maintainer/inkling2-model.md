@@ -648,9 +648,9 @@ run first, then the range over repeated or ABBA legs:
 | Decode, `--spec dspark`, temperature 0.8 | 83.47 tokens/s | 83.37-83.47 (see "Sampled requests") |
 | Decode, plain | 78.83 tokens/s | 78.45-78.83 on the 12 chats; 74.90-74.92 sampled at 0.8 |
 | Decode, 12 chats at 262,144 (200 W; master `dc867300`, 2026-11-23) | 94.37 tokens/s DSpark, 78.04 plain | `--max-context 262144 --vision --kv-dtype int8 --spec dspark --draft-tokens 3`, both adapters loaded but unused; DSpark 94.32-94.37 over two ABBA legs (61.0% of drafts accepted, 2.387 tokens per round, 78.7-119.8 per chat), plain 78.03-78.04; greedy md5 identical across the four legs |
-| Prefill (200 W, 2026-11-23, `--prefill-cublas`; `--max-context 131072 --prefill-chunk 8192`) | 2,687 tokens/s at 7,974 tokens, TTFT 2.97 s | 2,648-2,687 at 7,974; 2,187-2,195 at 34,674; 1,560-1,563 at 100,074. Chunk 4096: 2,360-2,394, 1,996-2,004 and 1,457-1,459 |
-| Prefill (200 W, `--prefill-cublas`; `--max-context 131072`, the default chunk 2048) | 2,069 tokens/s at 7,974 tokens, TTFT 3.85 s | 2,052-2,069 at 7,974; 1,797-1,810 at 1,074 (0.59 s); 1,760-1,763 at 34,674 (19.7 s); 1,296-1,298 at 100,074 (77.1 s). `--no-prefill-cublas`: 1,885-1,893, 1,703-1,719, 1,637-1,644 and 1,224-1,226. Before (250 W, `dad1623b`): 1,930 at 7,979, 1,629 at 1,098, 1,244 at 100,107 |
-| Prefill (200 W, `--prefill-cublas`; `--max-context 262144 --spec dspark --vision`, chunk 2048) | 2,032 tokens/s at 7,974 tokens, TTFT 3.92 s | 2,015-2,032 at 7,974; 1,771-1,779 at 1,074 (0.60 s); 1,729-1,734 at 34,674 (20.0 s); 1,281-1,284 at 100,074 (77.9 s). `--no-prefill-cublas`: 1,854-1,860, 1,680-1,694, 1,607-1,613 and 1,211-1,212. Before (250 W, 2026-11-22): 1,868, 1,671, 1,613 and 1,219; before the snapshots moved to the host the engine picked chunk 256 here: 699-703, 782-786, 739-743 and 629-632 (see "Context with DSpark and vision"). Chunks 4096 and 8192 do not fit here with FP16 KV |
+| Prefill (200 W, 2026-11-24, `--prefill-cublas`; `--max-context 131072 --prefill-chunk 8192`) | 2,727 tokens/s at 7,974 tokens, TTFT 2.92 s | 2,682-2,727 at 7,974; 2,214-2,227 at 34,674 (15.6 s); 1,575-1,577 at 100,074 (63.5 s). With the BF16-bank experts on cuBLAS: 2,657-2,694, 2,194-2,203, 1,564-1,567. Chunk 4096 (2026-11-23, before the BF16-bank change): 2,360-2,394, 1,996-2,004 and 1,457-1,459 |
+| Prefill (200 W, 2026-11-24, `--prefill-cublas`; `--max-context 131072`, the default chunk 2048) | 2,170 tokens/s at 7,974 tokens, TTFT 3.68 s | 2,153-2,170 at 7,974; 1,954-1,962 at 1,074 (0.55 s); 1,836-1,839 at 34,674 (18.9 s); 1,336-1,339 at 100,074 (74.8 s). With the BF16-bank experts on cuBLAS: 2,052-2,071, 1,799-1,807, 1,761-1,764 and 1,297-1,300. `--no-prefill-cublas` (2026-11-23): 1,885-1,893, 1,703-1,719, 1,637-1,644 and 1,224-1,226 |
+| Prefill (200 W, 2026-11-24, `--prefill-cublas`; `--max-context 262144 --spec dspark --vision`, chunk 2048) | 2,125 tokens/s at 7,974 tokens, TTFT 3.75 s | 2,114-2,125 at 7,974; 1,922-1,930 at 1,074 (0.56 s); 1,803-1,809 at 34,674 (19.2 s); 1,321-1,324 at 100,074 (75.6 s). With the BF16-bank experts on cuBLAS: 2,017-2,033, 1,771-1,779, 1,730-1,734 and 1,283-1,285. `--no-prefill-cublas` (2026-11-23): 1,854-1,860, 1,680-1,694, 1,607-1,613 and 1,211-1,212. Before the snapshots moved to the host the engine picked chunk 256 here: 699-703, 782-786, 739-743 and 629-632 (see "Context with DSpark and vision"). Chunks 4096 and 8192 do not fit here with FP16 KV |
 | Second turn of a chat (prefix reuse, same server; 200 W, 262,144 with DSpark, vision and `--kv-dtype int8`) | TTFT 1.03 s at 7,988 tokens, 6,144 reused (chunk 2048) | against 3.93 s cold; chunk 4096: 1.77 s (4,096 reused) against 3.38 s; chunk 8192: 3.04 s (nothing reused). With FP16 KV at chunk 2048: 1.02 s against 3.89 s. At 250 W: 1.51 s against 21.4 s at 34,699 tokens (32,768 reused); the output equals the cold request's. The restore copies 198 MiB host to device in 62 ms |
 | Decode after a long prompt (128 tokens, summarize) | 91.2 tokens/s, DSpark at 7,979 | DSpark 84.9-91.2 at 7,979, 88.0-89.8 at 9,798, 47.4-47.8 at 100,107; plain 71.5, 70.7 and 48.1 |
 | Batched aggregate | 198.2 tokens/s at `--max-concurrency 8` | see "Batched decode" |
@@ -1058,7 +1058,8 @@ FP32 prefill. Decode and DSpark's verify (at most 17 columns) are the FP32 progr
   - Inputs are FP16 under a power of two per entry.
   - The gate/up kernel applies SiTU and stores the activation in FP16 under one power of two for the call; the down
     kernel scatters each entry's column.
-  - Layers 20-23's BF16 banks take per-expert cuBLAS calls.
+  - Layers 20-23's BF16 banks (either form) take per-expert cuBLAS calls, except with `--prefill-cublas`, where their
+    experts with fewer than 512 entries run on the same kernels (see "cuBLAS prefill").
 - Attention: one pass of flash attention over the FP16 rings. A block takes 32 columns by the 3 heads of a KV group,
   so each staged key and value serves all three heads.
   - Q and the softmax weights are FP16, K and V as stored, and the sums FP32 on WMMA.
@@ -1119,6 +1120,15 @@ columns, and only when the tensor-core prefill is on (`--prefill-math fp32` stay
   forward is decoded whole into FP16 (exact: every NVFP4 value is) and multiplied by cuBLAS `GemmEx` with FP32
   accumulation in batches of up to 1024 entries, its inputs and activation under the kernels' own scales. Experts
   with fewer stay on the WMMA kernels, which win while an expert's decode is not amortised.
+- **BF16-bank experts** (`ProgramLimits::TensorCoreParts::bank_experts`, `kBankExpertsMin = 512`): layers 20-23's
+  BF16 banks get the same split, the other way round. Before, every one of their experts took the per-expert cuBLAS
+  route, which converts the expert's BF16 rows to FP16 each forward. Now the experts with fewer than 512 entries run
+  on the NVFP4 kernels' BF16 and MXFP8 variants (`expert_gemm_kernel<GateUp, ExpertFormat>`), which decode each row
+  into FP16 tiles under a per-row power of two (`SituExpertBank::row_exponents`, int16, one per row: 1.2 MB a layer, 4.7 MB in all,
+  computed at load by `ops::situ_bank_row_exponents`). Those are the FP16 values the cuBLAS route multiplies, so the
+  two routes differ only in the activation's scale (one power of two per call, as on the NVFP4 layers, against one
+  per entry) and the order of the FP32 sums. The MXFP8 form gives the BF16 form's results bit for bit, exponents
+  and kernels included (`ninfer_inkling2_fp32_ops_test`). The hot experts keep cuBLAS.
 
 **Two cuBLAS handles, on purpose.** The FP16 GEMMs use a handle in `CUBLAS_TENSOR_OP_MATH`. The FP32 GEMMs need
 their own in `CUBLAS_DEFAULT_MATH`: under `TENSOR_OP_MATH` cuBLAS runs single-precision GEMMs as
@@ -1152,29 +1162,66 @@ attention's sums), though on this sample its mean sits above the plain tensor-co
 | Tensor cores + cuBLAS | 4.62e-3 / 1.61e-1 | 379/390 | 5.24e-3 / 9.30e-2 | 380/390 |
 | Control: FP32, reordered | 6.00e-3 / 9.09e-1 | 382/390 | 4.32e-3 / 8.65e-2 | 379/390 |
 
-Not done: the layers 20-23 BF16 experts keep their per-expert cuBLAS route, which measures about 1.7 times slower per
-visit than the NVFP4 WMMA kernels (it converts each expert's BF16 rows to FP16 every forward); a WMMA kernel over the
-MXFP8 or BF16 rows would be the reverse move. The RTX 3090 keeps `--prefill-cublas` off by default: its tensor-core
-prefill was never measured against this route, so on sm_86 the flag is opt-in.
+The BF16-bank experts on the kernels, the same six slices re-run on 2026-11-24 in one session
+(`NINFER_INKLING2_BANK_EXPERTS` 0 is the route before, every BF16-bank expert on cuBLAS; 99999 puts all of them on
+the kernels). The three agree to three figures, so the change adds nothing measurable on top of the cuBLAS route.
+That session's cuBLAS-route mean is lower than the table's 4.62e-3 / 5.24e-3 above, from an earlier run; the reason
+was not tracked down, so compare rows within one table:
+
+| BF16-bank experts | 2K: KLD mean / max | 2K: argmax | 4K: KLD mean / max | 4K: argmax |
+|---|---|---|---|---|
+| all on cuBLAS (before) | 4.045e-3 / 1.258e-1 | 377/390 | 4.243e-3 / 7.04e-2 | 378/390 |
+| **under 512 entries on the kernels (default)** | **4.046e-3 / 1.256e-1** | **377/390** | **4.242e-3 / 7.04e-2** | **378/390** |
+| all on the kernels | 4.046e-3 / 1.256e-1 | 377/390 | 4.242e-3 / 7.04e-2 | 378/390 |
+
+Before that change the BF16-bank experts took about 1.7 times as long per visit as the NVFP4 WMMA kernels, because
+the cuBLAS route converts each expert's BF16 rows to FP16 every forward. With the kernels a BF16-bank visit takes
+8.65 ms against the NVFP4 layers' 11.0 ms, down from about 20.5 ms (nsys, chunk 2048, 12,288 tokens). The split
+point, tok/s on the program over the same real text (`NINFER_INKLING2_PREFILL_BENCH`, 12,288 tokens at chunk 2048
+and 16,384 at 8192, two legs each in ABBA):
+
+| Chunk | all on cuBLAS (before) | kernels under 256 | **512** | 1024 | all on the kernels |
+|---|---|---|---|---|---|
+| 2048 | 2,010-2,011 | 2,100-2,102 | **2,107-2,108** | 2,104 | 2,105-2,107 |
+| 8192 | 2,517-2,518 | 2,535-2,536 | **2,541-2,543** | 2,540-2,541 | 2,531-2,533 |
+
+The RTX 3090 keeps `--prefill-cublas` off by default, and with it this route: its tensor-core prefill was never
+measured against the cuBLAS route, so on sm_86 the flag is opt-in.
 
 Through `ninfer-serve` (200 W, ABBA): at 131,072 and the default chunk 2048, 1,810 / 2,069 / 1,763 / 1,298 tok/s at
 1K / 8K / 34K / 100K against 1,719 / 1,893 / 1,644 / 1,226 without the route (+5 / +9 / +7 / +6%); at 262,144 with
-DSpark and vision 1,779 / 2,032 / 1,734 / 1,284 against 1,694 / 1,860 / 1,613 / 1,212. The route adds no
-workspace (454 / 872 / 1,710 MiB at chunk 2048 / 4096 / 8192, as before), so the chunk the engine picks is
-unchanged.
+DSpark and vision 1,779 / 2,032 / 1,734 / 1,284 against 1,694 / 1,860 / 1,613 / 1,212 (2026-11-23, before the
+BF16-bank experts moved). The BF16-bank experts on the kernels, measured on 2026-11-24 (200 W, real-text prompts,
+A B B A against `NINFER_INKLING2_BANK_EXPERTS=0`, no thermal throttle, best leg with the range):
+
+| Config | 1K | 8K | 34K | 100K |
+|---|---|---|---|---|
+| 131,072, chunk 2048 | **1,962** (1,954-1,962) against 1,807 (1,799-1,807) | **2,170** (2,153-2,170) against 2,071 | **1,839** (1,836-1,839) against 1,764 | **1,339** (1,336-1,339) against 1,300 |
+| 262,144 with DSpark and vision, chunk 2048 | **1,930** (1,922-1,930) against 1,779 | **2,125** (2,114-2,125) against 2,033 | **1,809** (1,803-1,809) against 1,734 | **1,324** (1,321-1,324) against 1,285 |
+| 131,072, `--prefill-chunk 8192` | - | **2,727** (2,682-2,727) against 2,694 (2,657-2,694) | **2,227** (2,214-2,227) against 2,203 | **1,577** (1,575-1,577) against 1,567 |
+
+That is +8-9% at 1K, +4.5-4.8% at 8K, +4.3% at 34K and +3% at 100K at chunk 2048, and +0.6-1.2% at chunk 8192,
+where most experts are hot and already on cuBLAS.
+
+Workspace: the kernels' FP16 activation lives only between their gate/up and down launches, and the hot experts'
+buffers reuse its bytes (`moe_situ_experts_tc_workspace_bytes` takes the larger of the two). Chunk 2048 needs 463
+MiB (454 with every BF16-bank expert on cuBLAS) and chunk 8192 1,746 (1,710). Without that reuse the route needed 499
+MiB at chunk 2048, which pushed 262,144 with DSpark and vision down to chunk 1024. With it that configuration keeps
+chunk 2048 with 288 MiB free (296 before).
 
 The engine picks the widest chunk of 2048, 1024, 512 and 256 whose programs (with the drafter and the vision tower
 when they are on) fit beside `--max-context`, leaving 256 MiB free. It logs the choice and the free memory at
-startup. `--prefill-chunk N` sets the chunk instead. At 262,144 with DSpark and vision chunk 2048 leaves 302 MiB
-free, the prefix-reuse snapshots being in host memory (see "Context with DSpark and vision").
+startup. `--prefill-chunk N` sets the chunk instead. At 262,144 with DSpark and vision chunk 2048 leaves 288 MiB
+free (2026-11-24), the prefix-reuse snapshots being in host memory (see "Context with DSpark and vision").
 
 The automatic choice stops at 2048 on purpose. A wider chunk prefills a long prompt faster (with the cuBLAS route
-at 131,072, 200 W: 2,069 / 2,360-2,394 / 2,648-2,687 tok/s at 8K for chunk 2048 / 4096 / 8192, and 1,763 / 2,004 /
-2,195 at 34K), but prefix reuse resumes only at multiples of the chunk: a chat's second turn at 8K (262,144 with
+at 131,072, 200 W: 2,170 / 2,727 tok/s at 8K for chunk 2048 / 8192 and 1,839 / 2,227 at 34K; chunk 4096 gave
+2,360-2,394 and 2,004 before the BF16-bank experts moved), but prefix reuse resumes only at multiples of the chunk: a chat's second turn at 8K (262,144 with
 DSpark, vision and `int8` KV) answers in 1.03 s at 2048, 1.77 s at 4096 and 3.04 s at 8192, which reuses nothing
-below 8,192. `--prefill-chunk 4096` or `8192` is the setting for long single-shot prompts. Their workspaces (872 and
-1,710 MiB) do not fit at 262,144 with DSpark, vision and FP16 KV (startup runs out of memory); with
-`--kv-dtype int8` they leave 2,350 and 1,368 MiB free there, with the Q8 head and the whole drafter window.
+below 8,192. `--prefill-chunk 4096` or `8192` is the setting for long single-shot prompts. Their workspaces (872 MiB before the BF16-bank change, and
+1,746 MiB) do not fit at 262,144 with DSpark, vision and FP16 KV (startup runs out of memory); with
+`--kv-dtype int8` they left 2,350 and 1,368 MiB free there before that change, with the Q8 head and the whole drafter
+window.
 
 ## GGUF mapping (Unsloth `unsloth/Inkling-2-Mini-GGUF`)
 
@@ -1306,7 +1353,7 @@ Sizes are rough engineer-days for a person or agent who knows the codebase, incl
 | 2. Converter | `inkling2_gguf` recipe writes the artifact: C++ format registry for `ggml_nvfp4` and the new records, per-expert scales, padded vocab, tokenizer and chat resources. Reader test on the real file | 2-3 |
 | 3. Text MVP, correctness first (done, see "Engine") | Model, config and binding. Program with the 48-visit schedule. New Ops with naive FP32 kernels qualified against the oracles: rel-bias sink attention (decode and prefill), conv streams, MIX, CTRL, clips, sigmoid router, resident NVFP4/Q8_0/BF16 MoE. Linear problem registrations. Tokenizer matcher. Greedy text equals the golden. Done except Q8_0 experts and the Linear registrations (the MVP uses `projection_fp32`), which move to phase 4 | 8-12 |
 | 4. V100 decode performance (in progress; done so far: decode graphs, split and latency-hidden attention, FP16 rings, fused per-entry and expert-major experts, batched decode; 78.8 tok/s plain serve) | Fused decode kernels (MIX, CTRL, conv and norms), expert GEMV for NVFP4 via dp4a, global attention on FP16 KV, CUDA Graph per decode width; measure against the bandwidth floor | 5-8 |
-| 5. Prefill (done: [Tensor-core prefill](#tensor-core-prefill) and [cuBLAS prefill](#cublas-prefill---prefill-cublas), 2,069 tok/s at 8K at the default chunk, 2,687 at chunk 8192, 200 W) | cuBLAS HMMA for the dense and expert GEMMs (dequantize tiles to FP16), flash prefill with the relative bias and sink (extend the vendored `fattn` like [L]'s banded op) | 4-6 |
+| 5. Prefill (done: [Tensor-core prefill](#tensor-core-prefill) and [cuBLAS prefill](#cublas-prefill---prefill-cublas), 2,170 tok/s at 8K at the default chunk, 2,727 at chunk 8192, 200 W) | cuBLAS HMMA for the dense and expert GEMMs (dequantize tiles to FP16), flash prefill with the relative bias and sink (extend the vendored `fattn` like [L]'s banded op) | 4-6 |
 | 6. DSpark (done, greedy and sampled, adaptive width) | Drafter binding, tap capture at visits 5/23/41/48, Markov chain with the precomputed `W_head Wo`, verify of the full block (8) with `keep()` | 4-6 |
 | 7. Vision (done, correctness first) | mmproj conversion and the ViT (see "Vision tower") | 4-6 |
 | 8. Chat/serving (MVP done) | template, reasoning and tool parsers, effort control (see "Serving") | 2-3 |
