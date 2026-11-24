@@ -17,6 +17,17 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Qwen3.8-27B verify on int8 activations (2026-11-24)
+
+`--verify-a8`, the default in a V100 build, runs the 27B's Q4/Q5/Q6 linears at 1-8 tokens on int8
+activations with `dp4a`, so an MTP or DFlash2 verify round costs about a plain step's GEMVs. With the
+router's flags (200 W, greedy, ABBA against master): MTP3 **110.1 tok/s on code** (81.2-82.1 before),
+104.1 thinking (77.2-77.9), 77.0 story (57.0-57.7), 81.4 Chinese (57.2-57.8), 80.7 French (57.2-57.6);
+DFlash2 K7 146.5 on structured JSON (97.3); plain decode 45.0 (42.7-43.0); two requests at once
+122 tok/s in total (74). Lossy at the noise floor: decode-path KLD 7.2e-4 to 7.8e-4 against the FP32
+kernels, 98.9-99.2% the same top-1. The RTX 3090 does not build the kernel and is unchanged. Details:
+[tesla-v100.md](tesla-v100.md#qwen38-27b).
+
 ## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next hyper-connection collapse (2026-11-24)
 
 The hyper-connection mixer's up-collapse kernel is cheaper on the V100 (`sm_70` only, the same output

@@ -95,6 +95,27 @@ struct Q6StreamFormat {
     __device__ static __forceinline__ float correction(float, float x_odd) {
         return -kStreamOddScale * x_odd;
     }
+    // dp4a form (ops/linear/common/stream_dp4a.cuh): (n | pair << 4) ^ 0x20 is the weight plus
+    // 32. The high pairs of the even weights (bits 0, 4, 8, 12 of the word's 16) and of the odd
+    // ones (bits 2, 6, 10, 14) are spread to bits 4..5 of each byte beside the masked nibbles.
+    static constexpr bool kDp4a    = true;
+    static constexpr int kDp4aBias = 32;
+    template <int W>
+    __device__ static __forceinline__ void dp4a_word(const Slice& slice, std::uint32_t& even,
+                                                     std::uint32_t& odd) {
+        const std::uint32_t words[4] = {slice.codes.x, slice.codes.y, slice.codes.z,
+                                        slice.codes.w};
+        const std::uint32_t highs[2] = {slice.high.x, slice.high.y};
+        const std::uint32_t high     = (highs[W >> 1] >> (16 * (W & 1))) & 0xffffu;
+        const auto spread = [](std::uint32_t pairs) { // 2-bit fields at 4j -> 8j + 4
+            pairs = (pairs | (pairs << 8)) & 0x00330033u;
+            pairs = (pairs | (pairs << 4)) & 0x03030303u;
+            return pairs << 4;
+        };
+        even = ((words[W] & 0x0f0f0f0fu) | spread(high & 0x3333u)) ^ 0x20202020u;
+        odd  = (((words[W] >> 4) & 0x0f0f0f0fu) | spread((high >> 2) & 0x3333u)) ^ 0x20202020u;
+    }
+
     // The eight operands of packed word W (k offsets 8W .. 8W + 7 of the slice).
     template <int W>
     __device__ static __forceinline__ void decode_word(const Slice& slice,

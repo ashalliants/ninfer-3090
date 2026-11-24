@@ -46,6 +46,7 @@ struct Options {
     std::optional<std::filesystem::path> corpus;
     std::optional<std::filesystem::path> text;
     std::optional<std::filesystem::path> kld_base;
+    std::optional<std::filesystem::path> kld_write;
     std::optional<std::filesystem::path> output;
     std::uint32_t context     = 4096;
     std::uint32_t stride      = 2048;
@@ -69,6 +70,7 @@ struct Options {
     bool mtp_experts_q4                 = false;
     bool gdn_state_fp16                 = false;
     bool mlp_a8_decode                  = false;
+    bool verify_a8                      = ninfer::kVerifyA8Default;
     bool prefill_a8                     = true;
     bool prefill_cublas                 = ninfer::kPrefillCublasDefault;
     bool prefill_cublas_projections     = true;
@@ -79,16 +81,20 @@ std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>\n"
            "        | --kld-base <llama.kld> [--chunks N] [--decode-window T])\n"
+           "       [--kld-write <out.kld>]\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|<per-layer runs, e.g. rk4v4x8,int8x8>]\n"
            "       [--output <directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] [--gdn-state-fp16]\n"
-           "       [--mlp-a8-decode] [--no-prefill-a8]\n"
+           "       [--mlp-a8-decode] [--verify-a8 | --no-verify-a8] [--no-prefill-a8]\n"
            "       (--kld-base scores each chunk of a llama.cpp KL-divergence base: the first\n"
            "        half is prefilled, the second teacher-forced through the decode path, T\n"
            "        tokens per forward (default 3; T=1 is the ordinary decode step, wider\n"
            "        windows the speculative verify forward). Context comes from the base: no\n"
            "        --context or --stride. --chunks scores the first N chunks (default all))\n"
+           "       (--kld-write writes this run's decode-path log-probs as a base in the same\n"
+           "        layout, for comparing a build with itself: after --kld-base it holds the same\n"
+           "        tokens; with --text FILE it cuts the text into chunks of --context tokens)\n"
            "       (--mlp-a8-decode and other verify-phase routes are inert with --corpus and\n"
            "        --text, which score the prefill phase; --kld-base reaches a verify route\n"
            "        once --decode-window is wide enough for it)\n"
@@ -139,6 +145,8 @@ Options parse_options(int argc, char** argv) {
             out.text = std::filesystem::path(value("--text"));
         } else if (option == "--kld-base") {
             out.kld_base = std::filesystem::path(value("--kld-base"));
+        } else if (option == "--kld-write") {
+            out.kld_write = std::filesystem::path(value("--kld-write"));
         } else if (option == "--chunks") {
             out.chunks = ninfer::perplexity::parse_kld_chunks(value("--chunks"));
         } else if (option == "--decode-window") {
@@ -193,6 +201,10 @@ Options parse_options(int argc, char** argv) {
             out.gdn_state_fp16 = true;
         } else if (option == "--mlp-a8-decode") {
             out.mlp_a8_decode = true;
+        } else if (option == "--verify-a8") {
+            out.verify_a8 = true;
+        } else if (option == "--no-verify-a8") {
+            out.verify_a8 = false;
         } else if (option == "--no-prefill-a8") {
             out.prefill_a8 = false;
         } else if (option == "--prefill-cublas") {
@@ -214,8 +226,10 @@ Options parse_options(int argc, char** argv) {
                                             .context       = context_given,
                                             .stride        = stride_given,
                                             .chunks        = out.chunks.has_value(),
-                                            .decode_window = out.decode_window.has_value()});
-    if (!out.kld_base && (out.context < 2 || out.stride == 0 || out.stride >= out.context)) {
+                                            .decode_window = out.decode_window.has_value(),
+                                            .kld_write     = out.kld_write.has_value()});
+    if (!out.kld_base && !out.kld_write &&
+        (out.context < 2 || out.stride == 0 || out.stride >= out.context)) {
         usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
     }
     return out;
@@ -327,6 +341,7 @@ ninfer::EngineOptions scoring_engine_options(const Options& options,
     engine_options.mtp_experts_q4   = options.mtp_experts_q4;
     engine_options.gdn_state_fp16   = options.gdn_state_fp16;
     engine_options.mlp_a8_decode    = options.mlp_a8_decode;
+    engine_options.verify_a8        = options.verify_a8;
     engine_options.prefill_a8       = options.prefill_a8;
     engine_options.prefill_cublas   = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
@@ -354,7 +369,9 @@ int run_kld(const Options& options, const std::shared_ptr<spdlog::logger>& logge
 int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         ninfer::product::StartupLogRenderer& startup_log,
         const std::shared_ptr<ninfer::product::TerminalProgress>& progress) {
-    if (options.kld_base) { return run_kld(options, logger, startup_log, progress); }
+    if (options.kld_base || options.kld_write) {
+        return run_kld(options, logger, startup_log, progress);
+    }
     const Clock::time_point total_started = Clock::now();
     ninfer::Engine engine(scoring_engine_options(options, startup_log));
     const ninfer::LoadSummary load = engine.load_summary();
@@ -568,12 +585,19 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 // Scores one chunk's rows as the Engine delivers them: each row's logits against the base row.
 class KldRowScorer final : public ninfer::ScoreRowSink {
 public:
+    // `compare`: the base has rows to score against (--kld-base); `writer`: --kld-write.
     KldRowScorer(const ninfer::perplexity::KldBase& base, const ninfer::perplexity::KldChunk& chunk,
                  int chunk_index, std::vector<ninfer::perplexity::ScoredRow>& rows,
-                 std::ostream& tsv)
-        : base_(base), chunk_(chunk), chunk_index_(chunk_index), rows_(rows), tsv_(tsv) {}
+                 std::ostream& tsv, bool compare, ninfer::perplexity::KldBaseWriter* writer)
+        : base_(base), chunk_(chunk), chunk_index_(chunk_index), rows_(rows), tsv_(tsv),
+          compare_(compare), writer_(writer) {}
 
     void row(std::int64_t position, std::span<const float> logits) override {
+        if (writer_ != nullptr) { writer_->add_row(logits); }
+        if (!compare_) {
+            ++count_;
+            return;
+        }
         // The model's public token domain is the comparison domain: llama.cpp may pad n_vocab
         // past it (248,320 rows), and those rows are left out.
         const auto valid_vocab = static_cast<std::int32_t>(logits.size());
@@ -602,6 +626,8 @@ private:
     int chunk_index_;
     std::vector<ninfer::perplexity::ScoredRow>& rows_;
     std::ostream& tsv_;
+    bool compare_;
+    ninfer::perplexity::KldBaseWriter* writer_;
     std::size_t count_ = 0;
 };
 
@@ -621,22 +647,42 @@ int run_kld(const Options& options, const std::shared_ptr<spdlog::logger>& logge
             ninfer::product::StartupLogRenderer& startup_log,
             const std::shared_ptr<ninfer::product::TerminalProgress>& progress) {
     const Clock::time_point total_started = Clock::now();
-    const ninfer::perplexity::KldBase base = ninfer::perplexity::read_kld_base(*options.kld_base);
-    const int chunk_count  = ninfer::perplexity::kld_chunk_count(base, options.chunks);
+    // --kld-base scores against the file's rows; --text with --kld-write only writes a base.
+    const bool compare = options.kld_base.has_value();
+    std::optional<ninfer::perplexity::KldBase> file_base;
+    if (compare) { file_base = ninfer::perplexity::read_kld_base(*options.kld_base); }
+    const std::uint32_t n_ctx = compare ? file_base->n_ctx : options.context;
     const int window =
         options.decode_window.value_or(ninfer::perplexity::kDefaultDecodeWindow);
-    const std::uint32_t first_target = base.n_ctx / 2U + 1U;
-    const std::uint32_t rows_per_chunk = base.n_ctx - first_target;
-    logger->info("KL-divergence base | {} | n_ctx {} | n_vocab {} | {} of {} chunks | T={}",
-                 ninfer::product::format_pretty_text(base.path.string()), base.n_ctx, base.n_vocab,
-                 chunk_count, base.n_chunk, window);
 
     ninfer::EngineOptions engine_options = scoring_engine_options(options, startup_log);
-    engine_options.max_context           = base.n_ctx;
+    engine_options.max_context           = n_ctx;
     engine_options.scoring_decode_window = static_cast<std::uint32_t>(window);
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
     startup_log.engine_ready(load);
+
+    ninfer::perplexity::KldBase base;
+    if (compare) {
+        base = std::move(*file_base);
+    } else {
+        std::vector<ninfer::TokenId> all;
+        for (const auto& stream : ninfer::perplexity::load_custom_text(*options.text).streams) {
+            const std::vector<ninfer::TokenId> tokens = engine.tokenize_text(stream.text);
+            all.insert(all.end(), tokens.begin(), tokens.end());
+        }
+        base      = ninfer::perplexity::kld_base_from_tokens(all, n_ctx);
+        base.path = *options.text;
+    }
+    const int chunk_count  = ninfer::perplexity::kld_chunk_count(base, options.chunks);
+    const std::uint32_t first_target = base.n_ctx / 2U + 1U;
+    const std::uint32_t rows_per_chunk = base.n_ctx - first_target;
+    logger->info("KL-divergence base | {} | n_ctx {} | n_vocab {} | {} of {} chunks | T={}",
+                 ninfer::product::format_pretty_text(base.path.string()), base.n_ctx,
+                 compare ? std::to_string(base.n_vocab) : std::string("from the model"),
+                 chunk_count, base.n_chunk, window);
+    std::optional<ninfer::perplexity::KldBaseWriter> writer;
+    if (options.kld_write) { writer.emplace(*options.kld_write, base, chunk_count); }
 
     const std::string mode = "decode-t" + std::to_string(window);
     const std::filesystem::path output_directory = prepare_output_directory(
@@ -655,7 +701,8 @@ int run_kld(const Options& options, const std::shared_ptr<spdlog::logger>& logge
     Clock::time_point next_progress         = scoring_started + std::chrono::seconds(10);
     for (int chunk = 0; chunk < chunk_count; ++chunk) {
         const ninfer::perplexity::KldChunk input = ninfer::perplexity::kld_chunk(base, chunk);
-        KldRowScorer scorer(base, input, chunk, rows, tsv);
+        KldRowScorer scorer(base, input, chunk, rows, tsv, compare,
+                            writer ? &*writer : nullptr);
         std::vector<float> logprobs;
         try {
             logprobs = engine.score_tokens(input.tokens, input.first_target, scoring, &scorer);
@@ -668,7 +715,7 @@ int run_kld(const Options& options, const std::shared_ptr<spdlog::logger>& logge
                                      " returned an invalid row count");
         }
         if (!tsv) { throw std::runtime_error("cannot write rows file: " + rows_path.string()); }
-        if (Clock::now() >= next_progress || chunk + 1 == chunk_count) {
+        if (compare && (Clock::now() >= next_progress || chunk + 1 == chunk_count)) {
             const ninfer::perplexity::KldSummary partial = ninfer::perplexity::summarize(rows);
             std::ostringstream line;
             line << "scoring | chunk " << chunk + 1 << '/' << chunk_count << " | PPL " << std::fixed
@@ -687,6 +734,12 @@ int run_kld(const Options& options, const std::shared_ptr<spdlog::logger>& logge
     tsv.flush();
     if (!tsv) { throw std::runtime_error("cannot write rows file: " + rows_path.string()); }
     const double scoring_seconds = seconds_since(scoring_started);
+    if (writer) {
+        writer->finish();
+        std::cout << "KL-divergence base written: " << *options.kld_write << " (" << chunk_count
+                  << " chunks of " << base.n_ctx << ", decode window T=" << window << ")\n";
+    }
+    if (!compare) { return 0; }
 
     const ninfer::perplexity::KldSummary summary = ninfer::perplexity::summarize(rows);
     double base_nll = 0.0;

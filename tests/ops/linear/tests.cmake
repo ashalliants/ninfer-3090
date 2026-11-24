@@ -29,7 +29,22 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     set_tests_properties(ninfer_linear_${format}_a16_tensor_cores_test PROPERTIES
       ENVIRONMENT "NINFER_SM70_TENSOR_CORES=1" SKIP_RETURN_CODE 77)
   endforeach()
+  # The int8-activation streaming GEMV (EngineOptions::verify_a8, ops/linear/common/stream_dp4a.cuh)
+  # forced on: the A16 suites at its allowance (tests/ops/op_tester.h, with_stream_a8_allowance).
+  foreach(format q4 q5 q6)
+    add_test(NAME ninfer_linear_${format}_a16_stream_a8_test
+      COMMAND ninfer_tests ninfer_linear_${format}_a16_test)
+    set_tests_properties(ninfer_linear_${format}_a16_stream_a8_test PROPERTIES
+      ENVIRONMENT "NINFER_STREAM_DP4A=1" SKIP_RETURN_CODE 77)
+  endforeach()
 endif()
+
+# The per-stream verify_a8 switch (ops/linear/common/stream_a8.h): two engines keep their own
+# settings. Host only.
+ninfer_add_test(ninfer_stream_a8_registration_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_stream_a8.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_stream_a8_registration_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_op_test(ninfer_linear_t2_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_t2_a16.cpp"

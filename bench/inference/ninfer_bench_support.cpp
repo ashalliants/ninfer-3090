@@ -456,6 +456,8 @@ std::string usage_text(std::string_view program) {
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --no-prefill-a8             full prefill tiles keep their A16 routes\n"
+        << "  --no-verify-a8              sm_70: decode and verify linears keep FP32 activations "
+           "(--verify-a8, int8 activations and dp4a, is the default there)\n"
         << "  --prefill-cublas            hand wide prefill GEMMs to cuBLAS (quality trade; wants a "
            "larger --prefill-chunk; the default on sm_70, where the route is FP16)\n"
         << "  --no-prefill-cublas         keep wide prefill GEMMs off cuBLAS\n"
@@ -555,6 +557,10 @@ BenchOptions parse_args(int argc, char** argv) {
                 parse_u32(value("--ngram-min-match"), "ngram-min-match");
         } else if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
+        } else if (arg == "--verify-a8") {
+            options.verify_a8 = true;
+        } else if (arg == "--no-verify-a8") {
+            options.verify_a8 = false;
         } else if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
         } else if (arg == "--no-prefill-cublas") {

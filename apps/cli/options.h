@@ -58,6 +58,7 @@ struct Options {
     bool numeric_tripwire = false;
     float numeric_tripwire_limit = 65504.0F;
     bool mlp_a8_decode  = false;
+    bool verify_a8      = ninfer::kVerifyA8Default;
     bool prefill_a8     = true;
     bool prefill_cublas = ninfer::kPrefillCublasDefault;
     bool prefill_cublas_projections = true;

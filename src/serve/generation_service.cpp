@@ -368,6 +368,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.admission_affinity       = options.admission_affinity;
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
+    engine_options.verify_a8                = options.verify_a8;
     engine_options.prefill_a8               = options.prefill_a8;
     engine_options.prefill_cublas           = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;

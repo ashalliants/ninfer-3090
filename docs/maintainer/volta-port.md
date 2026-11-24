@@ -202,6 +202,7 @@ round spent ~26 ms of ~50 in it against a ~19 ms read. Two changes:
 | before | 78.3 | | | |
 | + input projections on the streaming GEMV | 82.3 | 75.6 | 72.5 | 72.3 |
 | + tensor-core verify GEMV | 86.3 | 85.9 | 85.4 | 84.2 |
+| + int8 verify GEMV (`--verify-a8`; 2026-11-24, 200 W, master then 88.0 and 93.2) | 118.9 | | | 141.9 |
 
 **Two lanes (`--max-concurrency 2`).** Two lanes widen what one lane runs on the streaming
 kernels into calls the shape tables still sent to emulated Ampere mma: the MTP proposal head (Q4
@@ -819,22 +820,83 @@ sensible text means the kernels are right, and the log carries decode and prefil
 Models the port is meant to run: Qwen3.8-27B, Ternary Bonsai 2 27B, Qwen3.6-35B-A3B and
 Qwen3.8-Flash-Next. A 32 GB V100 holds the 27B (19 GiB) with room for KV; the Bonsai 27B is 8.9 GiB.
 
+**Flat-cost verify on int8 activations (`--verify-a8`, on by default in an `sm_70` build).** The
+SIMT streaming GEMV pays one FFMA per weight per token and the tensor-core one above only covers
+some Q4 shapes, so a round's GEMV time still grew with its width: an MTP3 round cost ~43 ms and a
+DFlash2 K = 7 round ~80 ms against 23.3 ms for a plain step. `ops/linear/common/stream_dp4a.cuh`
+serves every Q4 / Q5 / Q6 streaming call of 1..8 tokens instead (the input projections, `linear_add`,
+SwiGLU, plain linears and the Q6 LM head):
+
+- each CTA quantises its staged activation to int8, one FP32 scale per 32 values and token (absmax /
+  127, llama.cpp's q8_1), and stores the slice's sum beside it;
+- the format turns a packed word of eight weights into two words of four biased unsigned bytes
+  (`dp4a_word`: 3 instructions for Q4, more for Q5's high plane and Q6's pairs), and each token
+  then costs one `dp4a` per four weights. The bias times the slice sum seeds each chain, so the
+  integer dot product is exact; the group scale and the activation scale apply in FP32 per slice;
+- about 0.4 + 0.45 T instructions per weight instead of 1.5 + 1.25 T, so the kernel stays at the
+  weight stream through T = 8; past 8 tokens the tile GEMM serves as before;
+- every token's sum is formed in the same order at any width: the K chunk is a function of K only,
+  lanes own fixed slices, the warp reduces a chunk, and chunks add in order. A token's result is
+  bit-for-bit the same at T = 1 as in an eight-token verify. End to end that does not make
+  speculative output equal plain decoding's: verify attention and the GDN recurrence still differ
+  by width, as before. On six greedy prompts (300-1,200 tokens) MTP3 and plain decoding gave the
+  same text on 0 of 6 (1 with DFlash2) against 2 of 6 on master, and parted after 56-1,522
+  characters; MTP3 and DFlash2 gave the same text on 1 of 6 (master: 1). `--no-verify-a8` gave
+  master's MTP3 text on all six.
+
+Microbenchmark, cold L2, us per call at T = 1 / 4 / 8 (`ninfer_linear_bench --sweep 1:8:1`, 200 W):
+
+| Shape | SIMT (before) | int8 `dp4a` |
+|---|---|---|
+| Q4 34816 x 5120 (gate/up) | 122 / 172 / 305 | 121 / 131 / 144 |
+| Q4 6144 x 5120 | 29 / 47 / 83 | 29 / 34 / 44 |
+| Q4 5120 x 17408 (down) | - / 108 / 185 | - / 86 / 112 |
+| Q5 5120 x 6144 | - / 61 / 95 | - / 39 / 47 |
+| Q6 248320 x 5120 (head) | 1,228 / 2,086 / 3,772 | 1,195 / 1,260 / 1,310 |
+
+(- : the bench's T = 1 call of that shape does not take the streaming route.)
+
+Accuracy, the decode-path KLD gate (`ninfer-perplexity --kld-write` / `--kld-base`, 17 chunks of 512
+tokens from four held-out domains, INT8 KV, FP16 GDN state; base = the FP32 kernels at T = 1):
+
+| Run | KLD mean | p99 | same top-1 | PPL |
+|---|---:|---:|---:|---:|
+| FP32 kernels, T = 1 (base against itself) | 0 | 4e-5 | 100% | 3.6102 |
+| FP32 kernels, T = 8 (master's own verify reordering) | 3.8e-4 | 3.0e-3 | 99.42% | 3.6116 |
+| int8, T = 1 | 7.2e-4 | 6.1e-3 | 98.87% | 3.6134 |
+| int8, T = 4 | 7.2e-4 | 6.2e-3 | 98.89% | 3.6156 |
+| int8, T = 8 | 7.8e-4 | 5.8e-3 | 99.19% | 3.6106 |
+
+That is about twice the FP32 reordering floor and a fifth of the Inkling FP16 tensor-core prefill
+(about 4e-3), so it is the default. `--no-verify-a8` (or `NINFER_STREAM_DP4A=0`) restores the FP32
+kernels; `NINFER_STREAM_DP4A=1` forces the route for op tests and A/B runs. The choice is per CUDA
+stream (`ops/linear/common/stream_a8.h`): a Qwen3.5-family model instance registers its ranks'
+streams with its own `verify_a8` for its lifetime (`runtime/engine/model_instance.cpp`), so two
+engines in one server keep their own settings, and a launch on any unregistered stream (other
+models, the op suites) keeps the A16 kernels. The op suites' `_stream_a8` variants run with the
+route forced, at a widened allowance (`with_stream_a8_allowance` in `tests/ops/op_tester.h`).
+
+An FP16 tensor-core form (`mma.m8n8k4`, exact FP16 weight integers, the activation scaled per token
+into [2^14, 2^15), FP32 accumulation per 64-weight group) was built first and measured slower than
+the int8 form at every width up to 8 (Q4 34816 x 5120: 152 / 179 / 182 us; 6144 x 5120: 34 / 54 /
+57 us). Turning the codes into FP16 pairs and applying the group scales costs about two
+instructions per weight however few tokens share them, against `dp4a`'s 0.4 + 0.45 T, and at one
+16-warp CTA per SM the kernel was latency-bound (25% occupancy, long-scoreboard stalls, 53-68%
+of DRAM bandwidth in `ncu`). 32-warp CTAs, two CTAs per SM and a three-deep load ring all
+measured slower. Lapilli's own FP16 variant of its `dense_mmvq` beats its `dp4a` form only from five
+columns on NVFP4 weights, and not on its 8-bit ones until 15 columns. It was not kept.
+
 ## Next, in order
 
 1. Run the full op suites (`scripts/v100_validate.sh --tests`); the linear, input-projection,
    `linear_add`, SwiGLU, GDN, MTP-round and attention suites have run.
 2. Measure small-T on the other models (MTP / DFlash verification on the 27B is done: see "Decode"), and re-pick the sm_86 route tables where an `mma`
    route loses to a SIMT one on Volta (`docs/maintainer/linear-tuning.md` has the method).
-3. Verify widths on the few-row matrices: the out projections (5120 x 6144) and the long down
-   projection (5120 x 17408) run at 35-55% of the weight stream at T = 4 in both streaming GEMVs
-   (the SIMT one stages K = 6144 in two chunks at four tokens; the tensor-core one has too few
-   rows in flight). At T = 4 the SIMT kernel is instruction-bound rather than short of loads in
-   flight: two slices in flight (`Unroll` 2) and 32-warp CTAs both measured slower (5120 x 17408
-   Q5: 150 -> 153 and 182 us; Q4: 119 -> 122 and 127 us), so a K-split, which only adds
-   parallelism, is not expected to help. The win would have to come from fewer instructions per
-   weight and token. Q5 on the tensor cores loses at T = 4 (above). Q6 (the verify LM head, 2 ms
-   of an MTP3 round) has no tensor-core form, and given Q5's result one is not expected to win
-   at T = 4.
+3. Verify widths past 8 tokens: the int8 streaming GEMV (above) holds 1..8 tokens at the weight
+   stream, so MTP up to seven drafts and DFlash2 up to K = 7 verify at about a plain step's GEMV
+   cost; wider DFlash2 windows (12-16 columns) and two-lane DFlash2 rounds still reach the tile GEMM. A
+   16-column form (Lapilli's `dense_mmvq` runs 16) would let deeper drafting pay. The DFlash2
+   drafter's own Q8 sliced-K and Q4 K-split `mma` routes are the next cost in its rounds.
 4. Kernel count: a plain decode step is ~700 kernels, and each short GEMV loses ~8 us to fill and
    drain between dependent kernels (Volta has no programmatic dependent launch), ~1-2 ms a token.
    Fusing the norms and small element-wise steps into their neighbours is the remaining decode

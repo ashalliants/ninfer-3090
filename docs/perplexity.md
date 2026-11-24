@@ -148,6 +148,28 @@ top-1 token. stdout shows PPL with its standard error and the base's PPL, the KL
 and max, and the top-1 agreement. The output directory (`--output`, or one under
 `profiles/perplexity/`) holds `rows.tsv`, one line per row, and `report.json` with the summary.
 
+### A base from this engine (`--kld-write`)
+
+`--kld-write FILE` writes the run's own decode-path log-probabilities as a base in the same layout,
+so a numerics change can be compared with this engine's own reference path rather than with
+llama.cpp's. With `--text FILE --context N` it cuts the text into chunks of `N` tokens (as
+`--kld-base` would have them) and only writes; after `--kld-base` it scores as usual and also writes
+the rows it computed for the same tokens. Each row stores the log-softmax quantized to 16 bits
+between its maximum and its minimum (floored at -20); on Qwen3.8-27B the round trip measured a KLD
+mean of 0 and a maximum of 7e-5 per row. `--chunks` and `--decode-window` apply; `--stride` is refused.
+
+```bash
+# the reference: the change off, the ordinary decode step
+NINFER_STREAM_DP4A=0 ./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
+  --text mix.txt --context 512 --decode-window 1 --kv-dtype int8 --kld-write ref.kld
+# the change, at the verify widths it serves
+./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
+  --kld-base ref.kld --decode-window 8 --kv-dtype int8
+```
+
+The same build and window against its own base gives that KLD of 0 and 100% top-1 agreement, so any
+KLD a comparison shows is the change. The V100's `--verify-a8` was gated this way ([tesla-v100.md](tesla-v100.md#qwen38-27b)).
+
 ### Reading the result
 
 Basalt found about 0.01-0.02 KLD of noise in the reference itself, so the absolute KLD against the

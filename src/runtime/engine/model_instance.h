@@ -6,6 +6,7 @@
 #include "models/qwen3_5/program/runtime_types.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
+#include "ops/linear/common/stream_a8.h"
 
 #include <memory>
 #include <vector>
@@ -30,6 +31,9 @@ struct ModelInstance {
     std::unique_ptr<models::qwen3_5::Program> program;
     // One pinned checkpoint per direct (direct_kv or softprompt_kv) graft, in Frontend graft order.
     std::vector<models::qwen3_5::CheckpointHandle> external_checkpoints;
+    // The device streams this instance launches on, registered with EngineOptions::verify_a8 for
+    // the sm_70 int8-activation GEMV (ops/linear/common/stream_a8.h) for the instance's life.
+    ops::StreamA8Registration stream_a8;
 
     ModelInstance(std::unique_ptr<models::qwen3_5::Model> model, const EngineOptions& options);
     // Rebuilds what depends on options.max_context (the Frontend and `capacity`) after a context

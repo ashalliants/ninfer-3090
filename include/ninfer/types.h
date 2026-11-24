@@ -889,6 +889,15 @@ inline constexpr bool kPrefillCublasDefault = true;
 inline constexpr bool kPrefillCublasDefault = false;
 #endif
 
+// Whether EngineOptions::verify_a8 starts on: the int8-activation dp4a streaming GEMV exists only
+// in sm_70 builds (ops/linear/common/stream_dp4a.cuh), where it keeps speculative verify widths at
+// the cost of the weight stream; the setting is inert elsewhere.
+#if defined(NINFER_SM70)
+inline constexpr bool kVerifyA8Default = true;
+#else
+inline constexpr bool kVerifyA8Default = false;
+#endif
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -1016,6 +1025,13 @@ struct EngineOptions {
     // Integer-activation MLP gate_up at decode and verify widths. Measured 4-6% off that Op from
     // sixteen columns up; see docs/maintainer/quality-trade-experiments.md.
     bool mlp_a8_decode                     = false;
+    // sm_70 (V100) only, Qwen3.5-family models: Q4/Q5/Q6 linears at 1-8 tokens (decode, MTP and
+    // DFlash verify, the LM head) round their activations to int8 per 32 values (absmax / 127) and
+    // run dp4a, so a verify round costs about the weight stream at any width. Lossy at the noise
+    // floor: on Qwen3.8-27B, KLD 7.2e-4 against the FP32 decode path and 98.9-99.2% same top-1
+    // (docs/tesla-v100.md). A token's linear sums are the same at every width. Off returns these
+    // calls to the FP32 SIMT kernels.
+    bool verify_a8                         = kVerifyA8Default;
     // Integer-activation routes at full prefill tiles, on by default where a route is registered.
     // Clearing it returns prefill to the A16 routes, which is the only way to measure what the
     // integer routes are worth on a whole request rather than per Op.

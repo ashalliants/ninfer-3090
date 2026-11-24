@@ -281,7 +281,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--suspend-weights artifact|host] [--no-auto-resume] [--sleep-idle-seconds N]] "
            "[--models-dir DIR] [--models-preset FILE] [--models-max N] [--no-models-autoload] "
            "[--unload-idle-seconds N] "
-           "[--mlp-a8-decode] [--no-prefill-a8] "
+           "[--mlp-a8-decode] [--verify-a8 | --no-verify-a8] [--no-prefill-a8] "
            "[--prefill-cublas | --no-prefill-cublas] [--no-prefill-cublas-projections] "
            "[--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
            "[--graft NAME=PATH]... [--default-graft NAME] [--lora NAME=PATH]... [--default-lora NAME] "
@@ -1339,6 +1339,10 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.models_autoload = false;
         } else if (arg == "--mlp-a8-decode") {
             options.mlp_a8_decode = true;
+        } else if (arg == "--verify-a8") {
+            options.verify_a8 = true;
+        } else if (arg == "--no-verify-a8") {
+            options.verify_a8 = false;
         } else if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
         } else if (arg == "--prefill-cublas") {

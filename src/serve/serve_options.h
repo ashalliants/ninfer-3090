@@ -104,6 +104,7 @@ struct ServeOptions {
     bool admission_fit_check = false;
     bool admission_affinity  = false;
     bool mlp_a8_decode      = false;
+    bool verify_a8          = kVerifyA8Default;
     bool prefill_a8         = true;
     bool prefill_cublas     = ninfer::kPrefillCublasDefault;
     bool prefill_cublas_projections = true;

@@ -366,6 +366,7 @@ int main(int argc, char** argv) {
             logger->warn("{}", ninfer::product::format_pretty_text(event.message));
         };
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
+        engine_options.verify_a8                = cli.verify_a8;
         engine_options.prefill_a8               = cli.prefill_a8;
         engine_options.prefill_cublas           = cli.prefill_cublas;
         engine_options.prefill_cublas_projections = cli.prefill_cublas_projections;

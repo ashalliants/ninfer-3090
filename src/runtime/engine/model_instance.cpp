@@ -661,6 +661,16 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     device.synchronize();
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+    {
+        // Before the Program exists, so its captured graphs see the setting. Every stream of
+        // every rank: the forward forks onto the side streams during capture.
+        std::vector<cudaStream_t> streams;
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            const RankContext& r = device.rank(rank);
+            streams.insert(streams.end(), {r.stream, r.transfer_stream, r.vision_stream});
+        }
+        instance->stream_a8 = ops::StreamA8Registration(std::move(streams), options.verify_a8);
+    }
     frontend.complete();
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     // Overlay Vision: size the encode window and pin the borrowable weight tail's mirror before
