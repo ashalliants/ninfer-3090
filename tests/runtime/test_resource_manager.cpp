@@ -2724,6 +2724,94 @@ void test_saturated_host_reclaim_work_stays_bounded() {
     }
 }
 
+// A Host tier full of `residents` tiny, nearly worthless entries (one or two tokens of history
+// each, ten bytes) and `demotable` long device checkpoints (about 2,000 tokens) that need `bytes`
+// of Host each: preserving one is worth evicting bytes / 10 of the tiny entries. The greedy victim
+// search adds one victim per round and every round prices each remaining entry; at 260 entries
+// and 1,500 bytes a single demotion's search prices about 28,000 unions on its own, before any
+// other plan is looked at. `cheap_first` makes the first plan priced a long checkpoint that needs
+// only one entry's worth of Host bytes.
+struct DeepSearchOutcome {
+    ninfer::runtime::ReclaimProgress progress;
+    std::uint64_t host_bytes_released_calls;
+    std::vector<Handle> demoted;
+    std::vector<Handle> released;
+    std::optional<Handle> cheap;
+};
+
+DeepSearchOutcome run_deep_host_search(std::size_t residents, std::size_t demotable,
+                                       std::size_t bytes, bool cheap_first,
+                                       bool releases_blocked) {
+    Fixture f(residents * 10);
+    auto& program            = f.program;
+    std::uint32_t next_token = 1;
+    for (std::size_t i = 0; i < residents; ++i) {
+        const auto key = tokens(1 + static_cast<std::uint32_t>(i % 2), next_token);
+        next_token += 40;
+        const auto handle = program.add(key, {program.host_block(10)});
+        program.contents[handle.index].device_state = false;
+        program.contents[handle.index].main_pages   = 0;
+        f.publish(handle);
+    }
+    std::optional<Handle> cheap;
+    for (std::size_t j = 0; j < demotable; ++j) {
+        const auto key = tokens(2000 + static_cast<std::uint32_t>(j), next_token);
+        next_token += 4000;
+        const auto handle = program.add(key);
+        const bool is_cheap = cheap_first && j == 0; // plans are priced in publication order
+        program.contents[handle.index].demotion_bytes  = is_cheap ? 10 : bytes;
+        program.contents[handle.index].release_blocked = releases_blocked;
+        if (is_cheap) { cheap = handle; }
+        f.publish(handle);
+    }
+    program.host_bytes_released_calls = 0;
+    const auto progress = f.cache.reclaim(program, {.state_slots = 1});
+    return {progress, program.host_bytes_released_calls, program.demoted, program.released, cheap};
+}
+
+// The pricing cap holds inside one Host victim search, not only between plans: once a step has an
+// action, a plan whose search would run long is left for the next step part way through.
+void test_reclaim_pricing_cap_stops_a_long_search_once_an_action_is_found() {
+    const auto out = run_deep_host_search(260, 8, 1500, true, false);
+    std::cout << "deep search after an action: host_bytes_released="
+              << out.host_bytes_released_calls << std::endl;
+    require(out.progress != ninfer::runtime::ReclaimProgress::Blocked,
+            "a reclaim with a cheap demotion in hand made no progress");
+    require(out.demoted.size() == 1 && out.demoted.front() == *out.cheap,
+            "the cheap demotion found before the cap was not the one taken");
+    // Measured 2,613. The cap checked only between plans let the next plan's search run to its end
+    // (about 28,000 unions, 193,642 calls with every plan priced).
+    require(out.host_bytes_released_calls <= 4000,
+            "a Host victim search ran past the pricing cap with an action already in hand");
+}
+
+// With no action yet a search runs to four times the cap and then stops; the step falls back on
+// releasing a checkpoint rather than holding the Engine thread for the whole search.
+void test_reclaim_pricing_cap_bounds_the_first_search() {
+    const auto out = run_deep_host_search(260, 8, 1500, false, false);
+    std::cout << "deep first search: host_bytes_released=" << out.host_bytes_released_calls
+              << std::endl;
+    require(out.progress == ninfer::runtime::ReclaimProgress::Changed,
+            "a capped reclaim with releases available made no progress");
+    require(out.demoted.empty() && out.released.size() == 1,
+            "a reclaim whose demotion searches ran past the cap did not fall back on a release");
+    // Measured 4,891; 55,948 when the first plan's search (and its revalidation) ran to its end.
+    require(out.host_bytes_released_calls <= 6500,
+            "the first Host victim search of a reclaim step ran past four times the pricing cap");
+}
+
+// The cap never turns progress into Blocked: when the bounded pricing finds nothing to do (here no
+// checkpoint may be released, and the only demotion's search, about 5,000 unions, is cut at four
+// times the cap), the step prices again in full and takes the demotion the uncapped search finds.
+void test_reclaim_pricing_cap_never_costs_progress() {
+    const auto out = run_deep_host_search(100, 1, 900, false, true);
+    require(out.progress != ninfer::runtime::ReclaimProgress::Blocked,
+            "the pricing cap reported Blocked although a full search finds a demotion");
+    require(out.demoted.size() == 1, "the full pricing pass did not take the demotion it found");
+    require(out.released.size() == 90,
+            "the full pricing pass did not evict the victims its demotion needs");
+}
+
 // What a randomized scenario decided: every reclaim's outcome and the Host victims it would pick.
 struct Decisions {
     std::vector<int> progress;
@@ -3000,6 +3088,9 @@ int main() {
         test_held_progress_anchor_is_retired_when_the_hold_ends();
         test_candidate_memo_cuts_victim_selection_work();
         test_saturated_host_reclaim_work_stays_bounded();
+        test_reclaim_pricing_cap_stops_a_long_search_once_an_action_is_found();
+        test_reclaim_pricing_cap_bounds_the_first_search();
+        test_reclaim_pricing_cap_never_costs_progress();
         test_candidate_memo_changes_no_decision();
         test_pinned_shared_prefix_survives_reclaim_and_cache_clear();
         test_demotion_competes_with_its_actual_host_recovery_loss();

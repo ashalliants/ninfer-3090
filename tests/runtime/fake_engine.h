@@ -532,6 +532,8 @@ struct Event {
         EnableLossy, // enable_lossy took the request; position: M
         Scout,       // a scout step: tokens scouted, position: M + already scouted
         ScoutEnd,    // a scout ended early and its lane was restored to M (abort, abort_lossy_scout)
+        Reclaim,     // a reclaim step freed part of a binding's shortage (see
+                     // set_admission_reclaim_steps)
     } kind;
     std::uint32_t lane       = 0;
     std::uint64_t request    = 0; // the plan's id
@@ -582,6 +584,12 @@ public:
     // While a lane scouts and another is bound, a Decode unit finds no KV pages: the memory
     // pressure under which the Engine has to pause a scouting lane.
     void set_decode_shortage_while_scouting(bool on) noexcept { decode_shortage_while_scouting_ = on; }
+    // A full context cache under admission: binding a new request finds its KV pages short until
+    // `steps` reclaim steps have run. Each step is one demotion the context cache plans and starts
+    // through its ordinary reclaim (nothing on the Host to evict), and is logged as Reclaim.
+    void set_admission_reclaim_steps(std::uint32_t steps) noexcept {
+        reclaim_steps_.store(steps, std::memory_order_release);
+    }
     [[nodiscard]] std::uint32_t scout_pause_refusals() const noexcept {
         return scout_pause_refusals_.load(std::memory_order_acquire);
     }
@@ -724,15 +732,24 @@ public:
     };
     [[nodiscard]] ReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
                                            std::span<const CheckpointHandle>,
-                                           ContextResourceUsage) const {
-        return {};
+                                           ContextResourceUsage shortage) const {
+        if (!shortage.main_kv_pages || reclaim_steps_.load(std::memory_order_acquire) == 0) {
+            return {};
+        }
+        return {.demotions = {Demotion{.released = {.main_kv_pages = 1}}}};
     }
     [[nodiscard]] std::vector<Release> plan_releases(std::span<const CheckpointHandle>,
                                                      std::span<const CheckpointHandle>,
                                                      ContextResourceUsage) const {
         return {};
     }
-    [[nodiscard]] bool start_demote(const Demotion&) { return false; }
+    [[nodiscard]] bool start_demote(const Demotion&) {
+        auto steps = reclaim_steps_.load(std::memory_order_acquire);
+        if (steps == 0) { return false; }
+        reclaim_steps_.store(steps - 1, std::memory_order_release);
+        record({Event::Kind::Reclaim});
+        return true;
+    }
 
     // ---- resources ----
     [[nodiscard]] ResourceReservation reserve_units(std::span<const ExecutionUnit> units) {
@@ -778,6 +795,9 @@ public:
                                                    std::uint32_t = 1) {
         if (transaction_ || lane.value >= lanes_.size() || lanes_[lane.value].bound) {
             return {};
+        }
+        if (resume == nullptr && reclaim_steps_.load(std::memory_order_acquire) != 0) {
+            return {.reserved = false, .shortage = {.main_kv_pages = 1}};
         }
         Transaction tx;
         tx.kind = ContextOperationKind::Bind;
@@ -1318,6 +1338,7 @@ private:
     double lossy_keep_                   = 0.2;
     bool lossy_supported_                = true;
     bool decode_shortage_while_scouting_ = false;
+    std::atomic<std::uint32_t> reclaim_steps_{0};
     std::atomic<std::uint32_t> scout_pause_refusals_{0};
     mutable std::mutex log_mutex_;
     std::vector<Event> log_;

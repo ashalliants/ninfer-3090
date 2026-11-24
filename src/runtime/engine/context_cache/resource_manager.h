@@ -707,6 +707,9 @@ public:
             std::vector<Handle> host_victims;
             std::optional<Admission> preservation;
             ActionRank rank;
+            // Candidate unions its Host victim search priced; the revalidation below may price no
+            // more (the same search over an unchanged cache prices exactly as many).
+            std::uint64_t search_work = 0;
         };
 
         const auto usage     = program.physical_usage();
@@ -725,125 +728,154 @@ public:
             return ReclaimProgress::Changed;
         }
 
-        std::vector<Action> actions;
-        actions.reserve(plans.demotions.size() + plans.releases.size());
-        for (auto& plan : plans.demotions) {
-            const auto units = useful(plan.released, shortage);
-            if (!units) { continue; }
-            // Bound the step's pricing (see kMaxReclaimPricingWork). Plans are in cache order, so
-            // the ones left out are the least preferred victims' neighbours, and the next step
-            // plans again.
-            if (evaluation.work >= pricing_work_cap_ &&
-                (!actions.empty() || evaluation.work >= 4 * pricing_work_cap_)) {
-                break;
+        // The step prices within its budget (kMaxReclaimPricingWork) first. The budget only bounds
+        // how long one step holds the Engine thread; it must never turn a step that can make
+        // progress into Blocked (an admission then drops its decision, and one with no resident
+        // beside it fails). So when the bounded pass finds nothing it can do and the budget left
+        // something unpriced, the step prices again in full, as it did before the budget existed.
+        for (const bool bounded : {true, false}) {
+            evaluation.exhausted = false;
+            std::vector<Action> actions;
+            actions.reserve(plans.demotions.size() + plans.releases.size());
+            for (const auto& plan : plans.demotions) {
+                const auto units = useful(plan.released, shortage);
+                if (!units) { continue; }
+                // Bound the step's pricing (see kMaxReclaimPricingWork). Plans are in cache
+                // order, so the ones left out are the least preferred victims' neighbours, and the
+                // next step plans again.
+                if (bounded && evaluation.work >= pricing_work_cap_ &&
+                    (!actions.empty() || evaluation.work >= 4 * pricing_work_cap_)) {
+                    evaluation.exhausted = true;
+                    break;
+                }
+                auto facts = action_facts(program, plan.sources, cursor, evaluation);
+                if (!admits(program, plan.sources, facts, cursor.admission, cursor, evaluation,
+                            true)) {
+                    continue;
+                }
+                auto preservation =
+                    preservation_admission(program, plan.sources, cursor, facts.priority);
+                // The same budget also stops a search part way, its opening retries included:
+                // one search over a Host tier of many small entries can price tens of thousands
+                // of unions.
+                evaluation.work_limit = !bounded         ? UINT64_MAX
+                                        : actions.empty() ? 4 * pricing_work_cap_
+                                                          : pricing_work_cap_;
+                const auto search_start = evaluation.work;
+                auto victims = demotion_host_victims(program, plan, excluded, preservation, cursor,
+                                                     evaluation);
+                evaluation.work_limit = UINT64_MAX;
+                if (!victims) { continue; }
+                auto rank = rank_action(program, plan.sources, facts, units, evaluation, true);
+                auto host_facts = action_facts(program, *victims, cursor, evaluation);
+                const auto host_rank =
+                    rank_action(program, *victims, host_facts, units, evaluation);
+                rank.loss            = host_rank.loss;
+                rank.waiting         = host_rank.waiting;
+                // Preserving a superseded branch is not itself evict-first work when it would
+                // displace other Host history.
+                rank.superseded = rank.superseded && (victims->empty() || host_rank.superseded);
+                rank.order      = std::max(rank.order, host_rank.order);
+                if (host_rank.priority.reused &&
+                    (!rank.priority.reused ||
+                     host_rank.priority.last_demand > rank.priority.last_demand)) {
+                    rank.priority = host_rank.priority;
+                }
+                actions.push_back({.demotion     = plan, // a second pass prices the plans again
+                                   .host_victims = std::move(*victims),
+                                   .preservation = std::move(preservation),
+                                   .rank         = rank,
+                                   .search_work  = evaluation.work - search_start});
             }
-            auto facts = action_facts(program, plan.sources, cursor, evaluation);
-            if (!admits(program, plan.sources, facts, cursor.admission, cursor, evaluation, true)) {
-                continue;
+            for (const auto& plan : plans.releases) {
+                const auto units = useful(plan.released, shortage);
+                if (!units) { continue; }
+                auto facts = action_facts(program, plan.sources, cursor, evaluation);
+                if (!admits(program, plan.sources, facts, cursor.admission, cursor, evaluation)) {
+                    continue;
+                }
+                auto rank = rank_action(program, plan.sources, facts, units, evaluation);
+                actions.push_back({.release = plan, .rank = rank});
             }
-            auto preservation =
-                preservation_admission(program, plan.sources, cursor, facts.priority);
-            auto victims =
-                demotion_host_victims(program, plan, excluded, preservation, cursor, evaluation);
-            if (!victims) { continue; }
-            auto rank       = rank_action(program, plan.sources, facts, units, evaluation, true);
-            auto host_facts = action_facts(program, *victims, cursor, evaluation);
-            const auto host_rank = rank_action(program, *victims, host_facts, units, evaluation);
-            rank.loss            = host_rank.loss;
-            rank.waiting         = host_rank.waiting;
-            // Preserving a superseded branch is not itself evict-first work when it would
-            // displace other Host history.
-            rank.superseded = rank.superseded && (victims->empty() || host_rank.superseded);
-            rank.order      = std::max(rank.order, host_rank.order);
-            if (host_rank.priority.reused &&
-                (!rank.priority.reused ||
-                 host_rank.priority.last_demand > rank.priority.last_demand)) {
-                rank.priority = host_rank.priority;
-            }
-            actions.push_back({.demotion     = std::move(plan),
-                               .host_victims = std::move(*victims),
-                               .preservation = std::move(preservation),
-                               .rank         = rank});
-        }
-        for (auto& plan : plans.releases) {
-            const auto units = useful(plan.released, shortage);
-            if (!units) { continue; }
-            auto facts = action_facts(program, plan.sources, cursor, evaluation);
-            if (!admits(program, plan.sources, facts, cursor.admission, cursor, evaluation)) {
-                continue;
-            }
-            auto rank = rank_action(program, plan.sources, facts, units, evaluation);
-            actions.push_back({.release = std::move(plan), .rank = rank});
-        }
-        std::stable_sort(actions.begin(), actions.end(),
-                         [](const auto& a, const auto& b) { return less_rank(a.rank, b.rank); });
-        for (std::size_t index = 0; index < actions.size(); ++index) {
-            const auto& action = actions[index];
-            if (action.demotion) {
-                if (!shortage.state_slots && action.host_victims.empty()) {
-                    // Preserve the ranked action order. Independent KV groups can share
-                    // one transfer transaction while every holder keeps its own rights.
-                    auto builder           = plans.begin_kv_batch(shortage);
-                    std::size_t components = 0;
-                    std::uint64_t released = 0;
-                    const auto needed =
-                        shortage.main_kv_pages ? shortage.main_kv_pages : shortage.backend_kv_pages;
-                    for (std::size_t next = index; next < actions.size() && released < needed;
-                         ++next) {
-                        const auto& candidate = actions[next];
-                        if (!candidate.demotion) {
-                            // These are alternative ways to reclaim physical resources.
-                            // A delete covered by earlier migrations adds no pages to this
-                            // deficit; keep it in actions for failure fallback, not the batch.
-                            if (builder.covers(*candidate.release)) { continue; }
-                            break;
-                        }
-                        if (!candidate.host_victims.empty()) { break; }
-                        if (!builder.append(*candidate.demotion)) { break; }
-                        ++components;
-                        released += useful(candidate.demotion->released, shortage);
-                    }
-                    if (components > 1) {
-                        if (const auto batch = builder.finish()) {
-                            auto facts = action_facts(program, batch->sources, cursor, evaluation);
-                            if (admits(program, batch->sources, facts, cursor.admission, cursor,
-                                       evaluation, true) &&
-                                program.start_demote(*batch)) {
-                                return program.has_context_transaction()
-                                           ? ReclaimProgress::Transferring
-                                           : ReclaimProgress::Changed;
+            std::stable_sort(actions.begin(), actions.end(), [](const auto& a, const auto& b) {
+                return less_rank(a.rank, b.rank);
+            });
+            for (std::size_t index = 0; index < actions.size(); ++index) {
+                const auto& action = actions[index];
+                if (action.demotion) {
+                    if (!shortage.state_slots && action.host_victims.empty()) {
+                        // Preserve the ranked action order. Independent KV groups can share
+                        // one transfer transaction while every holder keeps its own rights.
+                        auto builder           = plans.begin_kv_batch(shortage);
+                        std::size_t components = 0;
+                        std::uint64_t released = 0;
+                        const auto needed = shortage.main_kv_pages ? shortage.main_kv_pages
+                                                                   : shortage.backend_kv_pages;
+                        for (std::size_t next = index; next < actions.size() && released < needed;
+                             ++next) {
+                            const auto& candidate = actions[next];
+                            if (!candidate.demotion) {
+                                // These are alternative ways to reclaim physical resources.
+                                // A delete covered by earlier migrations adds no pages to this
+                                // deficit; keep it in actions for failure fallback, not the batch.
+                                if (builder.covers(*candidate.release)) { continue; }
+                                break;
                             }
+                            if (!candidate.host_victims.empty()) { break; }
+                            if (!builder.append(*candidate.demotion)) { break; }
+                            ++components;
+                            released += useful(candidate.demotion->released, shortage);
                         }
-                        // A combined reservation may fail without changing any replica.
-                        // The original first action remains the next legal choice.
+                        if (components > 1) {
+                            if (const auto batch = builder.finish()) {
+                                auto facts =
+                                    action_facts(program, batch->sources, cursor, evaluation);
+                                if (admits(program, batch->sources, facts, cursor.admission, cursor,
+                                           evaluation, true) &&
+                                    program.start_demote(*batch)) {
+                                    return program.has_context_transaction()
+                                               ? ReclaimProgress::Transferring
+                                               : ReclaimProgress::Changed;
+                                }
+                            }
+                            // A combined reservation may fail without changing any replica.
+                            // The original first action remains the next legal choice.
+                        }
                     }
+                    const auto& plan       = *action.demotion;
+                    auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
+                    protected_sources.insert(protected_sources.end(), plan.sources.begin(),
+                                             plan.sources.end());
+                    // A search that needs more pricing than it did above saw a changed cache, and
+                    // its answer is treated like a changed one: this action is skipped.
+                    evaluation.work_limit =
+                        bounded ? evaluation.work + action.search_work : UINT64_MAX;
+                    const auto current = demotion_host_victims(
+                        program, plan, excluded, *action.preservation, cursor, evaluation);
+                    evaluation.work_limit = UINT64_MAX;
+                    if (!current || *current != action.host_victims) { continue; }
+                    commit_release(program, action.host_victims, cursor, action.rank.loss);
+                    if (program.start_demote(plan)) {
+                        return program.has_context_transaction() ? ReclaimProgress::Transferring
+                                                                 : ReclaimProgress::Changed;
+                    }
+                    if (!action.host_victims.empty()) { return ReclaimProgress::Changed; }
+                    // The Host destination can fail on allocation geometry although the byte
+                    // quote fit. Superseded Host history goes before a live source is deleted;
+                    // the demotion is quoted again on the next pass.
+                    // Reached only when the quote needed no victims, so it saw a run that fits: the
+                    // state-run pricing (`needs_state_run`) never applies here.
+                    if (release_superseded_host(program, plan.host_bytes, protected_sources,
+                                                cursor)) {
+                        return ReclaimProgress::Changed;
+                    }
+                    continue;
                 }
-                const auto& plan       = *action.demotion;
-                auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
-                protected_sources.insert(protected_sources.end(), plan.sources.begin(),
-                                         plan.sources.end());
-                const auto current = demotion_host_victims(program, plan, excluded,
-                                                           *action.preservation, cursor, evaluation);
-                if (!current || *current != action.host_victims) { continue; }
-                commit_release(program, action.host_victims, cursor, action.rank.loss);
-                if (program.start_demote(plan)) {
-                    return program.has_context_transaction() ? ReclaimProgress::Transferring
-                                                             : ReclaimProgress::Changed;
-                }
-                if (!action.host_victims.empty()) { return ReclaimProgress::Changed; }
-                // The Host destination can fail on allocation geometry although the byte
-                // quote fit. Superseded Host history goes before a live source is deleted;
-                // the demotion is quoted again on the next pass.
-                // Reached only when the quote needed no victims, so it saw a run that fits: the
-                // state-run pricing (`needs_state_run`) never applies here.
-                if (release_superseded_host(program, plan.host_bytes, protected_sources, cursor)) {
-                    return ReclaimProgress::Changed;
-                }
-                continue;
+                // Native quoted every holder required for this actual physical release.
+                commit_release(program, action.release->sources, cursor, action.rank.loss);
+                return ReclaimProgress::Changed;
             }
-            // Native quoted every holder required for this actual physical release.
-            commit_release(program, action.release->sources, cursor, action.rank.loss);
-            return ReclaimProgress::Changed;
+            if (!evaluation.exhausted) { break; }
         }
         return ReclaimProgress::Blocked;
     }
@@ -1480,6 +1512,10 @@ private:
         // costs time linear in the checkpoint count on the Engine thread, so the step bounds the
         // total (kMaxReclaimPricingWork).
         std::uint64_t work = 0;
+        // A search that reaches this much work stops, reports no victims and sets `exhausted`
+        // (host_victims_in_order).
+        std::uint64_t work_limit = UINT64_MAX;
+        bool exhausted           = false;
     };
 
     // Each entry holds a copy of its source set, and the greedy loop offers a new union for every
@@ -1495,9 +1531,12 @@ private:
     // resident lane still for minutes (decode at 0 tok/s, GPU idle). Once a step has priced this
     // many unions and has an action to take, the remaining plans are left for the next step, which
     // plans afresh against the cache this step changed; with no action yet, pricing goes on to four
-    // times the cap before giving up on demotions (releases are still offered). The cut is
-    // deterministic (a count, not a clock) and loses no data: an unpriced plan is simply not
-    // chosen this step.
+    // times the cap before giving up on demotions (releases are still offered). The budget is
+    // checked at every union a search prices, not only between plans: one search over many small
+    // Host entries can need a round per victim and price tens of thousands of unions by itself.
+    // The cut is deterministic (a count, not a clock) and loses no data: an unpriced plan is
+    // simply not chosen this step. It never costs progress either: a step whose bounded pricing
+    // finds nothing it can do prices again without the budget (see reclaim).
     static constexpr std::uint64_t kMaxReclaimPricingWork = 1024;
 
     [[nodiscard]] static CandidateMemo* candidate_memo(Evaluation& evaluation,
@@ -1943,6 +1982,11 @@ private:
                     auto combined = selected;
                     for (const auto handle : remaining[i].sources) {
                         if (!contains(combined, handle)) { combined.push_back(handle); }
+                    }
+                    // The caller's pricing budget is spent: this search is abandoned (see reclaim).
+                    if (evaluation.work >= evaluation.work_limit) {
+                        evaluation.exhausted = true;
+                        return std::nullopt;
                     }
                     ++evaluation.work;
                     // The same candidate comes up for every plan of one reclaim: what it frees and its
