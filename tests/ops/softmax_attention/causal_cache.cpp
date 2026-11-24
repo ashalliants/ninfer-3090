@@ -3374,6 +3374,36 @@ int run_long_split_page_cases() {
     return failures;
 }
 
+// The 27B INT8 G64 shapes around the sm_70 tensor-core small-T kernel (small_t_i8_hmma.cuh), which
+// takes one column from 20,480 keys, two from 6,144, three and four from 1,024 and five to eight at
+// any count: each width above its threshold and the CUDA-core route just below one, with loose and
+// exact envelopes, fragmented pages, a split past 64 pages (167,936+ keys over its splits) and
+// values wide enough to move the kernel's value-scale exponent. Other targets run their own routes
+// on the same cases.
+int run_tensor_core_verify_cases() {
+    int failures            = 0;
+    const Geometry& geometry = kGeometries[0];
+    const AttentionCase append_cases[] = {
+        {1, 24576, 24577, 1101u}, {2, 6144, 6146, 1102u},  {3, 1500, 1503, 1103u},
+        {4, 40000, 40004, 1104u}, {5, 100, 8192, 1105u},   {8, 9000, 9008, 1106u},
+        {5, 3, 8, 1107u},         {8, 170000, 170008, 1108u}, {4, 900, 904, 1110u},
+    };
+    for (const AttentionCase& test_case : append_cases) {
+        failures += run_a1_case(geometry, kPlanInt8, test_case, MappingPattern::Fragmented);
+    }
+    AttentionCase wide_values{4, 6000, 6004, 1109u};
+    wide_values.v_amplitude = 300.0f;
+    failures += run_a1_case(geometry, KvCacheStorage::Int8Group64, wide_values,
+                            MappingPattern::Identity);
+    const AttentionCase cached_cases[] = {
+        {1, 30000, 30001, 1111u}, {4, 12000, 12004, 1112u}, {8, 2000, 65536, 1113u},
+    };
+    for (const AttentionCase& test_case : cached_cases) {
+        failures += run_a3_case(geometry, kPlanInt8, test_case, MappingPattern::Offset);
+    }
+    return failures;
+}
+
 // A grouped BF16 call keeps one update-compatible two-stage execution across short and long
 // envelopes. Verify each replay against the independent oracle. Upstream's version of this sweep
 // also exercises the batched path via run_batch_case(..., graph_replay=true, envelope_max), but
@@ -4266,6 +4296,7 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_bf16_small_prefill_cases();
     failures += run_batch_cases();
     failures += run_long_split_page_cases();
+    failures += run_tensor_core_verify_cases();
     const std::array<int, 7> prefill_queries{0, 63, 64, 127, 128, 511, 1023};
     for (const auto& geometry : kGeometries)
         failures += run_a1_case(geometry, KvCacheStorage::BFloat16, {1024, 8192, 9216, 951u},

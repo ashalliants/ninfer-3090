@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -130,6 +131,32 @@ std::int32_t causal_small_t_launch_capacity(CausalAttentionExecutionEnvelope env
 
 } // namespace
 
+bool causal_sm70_verify_hmma_enabled() noexcept {
+#if defined(NINFER_SM70)
+    static const bool enabled = [] {
+        const char* v = std::getenv("NINFER_SM70_VERIFY_ATTN_HMMA");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+bool causal_sm70_verify_hmma(std::int32_t q_heads, std::int32_t width, KvCacheStorage storage,
+                             std::uint32_t keys) noexcept {
+    if (q_heads != CausalD256H24Kv4::QHeads || storage != KvCacheStorage::Int8Group64 ||
+        width < 1 || width > 8 || !causal_sm70_verify_hmma_enabled()) {
+        return false;
+    }
+    if (width == 1) { return keys >= static_cast<std::uint32_t>(kVoltaVerifyHmmaOneTokenKeys); }
+    if (width == 2) { return keys >= static_cast<std::uint32_t>(kVoltaVerifyHmmaTwoTokenKeys); }
+    if (width <= 4) { // two two-token chunks on the CUDA-core route
+        return keys >= static_cast<std::uint32_t>(kVoltaVerifyHmmaTwoChunkKeys);
+    }
+    return true;
+}
+
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                              KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope,
@@ -143,6 +170,11 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
     if (q_heads == CausalD256H24Kv4::QHeads) {
         const int capacity =
             causal_small_t_launch_capacity<CausalD256H24Kv4>(envelope, tokens, cache_storage);
+        if (causal_sm70_verify_hmma(q_heads, tokens, cache_storage, envelope.max_visible_keys)) {
+            // One CTA per SM: past one wave a grid of 41 splits x 4 heads would run a nearly empty
+            // second one. The device policy takes min(its tier, this), as the reducer does.
+            return std::min(capacity, kVoltaVerifyHmmaSplits);
+        }
         if (batch_size > 1) {
             // Keep complete grids within one or two 170-SM waves. Rounding from 160 CTAs
             // leaves room for the indivisible 4*B group, including B=3/5/6/7.

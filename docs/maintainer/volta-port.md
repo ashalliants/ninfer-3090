@@ -166,6 +166,110 @@ changes, both inside the shared kernel:
   are md5-identical. The sm_86 SASS of the kernel is identical with and without the change, so the
   RTX 3090 is unaffected by construction (not measured on a 3090).
 
+**Small-T attention on the tensor cores (`NINFER_SM70_VERIFY_ATTN_HMMA`, on by default in an
+`sm_70` build).** With the verify GEMVs flat (`--verify-a8`), long-context rounds were attention:
+at 42.7K tokens an MTP3 round spent 18.6 of its 46.5 ms in verify attention (nsys), because the
+`SimtDecode` path above serves one row tile (two tokens on the 27B), so a four-column verify ran as
+two two-token launches per layer, each re-reading the whole INT8 cache and doing PV as FP32 FMAs
+on the CUDA cores. `small_t_i8_hmma.cuh` serves 1..8 columns of the 27B geometry over the INT8 G64
+cache in one launch on `mma.sync.m8n8k4` (FP16 in, FP32 accumulate), with the fragment maps
+measured for `qsa/attention_wide_hmma.cu`:
+
+- One CTA per (KV head, split), the same partials (FP32 accumulator, natural-log m and l) and the
+  same reducer as the general kernel; the split capacity drops to 20 per KV head
+  (`kVoltaVerifyHmmaSplits`), one wave of one CTA per SM. Groups of warps (four, or two from six
+  columns, where a fourth spilled) take 16-key tiles in turn, double-buffered in shared memory, and
+  merge in shared memory at the end. Holding the next tile in registers instead took the kernel to
+  255 registers with spills and ran ~1.8x slower.
+- QK takes the Hadamard-rotated query in FP16 (per row, scaled by a power of two so its absmax
+  lands in [2^7, 2^8)) against the key codes widened exactly to FP16, summed per 64-group in FP32
+  and scaled by the group scale in FP32. PV folds the value scale into the probability,
+  A = FP16(p * vscale * 2^u), against the exactly widened value codes; u is set from the first tile
+  and moved only when a tile's largest scale x 2^u would leave [2^0, 2^15), and the rescale of the
+  running output is skipped when no row's maximum moved, which is most tiles.
+- QK on `dp4a` (the query quantized to INT8 per 64-group, as the CUDA-core path does) was built in
+  the same structure and measured no faster (T = 4 at 164K keys 2.81 vs 2.80 ms, T = 8 5.77 vs 5.49
+  in the one-stage form), so the FP16 query, which keeps more bits, is the one kept.
+- Routing (`causal_sm70_verify_hmma`, `launch.h`): five to eight columns at every key count; three
+  and four (two CUDA-core chunks) from 1,024 keys, two from 6,144 and one from 20,480, where the
+  CUDA-core kernel's lower fixed cost stops winning (table below). In the served model a four-column
+  call at a few hundred keys took 74 us against the two chunks' 60 (nsys, a 300-token code reply,
+  about 0.25 ms of a 30.5 ms MTP3 round), more than the op bench shows there, so the four-column
+  threshold sits at 1K, where the op bench has 53 against 69.
+  The route, the split capacity, the graph launch shape (route bit 19) and the launcher all read
+  the envelope's maximum visible keys, so a captured graph re-captures when the decode envelope
+  crosses a threshold. `NINFER_SM70_VERIFY_ATTN_HMMA=0` restores the previous routes exactly.
+  Outside `sm_70` builds the kernel is not compiled and the switch is always off, so the RTX 3090
+  path is unchanged by construction.
+
+Op level, 27B geometry, INT8 KV, appending entry, CUDA Graph, cold L2, us per layer call (median of
+20, best of two interleaved rounds; `ninfer_causal_softmax_attention_bench`, 200 W, 2026-11-24),
+previous route / tensor cores; "-" where the route keeps the CUDA-core kernel:
+
+| Columns | 1K keys | 4K | 16K | 40K | 160K |
+|---|---:|---:|---:|---:|---:|
+| 1 (plain decode, MTP drafter) | 28 / - | 57 / - | 141 / - | 313 / 325 | 1,909 / **1,146** |
+| 2 | 36 / - | 77 / - | 194 / **156** | 437 / **326** | 2,720 / **1,146** |
+| 3 | 63 / **53** | 143 / **89** | 340 / **189** | 757 / **431** | 4,637 / **1,613** |
+| 4 (MTP3 verify) | 69 / **54** | 154 / **89** | 387 / **189** | 872 / **427** | 5,435 / **1,596** |
+| 6 | 100 / **55** | 230 / **92** | 579 / **233** | 1,309 / **516** | 8,149 / **1,914** |
+| 8 (DFlash2 K7 verify) | 132 / **60** | 305 / **97** | 773 / **237** | 1,744 / **520** | 10,867 / **1,927** |
+
+A crossover sweep at one and two columns set the thresholds: one column runs 216 / 251 us at 24K
+keys and 486 / 782 at 64K on the two kernels, with 40,960 the one measured count where the CUDA-core
+kernel's split tier fits better (325 / 313); two columns cross between 4K (80 / 77) and 6K
+(89 / 92). The previous route's cost grows with the column count because each two-token chunk
+re-reads the cache; the tensor-core kernel reads it once, so its cost barely depends on the width.
+
+Accuracy, the decode-path KLD gate (`ninfer-perplexity --kld-write` / `--kld-base`) at long
+context: two 32,768-token chunks of PG-19 text (books 01 and 02), each prefilled to 16,384 tokens
+and then decoded, so every scored row attends over 16-32K keys; INT8 KV, FP16 GDN state; base = the
+FP32 linears (`--no-verify-a8`) with the previous attention route at T = 1:
+
+| Run | KLD mean | p99 | same top-1 | PPL |
+|---|---:|---:|---:|---:|
+| previous route, T = 4 | 6.21e-4 | 3.20e-3 | 98.90% | 7.9720 |
+| tensor cores, T = 4 | 6.16e-4 | 3.19e-3 | 98.83% | 7.9712 |
+| previous route, T = 8 | 6.35e-4 | 3.20e-3 | 98.91% | 7.9737 |
+| tensor cores, T = 8 | 6.18e-4 | 3.23e-3 | 98.86% | 7.9728 |
+| tensor cores, T = 1 (from 20,480 keys) | 5.27e-4 | 2.63e-3 | 99.00% | 7.9733 |
+| `dp4a` QK variant, T = 4 | 6.21e-4 | 3.33e-3 | 98.89% | 7.9708 |
+| previous route, T = 4, `--verify-a8` (the default) | 1.01e-3 | 5.20e-3 | 98.52% | 7.9756 |
+| tensor cores, T = 4, `--verify-a8` (the default) | 1.01e-3 | 5.09e-3 | 98.43% | 7.9767 |
+
+(base PPL 7.9720.) The kernel is as far from the T = 1 base as the previous route's own verify
+reordering is, at every width. The T = 1 row is its distance from the CUDA-core kernel at one
+column, which rounds the query to INT8 where this kernel keeps it in FP16. Greedy text therefore
+parts from master's at near-ties.
+
+End to end, `ninfer-serve` with the router's flags, 256 greedy tokens (`ignore_eos`) on exact-hit
+repeats of a PG-19 prompt, 200 W, against master `96b14bca` (with #609's split fix; MTP3 ABBA,
+three repeats a leg, the legs of each side within 0.05 tok/s; DFlash2 one leg each; plain from
+the same build pair), tok/s and ms per speculative round (generation time over rounds; a round
+emits its accepted drafts plus one):
+
+| Context | MTP3 | master | DFlash2 K7 | master | plain | master |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4,215 | 84.6 (31.4 ms) | 75.9 (32.3) | 85.4 (40.9) | 62.3 (44.0) | 43.7 | 43.7 |
+| 42,663 | 69.5 (36.3) | 53.0 (50.1) | 50.4 (48.2) | 37.3 (75.9) | 36.1 | 34.6 |
+| 172,487 | 56.7 (52.3) | 26.4 (109.6) | 34.9 (71.0) | 14.0 (184.6) | 24.2 | 20.7 |
+
+nsys at 42,663 tokens, MTP3: verify attention went from 18.6 ms of a 46.5 ms round (3,504 chunk
+launches of the CUDA-core kernel for 1,749 verify calls) to 5.8 ms (364 us a call). The greedy
+text differs from master's at every context of this prompt (near-ties; at 172K both summarise
+the same section in different words), and acceptance moved with it, so at 4K most of
+the tok/s gain is acceptance: the round itself is 3% (MTP3) and 7% (DFlash2) cheaper.
+
+Short prompts (the nine-prompt set, 300-7,230 tokens generated, same flags, ABBA): an MTP3 round
+costs the same as master's on the short replies (30.50 against 30.50 ms on `code`, 30.51-30.60
+against 30.49-30.58 on the others) and 2.8% less on the 7K-token `struct` reply (31.65 against
+32.55 ms, 126.3 against 122.8 tok/s). `code` and `struct` produce master's text token for token;
+the other seven replies differ after a few dozen tokens, and their tok/s moves with acceptance
+both ways (`story` 71.9 against 77.0, `fr` 78.9 against 80.8 on 176/367 against 179/360 accepted).
+DFlash2 K7 (eight-column verifies, which take the tensor cores at every length): `struct` 189.2
+against 177.4 tok/s with identical text; the others differ in text and range from `think` 115.2
+against 125.6 to `code` 142.6 against 136.6. Plain decode below 20K keys runs the same kernel as master.
+
 What is left in decode, by size: the GEMVs' gap to the read rate (~3.5 ms), the per-kernel
 overhead of ~690 launches per token (~1.2 ms of gaps plus ramp/tail), and the GDN recurrent update
 (~0.5 ms, 32% of its byte rate). The Q6 LM head (993 MB) runs on the streaming GEMV at 86% of the
@@ -795,15 +899,16 @@ prompt's gate/up time drops 1,468 -> 1,387 ms, and its tiles are mostly full. Pr
 unchanged at 3.6-3.9K tokens: the compute stream waits on the expert uploads (4.3 s of copies over
 the 3.3 GB/s link). Prompt time improves ~6% at ~940 tokens (2.02 -> 1.87 s, two runs each).
 
-### Why there is no HMMA path yet
+### Why the shared kernels have no HMMA path
 
 The PTX `mma.m8n8k4` computes four independent 8x8x4 products per warp, one per octet (lanes
 4o..4o+3 and 16+4o..16+4o+3). Expressing a m16n8k16 with it needs the operands in the octet
-layout. With the m16n8k16 fragment layout the kernels already hold, that costs about 24 shuffles
+layout. With the m16n8k16 fragment layout the shared kernels hold, that costs about 24 shuffles
 per mma (so it is shuffle-bound at roughly the same rate as the emulation), or a zero-shuffle
-scheme that uses a quarter of the tensor work. The real fix is for the kernels that matter (the
-prefill GEMMs and attention) to hold Volta-layout fragments and use `wmma` or `m8n8k4` directly.
-That is a kernel rewrite, and it cannot be validated without hardware.
+scheme that uses a quarter of the tensor work. So the kernels that matter get Volta-only versions
+written in native `m8n8k4` fragments instead: the prefill GEMMs and Q4 linears above, prompt
+attention (`*_volta_flash.cu`), the wide QSA attention (`qsa/attention_wide_hmma.cu`) and the
+27B's small-T decode and verify attention (`causal_cache/small_t_i8_hmma.cuh`, "Decode").
 
 ## Compile-time facts (CUDA 12.8.1, `-arch=sm_70`)
 
