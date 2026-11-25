@@ -658,6 +658,16 @@ attention (~1.0 ms). The head now tries `try_launch_q6_stream` first, as the 27B
 Serve ABBA and KLD are in [tesla-v100.md](../tesla-v100.md#qwen36-35b-a3b): MTP3 +25-27% on every
 prompt, plain +5.4%. `NINFER_SM70_Q6_35_STREAM=0` keeps master's head.
 
+Next in that round were the Q8 mixer projections on the A16 streaming GEMV (~4.1 ms). The Q8
+rowsplit storage builds `dp4a` planes for every Q8 linear, but `Q8StreamFormat::kDp4aDrafterOnly`
+left the target's projections on A16. `try_launch_q8_verify_dp4a` (`stream_draft_dp4a.cuh`) now
+sends the identity-row Q8 calls of 2-8 columns (one pass, no token offsets) of shapes 12,288 x 2,048, 9,216 x 2,048 and 2,048 x 4,096 to the `dp4a`
+passes of eight when the stream registered `--verify-a8`; on the V100 artifacts only the 35B-A3B has
+Q8_G32 linears of those shapes (Inkling-2-Mini's are GGML `q8_0` at 2,304, the 27B's 5,120 wide).
+The pass loop moved into an ungated `launch_stream_dp4a_tokens` that the DFlash2 drafter's route
+shares. One-token calls stay on A16. MTP3 +5-14% on six of seven prompts, thinking -4.6% on a changed text with fewer drafts accepted (ABBA in [tesla-v100.md](../tesla-v100.md#qwen36-35b-a3b)), at
++6.8e-4 decode-path KLD at four tokens. `NINFER_SM70_Q8_VERIFY_A8=0` keeps A16.
+
 Profiling this model under nsys needs a workaround: a cooperative `grid.sync` kernel (the GDN gating
 projection's split schedules) faults with `cudaErrorInvalidPc` under nsys on sm_70, master included,
 so profiles were taken with those schedules disabled in a local build and that kernel's time

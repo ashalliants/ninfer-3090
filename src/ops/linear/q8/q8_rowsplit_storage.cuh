@@ -72,7 +72,8 @@ struct Q8StreamFormat {
     // dp4a form (ops/linear/common/stream_dp4a.cuh): the codes are signed int8 already, so word W's
     // even and odd k (8W + 0, 2, 4, 6 and 8W + 1, 3, 5, 7) are two byte permutes, with no bias.
     // Drafter-only: a speculative drafter's Q8 linears take it inside a ScopedDraftA8
-    // (stream_draft_dp4a.cuh); the verify route (EngineOptions::verify_a8) leaves Q8 on A16.
+    // (stream_draft_dp4a.cuh); the verify route (EngineOptions::verify_a8) leaves Q8 on A16, except
+    // the shapes try_launch_q8_verify_dp4a admits (the 35B-A3B's, through its own entry).
     static constexpr bool kDp4a            = true;
     static constexpr bool kDp4aDrafterOnly = true;
     static constexpr int kDp4aBias         = 0;

@@ -108,6 +108,7 @@ These are the model defaults it sets:
 | `NINFER_SM70_Q6_STREAM_WIDE=0` | 27B, DFlash2 | Runs the Q6 output head of a verify wider than eight columns (DFlash2 at two requests, or `--draft-tokens` 8-15) on the emulated `mma.sync` kernel instead of the default int8-activation `dp4a` passes of eight: 9.9 instead of 2.6 ms per 16-column round |
 | `NINFER_SM70_Q8_PREFILL_CUBLAS=0` | 35B-A3B | Prefills the Q8 mixer projections (GDN and attention input projections, both 2,048 x 4,096 output projections) on their emulated `mma.sync` kernels instead of the default cuBLAS FP16 route: 1,160 instead of 2,411 tok/s at 4.2K tokens |
 | `NINFER_SM70_MOE_PREFILL_HMMA=0` | 35B-A3B | Prefills the routed experts (Q4 gate/up, Q5/Q6 down) on the emulated `mma.sync` kernels instead of the default FP16 WMMA kernels: 765 instead of 1,160 tok/s at 4.2K tokens |
+| `NINFER_SM70_Q8_VERIFY_A8=0` | 35B-A3B | Runs the Q8 mixer projections of an MTP3 verify (the GDN and attention input projections, 12,288 and 9,216 x 2,048, and the 2,048 x 4,096 output projections) on the A16 streaming GEMV instead of the default int8-activation `dp4a` passes under `--verify-a8`: MTP3 5-14% slower on six of the seven measured prompts, decode-path KLD at four tokens 2.71e-3 instead of 3.37e-3 |
 | `NINFER_SM70_Q6_35_STREAM=0` | 35B-A3B | Runs the Q6 output head of a 2-32-column call (an MTP3 verify) on the emulated `mma.sync` sliced-K kernels and the one-token call on the A16 GEMV, instead of the default streaming GEMV (int8-activation `dp4a` passes of eight under `--verify-a8`): 4.1 instead of 0.5 ms per MTP3 verify |
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
@@ -334,20 +335,37 @@ prefills fastest); the mixes are for when KV bytes are short. See
 Decode, one stream, through `ninfer-serve` (`--kv-dtype rk4v4 --lm-head-draft --mtp-experts-q4
 --gdn-state-fp16 --prefill-cublas --prefill-chunk 4096`, 32,768 context), greedy, 300 tokens, warm,
 2026-11-25, **200 W** power limit, no thermal throttling. ABBA on one build against
-`NINFER_SM70_Q6_35_STREAM=0` (master's output head); the two legs of each side agreed within 0.1 tok/s:
+`NINFER_SM70_Q8_VERIFY_A8=0` (the Q8 mixer projections of a verify on the A16 GEMV); the two legs of
+each side agreed within 0.2 tok/s. The "#613" column is the earlier ABBA against
+`NINFER_SM70_Q6_35_STREAM=0` (master's output head before that change):
 
-| Prompt | MTP3 + draft head | before | plain | before |
-|---|---:|---:|---:|---:|
-| code | **241.5** | 189.8-189.9 | 155.3 | 147.3 |
-| thinking | **236.1** | 187.8 | 155.1-155.2 | 147.3 |
-| structured JSON | **278.5-278.6** | 221.6-221.7 | 155.3-155.4 | 147.4 |
-| story | **160.7** | 127.8 | 155.0 | 147.1 |
-| Chinese | **172.1-172.2** | 136.9-137.0 | 155.2-155.3 | 147.3-147.4 |
-| French | **168.3** | 133.8 | 155.3 | 147.3-147.4 |
-| conversation | **180.7** | 147.4-147.5 | 155.3 | 147.4 |
-| two requests at once (story + code), total | **184.4-188.4** | 148.0-150.0 | | |
+| Prompt | MTP3 + draft head | Q8 on A16 | before #613 | plain | before #613 |
+|---|---:|---:|---:|---:|---:|
+| structured JSON | **302.9** | 278.5-278.6 | 221.6-221.7 | 155.3 | 147.4 |
+| code | **253.6** | 241.3-241.5 | 189.8-189.9 | 155.2-155.3 | 147.3 |
+| thinking | 238.1 | **249.7** | 187.8 | 155.2-155.3 | 147.3 |
+| conversation | **192.7** | 180.7 | 147.4-147.5 | 155.3 | 147.4 |
+| French | **191.0** | 168.3 | 133.8 | 155.3 | 147.3-147.4 |
+| Chinese | **189.5** | 172.1-172.2 | 136.9-137.0 | 155.2-155.3 | 147.3-147.4 |
+| story | **172.6** | 160.5-160.7 | 127.8 | 154.9-155.0 | 147.1 |
+| two requests at once (story + code), total | **197.5-200.4** | 184.5-188.4 | 148.0-150.0 | | |
 
-Before this change the output head (Q6, 248,320 x 2,048) ran an MTP3 verify on the sliced-K
+Thinking is the exception: its greedy text changed, and on the new text the MTP module's drafts
+were accepted less often (202 of 288 against 213 of 257). Its rounds still got faster, 13.1 ms
+against 14.0.
+
+The Q8 mixer projections of an MTP3 verify (the GDN input projection 12,288 x 2,048, the attention
+input projection 9,216 x 2,048 and both output projections 2,048 x 4,096, about 4.1 ms of a round on
+the A16 streaming GEMV) now take the int8-activation `dp4a` streaming GEMV under `--verify-a8` (the
+default in a V100 build), as the 27B's verify does. One-token calls (plain decoding steps) keep the
+A16 GEMV, and calls wider than eight tokens keep their routes. Plain decoding keeps its speed, though
+its greedy text on these prompts changed too. The verify's activations are quantised to int8 per token, which costs
+accuracy: decode-path KLD at four tokens is 3.37e-3 / 97.27% the same top-1 against 2.71e-3 / 97.60%
+(three 8,192-token PG-19 chunks, BF16 KV, against an A16 one-token base), and PPL is flat (6.142
+against 6.145). The all-A16 reorder-only control at four tokens sits at 2.66e-3: most of that floor
+is the recurrent state's response to any change in summation order, not precision. `--no-verify-a8` or `NINFER_SM70_Q8_VERIFY_A8=0` keeps the A16 projections.
+
+Before #613 the output head (Q6, 248,320 x 2,048) ran an MTP3 verify on the sliced-K
 `mma.sync` kernels, which Volta emulates: 4.09 ms of a 17.5 ms round, so MTP3 lost to plain decoding
 on story, Chinese and French. It now takes the streaming GEMV (`dp4a` passes of eight under
 `--verify-a8`, the default): 0.51 ms at four columns, 0.48 at one. Story, Chinese, French and
