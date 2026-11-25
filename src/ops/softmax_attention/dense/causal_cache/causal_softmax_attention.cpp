@@ -417,16 +417,29 @@ struct SmallTWorkspace {
 
 #if defined(NINFER_SM70)
 // The prompt route on sm_70 (launch.h, kVoltaFlash*): FP16 tensor-core flash attention where the
-// INT8 prompt kernel would run emulated mma. One sequence, the two shipped geometries, INT8 G64 KV,
-// every width past the verify widths (graph profiles, which count kernel nodes per route, never
-// reach it).
+// INT8-family prompt kernel would run emulated mma. One sequence, the two shipped geometries, INT8
+// G64, rk8v4 or rk4v4 KV, every width past the verify widths (graph profiles, which count kernel
+// nodes per route, never reach it). The packed codings (rk8v4, rk4v4) take it unless
+// NINFER_SM70_FLASH_PACKED_KV=0, which keeps the emulated FA2 prompt kernel for them.
 static_assert(detail::kVoltaFlashMinimumWidth == kMaximumVerifyTokens + 1);
+bool volta_flash_packed_kv_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_SM70_FLASH_PACKED_KV");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width, std::int32_t batch_size,
                                 KvCacheStorage cache_storage) {
     // The two geometries the launcher instantiates (geometry.cuh: CausalD256H24Kv4,
     // CausalD256H16Kv2), by query heads.
     const bool supported_geometry = q_heads == 24 || q_heads == 16;
-    return supported_geometry && batch_size == 1 && cache_storage == KvCacheStorage::Int8Group64 &&
+    const bool packed = cache_storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+                        cache_storage == KvCacheStorage::RotatedLloyd4KeyInt4Value;
+    const bool supported_storage = cache_storage == KvCacheStorage::Int8Group64 ||
+                                   (packed && volta_flash_packed_kv_enabled());
+    return supported_geometry && batch_size == 1 && supported_storage &&
            width >= detail::kVoltaFlashMinimumWidth;
 }
 

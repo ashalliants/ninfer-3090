@@ -28,6 +28,7 @@
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
+#include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
@@ -269,6 +270,49 @@ __global__ void volta_flash_gather_kv_i8_kernel(
         paged_kv_element_offset<kKVCacheInt8Groups, kKVHeads>(block_table, h, key, group);
     k_out[dst] = __float2half(static_cast<float>(k_pages[code]) * __half2float(k_scales[scale]));
     v_out[dst] = __float2half(static_cast<float>(v_pages[code]) * __half2float(v_scales[scale]));
+}
+
+// Paged rk8v4 / rk4v4 -> contiguous FP16. Keys are rotated INT8 codes (rk4v4: 4-bit Lloyd-Max
+// indices, expanded to the same INT8 codes every INT8-family kernel uses) times their G64 scale;
+// values are packed signed int4 (low nibble = even dimension) times their G32 scale.
+template <int kKVHeads, bool PackedKeys>
+__global__ void volta_flash_gather_kv_packed_kernel(
+        const std::uint8_t* __restrict__ k_pages, const std::uint8_t* __restrict__ v_pages,
+        const half* __restrict__ k_scales, const half* __restrict__ v_scales,
+        const std::int32_t* __restrict__ block_tables, const std::int32_t* __restrict__ table_rows,
+        int logical_pages, half* __restrict__ k_out, half* __restrict__ v_out, int n_kv,
+        int n_kv_padded) {
+    const int key = blockIdx.x;
+    const int h   = blockIdx.y;
+    const int d   = threadIdx.x;
+    if (key >= n_kv_padded) { return; }
+
+    const std::int64_t dst =
+        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * key);
+    if (key >= n_kv) {
+        k_out[dst] = __float2half(0.0f);
+        v_out[dst] = __float2half(0.0f);
+        return;
+    }
+
+    const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
+    const std::int64_t packed =
+        paged_kv_element_offset<kHeadDim / 2, kKVHeads>(block_table, h, key, d / 2);
+    int k_code;
+    if constexpr (PackedKeys) {
+        const unsigned byte = k_pages[packed];
+        k_code = kv_cache_lloyd4_code(static_cast<int>((d & 1) != 0 ? byte >> 4 : byte & 0x0fu));
+    } else {
+        k_code = reinterpret_cast<const std::int8_t*>(
+            k_pages)[paged_kv_element_offset<kHeadDim, kKVHeads>(block_table, h, key, d)];
+    }
+    const std::int64_t k_scale = paged_kv_element_offset<kKVCacheInt8Groups, kKVHeads>(
+        block_table, h, key, d / kKVCacheInt8Group);
+    const std::int64_t v_scale = paged_kv_element_offset<kKVCacheInt4ValueGroups, kKVHeads>(
+        block_table, h, key, d / kKVCacheInt4ValueGroup);
+    k_out[dst] = __float2half(static_cast<float>(k_code) * __half2float(k_scales[k_scale]));
+    v_out[dst] = __float2half(static_cast<float>(kv_cache_int4_unpack(v_pages[packed], d & 1)) *
+                              __half2float(v_scales[v_scale]));
 }
 
 // BF16 [256, QHeads, T] -> FP32, same element order (the kernel's Q and ninfer's q
@@ -584,7 +628,12 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 
     // 1. Append this call's K/V for the whole width. The cached form (null K) attends over keys
     //    already in the cache.
+    const bool rotated_keys = cache.storage != KvCacheStorage::BFloat16;
     if (k.data == nullptr) {
+    } else if (cache.storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+               cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+        // The shared INT8-family append (one kernel), as the prompt route appends.
+        kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
     } else if (cache.storage == KvCacheStorage::Int8Group64) {
         constexpr int kWarpsPerBlock = 8;
         const int units              = width * kKVHeads;
@@ -616,6 +665,22 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                 static_cast<const half*>(cache.v_scale_pages.data), block_tables, rows,
                 logical_pages, static_cast<half*>(k_gathered.data),
                 static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
+    } else if (rotated_keys) {
+        const auto gather = [&]<bool PackedKeys>() {
+            volta_flash_gather_kv_packed_kernel<kKVHeads, PackedKeys>
+                <<<dim3(n_kv_alloc, kKVHeads), kHeadDim, 0, stream>>>(
+                    static_cast<const std::uint8_t*>(cache.k_pages.data),
+                    static_cast<const std::uint8_t*>(cache.v_pages.data),
+                    static_cast<const half*>(cache.k_scale_pages.data),
+                    static_cast<const half*>(cache.v_scale_pages.data), block_tables, rows,
+                    logical_pages, static_cast<half*>(k_gathered.data),
+                    static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
+        };
+        if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+            gather.template operator()<true>();
+        } else {
+            gather.template operator()<false>();
+        }
     } else {
         volta_flash_gather_kv_kernel<kKVHeads>
             <<<dim3(n_kv_alloc, kKVHeads), kHeadDim, 0, stream>>>(
@@ -652,7 +717,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 
         const auto* q_begin = static_cast<const __nv_bfloat16*>(q.data) +
                               static_cast<std::int64_t>(begin) * kQHeads * kHeadDim;
-        if (cache.storage == KvCacheStorage::Int8Group64) {
+        if (rotated_keys) {
             const int rows = tokens * kQHeads;
             volta_flash_convert_q_i8_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(
                 q_begin, static_cast<float*>(q_f32.data), rows);

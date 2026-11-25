@@ -17,6 +17,17 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): flash prompt attention over rk8v4 / rk4v4 KV (2026-11-25)
+
+In a V100 build prompt attention over an `rk8v4` or `rk4v4` cache takes the FP16 tensor-core flash
+route that `int8` KV already took, instead of the emulated FA2 prompt kernel. Qwen3.6-35B-A3B
+(rk4v4), one prompt each, 65,536 context, MTP3 flags, 200 W, ABBA: **3,984 tok/s at 4.2K tokens**
+(3,201 before), 3,866 at 13.4K (2,211), **3,118 at 40.2K** (1,098): ahead of llama.cpp's 2,745 at
+its default batch and 3,280 at `-ub 2048` on this card. Qwen3.8-27B with `--kv-dtype rk4v4`: 1,085
+at 4.2K (927), 904 at 40.2K (403). Decode is unchanged. `NINFER_SM70_FLASH_PACKED_KV=0` keeps the
+old kernel; the RTX 3090 does not build the route. Details:
+[tesla-v100.md](tesla-v100.md#qwen36-35b-a3b).
+
 ## Tesla V100 (`sm_70`): Qwen3.6-35B-A3B experts' prefill tiles (2026-11-25)
 
 In a V100 build the 35B-A3B's WMMA expert prefill kernels (routed and shared) take 128-row tiles and
