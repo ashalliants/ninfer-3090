@@ -798,8 +798,9 @@ int run_q8() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 12288, kHidden, 727U));
     int failures = 0;
-    // Representative registered T values around every current execution boundary.
-    for (const std::int32_t tokens : {1, 2, 17}) {
+    // Representative registered T values around every current execution boundary. 9, 12 and 16
+    // are the fused split-K conv's widths past one streaming-GEMV pass (sm_70 used to split them).
+    for (const std::int32_t tokens : {1, 2, 8, 9, 12, 16, 17}) {
         const std::int32_t initial_slot = tokens == 2 ? 0 : tokens + 1;
         failures += run_q8_case(parent, tokens, initial_slot);
     }

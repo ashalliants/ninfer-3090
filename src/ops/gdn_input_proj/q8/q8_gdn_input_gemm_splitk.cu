@@ -33,6 +33,9 @@ using Output                           = LinearBf16SegmentedOutput<8192, 4096>;
 
 template <class Publish>
 struct Q8GdnSplitKConvEpilogue {
+    // The causal conv reads every token of the call from one row's values, so the call must not be
+    // split into token passes (launch_q8_a16_sliced_k_mma; stream_gemv.cuh runs 9+ tokens as passes).
+    static constexpr bool kWholeCallTokens = true;
     GdnConvEpilogue<Publish> conv;
     __nv_bfloat16* z;
 
