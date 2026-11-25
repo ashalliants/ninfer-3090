@@ -3337,6 +3337,43 @@ int run_geometry(const Geometry& geometry) {
     return failures;
 }
 
+// Windows past 41 splits x 4,032 keys. The 27B geometry caps its small-T grid at 41 splits, so
+// from about 168K keys a split used to span more than the kernels' 64-entry shared page-id table
+// (200,000 keys made 77-page splits) and the kernels wrote the extra ids past it. The split
+// policy now steps the split count instead (kCausalSmallTSplitKeys: 82 splits at 200,000 keys).
+// Fragmented pages make a wrong page id visible in the output. Every quantized small-T kernel is
+// covered (INT8 G64 and rk8v4 share one; FP8, NVFP4 and K8V4 have their own), at one, two and four
+// columns, plus two INT8 batch rows (MTP3 lanes, T=4), which share the cap.
+int run_long_split_page_cases() {
+    int failures             = 0;
+    const Geometry& geometry = kGeometries[0];
+    for (const CachePlan& plan : {kPlanInt8, kPlanRk8v4}) {
+        for (int tokens : {1, 2, 4}) {
+            failures += run_a1_case(
+                geometry, plan,
+                {tokens, 200000, static_cast<std::uint32_t>(200000 + tokens), 1201u},
+                MappingPattern::Fragmented);
+        }
+        failures += run_a3_case(geometry, plan, {1, 200000, 200001, 1202u}, MappingPattern::Offset);
+    }
+    failures += run_batch_case(geometry, kPlanInt8,
+                               {4, {200000, 180000}, {4, 4}, {0, 1}, MappingPattern::Fragmented,
+                                1206u});
+    failures += run_case_allowing_arch_skip("causal_softmax_attention FP8 long splits", [&] {
+        return run_a1_case(geometry, kPlanFp8, {1, 200000, 200001, 1203u},
+                           MappingPattern::Fragmented);
+    });
+    failures += run_case_allowing_arch_skip("causal_softmax_attention nvfp4 long splits", [&] {
+        return run_a1_case(geometry, KvCacheStorage::Nvfp4Group16, {1, 200000, 200001, 1204u},
+                           MappingPattern::Fragmented);
+    });
+    failures += run_case_allowing_arch_skip("causal_softmax_attention k8v4 long splits", [&] {
+        return run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 200000, 200001, 1205u},
+                           MappingPattern::Fragmented);
+    });
+    return failures;
+}
+
 // A grouped BF16 call keeps one update-compatible two-stage execution across short and long
 // envelopes. Verify each replay against the independent oracle. Upstream's version of this sweep
 // also exercises the batched path via run_batch_case(..., graph_replay=true, envelope_max), but
@@ -4184,6 +4221,17 @@ int run_softmax_attention_dflash2_tests() {
     return failures == 0 ? 0 : 1;
 }
 
+// The long-split cases alone, for a quick compute-sanitizer run (--long-split-pages-only).
+int run_softmax_attention_long_split_page_tests() {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    const int failures = run_long_split_page_cases();
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " causal_softmax_attention long splits\n";
+    return failures == 0 ? 0 : 1;
+}
+
 int run_softmax_attention_causal_cache_tests() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -4217,6 +4265,7 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_bf16_graph_envelope_cases();
     failures += run_bf16_small_prefill_cases();
     failures += run_batch_cases();
+    failures += run_long_split_page_cases();
     const std::array<int, 7> prefill_queries{0, 63, 64, 127, 128, 511, 1023};
     for (const auto& geometry : kGeometries)
         failures += run_a1_case(geometry, KvCacheStorage::BFloat16, {1024, 8192, 9216, 951u},
