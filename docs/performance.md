@@ -17,6 +17,16 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Qwen3.6-35B-A3B DFlash verify attention off the emulated prompt kernel (2026-11-25)
+
+In a V100 build a 35B-A3B verify of 6-16 columns keeps the small-T attention routes at short
+contexts instead of the FA2 prompt kernel (emulated `mma.sync` on Volta). DFlash, rk4v4 KV, 200 W,
+greedy, 300 tokens, ABBA: **K7 319.1 tok/s on structured JSON** (293.3 before), 233.6 code (184.8),
+94.5 story (82.2); K6 251.6 thinking (186.0), 306.4 structured JSON (280.5). Rounds at the same
+acceptance are 8-9% shorter; MTP3 is unchanged. `NINFER_SM70_VERIFY_PROMPT_ATTN=1` restores the
+prompt route; the 27B (24 heads) and the RTX 3090 are unchanged. Details:
+[tesla-v100.md](tesla-v100.md#qwen36-35b-a3b).
+
 ## Tesla V100 (`sm_70`): Qwen3.6-35B-A3B verify projections on int8 activations (2026-11-25)
 
 In a V100 build the 35B-A3B's Q8 mixer projections of an MTP3 verify (GDN and attention input and
