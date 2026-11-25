@@ -37,11 +37,14 @@ stop() { kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; }
 trap stop EXIT
 echo "router pid $PID, log $LOG"
 
-for _ in $(seq 120); do
-  curl -fsS "$BASE/health" >/dev/null 2>&1 && break
+# /health answers before the router has loaded its preset's startup models: wait for the
+# "listening on" line, which the router logs once those loads are done.
+for _ in $(seq 1800); do
+  grep -q "listening on http" "$LOG" && break
   kill -0 "$PID" 2>/dev/null || { echo "router exited"; tail -20 "$LOG"; exit 1; }
   sleep 1
 done
+grep -q "listening on http" "$LOG" || { echo "FAIL: the router never finished starting"; exit 1; }
 
 rss_gib() { awk '/^VmRSS/ {printf "%.2f", $2 / 1048576}' "/proc/$PID/status"; }
 PROMPT="$(python3 -c "import sys; print(' '.join(f'note {i} about the hotel booking' for i in range(int(sys.argv[1]) // 6)))" "$WORDS")"
@@ -52,31 +55,45 @@ ask() { # model, prompt -> prints the response JSON
 }
 cached() { python3 -c 'import json,sys; u=json.load(sys.stdin).get("usage",{}); print((u.get("prompt_tokens_details") or {}).get("cached_tokens",0), u.get("prompt_tokens",0))'; }
 
-# Model states from GET /models: "id=state" per line (unloaded, loading, loaded, sleeping, unloading).
+# Model states from GET /models, "id=state" per line (unloaded, loading, loaded, sleeping,
+# unloading). Read into a variable and matched with here-strings: a `states | grep -q` pipeline
+# fails under pipefail when grep exits early, which read as "no match".
 states() { curl -fsS "$BASE/models" | python3 -c 'import json,sys
 for m in json.load(sys.stdin)["data"]: print(m["id"] + "=" + m["status"]["value"])'; }
-busy() { states | grep -v "=unloaded$" || true; }
-# The baseline is the router with nothing loaded: wait out any startup load (a preset default),
-# unload whatever is resident, and refuse to measure while anything is still there.
-for _ in $(seq 900); do states | grep -qE "=(loading|unloading)$" || break; sleep 1; done
-for m in $(states | grep -E "=(loaded|sleeping)$" | cut -d= -f1); do
-  echo "unloading $m (loaded at startup) before the baseline"
-  curl -fsS "$BASE/models/unload" -H 'Content-Type: application/json' -d "{\"model\": \"$m\"}" >/dev/null
+resident() { local st; st="$(states)"; grep -v "=unloaded$" <<<"$st" || true; }
+unload_and_wait() { # model: unload it and wait until GET /models says it is unloaded
+  curl -fsS "$BASE/models/unload" -H 'Content-Type: application/json' -d "{\"model\": \"$1\"}" >/dev/null
+  local st
+  for _ in $(seq 300); do
+    st="$(states)"
+    grep -qFx "$1=unloaded" <<<"$st" && return 0
+    sleep 1
+  done
+  echo "FAIL: $1 did not unload"; grep "^$1=" <<<"$st"; exit 1
+}
+log_since() { tail -n +"$(($1 + 1))" "$LOG"; } # log lines after line $1
+
+# The baseline is the router with nothing loaded: unload whatever startup left resident, then
+# refuse to measure while anything is still there.
+for m in $(resident | cut -d= -f1); do
+  echo "unloading $m (resident after startup) before the baseline"
+  unload_and_wait "$m"
 done
-for _ in $(seq 300); do [ -z "$(busy)" ] && break; sleep 1; done
-if [ -n "$(busy)" ]; then
-  echo "FAIL: a model is still loaded, so there is no empty baseline to measure:"; busy; exit 1
+if [ -n "$(resident)" ]; then
+  echo "FAIL: a model is still loaded, so there is no empty baseline to measure:"; resident; exit 1
 fi
 sleep 2
 START=$(rss_gib); echo "RAM at start, nothing loaded (checked via GET /models): $START GiB"
 read -r C1 P1 < <(ask "$FIRST" "$PROMPT" | cached); echo "$FIRST: $P1 prompt tokens, $C1 cached"
 LOADED=$(rss_gib); echo "RAM with $FIRST loaded: $LOADED GiB"
+SWITCH=$(wc -l <"$LOG") # only log lines after this belong to the switch
 ask "$SECOND" "hello" >/dev/null; echo "switched to $SECOND"
-grep -E "unloaded '$FIRST'" "$LOG" | tail -1 || echo "(no unload line for $FIRST)"
-curl -fsS "$BASE/models/unload" -H 'Content-Type: application/json' -d "{\"model\": \"$SECOND\"}" >/dev/null
-for _ in $(seq 120); do grep -q "unloaded '$SECOND'" "$LOG" && break; sleep 1; done
-grep -E "unloaded '$SECOND'" "$LOG" | tail -1
-if [ -n "$(busy)" ]; then echo "FAIL: models still loaded after the unloads:"; busy; exit 1; fi
+FIRST_UNLOAD="$(log_since "$SWITCH" | grep -F "unloaded '$FIRST'" | tail -1 || true)"
+echo "${FIRST_UNLOAD:-(no unload line for $FIRST)}"
+SECOND_AT=$(wc -l <"$LOG")
+unload_and_wait "$SECOND"
+log_since "$SECOND_AT" | grep -F "unloaded '$SECOND'" | tail -1 || true
+if [ -n "$(resident)" ]; then echo "FAIL: models still loaded after the unloads:"; resident; exit 1; fi
 EMPTY=$(rss_gib); echo "RAM after both unloaded (checked via GET /models): $EMPTY GiB"
 
 fail=0
@@ -86,8 +103,8 @@ else
   echo "FAIL: RAM after unloading is $EMPTY GiB, more than $SLACK GiB above the start ($START GiB)"; fail=1
 fi
 
-if grep -q "unloaded '$FIRST' | context store:" "$LOG"; then
-  if grep "unloaded '$FIRST' | context store:" "$LOG" | tail -1 | grep -qE "context store: [1-9][0-9]* saved"; then
+if grep -qF "| context store:" <<<"$FIRST_UNLOAD"; then
+  if grep -qE "context store: [1-9][0-9]* saved" <<<"$FIRST_UNLOAD"; then
     echo "PASS: $FIRST saved its conversation when unloaded"
   else
     echo "FAIL: $FIRST saved nothing when unloaded"; fail=1
