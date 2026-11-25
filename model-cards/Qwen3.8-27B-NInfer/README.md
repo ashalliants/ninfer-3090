@@ -218,13 +218,13 @@ The artifact supports:
 ## Speed on a Tesla V100 (ashalliants/ninfer-3090)
 
 The [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090) fork also runs this
-artifact on a Tesla V100-PCIE-32GB (`sm_70`). There, one stream decodes at **136 tok/s** on a code
+artifact on a Tesla V100-PCIE-32GB (`sm_70`). There, one stream decodes at **147 tok/s** on a code
 prompt with DFlash2 (`--spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15`),
-125 on a thinking prompt and 177 tok/s on long structured JSON; with MTP3 (`--spec mtp
---draft-tokens 3 --lm-head-draft`) 77-81 on story, Chinese and French prompts and 110 on code; 45
+116.5 on a thinking prompt and 190 tok/s on long structured JSON; with MTP3 (`--spec mtp
+--draft-tokens 3 --lm-head-draft`) 72-79 on story, Chinese and French prompts and 110 on code; 45
 tok/s plain; and 122 tok/s in total for two requests at once (MTP3; 95 with DFlash2 K7, where
 the output head of a 16-column verify runs on int8 activations). Those figures are
-`ninfer-serve` with INT8 KV and `--gdn-state-fp16`, greedy, a 200 W power limit, 2026-11-24. They
+`ninfer-serve` with INT8 KV and `--gdn-state-fp16`, greedy, a 200 W power limit, 2026-11-25 (single-stream decode, master `d309f3d8`) and 2026-11-24 (plain and two-request figures). They
 use the fork's defaults on that card: `--verify-a8` runs the target's decode and verify linears on
 int8 activations (KLD 7.2e-4 to 7.8e-4 against the FP32 decode path and 98.9-99.2% the same top-1
 token; `--no-verify-a8` turns it off), and the DFlash2 drafter's own linears run on int8

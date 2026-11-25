@@ -15,14 +15,14 @@ Each release ships a prebuilt V100 archive for Linux, `ninfer-v100-linux-x64-<ve
 
 All figures were measured on one V100-PCIE-32GB, connected over an OCuLink PCIe Gen3 x4 eGPU link
 (3.3 GB/s host-to-device), on a Linux host with 59 GiB of RAM, with a 250 W power limit
-(2026-11-16 to 2026-11-18), except the 27B's speculative decode, re-measured at 200 W on 2026-11-24, and Flash-Next's MTP
+(2026-11-16 to 2026-11-18), except the 27B's speculative decode, re-measured at 200 W on 2026-11-25 (master `d309f3d8`), and Flash-Next's MTP
 decode, re-measured at 200 W on 2026-11-25.
 Decode is greedy with MTP speculation, as `run-v100.sh` serves it (three drafts; seven for Flash-Next).
 
 | | Qwen3.8-27B | Qwen3.8-Flash-Next |
 |---|---:|---:|
 | **Context** | 262,144 tokens | **262,144 tokens** (`run-v100.sh` default) |
-| **Decode**, one stream, MTP | **110 tok/s** on code, 104 thinking, 77-81 story, Chinese and French (MTP3, 2026-11-24, 200 W) | **129.6 tok/s** on code, 103-106 thinking, 82-83 story, 81 Chinese, 77 French (MTP7 + draft vocabulary, warm cache, 2026-11-25, 200 W) |
+| **Decode**, one stream, MTP | **147 tok/s** on code, 116.5 thinking, 190 structured JSON (DFlash2 K7 + n-gram 15, the router's setting); 110.2 code, 97.0 thinking, 71.9-78.9 story, Chinese and French (MTP3); master `d309f3d8`, 2026-11-25, 200 W | **129.6 tok/s** on code, 103-106 thinking, 82-83 story, 81 Chinese, 77 French (MTP7 + draft vocabulary, warm cache, 2026-11-25, 200 W) |
 | **Decode**, plain | 45 tok/s (200 W) | 53 tok/s (250 W) |
 | **Prefill**, ~4K-token prompt | **~1,020 tok/s** | **~990 tok/s** (3,798 tokens in 3.8 s) |
 | **Prefill**, long prompts | | 38K tokens in 38.4 s (~1,000 tok/s) |
@@ -140,7 +140,7 @@ These are the model defaults it sets:
 | `NINFER_CPU_VERIFY_MISSES=on` | Flash-Next | During decode, experts that miss the cache are computed on CPU threads beside the GPU. A cold cache decodes at 68-80 instead of 48-63 tok/s |
 | `NINFER_PARTIAL_RAM_RESIDENCY=on` | Flash-Next UD-IQ3_XXS | Pins only the experts the VRAM cache does not hold (`--partial-ram-residency`), so the 42 GiB bank fits; no images, context 32,768. `off` pins every expert (about 50 GiB) and restores images and the 262,144-token context |
 | `NINFER_HOT_EMBEDDING_ROWS=8192` | Flash-Next | Only the common embedding rows stay in VRAM, freeing room for 216 more cached experts |
-| `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV: on this card it beats DFlash2 (`--draft-tokens 7`) on story, Chinese, French and sampled prose (77-81 tok/s); DFlash2 wins on code (136 against 110 tok/s), thinking (125 against 104) and long structured output (177 against 123) |
+| `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV: on this card it beats DFlash2 (`--draft-tokens 7`) on story, Chinese and French (71.9 / 73.5 / 78.9 tok/s against 61.5 / 41.4 / 69.0); DFlash2 with `--ngram-draft-tokens 15` wins on code (147.0 against 110.2 tok/s), thinking (116.5 against 97.0) and long structured output (190.0 against 126.1). Master `d309f3d8`, 2026-11-25, 200 W; see [Methodology and sources](#methodology-and-sources) |
 | `NINFER_VISION_RESIDENCY=resident` | 35B-A3B | Keeps the Vision tower in VRAM. `run.sh`'s overlay residency does not work for this model on the V100: the server refuses to start ("needs 2256 MiB of evict-ranked weights ... provide 1552 MiB"), so the launcher refuses `NINFER_VISION_RESIDENCY=overlay` before starting. `NINFER_VISION=off` serves text only |
 | `NINFER_CONCURRENCY=2` | 35B-A3B | Two lanes sharing one 262,144-token `rk4v4` KV pool (`run.sh` gives the 3090 three) |
 | `NINFER_GGML_STAGED=0` | Flash-Next | Returns the GGML dense linears' verify GEMVs (2-8 columns) to the kernel that casts the input in every CTA, instead of the default staged route that casts it once per call: the same output, about 2% slower decode on code |
@@ -273,6 +273,22 @@ NINFER_DEFAULT_THINKING_BUDGET=2048 scripts/run-v100.sh qwen38-27b
 ## Performance
 
 ### Qwen3.8-27B
+
+Current figures: decode, one stream, the same prompts and router flags, master `d309f3d8`, 2026-11-25,
+**200 W** (the run behind the comparison charts and the summaries above):
+
+| Prompt | MTP3 | DFlash2 K7 + n-gram 15 |
+|---|---:|---:|
+| code | 110.2 | **147.0** |
+| think | 97.0 | **116.5** |
+| story | **71.9** | 61.5 |
+| Chinese | **73.5** | 41.4 |
+| French | **78.9** | 69.0 |
+| structured JSON | 126.1 | **190.0** |
+
+The table below is the earlier 2026-11-24 ABBA record of the int8-activation DFlash2 drafter
+(#605); it is kept for its before/after columns and is the source of the plain and two-request
+figures, which were not re-measured on 2026-11-25.
 
 Decode, one stream, through `ninfer-serve` with the router's flags (`--gdn-state-fp16
 --prefill-cublas`, INT8 KV, vision overlay), greedy unless noted, 2026-11-24, **200 W** power limit,
