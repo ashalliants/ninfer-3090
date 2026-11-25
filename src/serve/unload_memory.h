@@ -4,6 +4,8 @@
 // found it: the model's retained conversations go to its context store first (when it has one),
 // and once its Engine is gone the heap it freed goes back to the system.
 
+#include "ninfer/engine.h"
+
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -26,11 +28,28 @@ struct UnloadStoreSave {
     std::string error;           // the save failed; the unload went ahead
 };
 
+// What save_context_before_unload needs of a model. Production adapts a GenerationService; tests
+// substitute a fake to drive every path.
+class UnloadStoreTarget {
+public:
+    virtual ~UnloadStoreTarget()                                 = default;
+    [[nodiscard]] virtual bool store_enabled() const             = 0;
+    [[nodiscard]] virtual bool failed() const                    = 0;
+    [[nodiscard]] virtual bool asleep() const                    = 0;
+    // Keeps an asleep model asleep through its teardown: the Engine's shutdown write must not
+    // resume it (Engine::suspend with auto_resume false).
+    virtual void hold_asleep()                                   = 0;
+    [[nodiscard]] virtual std::uint32_t flush_seconds() const    = 0;
+    virtual ninfer::ContextStoreFlushReport flush(std::chrono::milliseconds budget) = 0;
+};
+
 // Writes what the model's context store does not yet hold, within the smaller of
 // --context-store-flush-seconds and kUnloadStoreSaveBudget, through the store's own write path
 // (Engine::flush_context_store: the same eligibility and size limits as any store write). Never
-// throws: a failure is reported in `error`. Skipped when the store is off, the Engine failed, or
-// the model is asleep (waking it would claim the device memory the next model needs).
+// throws: a failure is reported in `error`. Skipped when the store is off or the Engine failed. An
+// asleep model is not woken: it is held asleep so that neither this write nor the Engine's
+// shutdown write during teardown claims the device memory the next model needs.
+[[nodiscard]] UnloadStoreSave save_context_before_unload(UnloadStoreTarget& target) noexcept;
 [[nodiscard]] UnloadStoreSave save_context_before_unload(GenerationService& service) noexcept;
 
 // Returns memory the process freed but the allocator kept (glibc's per-thread arenas hold freed

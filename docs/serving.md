@@ -190,8 +190,12 @@ different from the Qwen3.5 models:
 - **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup (with `--vision` also
   the 0.84 GiB tower, and the ledger counts up to 1.4 GiB of decoded media: about 2.2 GiB more in
   all). Before anything is pinned, a RAM ledger checks that the experts, every other planned allocation and a reserve for
-  Windows (`--ram-headroom-mib`, default 2048) fit in the memory available now; if not, startup
-  refuses with the shortfall ("... 2.9 GiB short. Close other programs ..."). Loading takes about
+  the system (`--ram-headroom-mib`, default 2048: the OS and other programs) fit in the memory
+  available now; if not, startup refuses with the shortfall ("... keeps 2.0 GiB free for the
+  system: 2.9 GiB short. Close other programs ..."). The programs it names fit the OS: WSL, Docker
+  and browsers on Windows; other model servers, Docker containers and browsers on Linux. In a
+  router, the RAM a model that unloaded freed is given back first (see [Several models
+  (router)](#several-models-router)). Loading takes about
   two minutes from a SATA SSD, less when the files are in the page cache. With
   `--partial-ram-residency` RAM holds only the experts the VRAM cache does not (see the table
   below), so a pack whose experts exceed RAM can still load.
@@ -1101,8 +1105,10 @@ not loaded loads or wakes it, unless `--no-models-autoload`. A model whose Engin
 once its requests are gone, so the next request loads it again.
 
 An unload leaves the machine as it found it. A model with a [context store](#context-store) first
-writes the conversations it retains that the store lacks (at most 20 s; one asleep or failed is not
-woken for it). Its Engine then stops, and the process gives the heap its loader and worker threads
+writes the conversations it retains that the store lacks (at most 20 s). A model that is asleep
+is not woken for it, neither by this write nor by the shutdown write as its Engine stops (waking
+it would claim the device memory the next model needs), so it loses only what its device alone
+held; a failed model writes nothing. Its Engine then stops, and the process gives the heap its loader and worker threads
 freed back to the system (`malloc_trim` on Linux): without that, glibc kept several GiB of freed
 memory in its per-thread arenas, and a large Flash-Next loaded next failed its RAM check. A load that
 fails does the same, so retries of a model that does not fit do not leave less RAM each time. Each
@@ -2866,7 +2872,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--context-store-ttl-hours N` | remove sessions unused this long; `0` keeps them until space is needed | `168` |
 | `--context-store-idle-seconds N` | write a session unused this long, and changed since it was last written, in the background; `0` writes only at shutdown | `30` |
 | `--context-store-restore-seconds N` | time budget for restoring sessions at start-up (only those the directory holds; a bucket's are downloaded on request), and the longest a request waits for its stored session to be read back, a download included | `120` |
-| `--context-store-flush-seconds N` | time budget for writing sessions that are not yet stored at shutdown | `60` |
+| `--context-store-flush-seconds N` | time budget for writing sessions that are not yet stored at shutdown; a router unload writes them first within the smaller of this and 20 s | `60` |
 | `--context-store-peer DIR` | import the sessions another engine on this box keeps in its store directory, by hard link (repeatable; same volume; each engine needs its own `--context-store`); see [Two engines on one box](#two-engines-on-one-box). Requires `--context-store` | none |
 | `--context-store-peer-poll-ms N` | how often peer directories are looked at (at least 1) | `250` |
 | `--context-store-compress` | write new chunks zstd-compressed, in the directory and the bucket (about 8 % smaller; chunks of both forms are always read); see [Context store](#context-store). Requires `--context-store` | off |

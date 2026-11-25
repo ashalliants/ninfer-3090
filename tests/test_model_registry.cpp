@@ -798,6 +798,88 @@ void unload_description() {
            "a skipped save says why");
 }
 
+// The production save path (save_context_before_unload) through a fake target: what it asks of
+// the model on each path, and what it reports.
+struct FakeTarget final : UnloadStoreTarget {
+    bool enabled = true, is_failed = false, is_asleep = false, throw_on_flush = false,
+         throw_on_enabled = false;
+    std::uint32_t seconds = 60;
+    ninfer::ContextStoreFlushReport report{.written = 3, .unsaved = 0};
+    std::vector<std::string> calls;
+    std::chrono::milliseconds budget{0};
+    bool store_enabled() const override {
+        if (throw_on_enabled) { throw std::runtime_error("options gone"); }
+        return enabled;
+    }
+    bool failed() const override { return is_failed; }
+    bool asleep() const override { return is_asleep; }
+    void hold_asleep() override { calls.push_back("hold asleep"); }
+    std::uint32_t flush_seconds() const override { return seconds; }
+    ninfer::ContextStoreFlushReport flush(std::chrono::milliseconds b) override {
+        calls.push_back("flush");
+        budget = b;
+        if (throw_on_flush) { throw std::runtime_error("disk full"); }
+        return report;
+    }
+};
+
+void save_before_unload_paths() {
+    {
+        FakeTarget t;
+        t.enabled = false;
+        const auto s = save_context_before_unload(t);
+        expect(!s.attempted && s.skipped.empty() && s.error.empty() && t.calls.empty(),
+               "no store: nothing asked, nothing reported");
+    }
+    {
+        FakeTarget t;
+        const auto s = save_context_before_unload(t);
+        expect(s.attempted && s.written == 3 && s.unsaved == 0 && s.error.empty(),
+               "enabled: the flush's counts are reported");
+        expect(t.calls == std::vector<std::string>{"flush"}, "enabled: one flush, no hold");
+        expect(t.budget == std::chrono::milliseconds(kUnloadStoreSaveBudget),
+               "the switch budget caps a longer --context-store-flush-seconds");
+    }
+    {
+        FakeTarget t;
+        t.seconds = 5;
+        t.report  = {.written = 1, .unsaved = 2};
+        const auto s = save_context_before_unload(t);
+        expect(t.budget == std::chrono::seconds(5), "a shorter flush budget is kept");
+        expect(s.attempted && s.unsaved == 2 && s.error.empty(),
+               "a flush that ran out of time reports what it left unsaved");
+    }
+    {
+        FakeTarget t;
+        t.is_failed = true;
+        const auto s = save_context_before_unload(t);
+        expect(!s.attempted && s.skipped == "the model failed" && t.calls.empty(),
+               "failed: skipped without touching the model");
+    }
+    {
+        FakeTarget t;
+        t.is_asleep = true;
+        const auto s = save_context_before_unload(t);
+        expect(!s.attempted && s.skipped == "the model is asleep",
+               "asleep: skipped");
+        expect(t.calls == std::vector<std::string>{"hold asleep"},
+               "asleep: held asleep for teardown, never flushed (which would wake it)");
+    }
+    {
+        FakeTarget t;
+        t.throw_on_flush = true;
+        const auto s = save_context_before_unload(t);
+        expect(s.attempted && s.error == "disk full", "a throwing flush is reported, not thrown");
+    }
+    {
+        FakeTarget t;
+        t.throw_on_enabled = true;
+        const auto s = save_context_before_unload(t);
+        expect(!s.attempted && s.error == "options gone" && t.calls.empty(),
+               "an exception before the flush is reported, not thrown");
+    }
+}
+
 #if defined(__GLIBC__) && defined(__linux__)
 // The mechanism behind the router's retained RAM: blocks freed into per-thread arenas stay
 // resident while a live block sits above them, until the allocator is trimmed.
@@ -844,6 +926,7 @@ int main() {
     try {
         unload_saves_then_releases();
         unload_description();
+        save_before_unload_paths();
 #if defined(__GLIBC__) && defined(__linux__)
         freed_arena_memory_goes_back();
 #endif

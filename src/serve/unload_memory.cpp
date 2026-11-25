@@ -15,26 +15,57 @@
 
 namespace ninfer::serve {
 
+namespace {
+
+class ServiceTarget final : public UnloadStoreTarget {
+public:
+    explicit ServiceTarget(GenerationService& service) : service_(service) {}
+    bool store_enabled() const override { return service_.engine_options().context_store.enabled(); }
+    bool failed() const override { return service_.has_failed(); }
+    bool asleep() const override {
+        const auto residency = service_.residency();
+        return residency.enabled && residency.state == ninfer::ModelResidency::Suspended;
+    }
+    void hold_asleep() override { (void)service_.suspend(false); }
+    std::uint32_t flush_seconds() const override { return service_.options().context_store_flush_seconds; }
+    ninfer::ContextStoreFlushReport flush(std::chrono::milliseconds budget) override {
+        return service_.flush_context_store(budget);
+    }
+
+private:
+    GenerationService& service_;
+};
+
+} // namespace
+
 UnloadStoreSave save_context_before_unload(GenerationService& service) noexcept {
+    ServiceTarget target(service);
+    return save_context_before_unload(target);
+}
+
+UnloadStoreSave save_context_before_unload(UnloadStoreTarget& target) noexcept {
     UnloadStoreSave out;
     try {
-        if (!service.engine_options().context_store.enabled()) { return out; }
-        if (service.has_failed()) {
+        if (!target.store_enabled()) { return out; }
+        if (target.failed()) {
             out.skipped = "the model failed";
             return out;
         }
-        const auto residency = service.residency();
-        if (residency.enabled && residency.state == ninfer::ModelResidency::Suspended) {
+        if (target.asleep()) {
             out.skipped = "the model is asleep";
+            try {
+                target.hold_asleep();
+            } catch (const std::exception& error) {
+                out.error = std::string("could not keep it asleep: ") + error.what();
+            } catch (...) { out.error = "could not keep it asleep"; }
             return out;
         }
         const std::chrono::milliseconds budget = std::min<std::chrono::milliseconds>(
-            std::chrono::seconds(service.options().context_store_flush_seconds),
-            kUnloadStoreSaveBudget);
+            std::chrono::seconds(target.flush_seconds()), kUnloadStoreSaveBudget);
         out.attempted      = true;
         const auto started = std::chrono::steady_clock::now();
         try {
-            const auto report = service.flush_context_store(budget);
+            const auto report = target.flush(budget);
             out.written       = report.written;
             out.unsaved       = report.unsaved;
         } catch (const std::exception& error) {
@@ -91,7 +122,9 @@ std::string gib(std::uint64_t bytes) {
 std::string describe_unload(const UnloadStoreSave& save, const HeapRelease& heap) {
     std::string out;
     char text[160];
-    if (!save.error.empty()) {
+    if (!save.error.empty() && !save.attempted) {
+        out += "context store: not saved (" + save.skipped + "; " + save.error + ")";
+    } else if (!save.error.empty()) {
         std::snprintf(text, sizeof(text), "context store: save failed after %.1f s (", save.seconds);
         out += text + save.error + "), unloading anyway";
     } else if (save.attempted) {
