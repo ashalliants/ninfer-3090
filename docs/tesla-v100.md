@@ -109,6 +109,7 @@ These are the model defaults it sets:
 | `NINFER_SM70_Q8_PREFILL_CUBLAS=0` | 35B-A3B | Prefills the Q8 mixer projections (GDN and attention input projections, both 2,048 x 4,096 output projections) on their emulated `mma.sync` kernels instead of the default cuBLAS FP16 route: 1,160 instead of 2,411 tok/s at 4.2K tokens |
 | `NINFER_SM70_MOE_PREFILL_HMMA=0` | 35B-A3B | Prefills the routed experts (Q4 gate/up, Q5/Q6 down) on the emulated `mma.sync` kernels instead of the default FP16 WMMA kernels: 765 instead of 1,160 tok/s at 4.2K tokens |
 | `NINFER_SM70_Q8_VERIFY_A8=0` | 35B-A3B | Runs the Q8 mixer projections of an MTP3 verify (the GDN and attention input projections, 12,288 and 9,216 x 2,048, and the 2,048 x 4,096 output projections) on the A16 streaming GEMV instead of the default int8-activation `dp4a` passes under `--verify-a8`: 5-14% slower MTP3, decode-path KLD at four tokens 2.71e-3 instead of 3.37e-3 |
+| `NINFER_SM70_VERIFY_PROMPT_ATTN=1` | 35B-A3B | Lets a DFlash or MTP verify of 6-16 columns take the FA2 prompt attention kernel at short contexts (its RTX 3090 limits, up to 288-1,024 keys) instead of the default small-T routes; the prompt kernel is emulated `mma.sync` on Volta: DFlash K7 structured JSON 293 instead of 319 tok/s |
 | `NINFER_SM70_Q6_35_STREAM=0` | 35B-A3B | Runs the Q6 output head of a 2-32-column call (an MTP3 verify) on the emulated `mma.sync` sliced-K kernels and the one-token call on the A16 GEMV, instead of the default streaming GEMV (int8-activation `dp4a` passes of eight under `--verify-a8`): 4.1 instead of 0.5 ms per MTP3 verify |
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
@@ -364,6 +365,27 @@ accuracy: decode-path KLD at four tokens is 3.37e-3 / 97.27% the same top-1 agai
 (three 8,192-token PG-19 chunks, BF16 KV, against an A16 one-token base), and PPL is flat (6.142
 against 6.145). The all-A16 reorder-only control at four tokens sits at 2.66e-3: most of that floor
 is the recurrent state's response to any change in summation order, not precision. `--no-verify-a8` or `NINFER_SM70_Q8_VERIFY_A8=0` keeps the A16 projections.
+
+DFlash (`--spec dflash`, same flags without the draft head and MTP experts), ABBA against
+`NINFER_SM70_VERIFY_PROMPT_ATTN=1` (the verify's attention on the FA2 prompt kernel at short
+contexts, as before), the two legs of each side within 0.4 tok/s:
+
+| Prompt | K7 | K7 before | K6 | K6 before |
+|---|---:|---:|---:|---:|
+| structured JSON | **318.7-319.1** | 293.3-293.5 | 306.3-306.4 | 280.5 |
+| code | 233.5-233.6 | 184.8 | 230.9 | 204.4 |
+| thinking | 184.2-184.3 | 182.9 | **251.5-251.6** | 186.0 |
+| conversation | 104.8-104.9 | 104.4 | 113.8 | 108.6 |
+| French | 99.3-99.4 | 89.6 | 107.9 | 90.3 |
+| story | 94.5 | 82.2 | 104.7 | 88.1 |
+| Chinese | 67.3 | 62.8 | 71.7-71.8 | 67.0 |
+
+A DFlash K6/K7 verify (seven or eight columns) below about 300 visible keys used to take the FA2
+prompt kernel, whose limits were measured on the RTX 3090; on Volta that kernel runs emulated
+`mma.sync` (3.67 ms of a K7 round). It now keeps the small-T routes, as wider contexts already did:
+rounds at the same acceptance are 8-9% shorter (structured JSON, K7: 23.4 ms against 25.5). The
+rest of each prompt's change is acceptance on a changed greedy text. MTP3 (four columns) is
+unchanged. DFlash with eight or more drafts (nine or more columns) needs #617's fix.
 
 Before #613 the output head (Q6, 248,320 x 2,048) ran an MTP3 verify on the sliced-K
 `mma.sync` kernels, which Volta emulates: 4.09 ms of a 17.5 ms round, so MTP3 lost to plain decoding

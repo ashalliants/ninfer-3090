@@ -668,6 +668,17 @@ The pass loop moved into an ungated `launch_stream_dp4a_tokens` that the DFlash2
 shares. One-token calls stay on A16. MTP3 +5-14% on every measured prompt (ABBA in [tesla-v100.md](../tesla-v100.md#qwen36-35b-a3b)), at
 +6.8e-4 decode-path KLD at four tokens. `NINFER_SM70_Q8_VERIFY_A8=0` keeps A16.
 
+A DFlash verify of six or seven drafts (seven or eight columns) at short contexts lost 2-4 ms a
+round to `causal_attention_prompt_i8_fa2_kernel`: `int8_family_prompt_keys` sends INT8-family verify
+widths 6-16 to the FA2 prompt kernel below per-width key limits measured on the RTX 3090 (288-1,024
+keys for the 35B's 16 heads under rk4v4), and on Volta that kernel is emulated `mma.sync`. For the
+16-head geometry on sm_70 the limits are now zero, so those launches take the sm_70 small-T routes
+(chunked CUDA-core small-T) at every key count: DFlash K7 rounds 25.5 -> 23.4 ms at the same
+acceptance, structured JSON 293 -> 319 tok/s. The 27B's 24-head geometry measured neutral (DFlash2
+K7 with n-gram copies, structured JSON 185.2 -> 185.9 at the same acceptance) and keeps its limits.
+`ninfer_qwen3_5_mtp_graph_profiles_test` (one route per graph profile) passes with the change.
+`NINFER_SM70_VERIFY_PROMPT_ATTN=1` restores the prompt route.
+
 Profiling this model under nsys needs a workaround: a cooperative `grid.sync` kernel (the GDN gating
 projection's split schedules) faults with `cudaErrorInvalidPc` under nsys on sm_70, master included,
 so profiles were taken with those schedules disabled in a local build and that kernel's time

@@ -28,6 +28,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -309,9 +311,30 @@ constexpr std::array<std::uint32_t, 11> kH16PromptKeysRk4v4{0,   288, 288, 352, 
 constexpr std::array<std::uint32_t, 11> kH16PromptKeysInt8{128, 512,  512,  512,  512, 640,
                                                            704, 1056, 1056, 1056, 1056};
 
+// sm_70: the FA2 prompt kernel runs Ampere mma.sync, which Volta emulates. For the 16-head
+// geometry (Qwen3.6-35B-A3B) a verify-width launch therefore keeps the small-T routes below at
+// every key count (the limits above are the 3090's): DFlash K7 (W = 8) at ~340 keys spent 3.67 ms
+// a round in the prompt kernel, and the rounds of W = 7-8 got 8-10% shorter without it. The 24-head
+// geometry (Qwen3.8-27B) measured neutral either way and keeps its limits.
+// NINFER_SM70_VERIFY_PROMPT_ATTN=1 restores the prompt route.
+bool sm70_verify_prompt_attention(std::int32_t q_heads) {
+#if defined(NINFER_SM70)
+    static const bool restored = [] {
+        const char* value = std::getenv("NINFER_SM70_VERIFY_PROMPT_ATTN");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return q_heads != 16 || restored;
+#else
+    (void)q_heads;
+    return true;
+#endif
+}
+
 std::uint32_t int8_family_prompt_keys(std::int32_t q_heads, std::int32_t width,
                                       KvCacheStorage storage) {
-    if (width < 6 || width > kMaximumVerifyTokens) { return 0; }
+    if (width < 6 || width > kMaximumVerifyTokens || !sm70_verify_prompt_attention(q_heads)) {
+        return 0;
+    }
     const bool rk4v4 = storage == KvCacheStorage::RotatedLloyd4KeyInt4Value;
     const auto& limits =
         q_heads == 24 ? (rk4v4 ? kH24PromptKeysRk4v4 : kH24PromptKeysInt8)
