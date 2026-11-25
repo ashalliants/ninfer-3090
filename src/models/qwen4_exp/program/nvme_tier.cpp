@@ -89,7 +89,7 @@ std::unique_ptr<TierFile> open_scratch_tier_file(const std::filesystem::path& pa
     return std::make_unique<ScratchTierFile>(path, bytes);
 }
 
-NvmeTier::NvmeTier(Options options, std::unique_ptr<TierFile> file) : options_(options), file_(std::move(file)) {
+NvmeTier::NvmeTier(Options options, std::shared_ptr<TierFile> file) : options_(options), file_(std::move(file)) {
     if (!file_ || options_.slabs == 0 || options_.slab_bytes == 0 || options_.slab_bytes % ScratchFile::kAlignment != 0 ||
         options_.bounce_slabs == 0) {
         throw std::invalid_argument("context cache NVMe tier: bad options");

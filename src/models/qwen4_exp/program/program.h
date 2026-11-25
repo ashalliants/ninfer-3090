@@ -57,6 +57,8 @@ namespace execution {
 class Parameters;
 }
 
+class TierFile; // program/nvme_tier.h
+
 namespace detail {
 class ProgramImpl;
 struct BasePlanImpl;
@@ -477,6 +479,9 @@ struct ProgramOptions {
     // Its pinned bounce buffer (both halves) is context_bounce_bytes.
     std::uint64_t context_nvme_bytes = 0;
     std::filesystem::path context_nvme_path;
+    // The tier's file, opened where the tier was planned (beside the RAM ledger, before the weights
+    // load), so the Program does not reopen it; null: the Program opens context_nvme_path itself.
+    std::shared_ptr<TierFile> context_nvme_file;
     std::uint64_t context_bounce_bytes = 128ULL << 20;
     // Each MoE block's shared expert on a side stream beside the routed experts (high priority in
     // eager calls; graph replays ignore it) (execution::ForwardOptions::shared_expert_stream).
@@ -689,6 +694,22 @@ void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, 
 // verification (1 + mtp_draft_tokens columns, gdn_records_spec), 256-byte aligned; 0 without MTP.
 [[nodiscard]] std::uint64_t plan_gdn_record_bytes(const ProgramOptions& options, const TextConfig& config);
 
+// The context cache's slab layout, from the Program's plan alone (no device, no weights): a record
+// is one KV page of every attention layer's five planes; a checkpoint's image (the lane's state,
+// its MTP residual and its logits) takes image_slabs records. Program::setup_context_cache sizes its
+// tiers with it, and the startup RAM ledger asks it whether a tier can open, so both apply one rule.
+struct CheckpointGeometry {
+    std::vector<std::array<std::size_t, 5>> record_planes; // each layer's plane offsets in a record
+    std::size_t page_kv_bytes = 0;
+    std::size_t record        = 0;
+    std::size_t image_saved = 0, image_logits = 0, image_bytes = 0;
+    std::uint32_t image_slabs = 0;
+    // Records a tier of `bytes` holds (at most UINT32_MAX / 2).
+    [[nodiscard]] std::uint32_t slabs(std::uint64_t bytes) const noexcept;
+    // Whether such a tier holds two checkpoints: the least a context cache tier opens with.
+    [[nodiscard]] bool holds_two_checkpoints(std::uint64_t bytes) const noexcept;
+};
+
 class Program {
 public:
     Program(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options);
@@ -703,6 +724,10 @@ public:
     [[nodiscard]] static ProgramDevicePlan plan_device(const ProgramOptions& options, const TextConfig& config,
                                                        std::uint32_t public_tokens,
                                                        std::span<const std::uint64_t> record_strides);
+    // The context cache's slab layout a Program with these options would use (see CheckpointGeometry).
+    [[nodiscard]] static CheckpointGeometry plan_checkpoint(const ProgramOptions& options, const TextConfig& config,
+                                                            std::uint32_t public_tokens,
+                                                            std::span<const std::uint64_t> record_strides);
     [[nodiscard]] const ProgramDevicePlan& device_plan() const noexcept;
     // How the expert frames were sized at construction.
     [[nodiscard]] const VramSizing& vram_sizing() const noexcept;

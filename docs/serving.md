@@ -187,12 +187,22 @@ different from the Qwen3.5 models:
   idle and at shutdown and restored at startup (or when a request for them arrives), exactly as for
   the other models; it needs the host tier or the disk tier. Images are tied to the model file, the
   MTP setting and `--vision`; a session written under another configuration is not restored. The
-  RAM ledger settles this before any weight is read. With no cache configured at all
-  (`--host-context-mib 0` and no `--context-nvme-mib`) a store is refused at once. When a cache was
-  asked for but the ledger cannot spare its 512 MiB minimum beside the experts, the model still
-  starts, with the store off for this run, and one warning says how far short it was and what to
-  change (free RAM, a lower `--ram-headroom-mib`, or a disk tier); the saved sessions stay on disk
-  for the next start, and output is unchanged (each prompt is prefilled in full):
+  RAM ledger settles this before any weight is read, using the same checkpoint layout the cache
+  opens its tiers with (a tier must hold two checkpoints), and it creates the disk tier's file there
+  and then. With no cache configured at all (`--host-context-mib 0` and no `--context-nvme-mib`) a
+  store is refused at once. When a cache was asked for but cannot be had this time, the model still
+  starts, with the store off for this run, and one warning names the cause and its remedy:
+
+  | Cause | Remedy the warning gives |
+  |---|---|
+  | the RAM ledger cannot spare the Host tier's 512 MiB minimum beside the experts | free RAM, a lower `--ram-headroom-mib`, or a disk tier (`--context-nvme-mib`) |
+  | `--host-context-mib` is set under the 512 MiB minimum, or the tier it gives cannot hold two checkpoints | raise `--host-context-mib` |
+  | the memory-lock limit (`RLIMIT_MEMLOCK`) cannot pin the minimum though RAM could | raise the lock limit (`ulimit -l`), or a disk tier |
+  | the disk tier cannot hold two checkpoints, or its file cannot be created | added to the line, with its reason |
+
+  A tier that still fails to open after the ledger (pinning it fails, say) is handled the same way
+  rather than failing the start. The saved sessions stay on disk for the next start, and output is
+  unchanged (each prompt is prefilled in full):
 
   ```text
   WARN  context store: off for this run: it restores sessions into the context cache, and the RAM ledger could spare only 300 MiB for that cache beside the experts, 212 MiB short of its 512 MiB minimum. ...

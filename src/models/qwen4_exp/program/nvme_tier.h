@@ -64,7 +64,7 @@ public:
     };
 
     // Throws when the pinned memory cannot be allocated.
-    NvmeTier(Options options, std::unique_ptr<TierFile> file);
+    NvmeTier(Options options, std::shared_ptr<TierFile> file);
     ~NvmeTier() override;
     NvmeTier(const NvmeTier&)            = delete;
     NvmeTier& operator=(const NvmeTier&) = delete;
@@ -112,7 +112,7 @@ private:
     void writer_loop() noexcept;
 
     Options options_;
-    std::unique_ptr<TierFile> file_;
+    std::shared_ptr<TierFile> file_;
     Pinned frames_memory_, bounce_;
     Pinned descriptors_[3]; // frames, bounce half 0, bounce half 1
     cudaEvent_t half_done_[2] = {nullptr, nullptr};

@@ -211,11 +211,15 @@ std::uint64_t fit_ngram_ram(const HostMemorySnapshot& snapshot, const HostMemory
 ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemoryDemand demand, std::uint64_t requested,
                                   std::uint64_t minimum, std::uint64_t granule) {
     ContextCacheFit out;
-    if (requested == 0 || granule == 0) { return out; }
+    if (requested == 0 || granule == 0) {
+        out.off = ContextCacheOff::NotRequested;
+        return out;
+    }
     demand.context_cache = 0;
     const HostMemoryLedger without = plan_host_memory(snapshot, demand);
     if (!without.fits) {
         out.shrunk = true;
+        out.off    = ContextCacheOff::ExpertsDoNotFit;
         return out;
     }
     // What is left above the reserve, the planned allocations and the experts' full need (the
@@ -225,6 +229,7 @@ ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemory
                                    saturating_sub(snapshot.available_commit, floor_bytes));
     // The cache's own lock bookkeeping comes out of the same room.
     spare = static_cast<std::uint64_t>(static_cast<double>(spare) / (1.0 + demand.lock_overhead));
+    const std::uint64_t ram_spare = spare;
     if (snapshot.lock_limit && !demand.lock_limit_advisory) {
         spare = std::min(spare, saturating_sub(*snapshot.lock_limit, without.pinned_total));
     }
@@ -241,28 +246,71 @@ ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemory
     }
     out.bytes  = bytes;
     out.shrunk = bytes < requested;
+    if (bytes == 0) {
+        // The first limit that kept the tier under its minimum, in the order a remedy would lift it.
+        out.off = requested < minimum                       ? ContextCacheOff::BelowMinimum
+                  : ram_spare / granule * granule < minimum ? ContextCacheOff::Ram
+                  : spare / granule * granule < minimum     ? ContextCacheOff::LockLimit
+                                                            : ContextCacheOff::Ram;
+    }
     return out;
 }
 
-ContextStoreStart decide_context_store(bool store_configured, std::uint64_t requested_cache,
-                                       const ContextCacheFit& fit, std::uint64_t nvme_bytes, std::uint64_t minimum) {
+namespace {
+
+std::string mib_text(std::uint64_t bytes) { return std::to_string(bytes >> 20); }
+
+constexpr const char* kStoreOff = "context store: off for this run: it restores sessions into the context cache, and ";
+constexpr const char* kStoreOffEnd = " Sessions already saved stay on disk for the next start.";
+
+} // namespace
+
+ContextStoreStart decide_context_store(bool store_configured, std::uint64_t requested_cache, const ContextCacheFit& fit,
+                                       bool host_holds_two_checkpoints, const NvmeTierStatus& nvme, std::uint64_t minimum) {
     ContextStoreStart out;
-    if (!store_configured || fit.bytes != 0 || nvme_bytes != 0) { return out; }
+    const bool host_cache = fit.bytes != 0 && host_holds_two_checkpoints;
+    if (!store_configured || host_cache || nvme.usable) { return out; }
     out.store_on = false;
-    if (requested_cache == 0) {
+    if (requested_cache == 0 && !nvme.configured) {
         out.refusal = "the context store restores sessions into the context cache, which is off: give it a Host "
                       "budget (--host-context-mib) or an NVMe tier (--context-nvme-mib)";
         return out;
     }
-    const auto mib = [](std::uint64_t bytes) { return std::to_string(bytes >> 20); };
-    const std::uint64_t short_by = minimum > fit.spare ? minimum - fit.spare : 0;
-    out.warning = "context store: off for this run: it restores sessions into the context cache, and the RAM "
-                  "ledger could spare only " + mib(fit.spare) + " MiB for that cache beside the experts, " +
-                  mib(short_by) + " MiB short of its " + mib(minimum) +
-                  " MiB minimum. Sessions already saved stay on disk for the next start. To keep it on, free RAM "
-                  "(close other programs), lower --ram-headroom-mib, or give the cache an NVMe tier "
-                  "(--context-nvme-mib)";
+    std::string why;
+    if (fit.bytes != 0) {
+        why = "its " + mib_text(fit.bytes) + " MiB Host tier cannot hold two checkpoints. Raise --host-context-mib";
+    } else {
+        switch (fit.off) {
+        case ContextCacheOff::BelowMinimum:
+            why = "the " + mib_text(requested_cache) + " MiB Host budget configured for it is under the " +
+                  mib_text(minimum) + " MiB minimum. Raise --host-context-mib to at least " + mib_text(minimum);
+            break;
+        case ContextCacheOff::LockLimit:
+            why = "the memory-lock limit (RLIMIT_MEMLOCK) leaves only " + mib_text(fit.spare) +
+                  " MiB to pin for it, under its " + mib_text(minimum) +
+                  " MiB minimum. Raise the lock limit (ulimit -l unlimited, or memlock in limits.conf), or give "
+                  "the cache an NVMe tier (--context-nvme-mib)";
+            break;
+        case ContextCacheOff::NotRequested:
+            why = "it has no Host budget (--host-context-mib 0). Give it one (--host-context-mib)";
+            break;
+        default: { // Ram, and ExpertsDoNotFit (startup refuses for the experts anyway)
+            const std::uint64_t short_by = minimum > fit.spare ? minimum - fit.spare : 0;
+            why = "the RAM ledger could spare only " + mib_text(fit.spare) + " MiB for that cache beside the experts, " +
+                  mib_text(short_by) + " MiB short of its " + mib_text(minimum) +
+                  " MiB minimum. To keep it on, free RAM (close other programs), lower --ram-headroom-mib, or give "
+                  "the cache an NVMe tier (--context-nvme-mib)";
+            break;
+        }
+        }
+    }
+    if (nvme.configured && !nvme.usable) { why += "; its NVMe tier cannot be used either (" + nvme.reason + ")"; }
+    out.warning = std::string(kStoreOff) + why + "." + kStoreOffEnd;
     return out;
+}
+
+std::string context_store_off_after_setup(const std::string& cause) {
+    return std::string(kStoreOff) + "the cache could not be set up (" + cause + ")." + kStoreOffEnd;
 }
 
 std::string HostMemoryLedger::describe() const {

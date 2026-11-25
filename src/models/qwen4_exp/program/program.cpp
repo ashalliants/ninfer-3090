@@ -817,6 +817,29 @@ Layout plan_layout(const ProgramOptions& o, const TextConfig& c, std::uint32_t p
     return d;
 }
 
+// The context cache's slab layout (models::qwen4_exp::CheckpointGeometry) from the plan: a record
+// is every attention layer's five KV planes of one page; the image is the lane's state, its MTP
+// residual (with drafts) and its logits.
+CheckpointGeometry checkpoint_geometry(const Layout& plan, const TextConfig& c) {
+    CheckpointGeometry g;
+    std::size_t at = 0;
+    for (const auto& planes : plan.kv.layers) {
+        std::array<std::size_t, 5> offsets{};
+        for (std::size_t p = 0; p < 5; ++p) {
+            offsets[p] = at;
+            at         = align(at + planes[p].page_bytes);
+            g.page_kv_bytes += planes[p].page_bytes;
+        }
+        g.record_planes.push_back(offsets);
+    }
+    g.record       = align(at, 4096);
+    g.image_saved  = align(plan.state);
+    g.image_logits = g.image_saved + (plan.drafts > 0 ? align(2ULL * c.residual_width()) : 0);
+    g.image_bytes  = g.image_logits + 2ULL * c.vocab_size;
+    g.image_slabs  = static_cast<std::uint32_t>((g.image_bytes + g.record - 1) / g.record);
+    return g;
+}
+
 } // namespace
 
 class ProgramImpl {
@@ -1624,6 +1647,11 @@ public:
     static ProgramDevicePlan plan_device(const ProgramOptions& options, const TextConfig& config,
                                          std::uint32_t public_tokens, std::span<const std::uint64_t> strides) {
         return plan_layout(options, config, public_tokens, strides).bytes;
+    }
+
+    static CheckpointGeometry plan_checkpoint(const ProgramOptions& options, const TextConfig& config,
+                                              std::uint32_t public_tokens, std::span<const std::uint64_t> strides) {
+        return checkpoint_geometry(plan_layout(options, config, public_tokens, strides), config);
     }
 
     // ---------------------------------------------------------------- admission
@@ -3283,38 +3311,32 @@ private:
     // RAM cache the Host bytes), else the pinned Host tier. An NVMe tier that cannot be opened falls
     // back to the Host tier; a tier that cannot be pinned leaves prefix reuse off. Each says so.
     void setup_context_cache() {
-        std::size_t at = 0;
-        page_kv_bytes_ = 0;
-        record_planes_.clear();
-        for (const auto& planes : plan_.kv.layers) {
-            std::array<std::size_t, 5> offsets{};
-            for (std::size_t p = 0; p < 5; ++p) {
-                offsets[p] = at;
-                at         = align(at + planes[p].page_bytes);
-                page_kv_bytes_ += planes[p].page_bytes;
-            }
-            record_planes_.push_back(offsets);
-        }
-        const std::size_t record = align(at, 4096);
-        image_saved_             = align(plan_.state);
-        image_logits_            = image_saved_ + (plan_.drafts > 0 ? align(2ULL * c_.residual_width()) : 0);
-        image_bytes_             = image_logits_ + 2ULL * c_.vocab_size;
-        image_slabs_             = static_cast<std::uint32_t>((image_bytes_ + record - 1) / record);
-        const auto ram_slabs     = static_cast<std::uint32_t>(options_.context_cache_bytes / record);
-        const auto disk_slabs    = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(options_.context_nvme_bytes / record, std::numeric_limits<std::uint32_t>::max() / 2));
+        // The layout the RAM ledger already checked the tiers against (checkpoint_geometry).
+        CheckpointGeometry geometry = checkpoint_geometry(plan_, c_);
+        page_kv_bytes_              = geometry.page_kv_bytes;
+        record_planes_              = std::move(geometry.record_planes);
+        const std::size_t record    = geometry.record;
+        image_saved_                = geometry.image_saved;
+        image_logits_               = geometry.image_logits;
+        image_bytes_                = geometry.image_bytes;
+        image_slabs_                = geometry.image_slabs;
+        const auto ram_slabs        = geometry.slabs(options_.context_cache_bytes);
+        const auto disk_slabs       = geometry.slabs(options_.context_nvme_bytes);
         const auto start = Clock::now();
         std::uint32_t slabs = 0;
         std::string where;
-        if (disk_slabs >= 2 * image_slabs_) {
+        if (geometry.holds_two_checkpoints(options_.context_nvme_bytes)) {
             try {
                 NvmeTier::Options tier;
                 tier.slabs        = disk_slabs;
                 tier.slab_bytes   = record;
                 tier.frames       = std::min(ram_slabs, disk_slabs); // frames past the file's slabs are unaddressable
                 tier.bounce_slabs = static_cast<std::uint32_t>(std::max<std::uint64_t>(1, options_.context_bounce_bytes / 2 / record));
-                auto file =
-                    open_scratch_tier_file(options_.context_nvme_path, static_cast<std::uint64_t>(disk_slabs) * record);
+                // The ledger opened the file where it planned the tier; open it here only without one.
+                std::shared_ptr<TierFile> file = options_.context_nvme_file;
+                if (!file) {
+                    file = open_scratch_tier_file(options_.context_nvme_path, static_cast<std::uint64_t>(disk_slabs) * record);
+                }
                 auto nvme = std::make_unique<NvmeTier>(tier, std::move(file));
                 nvme_     = nvme.get();
                 tier_     = std::move(nvme);
@@ -3333,7 +3355,7 @@ private:
                        " MiB cannot hold two checkpoints; checkpoints stay in RAM only");
         }
         if (!tier_) {
-            if (ram_slabs < 2 * image_slabs_) {
+            if (!geometry.holds_two_checkpoints(options_.context_cache_bytes)) {
                 if (options_.context_cache_bytes != 0) {
                     diagnostic("context cache: a Host tier of " + std::to_string(options_.context_cache_bytes >> 20) +
                                " MiB cannot hold two checkpoints; prefix reuse is off");
@@ -6746,6 +6768,20 @@ void require_shared_expert_workspace(std::uint64_t need, std::uint64_t planned, 
 ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const TextConfig& config,
                                        std::uint32_t public_tokens, std::span<const std::uint64_t> record_strides) {
     return detail::ProgramImpl::plan_device(options, config, public_tokens, record_strides);
+}
+
+CheckpointGeometry Program::plan_checkpoint(const ProgramOptions& options, const TextConfig& config,
+                                            std::uint32_t public_tokens, std::span<const std::uint64_t> record_strides) {
+    return detail::ProgramImpl::plan_checkpoint(options, config, public_tokens, record_strides);
+}
+
+std::uint32_t CheckpointGeometry::slabs(std::uint64_t bytes) const noexcept {
+    if (record == 0) { return 0; }
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes / record, std::numeric_limits<std::uint32_t>::max() / 2));
+}
+
+bool CheckpointGeometry::holds_two_checkpoints(std::uint64_t bytes) const noexcept {
+    return record != 0 && image_slabs != 0 && slabs(bytes) >= 2ULL * image_slabs;
 }
 
 const ProgramDevicePlan& Program::device_plan() const noexcept { return impl_->device_plan(); }
