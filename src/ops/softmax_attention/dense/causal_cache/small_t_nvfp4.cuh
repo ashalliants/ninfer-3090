@@ -53,7 +53,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
-    constexpr int PageIds              = 64;
+    constexpr int PageIds              = kCausalSmallTPageIds; // a split spans at most 64 pages
     constexpr float Log2E              = 1.4426950408889634074F;
     constexpr unsigned FullMask        = 0xffffffffU;
 

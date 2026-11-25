@@ -75,8 +75,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
-    // The 262144-key maximum envelope spans at most 49 pages in this split geometry.
-    constexpr int PageIds         = 64;
+    constexpr int PageIds         = kCausalSmallTPageIds; // a split spans at most 64 pages
     constexpr int ProducerThreads = RowTiles * 32;
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
     constexpr float Log2E         = 1.4426950408889634074f;

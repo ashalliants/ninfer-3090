@@ -659,6 +659,19 @@ Wrapper 验证 Tensor dtype、geometry、closed strides、table shape和executio
 Growing-cache Ops 直接消费 paged views。Page translation在 page/tile 粒度计算并复用，inner loop不解释
 request、pool kind或allocator state。Kernel correctness不能依赖相邻 logical pages映射到相邻 physical IDs。
 
+Kernel 在 shared memory 中缓存的 page-id 表也不能假设一个 split 覆盖的 pages 数有上限：split 数由
+envelope、split cap 和 launch capacity 共同决定，长 envelope 下每个 split 的 pages 随 context 增长。
+2026-11-24 修复：small-T partial kernels（`small_t_i8.cuh`、`small_t_fp8.cuh`、`small_t_k8v4.cuh`、
+`small_t_nvfp4.cuh`）的 64 项 page-id 表原本假设 262,144 keys 最多 49 pages per split（旧的 85-split cap）；
+27B 的 cap 降到 41 后，约 168K keys 以上一个 split 超过 64 pages，page ids 被写到表外（单序列和 batch 都会）。
+表不能变大（INT8 kernel 离 48 KB static shared 上限只差 64 bytes），kernel 内循环也不改（在循环里回读 block
+table 会让 128-register kernel 多 spill，op bench 各长度都慢 1.5-2%）。现在 split policy 保证每个 split 最多
+`kCausalSmallTSplitKeys` = 4,032 keys（最多 64 pages，`static_assert` 证明）：27B 超过 165,312 keys、35B 超过
+330,624 keys 时，split 数按 cap 的整数倍增长（保持 wave 完整），而不是 split 变长。在此之下 split 数和
+kernel 都不变（所有 small-T kernel 的 register、stack、shared 与修复前相同）。Reducer 最多合并 256 splits
+（27B 约 1M keys），host 端超出时报错。
+回归测试：`run_long_split_page_cases`（`tests/ops/softmax_attention/causal_cache.cpp`，200,000 keys）。
+
 Paging 不引入 gather-to-contiguous cache或与 context 长度成比例的 staging copy。Route-specific tile、
 split、warp和shared-memory方案可以独立优化，只要保持同一 logical Attention、persistent codec与上述
 address contract。Op 的数值与性能准入规则见 [Op development](op-development.md)。

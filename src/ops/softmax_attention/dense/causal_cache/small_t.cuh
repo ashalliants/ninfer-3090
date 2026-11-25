@@ -86,6 +86,30 @@ struct CausalSmallTSplitTiers {
     static constexpr int kKeysBeyond     = 480 / kDivisor;
 };
 
+// The small-T partial kernels (small_t_i8/fp8/k8v4/nvfp4.cuh) stage their split's physical page
+// ids in a shared table of kCausalSmallTPageIds entries. The table cannot grow (the INT8 kernel is
+// 64 bytes under the 48 KB static shared limit), and reading pages past it inside the kernels'
+// loops costs 1.5-2% at every length (more spills at 128 registers). So no split carries more than
+// kCausalSmallTSplitKeys keys. A split starts at most 64 - KeyBlock keys into a page and spans
+// at most kCausalSmallTSplitKeys + KeyBlock keys (fewer, when it is not tile-aligned), so it
+// touches at most 64 pages. Past SmallTMaximumSplits x 4,032 keys (165,312 for the 27B's 41 splits, 330,624
+// for the 35B's 82) the split count steps to whole multiples of the cap, which keep the grid's
+// waves full; below that the split counts, and the kernels, are unchanged.
+inline constexpr int kCausalSmallTPageIds   = 64;
+inline constexpr int kCausalSmallTSplitKeys = 4032;
+static_assert((kPagedKVPageSize + kCausalSmallTSplitKeys + kPagedKVPageSize - 1) /
+                  kPagedKVPageSize <=
+              kCausalSmallTPageIds);
+
+static_assert(CausalSmallTSplitTiers::kKeysBeyond <= kCausalSmallTSplitKeys);
+
+// The policy's split count with that bound applied.
+__host__ __device__ constexpr int causal_small_t_page_floor(int splits, int window) {
+    if (window <= splits * kCausalSmallTSplitKeys) { return splits; }
+    return splits * ((window + splits * kCausalSmallTSplitKeys - 1) /
+                     (splits * kCausalSmallTSplitKeys));
+}
+
 template <typename Geometry>
 __device__ __forceinline__ int causal_small_t_default_splits(int window) {
     using Tiers               = CausalSmallTSplitTiers;
@@ -100,7 +124,12 @@ __device__ __forceinline__ int causal_small_t_default_splits(int window) {
     constexpr int kMinSplits = 4 * Geometry::SmallTSplitScale;
     int splits               = div_up(window, target_keys_per_split);
     splits                   = splits > kMinSplits ? splits : kMinSplits;
-    return splits < Geometry::SmallTMaximumSplits ? splits : Geometry::SmallTMaximumSplits;
+    // causal_small_t_page_floor with a compile-time divisor: below the cap the window is already
+    // within the cap's span (tiers carry far fewer than kCausalSmallTSplitKeys keys per split).
+    constexpr int kSpan = Geometry::SmallTMaximumSplits * kCausalSmallTSplitKeys;
+    const int capped =
+        splits < Geometry::SmallTMaximumSplits ? splits : Geometry::SmallTMaximumSplits;
+    return window > kSpan ? capped * ((window + kSpan - 1) / kSpan) : capped;
 }
 
 template <typename Geometry, bool Int8>

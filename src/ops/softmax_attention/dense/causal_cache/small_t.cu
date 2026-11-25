@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -42,7 +43,9 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
     if (window > 8198) { include_tier(16390, Tiers::kKeysUpTo16390 / Geometry::SmallTSplitScale); }
     if (window > 16390) { include_tier(window, Tiers::kKeysBeyond / Geometry::SmallTSplitScale); }
 
-    return (splits < Geometry::SmallTMaximumSplits) ? splits : Geometry::SmallTMaximumSplits;
+    // The page-table bound of causal_small_t_default_splits (small_t.cuh).
+    return causal_small_t_page_floor(
+        (splits < Geometry::SmallTMaximumSplits) ? splits : Geometry::SmallTMaximumSplits, window);
 }
 
 template <typename Geometry>
@@ -115,6 +118,13 @@ std::int32_t causal_small_t_launch_capacity(CausalAttentionExecutionEnvelope env
     // Evaluating every segment end plus both interval ends gives the exact interval maximum.
     constexpr std::uint32_t ends[] = {128, 160, 512, 4096, 5000, 8198, 16390};
     for (const std::uint32_t end : ends) { include(end); }
+    // The page-table bound grows the split count with the window; the reducer merges one split
+    // per thread of its 256 (causal_merge_split_statistics): about 1M keys for the 27B.
+    if (capacity > 256) {
+        throw std::invalid_argument("causal_softmax_attention split capacity: " +
+                                    std::to_string(envelope.max_visible_keys) +
+                                    " visible keys need more than 256 small-T splits");
+    }
     return capacity;
 }
 
@@ -143,8 +153,8 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
             else if (cache_storage == KvCacheStorage::Nvfp4Group16)
                 target_ctas = narrow ? 320 : 160;
             const int grid_limit = div_up(target_ctas, 4 * batch_size);
-            // A split stages at most 64 physical-page IDs. Leave two 64-key pages for
-            // key-tile rounding and page alignment at the 262144-key resource limit.
+            // Keep splits within 62 pages of keys while the capacity allows; the capacity itself
+            // keeps them within kCausalSmallTSplitKeys (small_t.cuh) past the split cap.
             const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
             return std::min(capacity, std::max({4, grid_limit, page_limit}));
         }
