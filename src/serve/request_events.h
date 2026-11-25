@@ -106,6 +106,9 @@ struct ThroughputReport {
     bool final_interval = false;
 };
 
+// Whether a throughput interval saw any request or state activity; idle intervals are not logged.
+bool throughput_report_has_activity(const ThroughputReport& report);
+
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
                                            const RequestLogMetadata& metadata,

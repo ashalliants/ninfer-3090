@@ -1121,6 +1121,20 @@ int main() {
                      50.0) < 1.0e-12,
         "throughput Host work deltas or normalization are incorrect");
 
+    ThroughputReport idle;
+    idle.current.host_work.engine_maintenance_ns = 84'000;
+    idle.current.host_work.device_wait_ns        = 12'000;
+    failures += check(!throughput_report_has_activity(idle),
+                      "host-work ticks alone must not make an idle interval loggable");
+    ThroughputReport busy = idle;
+    busy.committed_decode_tokens = 1;
+    failures += check(throughput_report_has_activity(busy),
+                      "a decoded token makes the interval loggable");
+    ThroughputReport running = idle;
+    running.current.running_requests = 1;
+    failures += check(throughput_report_has_activity(running),
+                      "a running request makes the interval loggable");
+
     ThroughputReport zero_rounds;
     const Json zero_rounds_json =
         Json::parse(format_throughput_json("serve-test", 5001, zero_rounds));
