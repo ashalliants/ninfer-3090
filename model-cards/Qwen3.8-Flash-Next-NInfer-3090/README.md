@@ -24,6 +24,8 @@ tags:
 
 ![Qwen3.8-Flash-Next on one RTX 3090: NInfer-3090 against Strata on the same GGUF](assets/flash-next-speed.svg)
 
+![Qwen3.8-Flash-Next on one Tesla V100 32 GB: ashalliants/ninfer-3090 against Lapilli on the same card](assets/v100-flash-next.svg)
+
 This model card is the version-controlled source for
 [WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090).
 

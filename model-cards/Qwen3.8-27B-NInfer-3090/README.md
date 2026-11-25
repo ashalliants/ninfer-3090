@@ -24,6 +24,8 @@ tags:
 
 ![Qwen3.8-27B on one RTX 3090: prefill and agent-turn decode gains from NInfer-3090 v0.15.1](assets/perf-uplift.svg)
 
+![Qwen3.8-27B on one Tesla V100 32 GB: ashalliants/ninfer-3090 with DFlash2 and MTP3 against Lapilli on the same card](assets/v100-qwen38-27b.svg)
+
 This model card is the version-controlled source for
 [WarlaxZ/Qwen3.8-27B-NInfer-3090](https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090).
 

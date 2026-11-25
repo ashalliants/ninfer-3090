@@ -26,6 +26,8 @@ tags:
 
 > **Maintained at [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090)**: the engine, converter and builds this artifact is made and tested with. Releases, issues and updates live there, and a star helps others find it.
 
+![Inkling-2-Mini on one Tesla V100 32 GB: ashalliants/ninfer-3090 measured, against the other engines' reported figures](assets/v100-inkling2-mini.svg)
+
 This model card is the version-controlled source for
 [WarlaxZ/Inkling-2-Mini-NInfer-V100](https://huggingface.co/WarlaxZ/Inkling-2-Mini-NInfer-V100).
 

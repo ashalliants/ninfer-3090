@@ -19,6 +19,14 @@ different machine and prompt set, so read the ratio as indicative. The measureme
 
 ![NInfer-3090 throughput on one RTX 3090](docs/assets/perf-banner.svg)
 
+**Also first class on a 32 GB Tesla V100**, where it is faster than the next-best engine we could run
+or find on the same card for every model it serves: 1.34x llama.cpp's decode on Qwen3.6-35B-A3B,
+1.21x Lapilli's on Qwen3.8-27B (1.38x prefill), 1.02x Lapilli's on Flash-Next, and 1.34x the
+fastest reported Inkling-2-Mini decode (Strata's). Per-model charts, the losses and every source:
+[Tesla V100 comparison](docs/tesla-v100.md#comparison-charts).
+
+[![Tesla V100 32 GB: ashalliants/ninfer-3090's speed-up over the next-best engine on the same card, per model, for decode and prefill](docs/assets/v100-headline.svg)](docs/tesla-v100.md#comparison-charts)
+
 **Run a 27B model at about 140 tokens per second on one gaming GPU.** NInfer-3090 is a local LLM
 server with a drop-in OpenAI and Anthropic API, so Claude Code, Codex, Cursor, Cline and other
 tools can point at your own RTX 3090 instead of a paid service. On the same card it decodes up to
