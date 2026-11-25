@@ -274,6 +274,22 @@ NINFER_DEFAULT_THINKING_BUDGET=2048 scripts/run-v100.sh qwen38-27b
 
 ### Qwen3.8-27B
 
+Current figures: decode, one stream, the same prompts and router flags, master `d309f3d8`, 2026-11-25,
+**200 W** (the run behind the comparison charts and the summaries above):
+
+| Prompt | MTP3 | DFlash2 K7 + n-gram 15 |
+|---|---:|---:|
+| code | 110.2 | **147.0** |
+| think | 97.0 | **116.5** |
+| story | **71.9** | 61.5 |
+| Chinese | **73.5** | 41.4 |
+| French | **78.9** | 69.0 |
+| structured JSON | 126.1 | **190.0** |
+
+The table below is the earlier 2026-11-24 ABBA record of the int8-activation DFlash2 drafter
+(#605); it is kept for its before/after columns and is the source of the plain and two-request
+figures, which were not re-measured on 2026-11-25.
+
 Decode, one stream, through `ninfer-serve` with the router's flags (`--gdn-state-fp16
 --prefill-cublas`, INT8 KV, vision overlay), greedy unless noted, 2026-11-24, **200 W** power limit,
 no thermal throttling. DFlash2 runs `--draft-tokens 7 --ngram-draft-tokens 15`, plus
