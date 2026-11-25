@@ -695,8 +695,17 @@ scale, one rounding) and multiplies with WMMA m16n16k16, FP16 in, FP32 accumulat
 activations are staged as FP16 without scaling, exact for BF16 values in FP16's normal range. Gate
 and up rows of one intermediate row sit in one tile so the SwiGLU epilogue pairs them in shared
 memory. Prefill 765 -> 1,160 tok/s at 4.2K, 710 -> 1,000 at 13.4K; prefill-scored PPL (PG-19, 8,192
-context) 6.174 -> 6.173. `NINFER_SM70_MOE_PREFILL_HMMA=0` keeps the old kernels. The shared expert
-(Q8) still runs its `mma.sync` kernels.
+context) 6.174 -> 6.173. `NINFER_SM70_MOE_PREFILL_HMMA=0` keeps the old kernels.
+
+The shared expert (Q8, gate/up 1,024 x 2,048 and down 2,048 x 512, every token) kept its `mma.sync`
+kernels until a profile of a 4K prefill with both changes below put them at 330 ms of 1.75 s. It
+now runs the same WMMA tile GEMM (`hmma_q8_shared_gate_up_kernel`, `hmma_q8_shared_down_kernel`):
+work items of 64 tokens by 32 intermediate (64 output) rows over the whole slice, Q8 code x group
+scale to FP16, and the default kernel's merge order in the down epilogue (destination + routed sum +
+shared scale x down). The adaptive window (47-52 tokens with a Q5/Q6 down) keeps the default
+kernels, which read the device-side job count. 2,409 -> 2,838 tok/s at 4.2K, 1,796 -> 2,017 at
+13.4K; prefill-scored PPL 6.171 -> 6.176. `NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0` keeps the old
+kernels.
 
 The Q8 mixer projections ran their own `mma.sync` kernels too. Per call at 4,096 tokens (nsys,
 200 W, before either change): the GDN input projection (12,288 x 2,048) 38.2 ms, the attention input

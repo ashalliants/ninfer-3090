@@ -107,6 +107,7 @@ These are the model defaults it sets:
 | `NINFER_SM70_VERIFY_ATTN_HMMA=0` | 27B | Runs the INT8-KV small-T attention on the CUDA-core kernels (two-token launches for a verify) instead of the default FP16 tensor-core kernel: an MTP3 round at 172K tokens takes 110 ms instead of 52, at 43K 50 instead of 36 |
 | `NINFER_SM70_Q6_STREAM_WIDE=0` | 27B, DFlash2 | Runs the Q6 output head of a verify wider than eight columns (DFlash2 at two requests, or `--draft-tokens` 8-15) on the emulated `mma.sync` kernel instead of the default int8-activation `dp4a` passes of eight: 9.9 instead of 2.6 ms per 16-column round |
 | `NINFER_SM70_Q8_PREFILL_CUBLAS=0` | 35B-A3B | Prefills the Q8 mixer projections (GDN and attention input projections, both 2,048 x 4,096 output projections) on their emulated `mma.sync` kernels instead of the default cuBLAS FP16 route: 1,160 instead of 2,411 tok/s at 4.2K tokens |
+| `NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0` | 35B-A3B | Prefills the shared expert (Q8 gate/up and down) on its emulated `mma.sync` kernels instead of the default FP16 WMMA kernels: 2,402 instead of 2,836 tok/s at 4.2K tokens |
 | `NINFER_SM70_MOE_PREFILL_HMMA=0` | 35B-A3B | Prefills the routed experts (Q4 gate/up, Q5/Q6 down) on the emulated `mma.sync` kernels instead of the default FP16 WMMA kernels: 765 instead of 1,160 tok/s at 4.2K tokens |
 | `NINFER_SM70_Q8_VERIFY_A8=0` | 35B-A3B | Runs the Q8 mixer projections of an MTP3 verify (the GDN and attention input projections, 12,288 and 9,216 x 2,048, and the 2,048 x 4,096 output projections) on the A16 streaming GEMV instead of the default int8-activation `dp4a` passes under `--verify-a8`: 5-14% slower MTP3, decode-path KLD at four tokens 2.71e-3 instead of 3.37e-3 |
 | `NINFER_SM70_VERIFY_PROMPT_ATTN=1` | 35B-A3B | Lets a DFlash or MTP verify of 6-16 columns take the FA2 prompt attention kernel at short contexts (its RTX 3090 limits, up to 288-1,024 keys) instead of the default small-T routes; the prompt kernel is emulated `mma.sync` on Volta: DFlash K7 structured JSON 293 instead of 319 tok/s |
@@ -397,7 +398,22 @@ the same top-1 at one token and 2.57e-3 / 97.40% at four, against master's 2.49e
 2.51e-3 / 97.50%.
 
 Prefill, same server flags at 65,536 context with MTP3, one 4.2K / 13.4K / 40.2K-token prompt each,
-2026-11-25, 200 W, no thermal throttling, one ABBA over both sm_70 prefill routes:
+2026-11-25, 200 W, no thermal throttling. The shared expert's prefill GEMMs now run FP16 WMMA kernels
+too. ABBA against `NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0` (the shared expert on its emulated
+`mma.sync` kernels, as before):
+
+| Prompt | default | `NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0` |
+|---|---:|---:|
+| 4.2K tokens | **2,834.4-2,837.7** | 2,395.8-2,408.7 |
+| 13.4K | **2,015.4-2,016.8** | 1,794.5-1,795.7 |
+| 40.2K | **1,049.9** | 987.0 |
+
+llama.cpp prefills 2,745 tok/s at 4.2K on this card at its default batch (3,280 with `-ub 2048
+-b 4096`). Prefill-scored PPL (PG-19, 8,192 context, BF16 KV) is 6.176 against 6.171 with the
+opt-out; decode-path KLD after a prefilled first half is 2.60e-3 / 97.75% the same top-1, the
+model's floor for any change to prefill numerics (2.55e-3 without it).
+
+The earlier ABBA over the first two sm_70 prefill routes (before the shared expert's kernels):
 
 | Prompt | default | `NINFER_SM70_Q8_PREFILL_CUBLAS=0` | `NINFER_SM70_MOE_PREFILL_HMMA=0` | both off |
 |---|---:|---:|---:|---:|
@@ -407,9 +423,8 @@ Prefill, same server flags at 65,536 context with MTP3, one 4.2K / 13.4K / 40.2K
 
 The routed experts' gate/up (Q4) and down (Q5/Q6) prefill GEMMs run FP16 WMMA kernels, and the Q8
 mixer projections the cuBLAS FP16 prefill route; before, both ran Ampere `mma.sync` under
-emulation. llama.cpp prefills 2,745 tok/s at 4.2K on this card (default batch; 3,280 with
-`-ub 2048 -b 4096`), so the gap is now 12% at its default batch. Prefill-scored PPL (PG-19, 8,192
-context) is 6.171 with both against 6.174 with neither.
+emulation. With those two the gap to llama.cpp's 2,745 at 4.2K was 12%. Prefill-scored PPL (PG-19,
+8,192 context) is 6.171 with both against 6.174 with neither.
 
 ### Qwen3.8-Flash-Next
 

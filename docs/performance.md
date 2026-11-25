@@ -17,6 +17,15 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Qwen3.6-35B-A3B shared expert's prefill on the tensor cores (2026-11-25)
+
+In a V100 build the 35B-A3B prefills the shared expert (Q8 gate/up and down) on FP16 WMMA kernels,
+as the routed experts already were. One prompt each, 65,536 context, MTP3 flags, 200 W, ABBA:
+**2,838 tok/s at 4.2K tokens** (2,409 before), 2,017 at 13.4K (1,796), 1,050 at 40.2K (987), past
+llama.cpp's 2,745 at 4.2K on this card. Decode is unchanged. `NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0`
+keeps the old kernels; the RTX 3090 does not build the route. Details:
+[tesla-v100.md](tesla-v100.md#qwen36-35b-a3b).
+
 ## Tesla V100 (`sm_70`): Qwen3.6-35B-A3B DFlash verify attention off the emulated prompt kernel (2026-11-25)
 
 In a V100 build a 35B-A3B verify of 6-16 columns keeps the small-T attention routes at short

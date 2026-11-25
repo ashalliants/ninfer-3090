@@ -1324,7 +1324,14 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 
         const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
                                     (tokens + kExpertBN - 1) / kExpertBN);
-        if (adaptive) {
+        // sm_70: the shared expert on the FP16 tensor cores too (the adaptive window keeps the
+        // default kernels, which skip on the device-side job count).
+        const bool shared_hmma = !adaptive && sparse_moe_prefill_shared_hmma_enabled();
+        if (shared_hmma) {
+            sparse_moe_prefill_hmma_shared_gate_up(input, shared_gate_codes, shared_gate_scales,
+                                                   shared_activation, tokens,
+                                                   static_cast<int>(max_prefill_blocks), stream);
+        } else if (adaptive) {
             sparse_moe_prefill_q8_gate_up_kernel<false, true>
                 <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
                     input, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
@@ -1396,7 +1403,12 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 shared_down_grid(kHidden / kExpertBM, (tokens + kExpertBN - 1) / kExpertBN);
-        if (adaptive) {
+        if (shared_hmma) {
+            sparse_moe_prefill_hmma_shared_down(shared_activation, shared_down_codes,
+                                                shared_down_scales, routed_sum, shared_scale,
+                                                output, tokens,
+                                                static_cast<int>(max_prefill_blocks), stream);
+        } else if (adaptive) {
             sparse_moe_prefill_q8_down_kernel<false, true>
                 <<<shared_down_grid, kExpertThreads, 0, stream>>>(
                     shared_activation, nullptr, shared_down_codes, shared_down_scales, nullptr,
