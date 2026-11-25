@@ -15,14 +15,14 @@ Each release ships a prebuilt V100 archive for Linux, `ninfer-v100-linux-x64-<ve
 
 All figures were measured on one V100-PCIE-32GB, connected over an OCuLink PCIe Gen3 x4 eGPU link
 (3.3 GB/s host-to-device), on a Linux host with 59 GiB of RAM, with a 250 W power limit
-(2026-11-16 to 2026-11-18), except the 27B's speculative decode, re-measured at 200 W on 2026-11-24, and Flash-Next's MTP
+(2026-11-16 to 2026-11-18), except the 27B's speculative decode, re-measured at 200 W on 2026-11-25 (master `d309f3d8`), and Flash-Next's MTP
 decode, re-measured at 200 W on 2026-11-25.
 Decode is greedy with MTP speculation, as `run-v100.sh` serves it (three drafts; seven for Flash-Next).
 
 | | Qwen3.8-27B | Qwen3.8-Flash-Next |
 |---|---:|---:|
 | **Context** | 262,144 tokens | **262,144 tokens** (`run-v100.sh` default) |
-| **Decode**, one stream, MTP | **110 tok/s** on code, 104 thinking, 77-81 story, Chinese and French (MTP3, 2026-11-24, 200 W) | **129.6 tok/s** on code, 103-106 thinking, 82-83 story, 81 Chinese, 77 French (MTP7 + draft vocabulary, warm cache, 2026-11-25, 200 W) |
+| **Decode**, one stream, MTP | **147 tok/s** on code, 116.5 thinking, 190 structured JSON (DFlash2 K7 + n-gram 15, the router's setting); 110.2 code, 97.0 thinking, 71.9-78.9 story, Chinese and French (MTP3); master `d309f3d8`, 2026-11-25, 200 W | **129.6 tok/s** on code, 103-106 thinking, 82-83 story, 81 Chinese, 77 French (MTP7 + draft vocabulary, warm cache, 2026-11-25, 200 W) |
 | **Decode**, plain | 45 tok/s (200 W) | 53 tok/s (250 W) |
 | **Prefill**, ~4K-token prompt | **~1,020 tok/s** | **~990 tok/s** (3,798 tokens in 3.8 s) |
 | **Prefill**, long prompts | | 38K tokens in 38.4 s (~1,000 tok/s) |
