@@ -1252,4 +1252,53 @@ if out="$(run_v100_35b NINFER_VISION_RESIDENCY=overlay 2>&1)"; then v100_fail '3
 run_v100_35b NINFER_VISION=off NINFER_VISION_RESIDENCY=overlay >/dev/null 2>&1 || v100_fail '35B-A3B text only did not start'
 ! grep -q -- '--vision' "$tmp/v100.args" || v100_fail '35B-A3B NINFER_VISION=off still passed --vision'
 
+# package-release.sh ships the CLI as a link to ninfer-serve when the server runs as the CLI under the name
+# `ninfer` (apps/serve/main.cpp), and a separate `ninfer` binary otherwise. Exercise both on fake build trees in a
+# throwaway copy of the packager's inputs, so nothing lands in the real dist/.
+pkg_fail() { printf 'package-release.sh: %s\n' "$1" >&2; exit 1; }
+pkg="$tmp/pkgrepo"
+mkdir -p -- "$pkg/scripts" "$pkg/docs/release-notes" "$pkg/src/runtime/engine/compaction"
+cp -- "$root/package-release.sh" "$root/run.sh" "$root/download-model.sh" "$root/run-v100.sh" "$pkg/scripts/"
+cp -R -- "$root/profiles" "$pkg/scripts/profiles"
+cp -- "$repo_root/LICENSE" "$pkg/LICENSE"
+cp -- "$repo_root/src/runtime/engine/compaction/NOTICE" "$pkg/src/runtime/engine/compaction/NOTICE"
+cp -- "$repo_root/docs/release-archive-linux.md" "$repo_root/docs/release-archive-v100.md" "$pkg/docs/"
+printf '9.9.9-test\n' > "$pkg/VERSION"
+printf 'notes\n' > "$pkg/docs/release-notes/RELEASE_NOTES_9.9.9.md"
+fake_tree() {  # fake_tree <dir> multicall|legacy
+  mkdir -p -- "$1/apps" "$1/bench"
+  if [[ "$2" == multicall ]]; then
+    printf '#!/usr/bin/env bash\ncase "$(basename "$0")" in ninfer) echo "ninfer 9.9.9";; *) echo "ninfer-serve 9.9.9";; esac\n' > "$1/apps/ninfer-serve"
+  else
+    printf '#!/usr/bin/env bash\necho "ninfer-serve 9.9.9"\n' > "$1/apps/ninfer-serve"
+    printf '#!/usr/bin/env bash\necho "ninfer 9.9.9"\n' > "$1/apps/ninfer"
+    chmod +x "$1/apps/ninfer"
+  fi
+  printf '#!/usr/bin/env bash\necho bench\n' > "$1/bench/ninfer_bench"
+  chmod +x "$1/apps/ninfer-serve" "$1/bench/ninfer_bench"
+}
+unpack_archive() {  # unpack_archive <target> <tree> -> prints the unpacked directory
+  rm -rf -- "$pkg/dist" "$tmp/unpacked"; mkdir -p -- "$tmp/unpacked"
+  NINFER_PACKAGE_TARGET="$1" NINFER_BUILD_ROOT="$2" "$pkg/scripts/package-release.sh" >/dev/null 2>"$tmp/pkg.err" ||
+    pkg_fail "failed for $1: $(cat -- "$tmp/pkg.err")"
+  tar -xzf "$pkg"/dist/*.tar.gz -C "$tmp/unpacked"
+  printf '%s\n' "$tmp"/unpacked/*/
+}
+for target in rtx3090 v100; do
+  fake_tree "$tmp/pkgtree-multi" multicall
+  out="$(unpack_archive "$target" "$tmp/pkgtree-multi")"
+  [[ -L "${out}ninfer" && "$(readlink -- "${out}ninfer")" == ninfer-serve ]] || pkg_fail "$target: ninfer is not a link to ninfer-serve"
+  [[ "$("${out}ninfer" --version)" == 'ninfer 9.9.9' ]] || pkg_fail "$target: the linked ninfer does not run as the CLI"
+  [[ "$("${out}ninfer-serve" --version)" == 'ninfer-serve 9.9.9' ]] || pkg_fail "$target: ninfer-serve stopped being the server"
+  [[ -x "${out}ninfer_bench" ]] || pkg_fail "$target: ninfer_bench is missing"
+  grep -Eq '  ./ninfer$' "${out}SHA256SUMS.txt" || pkg_fail "$target: SHA256SUMS.txt omits the ninfer link"
+  ( cd -- "$out" && sha256sum -c --quiet SHA256SUMS.txt ) >/dev/null 2>&1 || pkg_fail "$target: SHA256SUMS.txt does not verify"
+
+  fake_tree "$tmp/pkgtree-legacy" legacy
+  out="$(unpack_archive "$target" "$tmp/pkgtree-legacy")"
+  [[ -f "${out}ninfer" && ! -L "${out}ninfer" ]] || pkg_fail "$target: a build without the CLI mode did not get its own ninfer"
+  [[ "$("${out}ninfer" --version)" == 'ninfer 9.9.9' ]] || pkg_fail "$target: the fallback ninfer is the wrong binary"
+done
+rm -rf -- "$pkg/dist" "$tmp/unpacked" "$tmp/pkgtree-multi" "$tmp/pkgtree-legacy"
+
 printf '%s\n' 'Linux script checks passed.'

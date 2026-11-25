@@ -106,7 +106,7 @@ mkdir -- "$product_root/profiles"
 cp -- "$repo_root"/scripts/profiles/*.json "$product_root/profiles/"
 (
   cd -- "$product_root"
-  mapfile -d '' files < <( { find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0
+  mapfile -d '' files < <( { find . -maxdepth 1 \( -type f -o -type l \) ! -name SHA256SUMS.txt -print0
                              find ./profiles -maxdepth 1 -type f -print0; } | LC_ALL=C sort -z)
   sha256sum -- "${files[@]}" > SHA256SUMS.txt
 )
