@@ -1230,4 +1230,26 @@ run_v100_fn NINFER_PREFIX_CACHE=off || v100_fail 'NINFER_PREFIX_CACHE=off did no
 ! grep -q -- '--context-store' "$tmp/v100.args" || v100_fail 'NINFER_PREFIX_CACHE=off still passed a store'
 [[ ! -e "$v100_home/.cache/ninfer/context-store" ]] || v100_fail 'NINFER_PREFIX_CACHE=off still created the store'
 
+# run-v100.sh serves Qwen3.6-35B-A3B at two lanes with the Vision tower resident (overlay refuses at
+# startup on this model), refuses NINFER_VISION_RESIDENCY=overlay before starting, and leaves
+# NINFER_VISION=off and NINFER_CONCURRENCY to the caller.
+run_v100_35b() {
+  clear_env HOME="$v100_home" NINFER_TEST_WHO="$tmp/v100.who" NINFER_TEST_ARGS="$tmp/v100.args" \
+    NINFER_MODEL_DIR="$tmp" BUILD_DIR="$v100_tree" "$@" "$root/run-v100.sh" qwen36-35b-a3b
+}
+v100_has() { tr '\n' ' ' < "$tmp/v100.args" | grep -qF -- "$1 "; }
+run_v100_35b >/dev/null 2>&1 || v100_fail '35B-A3B did not start'
+grep -qF -- 'qwen36-35b-a3b-tuned-mtp.json' "$tmp/v100.args" || v100_fail '35B-A3B did not use the tuned MTP profile'
+v100_has '--vision --vision-residency resident' || v100_fail '35B-A3B did not keep the Vision tower resident'
+v100_has '--max-concurrency 2' || v100_fail '35B-A3B did not default to two lanes'
+v100_has '--fit-context 32768' || v100_fail '35B-A3B lost the automatic context fit'
+run_v100_35b NINFER_CONCURRENCY=3 >/dev/null 2>&1 || v100_fail '35B-A3B with NINFER_CONCURRENCY=3 did not start'
+v100_has '--max-concurrency 3' || v100_fail '35B-A3B ignored NINFER_CONCURRENCY'
+rm -f -- "$tmp/v100.args"
+if out="$(run_v100_35b NINFER_VISION_RESIDENCY=overlay 2>&1)"; then v100_fail '35B-A3B accepted overlay residency'; fi
+[[ "$out" == *'NINFER_VISION_RESIDENCY=overlay does not work'* && ! -e "$tmp/v100.args" ]] ||
+  v100_fail "35B-A3B overlay was not refused before starting: $out"
+run_v100_35b NINFER_VISION=off NINFER_VISION_RESIDENCY=overlay >/dev/null 2>&1 || v100_fail '35B-A3B text only did not start'
+! grep -q -- '--vision' "$tmp/v100.args" || v100_fail '35B-A3B NINFER_VISION=off still passed --vision'
+
 printf '%s\n' 'Linux script checks passed.'

@@ -168,7 +168,7 @@ unpack it, and use its V100 launcher, which listens on the network, so set `NINF
 ```bash
 tar -xzf ninfer-v100-linux-x64-*.tar.gz && cd ninfer-v100-linux-x64-*/
 ./download-model.sh qwen38-27b           # ~19 GB, resumable
-NINFER_API_KEY=<a secret> ./run-v100.sh qwen38-27b   # MTP3 with INT8 KV, 262,144 tokens; also qwen38-flash-next
+NINFER_API_KEY=<a secret> ./run-v100.sh qwen38-27b   # MTP3 with INT8 KV, 262,144 tokens; also qwen38-flash-next, qwen36-35b-a3b
 ```
 
 [V100 guide](docs/tesla-v100.md) for Flash-Next, Inkling-2-Mini and the measurements.
