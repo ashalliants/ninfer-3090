@@ -69,17 +69,21 @@ gdn_input_proj_split_workspace_capacity_bytes(QType qk_qtype, std::int32_t qk_ro
  *   [2048,2048,6144,6144].
  *
  * The first three ranges are written contiguously to qkv and the final range is written to z.
- * Q8 uses A16 under every policy. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits
- * private activation quantization at every positive T. FP8 accepts all policies; AllowA8/AllowA4
- * selects A16 through T=7 and private activation quantization followed by A8 Tensor Core
- * contraction at every T>=8. Every route writes the two independent final allocations directly.
+ * Q8 uses A16 under every policy, except that on sm_70 AllowPrefillCublas (and its narrow form)
+ * admits the FP16 cuBLAS prefill route from the policy's token gate (cublas_prefill_min_tokens):
+ * the weight is materialised in the workspace as FP16 (code x group scale, one rounding) and the
+ * activation scaled exactly into FP16, with FP32 accumulation. NVFP4 uses A16 under
+ * A16Only/AllowA8; AllowA4 permits private activation quantization at every positive T. FP8
+ * accepts all policies; AllowA8/AllowA4 selects A16 through T=7 and private activation
+ * quantization followed by A8 Tensor Core contraction at every T>=8. Every route writes the two independent final allocations directly.
  * The complete projection is evaluated against the same exact-decode/naive-FP64 oracle;
  * activation quantization and the production reduction profile are private effects covered by the
  * selected criterion. x, both persistent weight planes, qkv, z, and the live workspace must be
  * mutually non-overlapping.
  *
  * The policy-bearing form uses caller-owned call-scoped transient storage sized by
- * gdn_input_proj_workspace_capacity_bytes(). A16 requires zero bytes. The convenience overload
+ * gdn_input_proj_workspace_capacity_bytes(). A16 requires zero bytes; the sm_70 Q8 cuBLAS route
+ * reports its scratch there under AllowPrefillCublas. The convenience overload
  * selects A16Only and requires no transient workspace.
  */
 [[nodiscard]] std::size_t

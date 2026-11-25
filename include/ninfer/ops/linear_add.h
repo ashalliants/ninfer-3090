@@ -57,7 +57,10 @@ namespace ninfer::ops {
  *   form, whose Q8_1 activation cast is a semantic boundary that the oracle applies too.
  *
  * Compute policy:
- *   All policies permit the A16 implementations of Q4, Q5, Q8 and BF16. NVFP4 uses A16 for
+ *   All policies permit the A16 implementations of Q4, Q5, Q8 and BF16. AllowPrefillCublas (and its
+ *   narrow form) admits the cuBLAS prefill route for Q4/Q5 and, on sm_70 only, Q8 (FP16 form:
+ *   weight materialised as code x group scale in the workspace, FP32 accumulation) from the
+ *   policy's token gate. NVFP4 uses A16 for
  *   A16Only/AllowA8 and may use A4 under AllowA4. FP8 may use A8 under AllowA8/AllowA4. GGML
  *   formats register only the Q8_1 (A8) profile, which every policy except A16Only admits.
  *   Each registration owns its production plan. A permissive policy
@@ -69,7 +72,8 @@ namespace ninfer::ops {
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_add_workspace_capacity_bytes(), scoped to
- *   the call. A16 routes require no storage; quantized-activation routes use the reported capacity.
+ *   the call. A16 routes require no storage; quantized-activation and cuBLAS prefill routes use the
+ *   reported capacity.
  *   There is no persistent state side effect.
  */
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,

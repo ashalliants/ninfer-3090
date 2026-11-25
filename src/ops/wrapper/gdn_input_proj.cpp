@@ -294,9 +294,10 @@ void validate_policy(LinearPolicy policy) {
     // below, where no such route is registered for their qtypes.
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
-    // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
-    // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
-    // one engine-wide setting does not have to be threaded per Op.
+    // The cuBLAS prefill route is registered for linear_swiglu, linear_add and, on sm_70, this
+    // Op's single Q8 parent (FP16 form, from the policy's token gate, with workspace scratch).
+    // Everywhere else this policy means exactly what AllowA8Int means, and is accepted rather than
+    // rejected so that one engine-wide setting does not have to be threaded per Op.
     case LinearPolicy::AllowPrefillCublas:
     case LinearPolicy::AllowPrefillCublasNarrow:
     // The lossy scout's int4 route, registered for the split Q4/Q5 pair's prefill form only.

@@ -88,9 +88,10 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::AllowA4:
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
-    // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
-    // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
-    // one engine-wide setting does not have to be threaded per Op.
+    // The cuBLAS prefill route is registered for linear_swiglu and linear_add (Q4/Q5, and Q8 on
+    // sm_70 in its FP16 form). Everywhere else this policy means exactly what AllowA8Int means, and
+    // is accepted rather than rejected so that one engine-wide setting does not have to be threaded
+    // per Op.
     case LinearPolicy::AllowPrefillCublas:
     case LinearPolicy::AllowPrefillCublasNarrow:
     // The scout's int4 route: AllowA8Int, with int4 activations for Q4 wherever the A8 route runs.
