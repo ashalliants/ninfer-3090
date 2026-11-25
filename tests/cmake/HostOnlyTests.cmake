@@ -42,6 +42,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_greedy_identity_test
   ninfer_hc_int8_codec_test
   ninfer_grammar_test
+  ninfer_inkling2_constraint_test
   ninfer_host_arena_replay_test
   ninfer_host_timing_test
   ninfer_http_security_test

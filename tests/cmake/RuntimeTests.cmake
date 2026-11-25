@@ -82,6 +82,13 @@ ninfer_add_test(ninfer_effective_thinking_budget_test
 ninfer_add_test(ninfer_grammar_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_grammar.cpp"
   LIBRARIES ninfer_grammar)
+# Inkling-2's constraint frame (models/inkling2/frontend/constraint.cpp) over the shared grammar; host only.
+# STANDALONE: it compiles constraint.cpp itself, which the bundled ninfer_tests also links via the model runtime.
+ninfer_add_test(ninfer_inkling2_constraint_test
+  STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_inkling2_constraint.cpp"
+          "${PROJECT_SOURCE_DIR}/src/models/inkling2/frontend/constraint.cpp"
+  LIBRARIES ninfer_grammar)
 
 # The Python oracles drive these probes by executable path, so they stay STANDALONE.
 ninfer_add_test(ninfer_regex_choice_test

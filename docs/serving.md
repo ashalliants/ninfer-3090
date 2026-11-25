@@ -1398,6 +1398,12 @@ Output constraints reject custom stops. OpenAI errors use
 legal next token. Anthropic reports these through its `invalid_request_error` envelope.
 The `grammar` and `guided_*` aliases are not accepted.
 
+**Inkling-2-Mini** serves every mode above. Its turn is framed by control tokens, which the server places
+itself: the reasoning stays free text (a thinking budget's close included), and the constraint covers the answer
+from its first token to the model's end. Under a constraint Inkling-2 writes no tool call, even with tools active.
+Constrained requests run with `--spec dspark` and with several lanes (`--max-concurrency`); see the
+[Inkling-2 notes](maintainer/inkling2-model.md#output-constraints).
+
 Constrained responses include a NInfer `constraint` observation. `branch` is `undecided`, `content`,
 or `tools`; `complete` means the committed language can end, and `terminated` means it accepted EOS.
 A complete JSON value can therefore have `complete:true`, `terminated:false` and a length finish

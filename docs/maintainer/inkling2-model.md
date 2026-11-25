@@ -569,15 +569,16 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   - grafts and LoRA adapters other than the two opt-in forms of [Adapters](#adapters-opt-in-uncensoring)
     (a `'+'` combination of grafts too);
   - video;
-  - output constraints (grammar, JSON schema) and `tool_choice` required or named;
+  - `tool_choice` required or named;
+  - an output constraint with custom stops, raw output or preserved special tokens (as the Qwen models refuse it);
   - logprobs;
   - a prompt that leaves no room for one output token (token counting still reports its length);
   - a stop token id outside the vocabulary.
-- Tool calls are free generation: the default `tool_constraints` (`basic`) is not enforced, since the route has
-  no grammar engine (output constraints are refused for the same reason). A call's name and arguments are what
-  the model wrote; malformed JSON stays content. `parallel_tool_calls: false` ends the request at the first
+- Tool calls are free generation: the default `tool_constraints` (`basic`) is not enforced. A call's name and
+  arguments are what the model wrote; malformed JSON stays content. `parallel_tool_calls: false` ends the request at the first
   complete call (finish reason stop token, as the model's end token would).
 - A server without `--vision` binds and uploads no vision tower, and one without `--spec dspark` no drafter.
+- Output constraints (JSON object and schema, GBNF, choice, regex): see [Output constraints](#output-constraints).
 
 **Output.** Control tokens switch the channel, as `tokenizer_config.json`'s `response_template` describes:
 
@@ -670,6 +671,38 @@ tokens/s through the Engine, and the same image at 234 tokens in 0.088 s of visi
   - a greedy chat returns `"content": "Paris"`, with the reasoning in `reasoning_content`;
   - streaming sends reasoning deltas, then content;
   - the image request describes "MEN WALK ON MOON".
+
+## Output constraints
+
+`models/inkling2/frontend/constraint.{h,cpp}`. The shared grammar (`text::GrammarCompiler`, xgrammar, the Qwen
+models' too) works on token text, and Inkling-2's channels are control tokens, which its vocabulary leaves empty
+(forbidden). So `ConstrainedOutput` enforces the turn's frame itself and hands the grammar the answer alone:
+
+```text
+<|message_model|> ( <|content_thinking|> reasoning <|end_message|> <|message_model|> )? <|content_text|>
+answer <|end_message|> <|content_model_end_sampling|>
+```
+
+- The reasoning is any text token (no control token but its `<|end_message|>`), unconstrained, as the Qwen
+  models' reasoning before their close. A thinking budget's injected close is the same path.
+- The answer is the grammar's language; `<|end_message|>` is the grammar's EOS, allowed once the answer is
+  complete. Nothing else is reachable: no tool call (also with tools active, where the Qwen models' JSON modes
+  allow one), no second reasoning message.
+- The grammar compiler is built on the first constrained request (an Engine that never sees one never builds
+  it); each request compiles its constraint in `submit()`, so a bad schema is a request error before it queues.
+- Each token is chosen from the column's logits on the host after `restrict()` sets the disallowed ids to
+  `-inf`. `sample()` is unchanged (one uniform a token), so a constrained greedy request skips the on-device
+  argmax and downloads its column; unconstrained requests run exactly as before.
+- `--spec dspark`: no change. A round's tokens are still chosen one at a time from the target's (now masked)
+  logits and a draft is consumed only when it equals that choice, so the output is plain constrained decoding's;
+  the drafter's proposals are unmasked, so fewer survive.
+- Batched decode (`--max-concurrency > 1`): a constrained row is read on the host as a sampled row is; the others
+  keep the device argmax.
+
+Tests: `ninfer_inkling2_constraint_test` (host only: the frame, the reasoning, the answer grammar, the budget's
+close, a schema, `restrict()`) and `ninfer_inkling2_engine_constraints_test` (real artifact: JSON schema, JSON
+object sampled under a thinking budget, choice; unconstrained requests unchanged around them; batched and DSpark
+give the solo and plain tokens; a custom stop is refused).
 
 ## Adapters (opt-in uncensoring)
 

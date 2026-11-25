@@ -150,8 +150,9 @@ calls (`parallel_tool_calls` honoured), reasoning and thinking budgets, stop str
   accumulation, by default. `--kv-dtype fp32` runs the exact FP32 program and prefill instead (slower; see
   [Accuracy](#accuracy)).
 
-Not supported yet: the context store and host cache tiers (the server refuses those options), JSON-schema or
-grammar output, and logprobs.
+JSON mode, JSON Schema, GBNF grammars, choice and regex output are supported (the reasoning stays free; the answer
+follows the constraint). Not supported yet: the context store and host cache tiers (the server refuses those
+options), and logprobs.
 
 **On an RTX 3090**, build NInfer for the 3090 (the [release archives](https://github.com/ashalliants/ninfer-3090/releases/latest)
 or the Linux build guide) and serve with a context that fits beside the desktop:
