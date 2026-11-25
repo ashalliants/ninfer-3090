@@ -698,6 +698,8 @@ private:
         // says so. The store is off for this Engine's life; its directory is untouched.
         if (!constructed.context_store_on) {
             constructed.load.context_store_off_for_run = options.context_store.directory.string();
+            constructed.load.context_store_off_reason =
+                models::qwen4_exp::context_store_off_summary(constructed.context_store_off_cause);
             options.context_store.directory.clear();
         }
         qwen4               = std::move(constructed.instance);
@@ -725,6 +727,8 @@ private:
                 "its tiers did not open; see the context cache line above");
             load.warnings.push_back(warning);
             load.context_store_off_for_run = options.context_store.directory.string();
+            load.context_store_off_reason =
+                models::qwen4_exp::context_store_off_summary(models::qwen4_exp::ContextStoreOff::TierSetupFailed);
             options.context_store.directory.clear();
         }
         if (options.context_store.enabled()) { attach_context_store(*generation); }

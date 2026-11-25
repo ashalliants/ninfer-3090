@@ -124,22 +124,46 @@ enum class ContextCacheOff : std::uint8_t {
 struct ContextCacheFit {
     std::uint64_t bytes = 0;
     bool shrunk         = false; // less than requested
-    // What the ledger could spare for the tier before the minimum and the granule applied (0 when
-    // the experts do not fit at all): how far short of `minimum` an off cache was.
+    // What the ledger could spare for the tier after the memory-lock limit and before the minimum
+    // and the granule applied (0 when the experts do not fit at all): how far short of `minimum` an
+    // off cache was.
     std::uint64_t spare = 0;
     ContextCacheOff off = ContextCacheOff::None;
 };
+// Why a Host tier came out at zero, from fit_context_cache's figures: `ram_spare` before the lock
+// limit, `spare` after it; `candidate` the tier the spare rounded to, and whether the final exact
+// ledger check then refused it and was lock-limited. The final check's verdict wins over the
+// pre-check figures.
+[[nodiscard]] ContextCacheOff context_cache_off_cause(std::uint64_t requested, std::uint64_t minimum, std::uint64_t granule,
+                                                      std::uint64_t ram_spare, std::uint64_t spare, std::uint64_t candidate,
+                                                      bool final_check_lock_limited) noexcept;
 [[nodiscard]] ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemoryDemand demand,
                                                 std::uint64_t requested, std::uint64_t minimum,
                                                 std::uint64_t granule);
 
 // Whether the context cache's NVMe tier (--context-nvme-mib) can serve as the cache: decided where
 // the tier is planned, which also opens its file. `reason` says why a configured tier cannot.
-struct NvmeTierStatus {
-    bool configured = false;
-    bool usable     = false;
-    std::string reason;
+// Why a configured NVMe tier cannot serve as the cache.
+enum class NvmeTierIssue : std::uint8_t {
+    None,
+    FreeSpaceUnreadable, // its drive's free space could not be read, so it could not be capped
+    BelowMinimum,        // under the tier minimum once capped at half the drive's free space
+    TooSmall,            // cannot hold two checkpoints
+    FileFailed           // its file could not be created
 };
+struct NvmeTierStatus {
+    bool configured     = false;
+    bool usable         = false;
+    NvmeTierIssue issue = NvmeTierIssue::None;
+    std::string detail; // the figures or the error, for the warning
+};
+// The NVMe tier's pinned bounce buffer the RAM ledger counts: only a usable tier allocates one, so a
+// tier that turned out unusable charges nothing (its Host-only fallback does not need it).
+[[nodiscard]] constexpr std::uint64_t nvme_bounce_demand(const NvmeTierStatus& status, std::uint64_t bounce_bytes) noexcept {
+    return status.usable ? bounce_bytes : 0;
+}
+// The phrase for an NVMe issue, used by the startup lines and the store warning alike.
+[[nodiscard]] std::string describe_nvme_issue(const NvmeTierStatus& status);
 
 // The context store restores saved sessions into the context cache, so a store needs a cache: a
 // Host tier that holds two checkpoints, or a usable NVMe tier. Decided with the RAM ledger, before
@@ -151,8 +175,21 @@ struct NvmeTierStatus {
 //   cannot hold two checkpoints or be opened): the model starts with the store off for this run,
 //   and `warning` gives the cause and the remedy that fits it. Sessions already on disk stay there
 //   for a later start; output is unchanged, prompts are just prefilled in full.
+// Why the context store is off for this run: one value, from which both the warning and the
+// startup log's short reason are written (context_store_off_summary).
+enum class ContextStoreOff : std::uint8_t {
+    None,
+    Ram,            // the RAM ledger could not spare the Host tier's minimum
+    BelowMinimum,   // the Host budget configured is under the minimum
+    HostTooSmall,   // the Host tier cannot hold two checkpoints
+    LockLimit,      // RLIMIT_MEMLOCK could not pin the Host tier's minimum
+    NvmeUnusable,   // no Host budget, and the NVMe tier configured cannot be used
+    TierSetupFailed // a tier the ledger planned did not open (a pin failure, say)
+};
+[[nodiscard]] const char* context_store_off_summary(ContextStoreOff cause) noexcept;
 struct ContextStoreStart {
-    bool store_on = true;
+    bool store_on         = true;
+    ContextStoreOff cause = ContextStoreOff::None;
     std::string refusal;
     std::string warning;
 };
@@ -160,7 +197,8 @@ struct ContextStoreStart {
                                                      const ContextCacheFit& fit, bool host_holds_two_checkpoints,
                                                      const NvmeTierStatus& nvme, std::uint64_t minimum);
 // The same rule after the Program opened its tiers: a store whose cache still came up off (a tier
-// the ledger planned failed to pin, say) runs off for this run instead of failing the start.
+// the ledger planned failed to pin, say) runs off for this run instead of failing the start. The
+// warning for ContextStoreOff::TierSetupFailed.
 [[nodiscard]] std::string context_store_off_after_setup(const std::string& cause);
 
 // --ngram-ram-mib: what the n-gram volume's RAM-held blocks (pageable) may take. They come last:

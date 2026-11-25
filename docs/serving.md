@@ -198,11 +198,15 @@ different from the Qwen3.5 models:
   | the RAM ledger cannot spare the Host tier's 512 MiB minimum beside the experts | free RAM, a lower `--ram-headroom-mib`, or a disk tier (`--context-nvme-mib`) |
   | `--host-context-mib` is set under the 512 MiB minimum, or the tier it gives cannot hold two checkpoints | raise `--host-context-mib` |
   | the memory-lock limit (`RLIMIT_MEMLOCK`) cannot pin the minimum though RAM could | raise the lock limit (`ulimit -l`), or a disk tier |
-  | the disk tier cannot hold two checkpoints, or its file cannot be created | added to the line, with its reason |
+  | only a disk tier is configured and it cannot be used: its drive's free space cannot be read, it is under the tier minimum once capped at half the free space, it cannot hold two checkpoints, or its file cannot be created | fix the disk tier (`--context-nvme-mib`, `--context-nvme-dir`), or a Host budget |
+  | a disk tier beside a Host cause cannot be used either | its reason is added to that cause's line |
 
-  A tier that still fails to open after the ledger (pinning it fails, say) is handled the same way
-  rather than failing the start. The saved sessions stay on disk for the next start, and output is
-  unchanged (each prompt is prefilled in full):
+  A disk tier that cannot be used is dropped before the ledger, so it never charges the RAM ledger
+  for its bounce buffer. A tier that still fails to open after the ledger (pinning it fails, say) is
+  handled the same way rather than failing the start. The saved sessions stay on disk for the next
+  start, output is unchanged (each prompt is prefilled in full), and the startup line repeats the
+  cause in a few words (here a RAM shortfall; a lock-limit one says "the memory-lock limit cannot
+  pin the context cache", and so on):
 
   ```text
   WARN  context store: off for this run: it restores sessions into the context cache, and the RAM ledger could spare only 300 MiB for that cache beside the experts, 212 MiB short of its 512 MiB minimum. ...
