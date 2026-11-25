@@ -48,11 +48,14 @@ reach the port can use the model, and the launcher says so at startup. `NINFER_H
 The endpoint is OpenAI- and Anthropic-compatible, so anything that speaks `/v1/chat/completions` or
 `/v1/messages` works.
 
-### The other two V100 models
+### The other V100 models
 
 ```bash
 ./download-model.sh qwen38-flash-next   # the 512-expert MoE, full 262,144-token context
 ./run-v100.sh qwen38-flash-next         # also: qwen38-flash-next-iq3 (Unsloth's 3-bit build)
+
+./download-model.sh qwen36-35b-a3b      # 21.2 GiB, the 256-expert MoE with vision
+./run-v100.sh qwen36-35b-a3b            # MTP3, rk4v4, the Vision tower resident in VRAM
 
 ./download-model.sh inkling2-mini       # 22.3 GiB, exact conversion of Unsloth's UD-Q8_K_XL
 ./ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark --host 0.0.0.0 --api-key <a secret>

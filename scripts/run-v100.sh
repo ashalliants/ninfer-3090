@@ -3,6 +3,7 @@
 # Serve a model on one Tesla V100 (sm_70): run.sh with the V100's own defaults.
 #
 #   run-v100.sh <model> [profile]          e.g.  run-v100.sh qwen38-flash-next
+#                                                run-v100.sh qwen36-35b-a3b
 #
 # Every run.sh variable (NINFER_*) still applies and wins over what this script picks; run.sh's
 # header documents them. What this adds:
@@ -28,6 +29,13 @@
 #   - Qwen3.8-27B: MTP3 with INT8 KV (NINFER_SPEC=mtp, NINFER_KV_DTYPE=int8) instead of run.sh's
 #     DFlash2 with rk4v4. On the V100 MTP3 decodes 76 tok/s against DFlash2's 66 (code), and INT8
 #     KV is the cache validated on the card;
+#   - Qwen3.6-35B-A3B: run.sh's `tuned` profile (profiles/qwen36-35b-a3b-tuned-mtp.json: rk4v4 KV,
+#     MTP3 with the draft head and Q4 MTP experts, FP16 GDN state, cuBLAS prefill at chunk 4096) at
+#     two lanes instead of three (NINFER_CONCURRENCY overrides), with the Vision tower resident in
+#     VRAM instead of run.sh's overlay. Overlay refuses at startup here ("needs 2256 MiB of
+#     evict-ranked weights ... provide 1552 MiB"), so NINFER_VISION_RESIDENCY=overlay is refused
+#     before the server starts; NINFER_VISION=off serves text only. Startup fits the full 262,144-token
+#     context, MTP3 decodes about 240-300 tok/s, and images work (docs/tesla-v100.md);
 #   - Flash-Next prefill calls of up to 1024 tokens hand the CPU every expert miss it can take
 #     (--prefill-cpu-all-columns 1024; NINFER_PREFILL_CPU_ALL_COLUMNS=0 turns it off), and longer
 #     calls hand it cold experts routed up to 64 tokens at share 0.5 (--prefill-cpu-max-columns 64
@@ -115,6 +123,22 @@ case "$model_key" in
   qwen38-27b)
     export NINFER_SPEC="${NINFER_SPEC:-mtp}"
     export NINFER_KV_DTYPE="${NINFER_KV_DTYPE:-int8}" ;;
+  qwen36-35b-a3b)
+    # The Vision tower stays resident: overlay cannot borrow enough VRAM for an encode window on this
+    # model (it needs 2,256 MiB of evict-ranked weights; the 35B provides 1,552), and the server
+    # refuses to start with it. Resident fits beside the full context on a 32 GB card.
+    if [[ "${NINFER_VISION:-on}" == 'on' && "${NINFER_VISION_RESIDENCY:-resident}" == 'overlay' ]]; then
+      printf 'NINFER_VISION_RESIDENCY=overlay does not work for Qwen3.6-35B-A3B on a V100: the server needs
+' >&2
+      printf '2256 MiB of evict-ranked weights for a Vision window and the model provides 1552 MiB.
+' >&2
+      printf 'Unset it (the V100 default is resident), or set NINFER_VISION=off for text only.
+' >&2
+      exit 2
+    fi
+    export NINFER_VISION_RESIDENCY="${NINFER_VISION_RESIDENCY:-resident}"
+    # Two lanes, as validated on the card (2026-11-25); they share the one 262,144-token KV pool.
+    export NINFER_CONCURRENCY="${NINFER_CONCURRENCY:-2}" ;;
   qwen38-flash-next|qwen38-flash-next-iq3)
     # The tuned profile's CPU share (0.4) suits long prompts; calls of up to 1024 tokens give the CPU
     # every miss it can take instead, since their missed experts see a few tokens each and the CPU

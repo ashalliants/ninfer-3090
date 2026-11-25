@@ -78,6 +78,7 @@ parallel compile jobs to fit the host's RAM. One `nvcc` job can peak at 1.5-2 Gi
 
 ```bash
 scripts/run-v100.sh qwen38-flash-next     # or: scripts/run-v100.sh qwen38-27b
+scripts/run-v100.sh qwen36-35b-a3b        # Qwen3.6-35B-A3B, text and images
 ```
 
 `run-v100.sh` finds the `sm_70` server in `build-v100/` (or uses `NINFER_SERVER`), checks that the
@@ -88,6 +89,26 @@ The server listens on every interface (`0.0.0.0`), so other machines on the netw
 `http://<this machine's IP or host name>:8080`. Set `NINFER_API_KEY` as well: without a key,
 anyone who can reach the port can use the model, and the launcher and server both warn about it.
 `NINFER_HOST=127.0.0.1` keeps it local to this machine.
+
+### Running Qwen3.6-35B-A3B
+
+```bash
+scripts/download-model.sh qwen36-35b-a3b   # 21.2 GiB, resumable
+scripts/run-v100.sh qwen36-35b-a3b
+```
+
+This serves `run.sh`'s `tuned` profile for the 35B (`scripts/profiles/qwen36-35b-a3b-tuned-mtp.json`:
+`rk4v4` KV, MTP3 with the draft head and Q4 MTP experts, FP16 GDN state, cuBLAS prefill at chunk
+4096) with two V100 changes: two lanes, and the Vision tower **resident** in VRAM. Overlay
+residency (`run.sh`'s default) fails at startup on this model, because an encode window needs 2,256
+MiB of evict-ranked weights and the 35B has only 1,552 MiB, so the launcher refuses
+`NINFER_VISION_RESIDENCY=overlay` before starting. Resident fits beside the full context.
+
+Checked through the launcher on master `d309f3d8e` (2026-11-25, 200 W): startup took 23 s and fitted
+the full 262,144-token context (`KV 262,144 tokens, rk4v4`, 7.2 GiB still free). A code prompt decoded at 280-290 tok/s
+(greedy, 265-300 tokens), and an image request (a 1024 x 1024 test card, 1,063 prompt tokens, 1.3 s
+TTFT) read the label and described the shape correctly. The decode figures by prompt type are under
+[Performance](#qwen36-35b-a3b).
 
 These are the model defaults it sets:
 
@@ -102,6 +123,8 @@ These are the model defaults it sets:
 | `NINFER_PARTIAL_RAM_RESIDENCY=on` | Flash-Next UD-IQ3_XXS | Pins only the experts the VRAM cache does not hold (`--partial-ram-residency`), so the 42 GiB bank fits; no images, context 32,768. `off` pins every expert (about 50 GiB) and restores images and the 262,144-token context |
 | `NINFER_HOT_EMBEDDING_ROWS=8192` | Flash-Next | Only the common embedding rows stay in VRAM, freeing room for 216 more cached experts |
 | `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV: on this card it beats DFlash2 (`--draft-tokens 7`) on story, Chinese, French and sampled prose (77-81 tok/s); DFlash2 wins on code (136 against 110 tok/s), thinking (125 against 104) and long structured output (177 against 123) |
+| `NINFER_VISION_RESIDENCY=resident` | 35B-A3B | Keeps the Vision tower in VRAM. `run.sh`'s overlay residency does not work for this model on the V100: the server refuses to start ("needs 2256 MiB of evict-ranked weights ... provide 1552 MiB"), so the launcher refuses `NINFER_VISION_RESIDENCY=overlay` before starting. `NINFER_VISION=off` serves text only |
+| `NINFER_CONCURRENCY=2` | 35B-A3B | Two lanes sharing one 262,144-token `rk4v4` KV pool (`run.sh` gives the 3090 three) |
 | `NINFER_GGML_STAGED=0` | Flash-Next | Returns the GGML dense linears' verify GEMVs (2-8 columns) to the kernel that casts the input in every CTA, instead of the default staged route that casts it once per call: the same output, about 2% slower decode on code |
 | `NINFER_DRAFT_A8=0` | 27B, DFlash2 | Runs the DFlash2 drafter's linears on its A16 kernels instead of the default int8-activation `dp4a` route: about 9 ms slower per K = 7 round, the same acceptance on most measured prompts |
 | `NINFER_SM70_VERIFY_ATTN_HMMA=0` | 27B | Runs the INT8-KV small-T attention on the CUDA-core kernels (two-token launches for a verify) instead of the default FP16 tensor-core kernel: an MTP3 round at 172K tokens takes 110 ms instead of 52, at 43K 50 instead of 36 |
