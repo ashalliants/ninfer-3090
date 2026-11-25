@@ -1,6 +1,7 @@
 #pragma once
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
+#include "ops/linear/common/stream_draft_dp4a.cuh"
 #include "ops/linear/common/stream_gemv.cuh"
 #include "ops/linear/q8/q8_a16_sliced_k_mma.cuh"
 #include "ops/linear/q8/q8_rowsplit_storage.cuh"
@@ -17,6 +18,12 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
     // computes it bound by the weight stream where mma.sync is emulated (sm_70 by default;
     // ops/linear/common/stream_gemv.cuh). Fused row maps keep this schedule.
     if constexpr (std::is_same_v<RowPolicy, Q8SlicedKIdentityRows>) {
+        // The 35B-A3B's projections take the int8-activation verify route first
+        // (try_launch_q8_verify_dp4a, sm_70 only).
+        if (operands.tokens <= kStreamGemvMaxTokens &&
+            try_launch_q8_verify_dp4a(operands, output, epilogue, stream)) {
+            return;
+        }
         if (operands.tokens <= kStreamGemvMaxTokens &&
             try_launch_stream_gemv<Q8StreamFormat>(operands.x, {operands.codes, operands.scales},
                                                    output, epilogue, operands.rows, operands.k,
