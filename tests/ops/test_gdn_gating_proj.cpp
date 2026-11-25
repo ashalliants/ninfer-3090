@@ -704,8 +704,11 @@ int main() {
     // The Qwen3.8 parent changes only the public storage boundary. One direct oracle case proves
     // its [A,B] row partition; the split 27B cases above cover every unchanged execution route.
     failures += run_projection_case(kQwen38Parent, 1, 0x1801u, execution);
-    // Every registered 35B projection route and its contiguous-parent storage contract.
-    for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
+    // Every registered 35B projection route and its contiguous-parent storage contract. 960, 1920,
+    // 2723 and 3904 are the top of split8/4/2's sm_86 ranges: their grids (240, 240, 172, 244 CTAs)
+    // exceed an sm_70 build's residency (84-87 registers, two CTAs on each of 80 SMs), so there
+    // the launch must split the token range instead of failing the cooperative launch.
+    for (const std::int32_t tokens : {1, 127, 128, 960, 1024, 1025, 1920, 2049, 2723, 3904, 4097}) {
         failures += run_projection_case(kQwen35, tokens,
                                         0x2000u + static_cast<std::uint32_t>(tokens), execution);
     }

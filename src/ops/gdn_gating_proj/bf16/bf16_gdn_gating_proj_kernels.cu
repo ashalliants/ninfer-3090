@@ -367,10 +367,39 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
     } else {
         constexpr std::int64_t kCtasPerTokenTile =
             static_cast<std::int64_t>(Geometry::kHeads / kBf16GdnBlockM) * SplitK;
+        // The constant is the sm_86 build's residency. Another target compiles the same kernel to
+        // a different register count (sm_70's emulated MMA: split-8/4/2 at 84-87 registers, two
+        // CTAs/SM instead of three), and a cooperative grid past the real residency fails with
+        // cudaErrorCooperativeLaunchTooLarge. So the launch also asks the runtime and takes the
+        // smaller figure; on sm_86 the two agree and the launch shape is unchanged.
         constexpr std::int32_t kResidentCtasPerSm =
             cooperative_resident_ctas_per_sm<Geometry, SplitK>();
+        std::int32_t resident_per_sm = kResidentCtasPerSm;
+        auto clamp_to_occupancy = [&](auto kernel) {
+            int per_sm = 0;
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel,
+                                                                     static_cast<int>(block.x),
+                                                                     kSmemBytes));
+            resident_per_sm = std::min<std::int32_t>(resident_per_sm, per_sm);
+        };
+        configure_cuda_device_once([] {
+            return cudaFuncSetAttribute(
+                bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, true, Warps,
+                                                     NormalizeInput, NormTokenCapacity>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+        });
+        configure_cuda_device_once([] {
+            return cudaFuncSetAttribute(
+                bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, false, Warps,
+                                                     NormalizeInput, NormTokenCapacity>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+        });
+        clamp_to_occupancy(bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, true, Warps,
+                                                                NormalizeInput, NormTokenCapacity>);
+        clamp_to_occupancy(bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, false, Warps,
+                                                                NormalizeInput, NormTokenCapacity>);
         const std::int64_t resident_ctas =
-            static_cast<std::int64_t>(multiprocessor_count) * kResidentCtasPerSm;
+            static_cast<std::int64_t>(multiprocessor_count) * resident_per_sm;
         const std::int64_t max_token_tiles = resident_ctas / kCtasPerTokenTile;
         if (max_token_tiles < 1) { return false; }
 

@@ -931,6 +931,14 @@ attention (`*_volta_flash.cu`), the wide QSA attention (`qsa/attention_wide_hmma
 - The container the build was checked in cannot run the result (no GPU). `ptxas` accepted every
   kernel, so register caps, shared-memory limits and instruction support are all checked; what is
   not checked is anything that needs execution.
+- Register counts differ from the `sm_86` build, because the emulated MMA needs more of them. A
+  residency figure measured with `cuobjdump -res-usage` on `sm_86` does not hold here, and a
+  cooperative grid sized from it fails to launch. The Qwen3.6-35B-A3B GDN gating projection's
+  split-8/4/2 kernels are 74 registers on `sm_86` (three CTAs per SM) and 84-87 on `sm_70` (two),
+  so every prompt of 2,700-3,900 tokens, or with a chunk of that size, stopped the server with
+  `cudaErrorCooperativeLaunchTooLarge` (2026-11-25). The launch now also asks
+  `cudaOccupancyMaxActiveBlocksPerMultiprocessor` and splits the token range to the smaller of the
+  two figures; `ninfer_gdn_gating_proj_test` covers the widths at each split's top.
 
 ## What is verified
 
