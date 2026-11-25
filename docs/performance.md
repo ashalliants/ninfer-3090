@@ -17,6 +17,17 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Qwen3.6-35B-A3B output head on the streaming GEMV (2026-11-25)
+
+In a V100 build the 35B-A3B's Q6 output head (248,320 x 2,048) runs its 1-32-column calls on the
+streaming GEMV (int8-activation `dp4a` passes of eight under `--verify-a8`, the default) instead of
+the emulated `mma.sync` sliced-K kernels: an MTP3 verify's head goes from 4.09 to 0.51 ms. MTP3 + draft
+head, 200 W, greedy, 300 tokens, ABBA: **241.5 tok/s on code** (189.8 before), 236.1 thinking (187.8),
+278.6 structured JSON (221.7), 160.7 story (127.8), 172.2 Chinese (137.0), 168.3 French (133.8);
+plain decode 155 (147); two requests 184-188 total (148-150). Decode-path KLD 2.54e-3 against
+master's 2.49e-3. `NINFER_SM70_Q6_35_STREAM=0` keeps the old head; the RTX 3090 does not build the
+route. Details: [tesla-v100.md](tesla-v100.md#qwen36-35b-a3b).
+
 ## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next draft vocabulary from the tokenizer (2026-11-25)
 
 On the V100 the MTP drafter's token list (`--mtp-draft-vocab auto`) is now derived from the model's

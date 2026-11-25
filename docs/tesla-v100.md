@@ -106,6 +106,7 @@ These are the model defaults it sets:
 | `NINFER_DRAFT_A8=0` | 27B, DFlash2 | Runs the DFlash2 drafter's linears on its A16 kernels instead of the default int8-activation `dp4a` route: about 9 ms slower per K = 7 round, the same acceptance on most measured prompts |
 | `NINFER_SM70_VERIFY_ATTN_HMMA=0` | 27B | Runs the INT8-KV small-T attention on the CUDA-core kernels (two-token launches for a verify) instead of the default FP16 tensor-core kernel: an MTP3 round at 172K tokens takes 110 ms instead of 52, at 43K 50 instead of 36 |
 | `NINFER_SM70_Q6_STREAM_WIDE=0` | 27B, DFlash2 | Runs the Q6 output head of a verify wider than eight columns (DFlash2 at two requests, or `--draft-tokens` 8-15) on the emulated `mma.sync` kernel instead of the default int8-activation `dp4a` passes of eight: 9.9 instead of 2.6 ms per 16-column round |
+| `NINFER_SM70_Q6_35_STREAM=0` | 35B-A3B | Runs the Q6 output head of a 2-32-column call (an MTP3 verify) on the emulated `mma.sync` sliced-K kernels and the one-token call on the A16 GEMV, instead of the default streaming GEMV (int8-activation `dp4a` passes of eight under `--verify-a8`): 4.1 instead of 0.5 ms per MTP3 verify |
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
 on, so the 27B's wide prefill GEMMs run on the tensor cores through cuBLAS instead of emulated integer
@@ -325,6 +326,37 @@ full-attention layers are the sensitive ones, so a little `int8` there buys back
 loss. On this card `int8` stays the right choice (it fits 262K at two lanes with 5.2 GiB free and
 prefills fastest); the mixes are for when KV bytes are short. See
 [the README](../README.md#per-layer-mixes---kv-dtype-rk4v4x12int8x4-opt-in).
+
+### Qwen3.6-35B-A3B
+
+Decode, one stream, through `ninfer-serve` (`--kv-dtype rk4v4 --lm-head-draft --mtp-experts-q4
+--gdn-state-fp16 --prefill-cublas --prefill-chunk 4096`, 32,768 context), greedy, 300 tokens, warm,
+2026-11-25, **200 W** power limit, no thermal throttling. ABBA on one build against
+`NINFER_SM70_Q6_35_STREAM=0` (master's output head); the two legs of each side agreed within 0.1 tok/s:
+
+| Prompt | MTP3 + draft head | before | plain | before |
+|---|---:|---:|---:|---:|
+| code | **241.5** | 189.8-189.9 | 155.3 | 147.3 |
+| thinking | **236.1** | 187.8 | 155.1-155.2 | 147.3 |
+| structured JSON | **278.5-278.6** | 221.6-221.7 | 155.3-155.4 | 147.4 |
+| story | **160.7** | 127.8 | 155.0 | 147.1 |
+| Chinese | **172.1-172.2** | 136.9-137.0 | 155.2-155.3 | 147.3-147.4 |
+| French | **168.3** | 133.8 | 155.3 | 147.3-147.4 |
+| conversation | **180.7** | 147.4-147.5 | 155.3 | 147.4 |
+| two requests at once (story + code), total | **184.4-188.4** | 148.0-150.0 | | |
+
+Before this change the output head (Q6, 248,320 x 2,048) ran an MTP3 verify on the sliced-K
+`mma.sync` kernels, which Volta emulates: 4.09 ms of a 17.5 ms round, so MTP3 lost to plain decoding
+on story, Chinese and French. It now takes the streaming GEMV (`dp4a` passes of eight under
+`--verify-a8`, the default): 0.51 ms at four columns, 0.48 at one. Story, Chinese, French and
+structured output keep their MTP3 text; code, thinking and the conversation part at near-ties.
+Decode-path KLD against an FP32 base (three 8,192-token PG-19 chunks, BF16 KV): 2.54e-3 / 97.66%
+the same top-1 at one token and 2.57e-3 / 97.40% at four, against master's 2.49e-3 / 97.76% and
+2.51e-3 / 97.50%.
+
+Prefill is ~770 tok/s at 4.2K tokens and 715 at 13.4K (`--prefill-chunk 4096`), about a quarter of
+llama.cpp's on this card; the routed experts' prefill GEMMs and the Q8 input projections run Ampere
+`mma.sync` under emulation, and `NINFER_SM70_TENSOR_CORES=1` does not reach them yet.
 
 ### Qwen3.8-Flash-Next
 
