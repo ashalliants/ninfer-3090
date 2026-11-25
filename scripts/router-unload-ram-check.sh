@@ -52,7 +52,23 @@ ask() { # model, prompt -> prints the response JSON
 }
 cached() { python3 -c 'import json,sys; u=json.load(sys.stdin).get("usage",{}); print((u.get("prompt_tokens_details") or {}).get("cached_tokens",0), u.get("prompt_tokens",0))'; }
 
-START=$(rss_gib); echo "RAM at start, nothing loaded: $START GiB"
+# Model states from GET /models: "id=state" per line (unloaded, loading, loaded, sleeping, unloading).
+states() { curl -fsS "$BASE/models" | python3 -c 'import json,sys
+for m in json.load(sys.stdin)["data"]: print(m["id"] + "=" + m["status"]["value"])'; }
+busy() { states | grep -v "=unloaded$" || true; }
+# The baseline is the router with nothing loaded: wait out any startup load (a preset default),
+# unload whatever is resident, and refuse to measure while anything is still there.
+for _ in $(seq 900); do states | grep -qE "=(loading|unloading)$" || break; sleep 1; done
+for m in $(states | grep -E "=(loaded|sleeping)$" | cut -d= -f1); do
+  echo "unloading $m (loaded at startup) before the baseline"
+  curl -fsS "$BASE/models/unload" -H 'Content-Type: application/json' -d "{\"model\": \"$m\"}" >/dev/null
+done
+for _ in $(seq 300); do [ -z "$(busy)" ] && break; sleep 1; done
+if [ -n "$(busy)" ]; then
+  echo "FAIL: a model is still loaded, so there is no empty baseline to measure:"; busy; exit 1
+fi
+sleep 2
+START=$(rss_gib); echo "RAM at start, nothing loaded (checked via GET /models): $START GiB"
 read -r C1 P1 < <(ask "$FIRST" "$PROMPT" | cached); echo "$FIRST: $P1 prompt tokens, $C1 cached"
 LOADED=$(rss_gib); echo "RAM with $FIRST loaded: $LOADED GiB"
 ask "$SECOND" "hello" >/dev/null; echo "switched to $SECOND"
@@ -60,7 +76,8 @@ grep -E "unloaded '$FIRST'" "$LOG" | tail -1 || echo "(no unload line for $FIRST
 curl -fsS "$BASE/models/unload" -H 'Content-Type: application/json' -d "{\"model\": \"$SECOND\"}" >/dev/null
 for _ in $(seq 120); do grep -q "unloaded '$SECOND'" "$LOG" && break; sleep 1; done
 grep -E "unloaded '$SECOND'" "$LOG" | tail -1
-EMPTY=$(rss_gib); echo "RAM after both unloaded: $EMPTY GiB"
+if [ -n "$(busy)" ]; then echo "FAIL: models still loaded after the unloads:"; busy; exit 1; fi
+EMPTY=$(rss_gib); echo "RAM after both unloaded (checked via GET /models): $EMPTY GiB"
 
 fail=0
 if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) + float(sys.argv[3]) else 1)' "$EMPTY" "$START" "$SLACK"; then
