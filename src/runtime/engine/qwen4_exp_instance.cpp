@@ -392,36 +392,35 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_rows_verify      = next.mtp_rows_verify;
     program_options.mtp_staged_drafts    = next.mtp_staged_drafts;
     if (mtp) {
-        // --mtp-draft-vocab: an explicit file on any card; "auto" (the default) reads
-        // <artifact>.draft-vocab when it exists, on a Tesla V100 (sm_70) only, where it was measured
-        // (the RTX 3090 cannot be measured here); off: the full head.
+        // --mtp-draft-vocab: an explicit file on any card; "tokenizer" the list derived from the
+        // artifact's tokenizer (tokenizer_draft_vocab) on any card; "auto" (the default) that list on
+        // a Tesla V100 (sm_70) only, where it was measured (the RTX 3090 keeps the full head: not
+        // measured there); off: the full head. A list file (such as the Basalt one
+        // scripts/download-model.sh fetches on request) is read only when named by its path.
         std::filesystem::path vocab;
-        if (next.mtp_draft_vocab == "auto") {
-            const std::filesystem::path sidecar = options.artifact_path.string() + ".draft-vocab";
-            std::error_code ec;
-            if (device.compute_capability() == 70 && std::filesystem::is_regular_file(sidecar, ec)) { vocab = sidecar; }
-        } else if (next.mtp_draft_vocab != "off") {
-            vocab = next.mtp_draft_vocab;
-        }
+        std::string source;
         const auto public_tokens = static_cast<std::int32_t>(plan.resources().public_token_count);
-        if (!vocab.empty()) {
-            try {
-                program_options.mtp_draft_vocab = std::make_shared<const std::vector<std::int32_t>>(
-                    models::qwen4_exp::load_draft_vocab(vocab, public_tokens));
-            } catch (const std::exception& error) {
-                // An explicit file must load; the optional sidecar falls back to the full head.
-                if (next.mtp_draft_vocab != "auto") { throw; }
-                report(std::string("MTP draft vocabulary: ignoring ") + vocab.string() + " (" + error.what() +
-                       "); the drafter uses the full head");
-                vocab.clear();
-            }
+        const bool from_tokenizer = next.mtp_draft_vocab == "tokenizer" ||
+                                    (next.mtp_draft_vocab == "auto" && device.compute_capability() == 70);
+        if (from_tokenizer) {
+            const auto& tokenizer = *plan.resources().tokenizer;
+            const auto added      = tokenizer.added_token_ids();
+            program_options.mtp_draft_vocab = std::make_shared<const std::vector<std::int32_t>>(
+                models::qwen4_exp::tokenizer_draft_vocab(
+                    public_tokens, [&](std::int32_t id) { return tokenizer.decode_token_bytes(id); }, added));
+            source = "the tokenizer";
+        } else if (next.mtp_draft_vocab != "auto" && next.mtp_draft_vocab != "off") {
+            vocab = next.mtp_draft_vocab;
+            program_options.mtp_draft_vocab = std::make_shared<const std::vector<std::int32_t>>(
+                models::qwen4_exp::load_draft_vocab(vocab, public_tokens));
+            source = vocab.string();
         }
-        if (!vocab.empty()) {
+        if (program_options.mtp_draft_vocab) {
             const GgmlBlock block = ggml_block(plan.output_head_format());
             program_options.mtp_draft_head_row_bytes =
                 static_cast<std::uint64_t>(config.hidden_size) / block.values * block.bytes;
             report("MTP draft vocabulary: " + std::to_string(program_options.mtp_draft_vocab->size()) + " of " +
-                   std::to_string(public_tokens) + " tokens from " + vocab.string() + " (" +
+                   std::to_string(public_tokens) + " tokens from " + source + " (" +
                    std::to_string(mib(program_options.mtp_draft_vocab->size() * program_options.mtp_draft_head_row_bytes)) +
                    " MiB of head rows in VRAM)");
         }

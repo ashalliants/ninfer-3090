@@ -105,11 +105,11 @@ sha256sum --check SHA256SUMS
   spread between prompts almost disappeared (table below). Decode barely moved (+0.8%).
 - **OS:** Windows. The `run.bat qwen38-flash-next` launcher is the supported way to serve it.
 - **Tesla V100 32 GB (Linux, built from source):** the same file serves its full 262,144-token
-  context on a V100 through `scripts/run-v100.sh`. Decode with up to seven MTP drafts and the reduced
-  draft vocabulary (2026-11-24, 200 W, 300 greedy tokens, warm cache): **126.7 tok/s** on code, 101.8-104.9
-  on a thinking prompt, 81.8-82.0 story, 80.3-80.5 Chinese, and **72.6-72.9 French, down from 88.7** with three drafts
-  and the full head (2026-11-23): the list covers French poorly. `--mtp-draft-vocab off` turns it off. The output
-  is the same either way; the conditions and ranges are in the
+  context on a V100 through `scripts/run-v100.sh`. Decode with up to seven MTP drafts and a reduced
+  draft vocabulary derived from the tokenizer (2026-11-25, 200 W, 300 greedy tokens, warm cache, the
+  router's flags): **129.6 tok/s** on code, 103-106 on a thinking prompt, 82.6 story, 80.7 Chinese and
+  77.2 French (126.6 / 72.7 on code / French with the Basalt list it replaces). `--mtp-draft-vocab off`
+  turns it off; the output is the same either way. The conditions and ranges are in the
   [V100 guide](https://github.com/ashalliants/ninfer-3090/blob/master/docs/tesla-v100.md#qwen38-flash-next).
 
 ## Measurements
@@ -288,11 +288,13 @@ DASLab GGUF repository and its IQ2_XS files declare `apache-2.0`; its mmproj dec
 from Qwen's checkpoint. A quantization does not change the license of the weights it encodes, so
 this artifact follows the base model's license.
 
-The optional MTP draft vocabulary (`<model>.draft-vocab`, used on a Tesla V100) is not part of this
-repository: `scripts/download-model.sh` fetches it at install time from jesdga's
-[Qwen3.8-Flash-Next-Basalt](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) pack, where it is
-published under the Qwen Community License 1.0, and it stays under that license. Credit to jesdga for
-the list and to chris83-dev's Lapilli (MIT) for its V100 use.
+The MTP draft vocabulary a Tesla V100 uses by default is derived from this model's own tokenizer when
+the server starts (`--mtp-draft-vocab auto`); no list file is shipped or needed. jesdga's Basalt list
+(from the [Qwen3.8-Flash-Next-Basalt](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) pack,
+Qwen Community License 1.0) is not part of this repository: `NINFER_DRAFT_VOCAB=basalt
+scripts/download-model.sh` fetches it at install time as `<model>.draft-vocab`, under that license, and
+`--mtp-draft-vocab <model>.draft-vocab` reads it. Credit to jesdga for the list and to chris83-dev's
+Lapilli (MIT) for its V100 use, which led to this one.
 
 ---
 

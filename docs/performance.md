@@ -17,6 +17,18 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next draft vocabulary from the tokenizer (2026-11-25)
+
+On the V100 the MTP drafter's token list (`--mtp-draft-vocab auto`) is now derived from the model's
+tokenizer at load (90,068 ids: every id below 65,536, the CJK ids below 120,000 and the added tokens)
+instead of read from jesdga's Basalt list (106,056), which stays selectable by path. With the router's
+flags (200 W, greedy, 300 tokens, warm cache, A B B A against master, the same text) decode is
+**129.6 tok/s on code** (126.6 before, 3.90 -> 4.05 tokens a round), **77.2 French** (72.7), 82.6 story
+(82.1), 80.7 Chinese (80.4), 109.3 thinking at budget 150 (104.8). Without the graft and presence
+penalty (Lapilli's settings): 126.0 code (121.7), 84.3 French (79.8), 89.2 story (86.5), 120.0
+thinking at budget 150 (118.5). The French slowdown of the Basalt list is gone. The RTX 3090 keeps the
+full head. Details: [tesla-v100.md](tesla-v100.md#qwen38-flash-next).
+
 ## Tesla V100 (`sm_70`): Qwen3.8-27B output head in verifies past eight columns (2026-11-25)
 
 In a V100 build a verify of 9-32 columns (DFlash2 with two requests at once, or `--draft-tokens`
@@ -67,7 +79,7 @@ DFlash2 K7 146.5 on structured JSON (97.3); plain decode 45.0 (42.7-43.0); two r
 kernels, 98.9-99.2% the same top-1. The RTX 3090 does not build the kernel and is unchanged. Details:
 [tesla-v100.md](tesla-v100.md#qwen38-27b).
 
-## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next staged GGML verify GEMV (2026-11-24)
+## Tesla V100 (`sm_70`): Qwen3.8-Flash-Next staged GGML verify GEMV (2026-11-24, superseded above)
 
 Flash-Next's GGML dense linears cast their 2-8 verify columns to int8 once per call instead of once
 in every CTA (`sm_70` only, the same output bit for bit; `NINFER_GGML_STAGED=0` turns it off). With

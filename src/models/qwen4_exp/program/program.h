@@ -38,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -612,6 +613,23 @@ struct NgramFlagPlan {
 // by repeating the last id. Throws when the file is unreadable, not a whole number of ids, or
 // leaves fewer than two ids.
 [[nodiscard]] std::vector<std::int32_t> load_draft_vocab(const std::filesystem::path& path, std::int32_t public_tokens);
+
+// The draft vocabulary derived from the tokenizer (--mtp-draft-vocab auto on a Tesla V100, or
+// "tokenizer"): every id below kDraftVocabCommonIds (byte-level BPE ids are in merge order, so these
+// are the most frequent pieces: code, English and the other Latin-script languages), the ids in
+// [kDraftVocabCommonIds, kDraftVocabCjkEnd) that are CJK text (draft_vocab_cjk_bytes), and every added token
+// id (`added_ids`: role markers, think and tool tags). `token_bytes(id)` is the id's decoded bytes.
+// Ids outside [0, public_tokens) are dropped; the result is sorted, distinct and padded to an even
+// count as load_draft_vocab does. The same tokenizer gives the same list on every run.
+inline constexpr std::int32_t kDraftVocabCommonIds = 65536;
+inline constexpr std::int32_t kDraftVocabCjkEnd    = 120000;
+// A token's bytes are CJK text when they hold a UTF-8 lead byte E3-E9 (U+3000-U+9FFF: CJK symbols,
+// kana, ideographs), a whole full-width form (U+FF00-U+FFEF) or Hangul syllable (U+AC00-U+D7AF), or
+// only continuation bytes (the tail of a split CJK character).
+[[nodiscard]] bool draft_vocab_cjk_bytes(std::string_view bytes) noexcept;
+[[nodiscard]] std::vector<std::int32_t> tokenizer_draft_vocab(std::int32_t public_tokens,
+                                                              const std::function<std::string_view(std::int32_t)>& token_bytes,
+                                                              std::span<const int> added_ids);
 
 // ProgramDevicePlan::steering of these options: FP32 [vectors][layers][hidden]; 0 without a vector.
 [[nodiscard]] std::uint64_t plan_steering(const ProgramOptions& options, const TextConfig& config);

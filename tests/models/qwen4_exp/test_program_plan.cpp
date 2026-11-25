@@ -266,6 +266,30 @@ int main() {
             check(threw, "a file that is not whole int32 ids is refused");
             std::filesystem::remove(path);
         }
+        // The tokenizer's draft vocabulary: ids below 65,536, CJK-text ids below 120,000, added tokens.
+        {
+            check(q4::draft_vocab_cjk_bytes("\xe4\xb8\xad"), "a CJK ideograph (U+4E2D) is CJK text");
+            check(q4::draft_vocab_cjk_bytes("\xe3\x81"), "a split kana lead byte is CJK text");
+            check(q4::draft_vocab_cjk_bytes("\x80\xbf"), "only continuation bytes are CJK text");
+            check(q4::draft_vocab_cjk_bytes("\xea\xb0\x80"), "a Hangul syllable (U+AC00) is CJK text");
+            check(q4::draft_vocab_cjk_bytes("\xef\xbc\x81"), "a full-width form (U+FF01) is CJK text");
+            check(!q4::draft_vocab_cjk_bytes("\xef\xbb\xbf"), "U+FEFF is not");
+            check(!q4::draft_vocab_cjk_bytes(" the"), "ASCII is not");
+            check(!q4::draft_vocab_cjk_bytes("\xc3\xa9t\xc3\xa9"), "Latin with accents is not");
+            check(!q4::draft_vocab_cjk_bytes(""), "an empty token is not");
+            const std::int32_t pub = 120010;
+            const auto bytes = [](std::int32_t id) -> std::string_view {
+                if (id == 70000 || id == 119999) { return "\xe4\xb8\xad"; }
+                if (id == 120005) { return "\xe4\xb8\xad"; }
+                return "ab";
+            };
+            const std::vector<int> added{120001, 5, 130000};
+            const auto ids = q4::tokenizer_draft_vocab(pub, bytes, added);
+            check(ids.size() == 65536 + 2 + 1 + 1, "common ids, two CJK ids, one added id and the even pad");
+            check(ids[65535] == 65535 && ids[65536] == 70000 && ids[65537] == 119999 && ids[65538] == 120001 &&
+                      ids[65539] == 120001,
+                  "sorted, CJK only below 120,000, added ids in range, padded by repeating the last");
+        }
 
         // --mtp-constrained: K + 1 masks of ceil(V / 32) words for a verification of K drafts.
         constexpr std::uint32_t kVocab = 248077; // 7753 words, the last one partial

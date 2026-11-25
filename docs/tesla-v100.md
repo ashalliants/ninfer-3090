@@ -15,14 +15,14 @@ Each release ships a prebuilt V100 archive for Linux, `ninfer-v100-linux-x64-<ve
 
 All figures were measured on one V100-PCIE-32GB, connected over an OCuLink PCIe Gen3 x4 eGPU link
 (3.3 GB/s host-to-device), on a Linux host with 59 GiB of RAM, with a 250 W power limit
-(2026-11-16 to 2026-11-18), except Flash-Next's MTP decode and the 27B's speculative decode, re-measured
-at 200 W on 2026-11-24.
+(2026-11-16 to 2026-11-18), except the 27B's speculative decode, re-measured at 200 W on 2026-11-24, and Flash-Next's MTP
+decode, re-measured at 200 W on 2026-11-25.
 Decode is greedy with MTP speculation, as `run-v100.sh` serves it (three drafts; seven for Flash-Next).
 
 | | Qwen3.8-27B | Qwen3.8-Flash-Next |
 |---|---:|---:|
 | **Context** | 262,144 tokens | **262,144 tokens** (`run-v100.sh` default) |
-| **Decode**, one stream, MTP | **110 tok/s** on code, 104 thinking, 77-81 story, Chinese and French (MTP3, 2026-11-24, 200 W) | **126.7 tok/s** on code, 102-105 thinking, 80-82 story and Chinese, 73 French (MTP7 + draft vocabulary, warm cache, 2026-11-24, 200 W) |
+| **Decode**, one stream, MTP | **110 tok/s** on code, 104 thinking, 77-81 story, Chinese and French (MTP3, 2026-11-24, 200 W) | **129.6 tok/s** on code, 103-106 thinking, 82-83 story, 81 Chinese, 77 French (MTP7 + draft vocabulary, warm cache, 2026-11-25, 200 W) |
 | **Decode**, plain | 45 tok/s (200 W) | 53 tok/s (250 W) |
 | **Prefill**, ~4K-token prompt | **~1,020 tok/s** | **~990 tok/s** (3,798 tokens in 3.8 s) |
 | **Prefill**, long prompts | | 38K tokens in 38.4 s (~1,000 tok/s) |
@@ -328,6 +328,34 @@ prefills fastest); the mixes are for when KV bytes are short. See
 
 ### Qwen3.8-Flash-Next
 
+**2026-11-25: the MTP draft vocabulary comes from the model's tokenizer**, with the same output.
+On a V100 `--mtp-draft-vocab auto` (the default) no longer reads the Basalt list beside the model: the
+server derives its list from the tokenizer at load. It holds every token id below 65,536 (the
+tokenizer numbers its tokens in merge order, so these are the commonest), the ids from 65,536 to
+119,999 whose bytes are CJK text, and the added tokens: 90,068 of 248,077, whose head rows take
+116 MiB of VRAM (the Basalt list: 106,056 and 137 MiB). It keeps the European-language tokens the
+Basalt list left out, so French is no longer slower than with the full head, and the drafter is
+right more often on code too. Measured in A B B A order against master (which reads the Basalt list)
+on the same box (200 W, no thermal throttling, 300 tokens at temperature 0, warm second request;
+tok/s, means of the two runs; tokens per verify round in brackets, the same in both runs):
+
+| Flags | Build | Story | Code | Chinese | French | Thinking | Thinking, budget 150 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| The router's (graft, `--presence-penalty 1.0`) | before (Basalt list) | 82.1 (1.91) | 126.6 (3.90) | 80.4 (1.88) | 72.7 (1.78) | 103.7 (3.03) | 104.8 (2.61) |
+| | **after** | **82.6** (1.91) | **129.6** (4.05) | **80.7** (1.90) | **77.2** (1.94) | 104.7 (3.03) | **109.3** (2.61) |
+| Without the graft and presence penalty (Lapilli's settings) | before (Basalt list) | 86.5 (2.00) | 121.7 (3.49) | 83.9 (1.95) | 79.8 (1.89) | 110.7 (3.41) | 118.5 (2.91) |
+| | **after** | **89.2** (2.07) | **126.0** (3.70) | 83.6 (1.94) | **84.3** (2.01) | 111.2 (3.41) | **120.0** (2.97) |
+
+Every run produced master's text (md5 of each answer). Code is 2.4-3.5% faster, French 6-8%; the
+router's thinking request varied between 102.3 and 106.3 tok/s across the four runs at the same
+acceptance. The Basalt list stays selectable by path (`NINFER_DRAFT_VOCAB=basalt
+scripts/download-model.sh qwen38-flash-next` fetches it, `--mtp-draft-vocab <model>.draft-vocab` reads
+it), and `--mtp-draft-vocab tokenizer` picks the new list on any card. The RTX 3090 keeps the full head
+(`auto` is `off` there); the list was not measured on it. The rule was chosen on this box from single
+runs of other lists (without the graft): the first 65,536 ids alone drop Chinese to 57 tok/s, CJK only
+up to 100,000 drops it to 73, the first 49,152 ids lose 3-4 tok/s on French and 2 on Chinese, and
+more CJK (up to 150,000, 118K ids) makes the list larger and code 1 tok/s slower.
+
 **2026-11-24: the dense verify GEMVs cast their input once (staged GGML route)**, with the same
 output bit for bit. Flash-Next's dense linears are GGML blocks (IQ4_XS, IQ3_S, Q6_K) on a `dp4a` GEMV
 over int8 activations, and every one of its 240 CTAs used to round all T columns of the input to int8
@@ -383,11 +411,9 @@ during any run). `run-v100.sh` now drafts up to seven tokens a round with the re
 | Chinese essay | **78.8 tok/s** (78.6-78.8) | 1.88 | 78.6 (76.7-78.6) | 1.90 |
 | French essay | **71.8 tok/s** (71.4-71.8) | 1.78 | 88.7 (83.1-88.7) | 2.18 |
 
-**French is slower with the draft vocabulary: 71.4-71.8 tok/s against 83.1-88.7, 14-19% down.** The
-list (below) holds few of the tokens French text uses, so the drafter proposes the wrong ones more
-often (1.78 tokens a round against 2.18); the text itself is unchanged. If you mostly generate French,
-or any language whose decode drops, turn the head off with `--mtp-draft-vocab off` (or
-`NINFER_DRAFT_TOKENS=3` as well for the previous configuration).
+French read slower with this first list (jesdga's Basalt one, below): 71.4-71.8 tok/s against
+83.1-88.7, at 1.78 tokens a round against 2.18, because it held few of the tokens French text uses.
+The list derived from the tokenizer that replaced it on 2026-11-25 (above) covers French.
 
 Every combination was run in one interleaved sequence on the same server binary, two runs each
 (order A B C D E E D C B A; tok/s, means of the two):
@@ -405,17 +431,18 @@ the draft vocabulary makes each draft step cheaper, which brings Chinese and sto
 code and thinking keep most of the gain.
 
 **The MTP draft vocabulary.** Each draft step ends in the 248,077-row output head. With
-`--mtp-draft-vocab` the drafter scores only the tokens of a list instead: 106,056 of them, whose head
-rows (137 MiB, IQ4_XS) are copied once into VRAM at load. Drafts are still checked by the full model,
-so the output is the same token for token. The list is the one jesdga's
+`--mtp-draft-vocab` the drafter scores only the tokens of a list instead, whose head rows (IQ4_XS) are
+copied once into VRAM at load. Drafts are still checked by the full model, so the output is the same
+token for token. These 2026-11-23 runs used the list jesdga's
 [Qwen3.8-Flash-Next-Basalt](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt) pack ships
-(`convert/mtp/rt/draft_vocab.bin`, Qwen Community License 1.0), whose use on a V100 we learned from
-chris83-dev's Lapilli (MIT). It is **not part of this repository**: `scripts/download-model.sh
-qwen38-flash-next` downloads it from that repository at a pinned revision, checks its sha256 and saves it as
-`<model>.draft-vocab` beside the model, under jesdga's licence. `ninfer-serve` reads that file by
-default on a V100 only (`--mtp-draft-vocab auto`); with no file, or one that does not load, it uses the full head, and
-`--mtp-draft-vocab PATH` or `off` choose explicitly. The RTX 3090 keeps the full head: it was not
-measured there.
+(`convert/mtp/rt/draft_vocab.bin`, 106,056 usable ids, 137 MiB, Qwen Community License 1.0), whose use
+on a V100 we learned from chris83-dev's Lapilli (MIT). Since 2026-11-25 the default on a V100
+(`--mtp-draft-vocab auto`) is a list ours derives from the model's tokenizer (above), so nothing is
+downloaded for it. The Basalt list is **not part of this repository**: `NINFER_DRAFT_VOCAB=basalt
+scripts/download-model.sh qwen38-flash-next` downloads it from that repository at a pinned revision,
+checks its sha256 and saves it as `<model>.draft-vocab`, under jesdga's licence, and
+`--mtp-draft-vocab <model>.draft-vocab` reads it. `tokenizer` picks the derived list on any card and
+`off` the full head; the RTX 3090 keeps the full head by default: it was not measured there.
 
 Conditions: `ninfer-serve` with the exact flags the V100 box's router gives Flash-Next (the `run-v100.sh`
 profile: INT8 KV, 262,144 context, `--draft-tokens 3`, `--mtp-joint-acceptance`, `--mtp-staged-drafts`,
@@ -473,6 +500,12 @@ build?"). It was built and tuned on an RTX 3090; first V100 measurements (2026-1
   | Chinese | 56.7 tok/s | 78.6 | 2.08 / 1.90 |
 
   Acceptance is about the same; the smaller expert cache is the cost.
+- **The tokenizer-derived draft vocabulary (2026-11-25)** helps French here too. With the router's
+  flags for this build (MTP3, vision, `--ngram-volume` the IQ2_XS one; A B B A against master, which
+  read the Basalt list beside this build; tok/s, means of two runs, same text): French 52.1 -> 56.6
+  (1.71 -> 1.88 tokens a round), code 64.3 -> 65.1 (3.09 -> 3.12), story 67.3 -> 67.6, Chinese 60.2 ->
+  60.1. Thinking read 57.3 and 60.5 against 61.0 and 61.1 at the same 2.68 tokens a round: this build
+  holds only 40% of its experts in VRAM, so its runs vary more (code 62.2-67.2 over the four runs).
 - **Perplexity** on the six fixture texts (5,114 positions, scored by `ninfer_qwen4_exp_forward_real_test
   --dump-logits` on the V100): 5.872 against IQ2_XS's 6.280 (-6.5%), the same ranking as on the 3090
   (5.859 / 6.315; the small differences are the sm_70 kernels' summation order).

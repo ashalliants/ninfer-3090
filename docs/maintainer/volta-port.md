@@ -444,6 +444,18 @@ self-distilled MTP dense, converted and run here, was slower (code 115 against 1
 are byte-identical; its UD-IQ2_XS target (IQ4_NL down projections in 26 layers) generates different
 text, which the drafter predicts better.
 
+**The draft vocabulary from the tokenizer (2026-11-25).** `--mtp-draft-vocab auto` on sm_70 now
+builds the list at load with `models::qwen4_exp::tokenizer_draft_vocab` (program.cpp) from the
+artifact's tokenizer: ids `[0, 65536)`, the ids in `[65536, 120000)` that `draft_vocab_cjk_bytes`
+accepts (any byte E3-E9, a whole full-width or Hangul character, or continuation bytes only: a CJK
+character split across tokens), and the added tokens; sorted, distinct, padded to an even count for the
+BF16 view of the rows. 90,068 ids against the Basalt list's 106,056. The Basalt list keeps every id
+below 32,768 and, above it, mostly CJK tokens, which is why French lost 0.4 tokens a round with it; the tokenizer's ids follow merge order, so a contiguous prefix covers every
+script's common tokens, and CJK needs the extra band because its characters merge late. Router flags,
+ABBA against master: code 126.6 -> 129.6 (3.90 -> 4.05 tokens a round), French 72.7 -> 77.2 (1.78 ->
+1.94), the same text. `tools/flash_next/draft_vocab.py` writes the same list from `tokenizer.json`
+(checked equal to the server's, id for id); `tokenizer` selects it on any card, a path reads a file.
+
 **Staged GGML verify GEMV (2026-11-24).** Flash-Next's dense linears (GDN and attention input and
 output projections, shared expert) are GGML blocks on `ggml_mmvq`, which was already a `dp4a` GEMV
 on Q8_1 activations: #600's int8 idea was there, and the verify columns still cost about 1 ms a
