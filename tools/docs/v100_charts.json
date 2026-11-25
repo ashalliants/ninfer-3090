@@ -31,7 +31,7 @@
            {"section": "Third-party reported figures (hatched): different boxes and conditions"},
            {"model": "Inkling-2-Mini", "versus": "vs Strata, reported on its model card (the fastest other figure found)",
             "cells": [
-              {"ours": [94.3], "theirs": [70.5], "reported": true, "detail": "ours: DSpark, 12-chat average at 262,144 context; Strata's prompt not stated"},
+              {"ours": [94.3], "theirs": [70.5], "reported": true, "detail": "ours: DSpark, 12-chat average at 262,144 context, full Q8_K_XL (23.9 GB). Strata runs smaller packs (SQ-20 19.4 GB / SQ-10 10.5 GB); its decode figure doesn't say which"},
               {"ours": [2727], "theirs": [2287], "reported": true, "detail": "ours: 8K prompt with --prefill-chunk 8192. At the default chunk 2048 (2,170) it is 0.95x: Strata's reported prefill is higher"}]}
          ]}
       ],
@@ -139,7 +139,7 @@
          "rows": [
            {"label": "Ours, DSpark", "detail": "12-chat average", "value": 94.3, "kind": "ours"},
            {"label": "Ours, plain", "detail": "no drafts", "value": 78.0, "kind": "alt"},
-           {"label": "Strata", "detail": "model card rev 04996a1e; draft decoding, prompt not stated", "value": 70.5, "kind": "reported"},
+           {"label": "Strata", "detail": "smaller pack (SQ-20 19.4 GB or SQ-10 10.5 GB, not stated); draft decoding", "value": 70.5, "kind": "reported"},
            {"label": "Lapilli-Inkling (Csavoldi)", "detail": "NVFP4 experts, empty context, no drafts", "value": 69, "kind": "reported"},
            {"label": "llama.cpp, realugbun fork", "detail": "UD-Q4_K_XL, tg128", "value": 50.7, "kind": "reported"},
            {"label": "llama.cpp mainline", "detail": "UD-Q4_K_XL, tg128, measured by realugbun", "value": 32.0, "kind": "reported"}
@@ -148,7 +148,7 @@
          "note": "Ours at 131,072 context. Our lead over Strata's reported prefill needs --prefill-chunk 8192; at the default chunk of 2048 Strata's figure is higher.",
          "rows": [
            {"label": "Ours, --prefill-chunk 8192", "detail": "7,974-token prompt", "value": 2727, "kind": "ours"},
-           {"label": "Strata", "detail": "SQ-20 pack, prompt length not stated", "value": 2287, "kind": "reported"},
+           {"label": "Strata", "detail": "SQ-20 pack, 19.4 GB vs our 23.9 GB; prompt length not stated", "value": 2287, "kind": "reported"},
            {"label": "Ours, default chunk 2048", "detail": "8K prompt", "value": 2170, "kind": "alt"},
            {"label": "llama.cpp, realugbun fork", "detail": "pp512", "value": 1185, "kind": "reported"},
            {"label": "Lapilli-Inkling (Csavoldi)", "detail": "short prompt", "value": 850, "kind": "reported"},
@@ -156,7 +156,7 @@
          ]}
       ],
       "notes": [
-        "Reported figures are copied from pinned sources (docs/tesla-v100.md, \"Methodology and sources\") and were not re-run here; power limits are mostly not stated. Strata's card still carried \"VERIFY before publishing\" comments in its source. Smaller quants usually decode faster."
+        "Reported figures are copied from pinned sources (docs/tesla-v100.md, \"Methodology and sources\") and were not re-run here; power limits are mostly not stated. Strata's card still carried \"VERIFY before publishing\" comments in its source. Strata's packs are smaller than ours: SQ-20 is 19.35 GB and SQ-10 10.47 GB, against our full Q8_K_XL at 23.9 GB (Strata reports SQ-20 matching the original on its own tests; SQ-10 drifts, perplexity +0.32). Smaller quants usually decode faster."
       ]
     }
   ]
