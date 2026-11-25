@@ -138,7 +138,8 @@ on a V100, kernels launched cooperatively (ones that synchronize their whole gri
 `cudaErrorInvalidPc`, on master too. With nsys 2025.1.3, a 97-token prompt to the 35B aborted that
 way (reported later, at an unrelated `CUDA_CHECK`); with the variable set, the same run completed. The Qwen3.6-35B-A3B uses such kernels for its GDN gating
 projection (the split-K `MmaCooperativeSplit*` schedules) and for the fused norm-gating route of
-calls up to 16 tokens, so it cannot be profiled without this variable. With it set, those calls
+calls up to 16 tokens, so its profiles can fail without this variable (other widths, such as a
+1K-token prompt, profiled cleanly; set it for reliable profiles). With it set, those calls
 take their non-cooperative schedules instead (`MmaUnsplit`, and the composed norm then gating):
 
 ```bash

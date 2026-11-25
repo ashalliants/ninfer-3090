@@ -13,6 +13,24 @@ namespace {
 
 int failures = 0;
 
+// setenv / unsetenv are POSIX; the Windows CRT has _putenv_s, where an empty value removes the
+// variable.
+int set_env(const char* name, const char* value) {
+#if defined(_WIN32)
+    return _putenv_s(name, value);
+#else
+    return ::setenv(name, value, 1);
+#endif
+}
+
+void unset_env(const char* name) {
+#if defined(_WIN32)
+    (void)_putenv_s(name, "");
+#else
+    (void)::unsetenv(name);
+#endif
+}
+
 void check(bool ok, const std::string& what) {
     if (!ok) {
         std::fprintf(stderr, "FAIL: %s\n", what.c_str());
@@ -34,13 +52,13 @@ int main() {
 
     // The process value: whatever the environment says when first asked, and fixed after that, so
     // a plan resolved early and one resolved late always agree.
-    if (::setenv("NINFER_NO_COOPERATIVE_KERNELS", "1", 1) != 0) {
+    if (set_env("NINFER_NO_COOPERATIVE_KERNELS", "1") != 0) {
         std::fprintf(stderr, "FAIL: setenv\n");
         return 1;
     }
     check(!ninfer::ops::cooperative_kernels_allowed(),
           "NINFER_NO_COOPERATIVE_KERNELS=1 left cooperative kernels allowed");
-    ::unsetenv("NINFER_NO_COOPERATIVE_KERNELS");
+    unset_env("NINFER_NO_COOPERATIVE_KERNELS");
     check(!ninfer::ops::cooperative_kernels_allowed(),
           "the setting changed after it was first read");
 
