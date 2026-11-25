@@ -106,6 +106,7 @@ These are the model defaults it sets:
 | `NINFER_DRAFT_A8=0` | 27B, DFlash2 | Runs the DFlash2 drafter's linears on its A16 kernels instead of the default int8-activation `dp4a` route: about 9 ms slower per K = 7 round, the same acceptance on most measured prompts |
 | `NINFER_SM70_VERIFY_ATTN_HMMA=0` | 27B | Runs the INT8-KV small-T attention on the CUDA-core kernels (two-token launches for a verify) instead of the default FP16 tensor-core kernel: an MTP3 round at 172K tokens takes 110 ms instead of 52, at 43K 50 instead of 36 |
 | `NINFER_SM70_Q6_STREAM_WIDE=0` | 27B, DFlash2 | Runs the Q6 output head of a verify wider than eight columns (DFlash2 at two requests, or `--draft-tokens` 8-15) on the emulated `mma.sync` kernel instead of the default int8-activation `dp4a` passes of eight: 9.9 instead of 2.6 ms per 16-column round |
+| `NINFER_SM70_MOE_PREFILL_HMMA=0` | 35B-A3B | Prefills the routed experts (Q4 gate/up, Q5/Q6 down) on the emulated `mma.sync` kernels instead of the default FP16 WMMA kernels: 765 instead of 1,160 tok/s at 4.2K tokens |
 | `NINFER_SM70_Q6_35_STREAM=0` | 35B-A3B | Runs the Q6 output head of a 2-32-column call (an MTP3 verify) on the emulated `mma.sync` sliced-K kernels and the one-token call on the A16 GEMV, instead of the default streaming GEMV (int8-activation `dp4a` passes of eight under `--verify-a8`): 4.1 instead of 0.5 ms per MTP3 verify |
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
@@ -354,9 +355,10 @@ Decode-path KLD against an FP32 base (three 8,192-token PG-19 chunks, BF16 KV): 
 the same top-1 at one token and 2.57e-3 / 97.40% at four, against master's 2.49e-3 / 97.76% and
 2.51e-3 / 97.50%.
 
-Prefill is ~770 tok/s at 4.2K tokens and 715 at 13.4K (`--prefill-chunk 4096`), about a quarter of
-llama.cpp's on this card; the routed experts' prefill GEMMs and the Q8 input projections run Ampere
-`mma.sync` under emulation, and `NINFER_SM70_TENSOR_CORES=1` does not reach them yet.
+Prefill, same server flags at 65,536 context with MTP3, one 4.2K / 13.4K / 40.2K-token prompt each,
+2026-11-25, 200 W, no thermal throttling, ABBA against `NINFER_SM70_MOE_PREFILL_HMMA=0`: **1,160 tok/s** at 4.2K
+(765 before), 1,000 at 13.4K (710), 685 at 40.2K (536). The change puts the routed experts' gate/up (Q4) and down (Q5/Q6) prefill GEMMs on FP16 WMMA kernels. The Q8 mixer projections still run Ampere `mma.sync` under emulation, about half of what is left.
+llama.cpp prefills 2,745 tok/s at 4.2K on this card (default batch; 3,280 with `-ub 2048 -b 4096`).
 
 ### Qwen3.8-Flash-Next
 
