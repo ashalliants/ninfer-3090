@@ -154,6 +154,30 @@ at 34K at chunk 8192; chunk 4096 gave 2,004 before the BF16-bank change and was 
 8192 needs 1,746 MiB of workspace (chunk 4096 needed 872 before that change): at 262,144 with DSpark and
 vision they fit with `--kv-dtype int8`, not with the default FP16 KV.
 
+### Profiling with nsys
+
+**Set `NINFER_NO_COOPERATIVE_KERNELS=1` when running under `nsys` on `sm_70`.** Under Nsight Systems
+on a V100, kernels launched cooperatively (ones that synchronize their whole grid) can fault with
+`cudaErrorInvalidPc`, on master too. With nsys 2025.1.3, a 97-token prompt to the 35B aborted that
+way (reported later, at an unrelated `CUDA_CHECK`); with the variable set, the same run completed. The Qwen3.6-35B-A3B uses such kernels for its GDN gating
+projection (the split-K `MmaCooperativeSplit*` schedules) and for the fused norm-gating route of
+calls up to 16 tokens, so its profiles can fail without this variable (other widths, such as a
+1K-token prompt, profiled cleanly; set it for reliable profiles). With it set, those calls
+take their non-cooperative schedules instead (`MmaUnsplit`, and the composed norm then gating):
+
+```bash
+NINFER_NO_COOPERATIVE_KERNELS=1 nsys profile -o 35b --trace cuda,nvtx \
+  build-v100/apps/ninfer ~/models/qwen3_6_35b_a3b.ninfer --max-context 8192 --kv-dtype rk4v4 \
+  --spec mtp --draft-tokens 3 --lm-head-draft --mtp-experts-q4 --gdn-state-fp16 \
+  --prefill-chunk 4096 --greedy --max-new 32 --prompt "$(cat prompt-1k.txt)"
+```
+
+It is off by default and read once at startup. It works on every card (on an RTX 3090 it only
+moves those calls to the slower schedule) and changes nothing else. The non-cooperative schedules
+sum the split-K partials in a different order, so the output can differ in the last bits and those
+calls are slower: leave it unset for timing and for bit-identity checks, and correct the gating
+kernels' share of a profile by their op bench (`ninfer_tests ninfer_gdn_gating_proj_test`).
+
 ### Refusal steering (Flash-Next)
 
 The community refusal-direction vector for Qwen3.8-Flash-Next ships in the Strata repository as

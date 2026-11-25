@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
+#include "ops/common/cooperative_kernels.h"
+
 #include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/rmsnorm.h"
 
@@ -260,8 +262,11 @@ bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int3
 }
 
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingProblem& problem,
-                        std::int32_t sm_count) noexcept {
+                        std::int32_t sm_count, bool allow_cooperative) noexcept {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
+    // NINFER_NO_COOPERATIVE_KERNELS=1 (ops/common/cooperative_kernels.h): every cooperative
+    // schedule is illegal, so each width takes the next legal route, ending at MmaUnsplit.
+    if (!allow_cooperative && cooperative_split_k(schedule) != 0) { return false; }
     if (is_27(problem)) {
         switch (schedule) {
         case Bf16GdnGatingScheduleId::GemvPairedRows:
@@ -409,6 +414,20 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
     throw std::logic_error("BF16 GDN gating: unknown schedule");
 }
 
+// The plan of a schedule already known to be legal for `problem`.
+Bf16GdnGatingPlan resolved_candidate(Bf16GdnGatingScheduleId schedule,
+                                     const Bf16GdnGatingProblem& problem) {
+    const bool mma                          = schedule_uses_mma(schedule);
+    const Bf16GdnGatingTokenVariant variant = !mma ? Bf16GdnGatingTokenVariant::None
+                                                   : ((problem.cols % mma_tile_cols(problem)) == 0
+                                                          ? Bf16GdnGatingTokenVariant::Full
+                                                          : Bf16GdnGatingTokenVariant::Predicated);
+    const std::int32_t split_k              = schedule_split_k(schedule);
+    const std::size_t workspace =
+        split_k > 1 ? checked_partial_bytes(problem.heads, split_k, problem.cols) : 0;
+    return {schedule, variant, workspace};
+}
+
 // The plan for each width is exact, and on a device with fewer SMs than the table was tuned on a
 // route can hand over to a less-split schedule partway through, so the largest workspace need not be
 // at a route's end. Take the maximum over every width in the interval.
@@ -476,18 +495,10 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId sche
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
                                                     const Bf16GdnGatingProblem& problem,
                                                     std::int32_t sm_count) {
-    if (!candidate_is_legal(schedule, problem, sm_count)) {
+    if (!candidate_is_legal(schedule, problem, sm_count, cooperative_kernels_allowed())) {
         throw std::invalid_argument("BF16 GDN gating: candidate is not legal for exact problem");
     }
-    const bool mma                          = schedule_uses_mma(schedule);
-    const Bf16GdnGatingTokenVariant variant = !mma ? Bf16GdnGatingTokenVariant::None
-                                                   : ((problem.cols % mma_tile_cols(problem)) == 0
-                                                          ? Bf16GdnGatingTokenVariant::Full
-                                                          : Bf16GdnGatingTokenVariant::Predicated);
-    const std::int32_t split_k              = schedule_split_k(schedule);
-    const std::size_t workspace =
-        split_k > 1 ? checked_partial_bytes(problem.heads, split_k, problem.cols) : 0;
-    return {schedule, variant, workspace};
+    return resolved_candidate(schedule, problem);
 }
 
 namespace {
@@ -498,12 +509,13 @@ namespace {
 // routes split K less, so they launch fewer CTAs, and the last is unsplit and needs no residency.
 template <std::size_t N>
 Bf16GdnGatingPlan resolve_from_routes(const std::array<RouteSpec, N>& routes,
-                                      const Bf16GdnGatingProblem& problem, std::int32_t sm_count) {
+                                      const Bf16GdnGatingProblem& problem, std::int32_t sm_count,
+                                      bool allow_cooperative) {
     for (std::size_t index = 0; index < routes.size(); ++index) {
         if (!routes[index].cols.contains(problem.cols)) { continue; }
         for (std::size_t later = index; later < routes.size(); ++later) {
-            if (candidate_is_legal(routes[later].schedule, problem, sm_count)) {
-                return bf16_gdn_gating_resolve_candidate(routes[later].schedule, problem, sm_count);
+            if (candidate_is_legal(routes[later].schedule, problem, sm_count, allow_cooperative)) {
+                return resolved_candidate(routes[later].schedule, problem);
             }
         }
     }
@@ -518,12 +530,17 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
                                                std::int32_t sm_count) {
+    return bf16_gdn_gating_resolve_plan(problem, sm_count, cooperative_kernels_allowed());
+}
+
+Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
+                                               std::int32_t sm_count, bool allow_cooperative) {
     if (!bf16_gdn_gating_admits(problem)) {
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
-    return is_27(problem) ? resolve_from_routes(k27Routes, problem, sm_count)
-                          : resolve_from_routes(k35Routes, problem, sm_count);
+    return is_27(problem) ? resolve_from_routes(k27Routes, problem, sm_count, allow_cooperative)
+                          : resolve_from_routes(k35Routes, problem, sm_count, allow_cooperative);
 }
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
@@ -536,14 +553,26 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
 }
 
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
-    Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
+    return bf16_gdn_norm_gating_resolve_plan(problem, device_sm_count(),
+                                             cooperative_kernels_allowed());
+}
+
+Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
+                                                        std::int32_t sm_count,
+                                                        bool allow_cooperative) {
+    Bf16GdnGatingPlan control = bf16_gdn_gating_resolve_plan(problem, sm_count, allow_cooperative);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
     if (is_27(problem) && problem.cols <= 42)
         return {Bf16GdnNormGatingScheduleId::FusedSimt27, control, 0};
-    if (is_35(problem) && problem.cols <= 16) {
-        control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
-                                                     problem);
+    // The fused 35B route is cooperative; without cooperative kernels it is Composed (rmsnorm,
+    // then the control projection's own non-cooperative route).
+    if (is_35(problem) && problem.cols <= 16 && allow_cooperative) {
+        if (!candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit32, problem, sm_count,
+                                true)) {
+            throw std::invalid_argument("BF16 GDN gating: candidate is not legal for exact problem");
+        }
+        control  = resolved_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32, problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
         norm_splits = 32;
     }

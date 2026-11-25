@@ -3,6 +3,7 @@
 #include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/weight_input.h"
 
+#include "ops/common/cooperative_kernels.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
@@ -564,7 +565,7 @@ int verify_plan_across_sm_counts() {
         // The tuned device keeps its tuned routes at every width.
         for (std::int32_t cols = 1; cols <= kWidths; ++cols) {
             const Bf16GdnGatingPlan plan =
-                ninfer::ops::detail::bf16_gdn_gating_resolve_plan({g.heads, g.rows, cols}, 82);
+                ninfer::ops::detail::bf16_gdn_gating_resolve_plan({g.heads, g.rows, cols}, 82, true);
             check(plan.schedule == tuned(g, cols),
                   std::string(g.label) + ": 82 SMs changed the tuned route at " +
                       std::to_string(cols) + " columns");
@@ -574,7 +575,7 @@ int verify_plan_across_sm_counts() {
         for (const std::int32_t sms : {84, 68, 48, 40, 30}) {
             for (std::int32_t cols = 1; cols <= kWidths; ++cols) {
                 const Bf16GdnGatingPlan plan = ninfer::ops::detail::bf16_gdn_gating_resolve_plan(
-                    {g.heads, g.rows, cols}, sms);
+                    {g.heads, g.rows, cols}, sms, true);
                 const std::string where = std::string(g.label) + ": " + std::to_string(sms) +
                                           " SMs, " + std::to_string(cols) + " columns";
                 check(grid_fits(g, plan.schedule, cols, sms), where + " got a grid that is not resident");
@@ -588,6 +589,7 @@ int verify_plan_across_sm_counts() {
             }
         }
         // Naming a schedule that does not fit is an error, not a silent substitution.
+        // (Under NINFER_NO_COOPERATIVE_KERNELS=1 every cooperative candidate is refused anyway.)
         bool threw = false;
         try {
             (void)ninfer::ops::detail::bf16_gdn_gating_resolve_candidate(
@@ -599,6 +601,61 @@ int verify_plan_across_sm_counts() {
     }
     if (failures != 0) { std::cerr << failures << " gating plan failures\n"; }
     return failures;
+}
+
+// NINFER_NO_COOPERATIVE_KERNELS=1 (allow_cooperative = false): no width, on any device, gets a
+// cooperative schedule. The 27B keeps its GEMV and small-T routes and the 35B the fused norm route
+// is replaced by Composed; everything the table sends to a split goes to MmaUnsplit. The
+// env-following overloads agree with whatever this process's setting is.
+int verify_no_cooperative_routes() {
+    using ninfer::ops::detail::Bf16GdnNormGatingPlan;
+    using NormId = ninfer::ops::detail::Bf16GdnNormGatingScheduleId;
+    const int before = failures;
+    for (const Geometry& g : {k27, k35}) {
+        for (const std::int32_t sms : {82, 80, 48}) {
+            for (std::int32_t cols = 1; cols <= 6000; ++cols) {
+                const std::string where = std::string(g.label) + ": " + std::to_string(sms) +
+                                          " SMs, " + std::to_string(cols) + " columns";
+                const Bf16GdnGatingPlan plan = ninfer::ops::detail::bf16_gdn_gating_resolve_plan(
+                    {g.heads, g.rows, cols}, sms, false);
+                const Id expected = g.heads == 48 && cols == 1  ? Id::GemvPairedRows
+                                    : g.heads == 48 && cols <= 8 ? Id::SmallTSplit10
+                                                                 : Id::MmaUnsplit;
+                check(plan.schedule == expected,
+                      where + " without cooperative kernels got " +
+                          ninfer::ops::detail::bf16_gdn_gating_schedule_name(plan.schedule));
+                check(expected == Id::SmallTSplit10 || plan.workspace_bytes == 0,
+                      where + " without cooperative kernels kept a split-K workspace");
+                const Bf16GdnGatingPlan env = ninfer::ops::detail::bf16_gdn_gating_resolve_plan(
+                    {g.heads, g.rows, cols}, sms);
+                const Bf16GdnGatingPlan explicit_env =
+                    ninfer::ops::detail::bf16_gdn_gating_resolve_plan(
+                        {g.heads, g.rows, cols}, sms, ninfer::ops::cooperative_kernels_allowed());
+                check(env.schedule == explicit_env.schedule &&
+                          env.workspace_bytes == explicit_env.workspace_bytes,
+                      where + " did not follow NINFER_NO_COOPERATIVE_KERNELS");
+                if (cols > 64) { continue; }
+                const Bf16GdnNormGatingPlan norm =
+                    ninfer::ops::detail::bf16_gdn_norm_gating_resolve_plan({g.heads, g.rows, cols},
+                                                                           sms, false);
+                const NormId expected_norm = g.heads == 48 && cols <= 42 ? NormId::FusedSimt27
+                                                                         : NormId::Composed;
+                check(norm.schedule == expected_norm && split_of(norm.control.schedule) == 0,
+                      where + " norm gating without cooperative kernels got " +
+                          ninfer::ops::detail::bf16_gdn_norm_gating_schedule_name(norm.schedule));
+                const Bf16GdnNormGatingPlan norm_coop =
+                    ninfer::ops::detail::bf16_gdn_norm_gating_resolve_plan({g.heads, g.rows, cols},
+                                                                           sms, true);
+                if (g.heads == 32 && cols <= 16) {
+                    check(norm_coop.schedule == NormId::MmaCooperativeSplit32,
+                          where + " norm gating lost its fused cooperative route");
+                }
+            }
+        }
+    }
+    const int added = failures - before;
+    if (added != 0) { std::cerr << added << " no-cooperative plan failures\n"; }
+    return added;
 }
 
 } // namespace sm_count_routes
@@ -690,6 +747,11 @@ int main() {
     const DeviceExecutionView execution{nullptr, device.multiprocessor_count()};
     const DeviceExecutionView norm_execution{device.stream, device.multiprocessor_count()};
     int failures = sm_count_routes::verify_plan_across_sm_counts();
+    failures += sm_count_routes::verify_no_cooperative_routes();
+    std::cout << "cooperative kernels "
+              << (ninfer::ops::cooperative_kernels_allowed() ? "allowed"
+                                                             : "off (NINFER_NO_COOPERATIVE_KERNELS=1)")
+              << '\n';
     failures +=
         verify_workspace_capacity_contract(kQwen27, {1, 8, 768, 769, 1664, 1665, 3456, 3457});
     failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 960, 1920, 3904, 3905});

@@ -19,6 +19,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_context_cost_measure_test
   ninfer_context_cost_test
   ninfer_context_store_test
+  ninfer_cooperative_kernels_env_test
   ninfer_dashboard_page_test
   ninfer_effective_thinking_budget_test
   ninfer_dsv4_engine_plan_test
