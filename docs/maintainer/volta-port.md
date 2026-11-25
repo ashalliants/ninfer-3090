@@ -682,7 +682,9 @@ K7 with n-gram copies, structured JSON 185.2 -> 185.9 at the same acceptance) an
 Profiling this model under nsys needs a workaround: a cooperative `grid.sync` kernel (the GDN gating
 projection's split schedules) faults with `cudaErrorInvalidPc` under nsys on sm_70, master included,
 so profiles were taken with those schedules disabled in a local build and that kernel's time
-corrected by its op bench (14 us a call at T = 1-4).
+corrected by its op bench (14 us a call at T = 1-4). `NINFER_NO_COOPERATIVE_KERNELS=1`
+(`src/ops/common/cooperative_kernels.h`) now does this in any build: set it when running under nsys
+on sm_70 (docs/tesla-v100.md, "Profiling with nsys").
 
 ### Prefill: Qwen3.6-35B-A3B
 

@@ -69,6 +69,12 @@ ninfer_add_op_test(ninfer_ggml_mma_emulation_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_mma_emulation.cpp"
   LIBRARIES ninfer_core)
 
+# Host-only: NINFER_NO_COOPERATIVE_KERNELS, the opt-out of cooperative (grid-sync) schedules for
+# profiling under nsys on sm_70 (ops/common/cooperative_kernels.h).
+ninfer_add_op_test(ninfer_cooperative_kernels_env_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_cooperative_kernels_env.cpp"
+  LIBRARIES ninfer_core)
+
 # Host-only: the GatedDeltaNet head map in the FP64 oracle. The tiled map (value head h reads key
 # head h % Hqk, Qwen3.8-Flash-Next) on 16 q/k heads equals, bit for bit, the blocked map on q/k
 # tiled to one head per value head.

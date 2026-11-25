@@ -60,6 +60,11 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId sche
 // schedules need their whole grid resident, so which schedule a width gets depends on it.
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
                                                std::int32_t sm_count);
+// The same with cooperative schedules allowed or not, instead of as NINFER_NO_COOPERATIVE_KERNELS
+// says (ops/common/cooperative_kernels.h). Without them every width takes the first later route
+// that is not cooperative, so MmaUnsplit wherever the table names a cooperative split.
+Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
+                                               std::int32_t sm_count, bool allow_cooperative);
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
                                                     const Bf16GdnGatingProblem& problem,
                                                     std::int32_t sm_count);
@@ -68,6 +73,11 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
                                                      std::int32_t min_cols, std::int32_t max_cols);
 const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId schedule) noexcept;
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
+// The same for `sm_count` multiprocessors, with cooperative schedules allowed or not. Without them
+// the 35B's fused MmaCooperativeSplit32 route (cols <= 16) is Composed.
+Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
+                                                        std::int32_t sm_count,
+                                                        bool allow_cooperative);
 std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
                                                           std::int32_t min_cols,
