@@ -108,7 +108,7 @@ These are the model defaults it sets:
 | `NINFER_SM70_Q6_STREAM_WIDE=0` | 27B, DFlash2 | Runs the Q6 output head of a verify wider than eight columns (DFlash2 at two requests, or `--draft-tokens` 8-15) on the emulated `mma.sync` kernel instead of the default int8-activation `dp4a` passes of eight: 9.9 instead of 2.6 ms per 16-column round |
 | `NINFER_SM70_Q8_PREFILL_CUBLAS=0` | 35B-A3B | Prefills the Q8 mixer projections (GDN and attention input projections, both 2,048 x 4,096 output projections) on their emulated `mma.sync` kernels instead of the default cuBLAS FP16 route: 1,160 instead of 2,411 tok/s at 4.2K tokens |
 | `NINFER_SM70_MOE_PREFILL_HMMA=0` | 35B-A3B | Prefills the routed experts (Q4 gate/up, Q5/Q6 down) on the emulated `mma.sync` kernels instead of the default FP16 WMMA kernels: 765 instead of 1,160 tok/s at 4.2K tokens |
-| `NINFER_SM70_Q8_VERIFY_A8=0` | 35B-A3B | Runs the Q8 mixer projections of an MTP3 verify (the GDN and attention input projections, 12,288 and 9,216 x 2,048, and the 2,048 x 4,096 output projections) on the A16 streaming GEMV instead of the default int8-activation `dp4a` passes under `--verify-a8`: MTP3 5-14% slower on six of the seven measured prompts, decode-path KLD at four tokens 2.71e-3 instead of 3.37e-3 |
+| `NINFER_SM70_Q8_VERIFY_A8=0` | 35B-A3B | Runs the Q8 mixer projections of an MTP3 verify (the GDN and attention input projections, 12,288 and 9,216 x 2,048, and the 2,048 x 4,096 output projections) on the A16 streaming GEMV instead of the default int8-activation `dp4a` passes under `--verify-a8`: 5-14% slower MTP3, decode-path KLD at four tokens 2.71e-3 instead of 3.37e-3 |
 | `NINFER_SM70_Q6_35_STREAM=0` | 35B-A3B | Runs the Q6 output head of a 2-32-column call (an MTP3 verify) on the emulated `mma.sync` sliced-K kernels and the one-token call on the A16 GEMV, instead of the default streaming GEMV (int8-activation `dp4a` passes of eight under `--verify-a8`): 4.1 instead of 0.5 ms per MTP3 verify |
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
@@ -341,18 +341,18 @@ each side agreed within 0.2 tok/s. The "#613" column is the earlier ABBA against
 
 | Prompt | MTP3 + draft head | Q8 on A16 | before #613 | plain | before #613 |
 |---|---:|---:|---:|---:|---:|
-| structured JSON | **302.9** | 278.5-278.6 | 221.6-221.7 | 155.3 | 147.4 |
-| code | **253.6** | 241.3-241.5 | 189.8-189.9 | 155.2-155.3 | 147.3 |
-| thinking | 238.1 | **249.7** | 187.8 | 155.2-155.3 | 147.3 |
-| conversation | **192.7** | 180.7 | 147.4-147.5 | 155.3 | 147.4 |
-| French | **191.0** | 168.3 | 133.8 | 155.3 | 147.3-147.4 |
-| Chinese | **189.5** | 172.1-172.2 | 136.9-137.0 | 155.2-155.3 | 147.3-147.4 |
-| story | **172.6** | 160.5-160.7 | 127.8 | 154.9-155.0 | 147.1 |
-| two requests at once (story + code), total | **197.5-200.4** | 184.5-188.4 | 148.0-150.0 | | |
+| structured JSON | **302.9** | 278.5 | 221.6-221.7 | 155.4-155.5 | 147.4 |
+| thinking | **265.0** | 249.6-249.7 | 187.8 | 155.3 | 147.3 |
+| code | **253.6-253.7** | 241.4-241.5 | 189.8-189.9 | 155.2-155.3 | 147.3 |
+| conversation | **192.7** | 180.6-180.7 | 147.4-147.5 | 155.4 | 147.4 |
+| French | **191.0** | 168.2-168.3 | 133.8 | 155.3-155.4 | 147.3-147.4 |
+| Chinese | **189.5** | 172.2 | 136.9-137.0 | 155.3-155.4 | 147.3-147.4 |
+| story | **172.6** | 160.8 | 127.8 | 155.0 | 147.1 |
+| two requests at once (story + code), total | **197.5-200.4** | 183.1-188.4 | 148.0-150.0 | | |
 
-Thinking is the exception: its greedy text changed, and on the new text the MTP module's drafts
-were accepted less often (202 of 288 against 213 of 257). Its rounds still got faster, 13.1 ms
-against 14.0.
+Measured on master with the 35B's prefill routes (#615, #616) in place. Each prefill change moved
+some greedy texts, and with them acceptance: in an earlier session, between those two merges,
+thinking measured 238.1 against 249.7.
 
 The Q8 mixer projections of an MTP3 verify (the GDN input projection 12,288 x 2,048, the attention
 input projection 9,216 x 2,048 and both output projections 2,048 x 4,096, about 4.1 ms of a round on

@@ -665,7 +665,7 @@ sends the identity-row Q8 calls of 2-8 columns (one pass, no token offsets) of s
 passes of eight when the stream registered `--verify-a8`; on the V100 artifacts only the 35B-A3B has
 Q8_G32 linears of those shapes (Inkling-2-Mini's are GGML `q8_0` at 2,304, the 27B's 5,120 wide).
 The pass loop moved into an ungated `launch_stream_dp4a_tokens` that the DFlash2 drafter's route
-shares. One-token calls stay on A16. MTP3 +5-14% on six of seven prompts, thinking -4.6% on a changed text with fewer drafts accepted (ABBA in [tesla-v100.md](../tesla-v100.md#qwen36-35b-a3b)), at
+shares. One-token calls stay on A16. MTP3 +5-14% on every measured prompt (ABBA in [tesla-v100.md](../tesla-v100.md#qwen36-35b-a3b)), at
 +6.8e-4 decode-path KLD at four tokens. `NINFER_SM70_Q8_VERIFY_A8=0` keeps A16.
 
 Profiling this model under nsys needs a workaround: a cooperative `grid.sync` kernel (the GDN gating

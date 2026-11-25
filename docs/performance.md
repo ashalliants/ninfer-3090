@@ -22,9 +22,9 @@
 In a V100 build the 35B-A3B's Q8 mixer projections of an MTP3 verify (GDN and attention input and
 output projections) run the int8-activation `dp4a` streaming GEMV under `--verify-a8` (the default)
 instead of the A16 one. MTP3 + draft head, 200 W, greedy, 300 tokens, ABBA: **302.9 tok/s on
-structured JSON** (278.6 before), 253.6 code (241.5), 192.7 conversation (180.7), 191.0 French
-(168.3), 189.5 Chinese (172.2), 172.6 story (160.7); thinking 238.1 (249.7: its text changed and
-fewer drafts were accepted, though each round got faster); two requests 197-200 total (185-188);
+structured JSON** (278.5 before), 253.7 code (241.5), 192.7 conversation (180.7), 191.0 French
+(168.3), 189.5 Chinese (172.2), 172.6 story (160.8), 265.0 thinking (249.7); two requests 197-200
+total (183-188);
 plain decode unchanged at 155. Decode-path KLD at four tokens 3.37e-3 against 2.71e-3 (2.66e-3 for the all-A16 reorder-only control).
 `NINFER_SM70_Q8_VERIFY_A8=0` or `--no-verify-a8` keeps the A16 projections; the RTX 3090 does not
 build the route. Details: [tesla-v100.md](tesla-v100.md#qwen36-35b-a3b).
