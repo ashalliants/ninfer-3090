@@ -1,0 +1,163 @@
+{
+  "meta": {
+    "gpu": "One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM",
+    "power": "200 W limit",
+    "date": "2026-11-25",
+    "sources": "docs/tesla-v100.md#methodology-and-sources"
+  },
+  "charts": [
+    {
+      "file": "v100-headline.svg",
+      "title": "One Tesla V100 32 GB: faster than the next-best engine",
+      "subtitle": "Speed of ashalliants/ninfer-3090 divided by the fastest other engine we could run or find for each model on the same card. Above 1.0x means ours is faster. Decode is the geometric mean over the prompts in each model's chart.",
+      "desc": "Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata's reported figures: 1.34x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).",
+      "build": "35B-A3B #614/#618/#621, 27B d309f3d8, Flash-Next fdcac347 (#611), Inkling-2-Mini dc867300 and #596",
+      "panels": [
+        {"type": "ratio", "columns": ["Decode", "Prefill"], "max": 1.6,
+         "rows": [
+           {"section": "Measured on this box, same prompts, greedy"},
+           {"model": "Qwen3.6-35B-A3B", "versus": "vs llama.cpp 36d818e16, best of MTP n2 / MTP n3 / DFlash n7 per prompt",
+            "cells": [
+              {"ours": [172.6, 253.7, 189.5, 191.0, 265.0, 192.7, 319.1], "theirs": [131, 195, 135, 135, 177, 140, 293], "detail": "7 prompts; ours MTP3, DFlash K7 on JSON"},
+              {"ours": [3984, 3866], "theirs": [3280, 3250], "detail": "4.2K and 13K prompts; llama.cpp with tuned batch (-ub 2048 -b 4096)"}]},
+           {"model": "Qwen3.8-27B", "versus": "vs Lapilli f9b7dd09 (DFlash2, its default)",
+            "cells": [
+              {"ours": [71.9, 147.0, 73.5, 78.9, 116.5, 103.5, 190.0], "theirs": [69.0, 119.9, 48.3, 66.1, 96.2, 83.5, 175.8], "detail": "7 prompts, the faster of our MTP3 and DFlash2 per prompt; DFlash2 alone 1.07x, MTP3 alone 1.04x"},
+              {"ours": [957.7, 945.7], "theirs": [699.4, 680.5], "detail": "4.2K and 13.4K prompts"}]},
+           {"model": "Qwen3.8-Flash-Next", "versus": "vs Lapilli f9b7dd09 (its UD-IQ2_XS; ours a different quant of the same size)",
+            "cells": [
+              {"ours": [89.2, 126.0, 83.6, 84.3, 120.0], "theirs": [86.8, 124.7, 83.3, 78.4, 119.8], "detail": "5 prompts; ahead on all five, by 0.2% to 8%"},
+              {"none": "Not compared: Lapilli's Flash-Next prefill was not measured on this box"}]},
+           {"section": "Third-party reported figures (hatched): different boxes and conditions"},
+           {"model": "Inkling-2-Mini", "versus": "vs Strata, reported on its model card (the fastest other figure found)",
+            "cells": [
+              {"ours": [94.3], "theirs": [70.5], "reported": true, "detail": "ours: DSpark, 12-chat average at 262,144 context; Strata's prompt not stated"},
+              {"ours": [2727], "theirs": [2287], "reported": true, "detail": "ours: 8K prompt with --prefill-chunk 8192. At the default chunk 2048 (2,170) it is 0.95x: Strata's reported prefill is higher"}]}
+         ]}
+      ],
+      "notes": [
+        "Per-model charts, prompts, quants and the pinned sources for every competitor figure: docs/tesla-v100.md, \"Methodology and sources\". Competitor versions: llama.cpp 36d818e16 with ggml-org Q4_K_M and its MTP / DFlash Q8_0 sidecars; Lapilli f9b7dd09."
+      ]
+    },
+    {
+      "file": "v100-qwen38-27b.svg",
+      "title": "Qwen3.8-27B on one Tesla V100 32 GB",
+      "subtitle": "ashalliants/ninfer-3090 against Lapilli (chris83-dev/lapilli-v100 f9b7dd09), both run on this card with the same prompts, greedy, 300 output tokens, warm. Both of our configurations are shown: each wins different prompts.",
+      "desc": "Qwen3.8-27B decode and prefill on one Tesla V100: ashalliants/ninfer-3090 with DFlash2 K7 and with MTP3 against Lapilli.",
+      "build": "build d309f3d8 (long context: 3c6a616d, #608/#609)",
+      "panels": [
+        {"type": "grouped", "title": "Decode, one request (tok/s)",
+         "note": "Conversation (temperature 0.6) and JSON are Lapilli's basalt-bench fixtures (seed 7); the JSON prompt runs to about 7.2-7.6K output tokens.",
+         "groups": ["story", "code", "Chinese", "French", "thinking", "conversation", "JSON"],
+         "series": [
+           {"name": "Ours, DFlash2 K7 + n-gram 15 (router)", "kind": "ours", "values": [61.5, 147.0, 41.4, 69.0, 116.5, 103.5, 190.0]},
+           {"name": "Ours, MTP3", "kind": "alt", "values": [71.9, 110.2, 73.5, 78.9, 97.0, 90.0, 126.1]},
+           {"name": "Lapilli, DFlash2 (its default)", "kind": "same", "values": [69.0, 119.9, 48.3, 66.1, 96.2, 83.5, 175.8]}
+         ]},
+        {"type": "grouped", "title": "Prefill (tok/s)", "note": "A fresh prompt each time, two repeats each (ours 951-958 at 4.2K).", "label_w": 120,
+         "groups": ["4.2K prompt", "13.4K prompt"],
+         "series": [
+           {"name": "Ours", "kind": "ours", "values": [957.7, 945.7]},
+           {"name": "Lapilli", "kind": "same", "values": [699.4, 680.5]}
+         ]},
+        {"type": "grouped", "title": "Decode at long context, MTP3 (tok/s)",
+         "note": "Decode after a prompt of that many tokens, build 3c6a616d with #608/#609, against master before them. Lapilli was not run at long context.",
+         "groups": ["4,215 tokens", "42,663 tokens", "172,487 tokens"],
+         "series": [
+           {"name": "Ours, MTP3 (#608/#609)", "kind": "alt", "values": [84.6, 69.5, 56.7]},
+           {"name": "Ours, master before #608/#609", "kind": "prev", "values": [75.9, 53.0, 26.4]}
+         ]}
+      ],
+      "notes": [
+        "Where we lose: our DFlash2 router configuration is slower than Lapilli on story (61.5 vs 69.0) and Chinese (41.4 vs 48.3); MTP3 wins those but is slower than Lapilli on code (110.2 vs 119.9) and JSON (126.1 vs 175.8). Use MTP3 for prose and non-English text, DFlash2 for code, thinking and structured output.",
+        "Quants differ: ours is NInfer's Q4/Q5 group-quant mix (19.0 GB), Lapilli runs its Qwen3.8-27B QUASAR NVFP4 pack (21.1 GB). A second Lapilli run agreed: story 69.3, code 123.0, thinking 97.2."
+      ]
+    },
+    {
+      "file": "v100-flash-next.svg",
+      "title": "Qwen3.8-Flash-Next on one Tesla V100 32 GB",
+      "subtitle": "ashalliants/ninfer-3090 against Lapilli (f9b7dd09) on this card, same five prompts, greedy, a 150-token thinking budget. The 512-expert model's experts stream from host RAM over a PCIe Gen3 x4 link.",
+      "desc": "Qwen3.8-Flash-Next decode on one Tesla V100: ashalliants/ninfer-3090 against Lapilli, plus prefill against third-party reports.",
+      "build": "build fdcac347 (#611)",
+      "panels": [
+        {"type": "grouped", "title": "Decode, one request (tok/s)",
+         "groups": ["story", "code", "Chinese", "French", "thinking"],
+         "series": [
+           {"name": "Ours, MTP (#611 settings)", "kind": "ours", "values": [89.2, 126.0, 83.6, 84.3, 120.0]},
+           {"name": "Lapilli, measured on this box 2026-11-23", "kind": "same", "values": [86.8, 124.7, 83.3, 78.4, 119.8]}
+         ]},
+        {"type": "rows", "title": "Prefill (tok/s)",
+         "note": "No same-box Lapilli prefill figure. The two reported rows are derived by us from time to first token on another box (i9-10940X, 96 GB RAM), so they include request overheads.",
+         "rows": [
+           {"label": "Ours", "detail": "3.8K-token prompt (250 W, 2026-11-18)", "value": 990, "kind": "ours"},
+           {"label": "Lapilli (user nebod99)", "detail": "7,242-token prompt, IQ3_S, from an 8.7 s TTFT", "value": 830, "kind": "reported"},
+           {"label": "Strata (user nebod99)", "detail": "same test, from a 22.6 s TTFT", "value": 320, "kind": "reported"}
+         ]}
+      ],
+      "notes": [
+        "Close race: we lead Lapilli on all five prompts, by 0.2% (thinking) to 8% (French). Quants differ but sit in the same size class: ours is ISTA-DASLab's GSQ-RCO IQ2_XS repacked, Lapilli's is Unsloth's UD-IQ2_XS. With the router's flags ours reaches 129.6 on code.",
+        "Hosts with more RAM and a wider link report more: FNFL reports 106.8 tok/s (poetry, IQ3_XXS, 128 GB RAM, PCIe x8), above our story figure."
+      ]
+    },
+    {
+      "file": "v100-qwen36-35b-a3b.svg",
+      "title": "Qwen3.6-35B-A3B on one Tesla V100 32 GB",
+      "subtitle": "ashalliants/ninfer-3090 against llama.cpp 36d818e16 (ggml-org Q4_K_M with its MTP and DFlash Q8_0 sidecars), both on this card, same prompts, greedy, 300 output tokens, warm. Lapilli does not run this model.",
+      "desc": "Qwen3.6-35B-A3B decode and prefill on one Tesla V100: ashalliants/ninfer-3090 against llama.cpp's best mode per prompt.",
+      "build": "#614 (MTP3), #618 (DFlash K7), #621 (prefill), build d309f3d8",
+      "panels": [
+        {"type": "grouped", "title": "Decode, one request (tok/s)",
+         "note": "llama.cpp is shown at its best mode for each prompt (MTP with 2 or 3 drafts, or DFlash with 7), named beside its bar. Our DFlash K7 was measured on code and JSON only.",
+         "groups": ["story", "code", "Chinese", "French", "thinking", "conversation", "JSON", "no drafts"],
+         "series": [
+           {"name": "Ours, MTP3 + draft head (default)", "kind": "ours", "values": [172.6, 253.7, 189.5, 191.0, 265.0, 192.7, 302.9, 155], "labels": [null, null, null, null, null, null, null, "plain"]},
+           {"name": "Ours, DFlash K7", "kind": "alt", "values": [null, 233.6, null, null, null, null, 319.1, null]},
+           {"name": "llama.cpp, best mode per prompt", "kind": "same", "values": [131, 195, 135, 135, 177, 140, 293, 98],
+            "labels": ["MTP n2", "DFlash n7", "MTP n3", "MTP n2", "MTP n3", "MTP n2", "DFlash n7", "plain"]}
+         ]},
+        {"type": "grouped", "title": "Prefill (tok/s)",
+         "note": "llama.cpp with a tuned batch (-ub 2048 -b 4096); at its default batch it reached 2,745 at 4.2K. The longest prompts differ: ours 40.2K tokens, llama.cpp 50K.",
+         "groups": ["4.2K prompt", "13K prompt", "40-50K prompt"],
+         "series": [
+           {"name": "Ours (#621)", "kind": "ours", "values": [3984, 3866, 3118], "labels": [null, null, "40.2K"]},
+           {"name": "llama.cpp, tuned batch", "kind": "same", "values": [3280, 3250, 2326], "labels": [null, null, "50K"]}
+         ]}
+      ],
+      "notes": [
+        "Closest call: JSON, where llama.cpp's DFlash n7 (293) is within 4% of our MTP3 (302.9) and 8% behind our DFlash K7 (319.1). Our DFlash K7 is slower than our MTP3 on code (233.6 vs 253.7). Two requests at once: 197.5-200.4 tok/s in total (MTP3, #614)."
+      ]
+    },
+    {
+      "file": "v100-inkling2-mini.svg",
+      "title": "Inkling-2-Mini on one Tesla V100 32 GB",
+      "subtitle": "ashalliants/ninfer-3090 measured on this card, against every other single-V100 32 GB figure we found. Those are third-party reported (hatched): other machines, quants and prompts, not re-run by us.",
+      "desc": "Inkling-2-Mini decode and prefill on one Tesla V100: ashalliants/ninfer-3090 measured, Strata, Lapilli-Inkling and llama.cpp as reported.",
+      "build": "decode master dc867300 (2026-11-23), prefill since #596 (2026-11-24)",
+      "panels": [
+        {"type": "rows", "title": "Decode, one request (tok/s)",
+         "note": "Ours: UD-Q8_K_XL repacked byte-exact, the largest quant here, average over 12 chats, greedy, 300 tokens, at 262,144 context with vision and INT8 KV. DSpark output equals plain greedy output.",
+         "rows": [
+           {"label": "Ours, DSpark", "detail": "12-chat average", "value": 94.3, "kind": "ours"},
+           {"label": "Ours, plain", "detail": "no drafts", "value": 78.0, "kind": "alt"},
+           {"label": "Strata", "detail": "model card rev 04996a1e; draft decoding, prompt not stated", "value": 70.5, "kind": "reported"},
+           {"label": "Lapilli-Inkling (Csavoldi)", "detail": "NVFP4 experts, empty context, no drafts", "value": 69, "kind": "reported"},
+           {"label": "llama.cpp, realugbun fork", "detail": "UD-Q4_K_XL, tg128", "value": 50.7, "kind": "reported"},
+           {"label": "llama.cpp mainline", "detail": "UD-Q4_K_XL, tg128, measured by realugbun", "value": 32.0, "kind": "reported"}
+         ]},
+        {"type": "rows", "title": "Prefill (tok/s)",
+         "note": "Ours at 131,072 context. Our lead over Strata's reported prefill needs --prefill-chunk 8192; at the default chunk of 2048 Strata's figure is higher.",
+         "rows": [
+           {"label": "Ours, --prefill-chunk 8192", "detail": "7,974-token prompt", "value": 2727, "kind": "ours"},
+           {"label": "Strata", "detail": "SQ-20 pack, prompt length not stated", "value": 2287, "kind": "reported"},
+           {"label": "Ours, default chunk 2048", "detail": "8K prompt", "value": 2170, "kind": "alt"},
+           {"label": "llama.cpp, realugbun fork", "detail": "pp512", "value": 1185, "kind": "reported"},
+           {"label": "Lapilli-Inkling (Csavoldi)", "detail": "short prompt", "value": 850, "kind": "reported"},
+           {"label": "llama.cpp mainline", "detail": "pp512, measured by realugbun", "value": 725, "kind": "reported"}
+         ]}
+      ],
+      "notes": [
+        "Reported figures are copied from pinned sources (docs/tesla-v100.md, \"Methodology and sources\") and were not re-run here; power limits are mostly not stated. Strata's card still carried \"VERIFY before publishing\" comments in its source. Smaller quants usually decode faster."
+      ]
+    }
+  ]
+}

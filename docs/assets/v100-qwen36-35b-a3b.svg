@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 959" width="960" height="959" role="img" aria-label="Qwen3.6-35B-A3B decode and prefill on one Tesla V100: ashalliants/ninfer-3090 against llama.cpp&#x27;s best mode per prompt.">
+  <title>Qwen3.6-35B-A3B on one Tesla V100 32 GB</title>
+  <desc>Qwen3.6-35B-A3B decode and prefill on one Tesla V100: ashalliants/ninfer-3090 against llama.cpp&#x27;s best mode per prompt.</desc>
+
+  <style>
+    .surface { fill: #fcfcfb; stroke: rgba(11,11,11,0.10); }
+    .t1 { fill: #0b0b0b; } .t2 { fill: #52514e; } .t3 { fill: #6f6e69; }
+    .grid { stroke: #e6e5df; } .base { stroke: #c3c2b7; } .ref { stroke: #52514e; stroke-dasharray: 4 3; }
+    .ours { fill: #2a78d6; } .alt { fill: #1baf7a; } .same { fill: #eb6834; } .prev { fill: #b5b3aa; }
+    .rep { fill: url(#hatch-v100-qwen36-35b-a3b); } .hatchbg { fill: #e4e2da; } .hatchln { stroke: #8f8d86; }
+    .win { fill: #1d5fb0; } .loss { fill: #b8471d; }
+    text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #1a1a19; stroke: rgba(255,255,255,0.12); }
+      .t1 { fill: #f4f3ef; } .t2 { fill: #c3c2b7; } .t3 { fill: #a3a29b; }
+      .grid { stroke: #2e2e2b; } .base { stroke: #4a4a46; } .ref { stroke: #c3c2b7; }
+      .ours { fill: #3987e5; } .alt { fill: #199e70; } .same { fill: #d95926; } .prev { fill: #6f6e69; }
+      .hatchbg { fill: #3a3935; } .hatchln { stroke: #8f8d86; }
+      .win { fill: #79b0f0; } .loss { fill: #f08a5d; }
+    }
+  </style>
+  <defs><pattern id="hatch-v100-qwen36-35b-a3b" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" class="hatchbg"/><line x1="0" y1="0" x2="0" y2="6" class="hatchln" stroke-width="2"/></pattern></defs>
+  <rect x="1" y="1" width="958" height="957" rx="14" class="surface" stroke-width="1"/>
+  <text x="32.0" y="48.0" class="t1" font-size="22" font-weight="700" text-anchor="start">Qwen3.6-35B-A3B on one Tesla V100 32 GB</text>
+  <text x="32.0" y="72.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">ashalliants/ninfer-3090 against llama.cpp 36d818e16 (ggml-org Q4_K_M with its MTP and DFlash Q8_0 sidecars), both</text>
+  <text x="32.0" y="91.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">on this card, same prompts, greedy, 300 output tokens, warm. Lapilli does not run this model.</text>
+  <text x="32.0" y="132.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Decode, one request (tok/s)</text>
+  <text x="32.0" y="152.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">llama.cpp is shown at its best mode for each prompt (MTP with 2 or 3 drafts, or DFlash with 7), named beside its bar. Our DFlash K7</text>
+  <text x="32.0" y="167.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">was measured on code and JSON only.</text>
+  <path class="ours" d="M32.0,188.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours, MTP3 + draft head (default)</title></path>
+  <text x="52.0" y="198.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours, MTP3 + draft head (default)</text>
+  <path class="alt" d="M309.2,188.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours, DFlash K7</title></path>
+  <text x="329.2" y="198.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours, DFlash K7</text>
+  <path class="same" d="M456.0,188.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>llama.cpp, best mode per prompt</title></path>
+  <text x="476.0" y="198.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">llama.cpp, best mode per prompt</text>
+  <line x1="152.0" y1="214.0" x2="152.0" y2="567.0" class="base" stroke-width="1"/>
+  <text x="152.0" y="581.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">0</text>
+  <line x1="316.0" y1="214.0" x2="316.0" y2="567.0" class="grid" stroke-width="1"/>
+  <text x="316.0" y="581.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">100</text>
+  <line x1="480.0" y1="214.0" x2="480.0" y2="567.0" class="grid" stroke-width="1"/>
+  <text x="480.0" y="581.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">200</text>
+  <line x1="644.0" y1="214.0" x2="644.0" y2="567.0" class="grid" stroke-width="1"/>
+  <text x="644.0" y="581.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">300</text>
+  <line x1="808.0" y1="214.0" x2="808.0" y2="567.0" class="grid" stroke-width="1"/>
+  <text x="808.0" y="581.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">400</text>
+  <text x="142.0" y="236.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">story</text>
+  <path class="ours" d="M152.0,218.0 h279.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-279.1 z"><title>Ours, MTP3 + draft head (default): story 172.6 tok/s</title></path>
+  <text x="440.1" y="228.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">172.6</text>
+  <path class="same" d="M152.0,233.0 h210.8 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-210.8 z"><title>llama.cpp, best mode per prompt: story 131 tok/s (MTP n2)</title></path>
+  <text x="371.8" y="243.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">131</text>
+  <text x="395.9" y="243.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">MTP n2</text>
+  <text x="142.0" y="285.0" class="t2" font-size="12.5" font-weight="400" text-anchor="end">code</text>
+  <path class="ours" d="M152.0,259.0 h412.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-412.1 z"><title>Ours, MTP3 + draft head (default): code 253.7 tok/s</title></path>
+  <text x="573.1" y="269.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">253.7</text>
+  <path class="alt" d="M152.0,274.0 h379.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-379.1 z"><title>Ours, DFlash K7: code 233.6 tok/s</title></path>
+  <text x="540.1" y="284.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">233.6</text>
+  <path class="same" d="M152.0,289.0 h315.8 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-315.8 z"><title>llama.cpp, best mode per prompt: code 195 tok/s (DFlash n7)</title></path>
+  <text x="476.8" y="299.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">195</text>
+  <text x="500.8" y="299.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">DFlash n7</text>
+  <text x="142.0" y="333.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">Chinese</text>
+  <path class="ours" d="M152.0,315.0 h306.8 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-306.8 z"><title>Ours, MTP3 + draft head (default): Chinese 189.5 tok/s</title></path>
+  <text x="467.8" y="325.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">189.5</text>
+  <path class="same" d="M152.0,330.0 h217.4 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-217.4 z"><title>llama.cpp, best mode per prompt: Chinese 135 tok/s (MTP n3)</title></path>
+  <text x="378.4" y="340.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">135</text>
+  <text x="402.4" y="340.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">MTP n3</text>
+  <text x="142.0" y="374.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">French</text>
+  <path class="ours" d="M152.0,356.0 h309.2 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-309.2 z"><title>Ours, MTP3 + draft head (default): French 191 tok/s</title></path>
+  <text x="470.2" y="366.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">191</text>
+  <path class="same" d="M152.0,371.0 h217.4 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-217.4 z"><title>llama.cpp, best mode per prompt: French 135 tok/s (MTP n2)</title></path>
+  <text x="378.4" y="381.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">135</text>
+  <text x="402.4" y="381.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">MTP n2</text>
+  <text x="142.0" y="415.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">thinking</text>
+  <path class="ours" d="M152.0,397.0 h430.6 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-430.6 z"><title>Ours, MTP3 + draft head (default): thinking 265 tok/s</title></path>
+  <text x="591.6" y="407.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">265</text>
+  <path class="same" d="M152.0,412.0 h286.3 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-286.3 z"><title>llama.cpp, best mode per prompt: thinking 177 tok/s (MTP n3)</title></path>
+  <text x="447.3" y="422.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">177</text>
+  <text x="471.3" y="422.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">MTP n3</text>
+  <text x="142.0" y="456.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">conversation</text>
+  <path class="ours" d="M152.0,438.0 h312.0 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-312.0 z"><title>Ours, MTP3 + draft head (default): conversation 192.7 tok/s</title></path>
+  <text x="473.0" y="448.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">192.7</text>
+  <path class="same" d="M152.0,453.0 h225.6 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-225.6 z"><title>llama.cpp, best mode per prompt: conversation 140 tok/s (MTP n2)</title></path>
+  <text x="386.6" y="463.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">140</text>
+  <text x="410.6" y="463.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">MTP n2</text>
+  <text x="142.0" y="505.0" class="t2" font-size="12.5" font-weight="400" text-anchor="end">JSON</text>
+  <path class="ours" d="M152.0,479.0 h492.8 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-492.8 z"><title>Ours, MTP3 + draft head (default): JSON 302.9 tok/s</title></path>
+  <text x="653.8" y="489.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">302.9</text>
+  <path class="alt" d="M152.0,494.0 h519.3 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-519.3 z"><title>Ours, DFlash K7: JSON 319.1 tok/s</title></path>
+  <text x="680.3" y="504.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">319.1</text>
+  <path class="same" d="M152.0,509.0 h476.5 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-476.5 z"><title>llama.cpp, best mode per prompt: JSON 293 tok/s (DFlash n7)</title></path>
+  <text x="637.5" y="519.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">293</text>
+  <text x="661.5" y="519.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">DFlash n7</text>
+  <text x="142.0" y="553.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">no drafts</text>
+  <path class="ours" d="M152.0,535.0 h250.2 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-250.2 z"><title>Ours, MTP3 + draft head (default): no drafts 155 tok/s (plain)</title></path>
+  <text x="411.2" y="545.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">155</text>
+  <text x="438.0" y="545.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">plain</text>
+  <path class="same" d="M152.0,550.0 h156.7 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-156.7 z"><title>llama.cpp, best mode per prompt: no drafts 98.0 tok/s (plain)</title></path>
+  <text x="317.7" y="560.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">98.0</text>
+  <text x="348.4" y="560.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">plain</text>
+  <text x="808.0" y="597.0" class="t3" font-size="11" font-weight="400" text-anchor="end">tokens per second, higher is better</text>
+  <text x="32.0" y="619.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Prefill (tok/s)</text>
+  <text x="32.0" y="639.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">llama.cpp with a tuned batch (-ub 2048 -b 4096); at its default batch it reached 2,745 at 4.2K. The longest prompts differ: ours 40.2K</text>
+  <text x="32.0" y="654.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">tokens, llama.cpp 50K.</text>
+  <path class="ours" d="M32.0,675.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours (#621)</title></path>
+  <text x="52.0" y="685.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours (#621)</text>
+  <path class="same" d="M149.8,675.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>llama.cpp, tuned batch</title></path>
+  <text x="169.8" y="685.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">llama.cpp, tuned batch</text>
+  <line x1="152.0" y1="701.0" x2="152.0" y2="819.0" class="base" stroke-width="1"/>
+  <text x="152.0" y="833.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">0</text>
+  <line x1="283.2" y1="701.0" x2="283.2" y2="819.0" class="grid" stroke-width="1"/>
+  <text x="283.2" y="833.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">1,000</text>
+  <line x1="414.4" y1="701.0" x2="414.4" y2="819.0" class="grid" stroke-width="1"/>
+  <text x="414.4" y="833.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">2,000</text>
+  <line x1="545.6" y1="701.0" x2="545.6" y2="819.0" class="grid" stroke-width="1"/>
+  <text x="545.6" y="833.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">3,000</text>
+  <line x1="676.8" y1="701.0" x2="676.8" y2="819.0" class="grid" stroke-width="1"/>
+  <text x="676.8" y="833.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">4,000</text>
+  <line x1="808.0" y1="701.0" x2="808.0" y2="819.0" class="grid" stroke-width="1"/>
+  <text x="808.0" y="833.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">5,000</text>
+  <text x="142.0" y="723.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">4.2K prompt</text>
+  <path class="ours" d="M152.0,705.0 h518.7 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-518.7 z"><title>Ours (#621): 4.2K prompt 3,984 tok/s</title></path>
+  <text x="679.7" y="715.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">3,984</text>
+  <path class="same" d="M152.0,720.0 h426.3 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-426.3 z"><title>llama.cpp, tuned batch: 4.2K prompt 3,280 tok/s</title></path>
+  <text x="587.3" y="730.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">3,280</text>
+  <text x="142.0" y="764.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">13K prompt</text>
+  <path class="ours" d="M152.0,746.0 h503.2 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-503.2 z"><title>Ours (#621): 13K prompt 3,866 tok/s</title></path>
+  <text x="664.2" y="756.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">3,866</text>
+  <path class="same" d="M152.0,761.0 h422.4 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-422.4 z"><title>llama.cpp, tuned batch: 13K prompt 3,250 tok/s</title></path>
+  <text x="583.4" y="771.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">3,250</text>
+  <text x="142.0" y="805.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">40-50K prompt</text>
+  <path class="ours" d="M152.0,787.0 h405.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-405.1 z"><title>Ours (#621): 40-50K prompt 3,118 tok/s (40.2K)</title></path>
+  <text x="566.1" y="797.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">3,118</text>
+  <text x="608.0" y="797.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">40.2K</text>
+  <path class="same" d="M152.0,802.0 h301.2 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-301.2 z"><title>llama.cpp, tuned batch: 40-50K prompt 2,326 tok/s (50K)</title></path>
+  <text x="462.2" y="812.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">2,326</text>
+  <text x="499.5" y="812.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">50K</text>
+  <text x="808.0" y="849.0" class="t3" font-size="11" font-weight="400" text-anchor="end">tokens per second, higher is better</text>
+  <line x1="32" y1="861.0" x2="928" y2="861.0" class="grid" stroke-width="1"/>
+  <text x="32.0" y="879.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Closest call: JSON, where llama.cpp&#x27;s DFlash n7 (293) is within 4% of our MTP3 (302.9) and 8% behind our DFlash K7 (319.1). Our DFlash</text>
+  <text x="32.0" y="894.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">K7 is slower than our MTP3 on code (233.6 vs 253.7). Two requests at once: 197.5-200.4 tok/s in total (MTP3, #614).</text>
+  <text x="32.0" y="915.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM · 200 W limit · 2026-11-25 · ours: #614 (MTP3), #618 (DFlash</text>
+  <text x="32.0" y="930.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">K7), #621 (prefill), build d309f3d8 · competitors measured on this box unless marked “reported”</text>
+</svg>

@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 923" width="960" height="923" role="img" aria-label="Inkling-2-Mini decode and prefill on one Tesla V100: ashalliants/ninfer-3090 measured, Strata, Lapilli-Inkling and llama.cpp as reported.">
+  <title>Inkling-2-Mini on one Tesla V100 32 GB</title>
+  <desc>Inkling-2-Mini decode and prefill on one Tesla V100: ashalliants/ninfer-3090 measured, Strata, Lapilli-Inkling and llama.cpp as reported.</desc>
+
+  <style>
+    .surface { fill: #fcfcfb; stroke: rgba(11,11,11,0.10); }
+    .t1 { fill: #0b0b0b; } .t2 { fill: #52514e; } .t3 { fill: #6f6e69; }
+    .grid { stroke: #e6e5df; } .base { stroke: #c3c2b7; } .ref { stroke: #52514e; stroke-dasharray: 4 3; }
+    .ours { fill: #2a78d6; } .alt { fill: #1baf7a; } .same { fill: #eb6834; } .prev { fill: #b5b3aa; }
+    .rep { fill: url(#hatch-v100-inkling2-mini); } .hatchbg { fill: #e4e2da; } .hatchln { stroke: #8f8d86; }
+    .win { fill: #1d5fb0; } .loss { fill: #b8471d; }
+    text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #1a1a19; stroke: rgba(255,255,255,0.12); }
+      .t1 { fill: #f4f3ef; } .t2 { fill: #c3c2b7; } .t3 { fill: #a3a29b; }
+      .grid { stroke: #2e2e2b; } .base { stroke: #4a4a46; } .ref { stroke: #c3c2b7; }
+      .ours { fill: #3987e5; } .alt { fill: #199e70; } .same { fill: #d95926; } .prev { fill: #6f6e69; }
+      .hatchbg { fill: #3a3935; } .hatchln { stroke: #8f8d86; }
+      .win { fill: #79b0f0; } .loss { fill: #f08a5d; }
+    }
+  </style>
+  <defs><pattern id="hatch-v100-inkling2-mini" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" class="hatchbg"/><line x1="0" y1="0" x2="0" y2="6" class="hatchln" stroke-width="2"/></pattern></defs>
+  <rect x="1" y="1" width="958" height="921" rx="14" class="surface" stroke-width="1"/>
+  <text x="32.0" y="48.0" class="t1" font-size="22" font-weight="700" text-anchor="start">Inkling-2-Mini on one Tesla V100 32 GB</text>
+  <text x="32.0" y="72.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">ashalliants/ninfer-3090 measured on this card, against every other single-V100 32 GB figure we found. Those are</text>
+  <text x="32.0" y="91.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">third-party reported (hatched): other machines, quants and prompts, not re-run by us.</text>
+  <text x="32.0" y="132.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Decode, one request (tok/s)</text>
+  <text x="32.0" y="152.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">Ours: UD-Q8_K_XL repacked byte-exact, the largest quant here, average over 12 chats, greedy, 300 tokens, at 262,144 context with</text>
+  <text x="32.0" y="167.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vision and INT8 KV. DSpark output equals plain greedy output.</text>
+  <text x="32.0" y="206.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours, DSpark</text>
+  <text x="139.0" y="206.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">12-chat average</text>
+  <path class="ours" d="M32.0,212.0 h756.1 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-756.1 z"><title>Ours, DSpark 12-chat average: 94.3</title></path>
+  <text x="798.1" y="223.5" class="t1" font-size="12" font-weight="600" text-anchor="start">94.3</text>
+  <text x="32.0" y="250.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours, plain</text>
+  <text x="130.8" y="250.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">no drafts</text>
+  <path class="alt" d="M32.0,256.0 h624.7 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-624.7 z"><title>Ours, plain no drafts: 78.0</title></path>
+  <text x="666.7" y="267.5" class="t1" font-size="12" font-weight="600" text-anchor="start">78.0</text>
+  <text x="32.0" y="294.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Strata</text>
+  <text x="83.5" y="294.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">model card rev 04996a1e; draft decoding, prompt not stated</text>
+  <path class="rep" d="M32.0,300.0 h564.2 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-564.2 z"><title>Strata model card rev 04996a1e; draft decoding, prompt not stated: 70.5</title></path>
+  <text x="606.2" y="311.5" class="t2" font-size="12" font-weight="400" text-anchor="start">70.5 reported</text>
+  <text x="32.0" y="338.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Lapilli-Inkling (Csavoldi)</text>
+  <text x="228.5" y="338.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">NVFP4 experts, empty context, no drafts</text>
+  <path class="rep" d="M32.0,344.0 h552.1 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-552.1 z"><title>Lapilli-Inkling (Csavoldi) NVFP4 experts, empty context, no drafts: 69.0</title></path>
+  <text x="594.1" y="355.5" class="t2" font-size="12" font-weight="400" text-anchor="start">69.0 reported</text>
+  <text x="32.0" y="382.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">llama.cpp, realugbun fork</text>
+  <text x="221.2" y="382.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">UD-Q4_K_XL, tg128</text>
+  <path class="rep" d="M32.0,388.0 h404.6 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-404.6 z"><title>llama.cpp, realugbun fork UD-Q4_K_XL, tg128: 50.7</title></path>
+  <text x="446.6" y="399.5" class="t2" font-size="12" font-weight="400" text-anchor="start">50.7 reported</text>
+  <text x="32.0" y="426.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">llama.cpp mainline</text>
+  <text x="170.5" y="426.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">UD-Q4_K_XL, tg128, measured by realugbun</text>
+  <path class="rep" d="M32.0,432.0 h253.9 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-253.9 z"><title>llama.cpp mainline UD-Q4_K_XL, tg128, measured by realugbun: 32.0</title></path>
+  <text x="295.9" y="443.5" class="t2" font-size="12" font-weight="400" text-anchor="start">32.0 reported</text>
+  <text x="32.0" y="476.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Prefill (tok/s)</text>
+  <text x="32.0" y="496.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">Ours at 131,072 context. Our lead over Strata&#x27;s reported prefill needs --prefill-chunk 8192; at the default chunk of 2048 Strata&#x27;s</text>
+  <text x="32.0" y="511.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">figure is higher.</text>
+  <text x="32.0" y="550.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours, --prefill-chunk 8192</text>
+  <text x="254.5" y="550.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">7,974-token prompt</text>
+  <path class="ours" d="M32.0,556.0 h728.7 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-728.7 z"><title>Ours, --prefill-chunk 8192 7,974-token prompt: 2,727</title></path>
+  <text x="770.7" y="567.5" class="t1" font-size="12" font-weight="600" text-anchor="start">2,727</text>
+  <text x="32.0" y="594.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Strata</text>
+  <text x="83.5" y="594.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">SQ-20 pack, prompt length not stated</text>
+  <path class="rep" d="M32.0,600.0 h610.4 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-610.4 z"><title>Strata SQ-20 pack, prompt length not stated: 2,287</title></path>
+  <text x="652.4" y="611.5" class="t2" font-size="12" font-weight="400" text-anchor="start">2,287 reported</text>
+  <text x="32.0" y="638.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours, default chunk 2048</text>
+  <text x="238.0" y="638.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">8K prompt</text>
+  <path class="alt" d="M32.0,644.0 h579.0 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-579.0 z"><title>Ours, default chunk 2048 8K prompt: 2,170</title></path>
+  <text x="621.0" y="655.5" class="t1" font-size="12" font-weight="600" text-anchor="start">2,170</text>
+  <text x="32.0" y="682.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">llama.cpp, realugbun fork</text>
+  <text x="221.2" y="682.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">pp512</text>
+  <path class="rep" d="M32.0,688.0 h314.4 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-314.4 z"><title>llama.cpp, realugbun fork pp512: 1,185</title></path>
+  <text x="356.4" y="699.5" class="t2" font-size="12" font-weight="400" text-anchor="start">1,185 reported</text>
+  <text x="32.0" y="726.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Lapilli-Inkling (Csavoldi)</text>
+  <text x="228.5" y="726.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">short prompt</text>
+  <path class="rep" d="M32.0,732.0 h224.4 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-224.4 z"><title>Lapilli-Inkling (Csavoldi) short prompt: 850</title></path>
+  <text x="266.4" y="743.5" class="t2" font-size="12" font-weight="400" text-anchor="start">850 reported</text>
+  <text x="32.0" y="770.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">llama.cpp mainline</text>
+  <text x="170.5" y="770.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">pp512, measured by realugbun</text>
+  <path class="rep" d="M32.0,776.0 h190.8 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-190.8 z"><title>llama.cpp mainline pp512, measured by realugbun: 725</title></path>
+  <text x="232.8" y="787.5" class="t2" font-size="12" font-weight="400" text-anchor="start">725 reported</text>
+  <line x1="32" y1="810.0" x2="928" y2="810.0" class="grid" stroke-width="1"/>
+  <text x="32.0" y="828.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Reported figures are copied from pinned sources (docs/tesla-v100.md, &quot;Methodology and sources&quot;) and were not re-run here; power limits</text>
+  <text x="32.0" y="843.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">are mostly not stated. Strata&#x27;s card still carried &quot;VERIFY before publishing&quot; comments in its source. Smaller quants usually decode</text>
+  <text x="32.0" y="858.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">faster.</text>
+  <text x="32.0" y="879.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM · 200 W limit · 2026-11-25 · ours: decode master dc867300</text>
+  <text x="32.0" y="894.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">(2026-11-23), prefill since #596 (2026-11-24) · competitors measured on this box unless marked “reported”</text>
+</svg>

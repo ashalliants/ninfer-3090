@@ -1,0 +1,168 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 1237" width="960" height="1237" role="img" aria-label="Qwen3.8-27B decode and prefill on one Tesla V100: ashalliants/ninfer-3090 with DFlash2 K7 and with MTP3 against Lapilli.">
+  <title>Qwen3.8-27B on one Tesla V100 32 GB</title>
+  <desc>Qwen3.8-27B decode and prefill on one Tesla V100: ashalliants/ninfer-3090 with DFlash2 K7 and with MTP3 against Lapilli.</desc>
+
+  <style>
+    .surface { fill: #fcfcfb; stroke: rgba(11,11,11,0.10); }
+    .t1 { fill: #0b0b0b; } .t2 { fill: #52514e; } .t3 { fill: #6f6e69; }
+    .grid { stroke: #e6e5df; } .base { stroke: #c3c2b7; } .ref { stroke: #52514e; stroke-dasharray: 4 3; }
+    .ours { fill: #2a78d6; } .alt { fill: #1baf7a; } .same { fill: #eb6834; } .prev { fill: #b5b3aa; }
+    .rep { fill: url(#hatch-v100-qwen38-27b); } .hatchbg { fill: #e4e2da; } .hatchln { stroke: #8f8d86; }
+    .win { fill: #1d5fb0; } .loss { fill: #b8471d; }
+    text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #1a1a19; stroke: rgba(255,255,255,0.12); }
+      .t1 { fill: #f4f3ef; } .t2 { fill: #c3c2b7; } .t3 { fill: #a3a29b; }
+      .grid { stroke: #2e2e2b; } .base { stroke: #4a4a46; } .ref { stroke: #c3c2b7; }
+      .ours { fill: #3987e5; } .alt { fill: #199e70; } .same { fill: #d95926; } .prev { fill: #6f6e69; }
+      .hatchbg { fill: #3a3935; } .hatchln { stroke: #8f8d86; }
+      .win { fill: #79b0f0; } .loss { fill: #f08a5d; }
+    }
+  </style>
+  <defs><pattern id="hatch-v100-qwen38-27b" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" class="hatchbg"/><line x1="0" y1="0" x2="0" y2="6" class="hatchln" stroke-width="2"/></pattern></defs>
+  <rect x="1" y="1" width="958" height="1235" rx="14" class="surface" stroke-width="1"/>
+  <text x="32.0" y="48.0" class="t1" font-size="22" font-weight="700" text-anchor="start">Qwen3.8-27B on one Tesla V100 32 GB</text>
+  <text x="32.0" y="72.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">ashalliants/ninfer-3090 against Lapilli (chris83-dev/lapilli-v100 f9b7dd09), both run on this card with the same</text>
+  <text x="32.0" y="91.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">prompts, greedy, 300 output tokens, warm. Both of our configurations are shown: each wins different prompts.</text>
+  <text x="32.0" y="132.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Decode, one request (tok/s)</text>
+  <text x="32.0" y="152.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">Conversation (temperature 0.6) and JSON are Lapilli&#x27;s basalt-bench fixtures (seed 7); the JSON prompt runs to about 7.2-7.6K output</text>
+  <text x="32.0" y="167.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">tokens.</text>
+  <path class="ours" d="M32.0,188.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours, DFlash2 K7 + n-gram 15 (router)</title></path>
+  <text x="52.0" y="198.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours, DFlash2 K7 + n-gram 15 (router)</text>
+  <path class="alt" d="M338.2,188.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours, MTP3</title></path>
+  <text x="358.2" y="198.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours, MTP3</text>
+  <path class="same" d="M448.8,188.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Lapilli, DFlash2 (its default)</title></path>
+  <text x="468.8" y="198.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Lapilli, DFlash2 (its default)</text>
+  <line x1="152.0" y1="214.0" x2="152.0" y2="601.0" class="base" stroke-width="1"/>
+  <text x="152.0" y="615.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">0</text>
+  <line x1="316.0" y1="214.0" x2="316.0" y2="601.0" class="grid" stroke-width="1"/>
+  <text x="316.0" y="615.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">50</text>
+  <line x1="480.0" y1="214.0" x2="480.0" y2="601.0" class="grid" stroke-width="1"/>
+  <text x="480.0" y="615.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">100</text>
+  <line x1="644.0" y1="214.0" x2="644.0" y2="601.0" class="grid" stroke-width="1"/>
+  <text x="644.0" y="615.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">150</text>
+  <line x1="808.0" y1="214.0" x2="808.0" y2="601.0" class="grid" stroke-width="1"/>
+  <text x="808.0" y="615.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">200</text>
+  <text x="142.0" y="244.0" class="t2" font-size="12.5" font-weight="400" text-anchor="end">story</text>
+  <path class="ours" d="M152.0,218.0 h197.7 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-197.7 z"><title>Ours, DFlash2 K7 + n-gram 15 (router): story 61.5 tok/s</title></path>
+  <text x="358.7" y="228.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">61.5</text>
+  <path class="alt" d="M152.0,233.0 h231.8 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-231.8 z"><title>Ours, MTP3: story 71.9 tok/s</title></path>
+  <text x="392.8" y="243.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">71.9</text>
+  <path class="same" d="M152.0,248.0 h222.3 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-222.3 z"><title>Lapilli, DFlash2 (its default): story 69.0 tok/s</title></path>
+  <text x="383.3" y="258.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">69.0</text>
+  <text x="142.0" y="300.0" class="t2" font-size="12.5" font-weight="400" text-anchor="end">code</text>
+  <path class="ours" d="M152.0,274.0 h478.2 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-478.2 z"><title>Ours, DFlash2 K7 + n-gram 15 (router): code 147 tok/s</title></path>
+  <text x="639.2" y="284.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">147</text>
+  <path class="alt" d="M152.0,289.0 h357.5 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-357.5 z"><title>Ours, MTP3: code 110.2 tok/s</title></path>
+  <text x="518.5" y="299.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">110.2</text>
+  <path class="same" d="M152.0,304.0 h389.3 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-389.3 z"><title>Lapilli, DFlash2 (its default): code 119.9 tok/s</title></path>
+  <text x="550.3" y="314.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">119.9</text>
+  <text x="142.0" y="356.0" class="t2" font-size="12.5" font-weight="400" text-anchor="end">Chinese</text>
+  <path class="ours" d="M152.0,330.0 h131.8 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-131.8 z"><title>Ours, DFlash2 K7 + n-gram 15 (router): Chinese 41.4 tok/s</title></path>
+  <text x="292.8" y="340.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">41.4</text>
+  <path class="alt" d="M152.0,345.0 h237.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-237.1 z"><title>Ours, MTP3: Chinese 73.5 tok/s</title></path>
+  <text x="398.1" y="355.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">73.5</text>
+  <path class="same" d="M152.0,360.0 h154.4 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-154.4 z"><title>Lapilli, DFlash2 (its default): Chinese 48.3 tok/s</title></path>
+  <text x="315.4" y="370.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">48.3</text>
+  <text x="142.0" y="412.0" class="t2" font-size="12.5" font-weight="400" text-anchor="end">French</text>
+  <path class="ours" d="M152.0,386.0 h222.3 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-222.3 z"><title>Ours, DFlash2 K7 + n-gram 15 (router): French 69.0 tok/s</title></path>
+  <text x="383.3" y="396.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">69.0</text>
+  <path class="alt" d="M152.0,401.0 h254.8 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-254.8 z"><title>Ours, MTP3: French 78.9 tok/s</title></path>
+  <text x="415.8" y="411.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">78.9</text>
+  <path class="same" d="M152.0,416.0 h212.8 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-212.8 z"><title>Lapilli, DFlash2 (its default): French 66.1 tok/s</title></path>
+  <text x="373.8" y="426.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">66.1</text>
+  <text x="142.0" y="468.0" class="t2" font-size="12.5" font-weight="400" text-anchor="end">thinking</text>
+  <path class="ours" d="M152.0,442.0 h378.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-378.1 z"><title>Ours, DFlash2 K7 + n-gram 15 (router): thinking 116.5 tok/s</title></path>
+  <text x="539.1" y="452.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">116.5</text>
+  <path class="alt" d="M152.0,457.0 h314.2 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-314.2 z"><title>Ours, MTP3: thinking 97.0 tok/s</title></path>
+  <text x="475.2" y="467.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">97.0</text>
+  <path class="same" d="M152.0,472.0 h311.5 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-311.5 z"><title>Lapilli, DFlash2 (its default): thinking 96.2 tok/s</title></path>
+  <text x="472.5" y="482.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">96.2</text>
+  <text x="142.0" y="524.0" class="t2" font-size="12.5" font-weight="400" text-anchor="end">conversation</text>
+  <path class="ours" d="M152.0,498.0 h335.5 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-335.5 z"><title>Ours, DFlash2 K7 + n-gram 15 (router): conversation 103.5 tok/s</title></path>
+  <text x="496.5" y="508.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">103.5</text>
+  <path class="alt" d="M152.0,513.0 h291.2 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-291.2 z"><title>Ours, MTP3: conversation 90.0 tok/s</title></path>
+  <text x="452.2" y="523.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">90.0</text>
+  <path class="same" d="M152.0,528.0 h269.9 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-269.9 z"><title>Lapilli, DFlash2 (its default): conversation 83.5 tok/s</title></path>
+  <text x="430.9" y="538.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">83.5</text>
+  <text x="142.0" y="580.0" class="t2" font-size="12.5" font-weight="400" text-anchor="end">JSON</text>
+  <path class="ours" d="M152.0,554.0 h619.2 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-619.2 z"><title>Ours, DFlash2 K7 + n-gram 15 (router): JSON 190 tok/s</title></path>
+  <text x="780.2" y="564.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">190</text>
+  <path class="alt" d="M152.0,569.0 h409.6 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-409.6 z"><title>Ours, MTP3: JSON 126.1 tok/s</title></path>
+  <text x="570.6" y="579.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">126.1</text>
+  <path class="same" d="M152.0,584.0 h572.6 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-572.6 z"><title>Lapilli, DFlash2 (its default): JSON 175.8 tok/s</title></path>
+  <text x="733.6" y="594.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">175.8</text>
+  <text x="808.0" y="631.0" class="t3" font-size="11" font-weight="400" text-anchor="end">tokens per second, higher is better</text>
+  <text x="32.0" y="653.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Prefill (tok/s)</text>
+  <text x="32.0" y="673.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">A fresh prompt each time, two repeats each (ours 951-958 at 4.2K).</text>
+  <path class="ours" d="M32.0,694.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours</title></path>
+  <text x="52.0" y="704.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours</text>
+  <path class="same" d="M99.0,694.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Lapilli</title></path>
+  <text x="119.0" y="704.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Lapilli</text>
+  <line x1="152.0" y1="720.0" x2="152.0" y2="797.0" class="base" stroke-width="1"/>
+  <text x="152.0" y="811.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">0</text>
+  <line x1="283.2" y1="720.0" x2="283.2" y2="797.0" class="grid" stroke-width="1"/>
+  <text x="283.2" y="811.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">200</text>
+  <line x1="414.4" y1="720.0" x2="414.4" y2="797.0" class="grid" stroke-width="1"/>
+  <text x="414.4" y="811.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">400</text>
+  <line x1="545.6" y1="720.0" x2="545.6" y2="797.0" class="grid" stroke-width="1"/>
+  <text x="545.6" y="811.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">600</text>
+  <line x1="676.8" y1="720.0" x2="676.8" y2="797.0" class="grid" stroke-width="1"/>
+  <text x="676.8" y="811.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">800</text>
+  <line x1="808.0" y1="720.0" x2="808.0" y2="797.0" class="grid" stroke-width="1"/>
+  <text x="808.0" y="811.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">1,000</text>
+  <text x="142.0" y="742.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">4.2K prompt</text>
+  <path class="ours" d="M152.0,724.0 h624.3 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-624.3 z"><title>Ours: 4.2K prompt 957.7 tok/s</title></path>
+  <text x="785.3" y="734.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">957.7</text>
+  <path class="same" d="M152.0,739.0 h454.8 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-454.8 z"><title>Lapilli: 4.2K prompt 699.4 tok/s</title></path>
+  <text x="615.8" y="749.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">699.4</text>
+  <text x="142.0" y="783.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">13.4K prompt</text>
+  <path class="ours" d="M152.0,765.0 h616.4 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-616.4 z"><title>Ours: 13.4K prompt 945.7 tok/s</title></path>
+  <text x="777.4" y="775.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">945.7</text>
+  <path class="same" d="M152.0,780.0 h442.4 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-442.4 z"><title>Lapilli: 13.4K prompt 680.5 tok/s</title></path>
+  <text x="603.4" y="790.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">680.5</text>
+  <text x="808.0" y="827.0" class="t3" font-size="11" font-weight="400" text-anchor="end">tokens per second, higher is better</text>
+  <text x="32.0" y="849.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Decode at long context, MTP3 (tok/s)</text>
+  <text x="32.0" y="869.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">Decode after a prompt of that many tokens, build 3c6a616d with #608/#609, against master before them. Lapilli was not run at long</text>
+  <text x="32.0" y="884.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">context.</text>
+  <path class="alt" d="M32.0,905.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours, MTP3 (#608/#609)</title></path>
+  <text x="52.0" y="915.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours, MTP3 (#608/#609)</text>
+  <path class="prev" d="M229.5,905.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours, master before #608/#609</title></path>
+  <text x="249.5" y="915.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours, master before #608/#609</text>
+  <line x1="152.0" y1="931.0" x2="152.0" y2="1049.0" class="base" stroke-width="1"/>
+  <text x="152.0" y="1063.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">0</text>
+  <line x1="283.2" y1="931.0" x2="283.2" y2="1049.0" class="grid" stroke-width="1"/>
+  <text x="283.2" y="1063.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">20</text>
+  <line x1="414.4" y1="931.0" x2="414.4" y2="1049.0" class="grid" stroke-width="1"/>
+  <text x="414.4" y="1063.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">40</text>
+  <line x1="545.6" y1="931.0" x2="545.6" y2="1049.0" class="grid" stroke-width="1"/>
+  <text x="545.6" y="1063.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">60</text>
+  <line x1="676.8" y1="931.0" x2="676.8" y2="1049.0" class="grid" stroke-width="1"/>
+  <text x="676.8" y="1063.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">80</text>
+  <line x1="808.0" y1="931.0" x2="808.0" y2="1049.0" class="grid" stroke-width="1"/>
+  <text x="808.0" y="1063.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">100</text>
+  <text x="142.0" y="953.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">4,215 tokens</text>
+  <path class="alt" d="M152.0,935.0 h551.0 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-551.0 z"><title>Ours, MTP3 (#608/#609): 4,215 tokens 84.6 tok/s</title></path>
+  <text x="712.0" y="945.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">84.6</text>
+  <path class="prev" d="M152.0,950.0 h493.9 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-493.9 z"><title>Ours, master before #608/#609: 4,215 tokens 75.9 tok/s</title></path>
+  <text x="654.9" y="960.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">75.9</text>
+  <text x="142.0" y="994.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">42,663 tokens</text>
+  <path class="alt" d="M152.0,976.0 h451.9 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-451.9 z"><title>Ours, MTP3 (#608/#609): 42,663 tokens 69.5 tok/s</title></path>
+  <text x="612.9" y="986.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">69.5</text>
+  <path class="prev" d="M152.0,991.0 h343.7 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-343.7 z"><title>Ours, master before #608/#609: 42,663 tokens 53.0 tok/s</title></path>
+  <text x="504.7" y="1001.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">53.0</text>
+  <text x="142.0" y="1035.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">172,487 tokens</text>
+  <path class="alt" d="M152.0,1017.0 h368.0 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-368.0 z"><title>Ours, MTP3 (#608/#609): 172,487 tokens 56.7 tok/s</title></path>
+  <text x="529.0" y="1027.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">56.7</text>
+  <path class="prev" d="M152.0,1032.0 h169.2 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-169.2 z"><title>Ours, master before #608/#609: 172,487 tokens 26.4 tok/s</title></path>
+  <text x="330.2" y="1042.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">26.4</text>
+  <text x="808.0" y="1079.0" class="t3" font-size="11" font-weight="400" text-anchor="end">tokens per second, higher is better</text>
+  <line x1="32" y1="1091.0" x2="928" y2="1091.0" class="grid" stroke-width="1"/>
+  <text x="32.0" y="1109.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Where we lose: our DFlash2 router configuration is slower than Lapilli on story (61.5 vs 69.0) and Chinese (41.4 vs 48.3); MTP3 wins</text>
+  <text x="32.0" y="1124.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">those but is slower than Lapilli on code (110.2 vs 119.9) and JSON (126.1 vs 175.8). Use MTP3 for prose and non-English text, DFlash2</text>
+  <text x="32.0" y="1139.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">for code, thinking and structured output.</text>
+  <text x="32.0" y="1157.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Quants differ: ours is NInfer&#x27;s Q4/Q5 group-quant mix (19.0 GB), Lapilli runs its Qwen3.8-27B QUASAR NVFP4 pack (21.1 GB). A second</text>
+  <text x="32.0" y="1172.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Lapilli run agreed: story 69.3, code 123.0, thinking 97.2.</text>
+  <text x="32.0" y="1193.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM · 200 W limit · 2026-11-25 · ours: build d309f3d8 (long context:</text>
+  <text x="32.0" y="1208.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">3c6a616d, #608/#609) · competitors measured on this box unless marked “reported”</text>
+</svg>

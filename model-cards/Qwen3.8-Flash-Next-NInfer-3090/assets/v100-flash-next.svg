@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 761" width="960" height="761" role="img" aria-label="Qwen3.8-Flash-Next decode on one Tesla V100: ashalliants/ninfer-3090 against Lapilli, plus prefill against third-party reports.">
+  <title>Qwen3.8-Flash-Next on one Tesla V100 32 GB</title>
+  <desc>Qwen3.8-Flash-Next decode on one Tesla V100: ashalliants/ninfer-3090 against Lapilli, plus prefill against third-party reports.</desc>
+
+  <style>
+    .surface { fill: #fcfcfb; stroke: rgba(11,11,11,0.10); }
+    .t1 { fill: #0b0b0b; } .t2 { fill: #52514e; } .t3 { fill: #6f6e69; }
+    .grid { stroke: #e6e5df; } .base { stroke: #c3c2b7; } .ref { stroke: #52514e; stroke-dasharray: 4 3; }
+    .ours { fill: #2a78d6; } .alt { fill: #1baf7a; } .same { fill: #eb6834; } .prev { fill: #b5b3aa; }
+    .rep { fill: url(#hatch-v100-flash-next); } .hatchbg { fill: #e4e2da; } .hatchln { stroke: #8f8d86; }
+    .win { fill: #1d5fb0; } .loss { fill: #b8471d; }
+    text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #1a1a19; stroke: rgba(255,255,255,0.12); }
+      .t1 { fill: #f4f3ef; } .t2 { fill: #c3c2b7; } .t3 { fill: #a3a29b; }
+      .grid { stroke: #2e2e2b; } .base { stroke: #4a4a46; } .ref { stroke: #c3c2b7; }
+      .ours { fill: #3987e5; } .alt { fill: #199e70; } .same { fill: #d95926; } .prev { fill: #6f6e69; }
+      .hatchbg { fill: #3a3935; } .hatchln { stroke: #8f8d86; }
+      .win { fill: #79b0f0; } .loss { fill: #f08a5d; }
+    }
+  </style>
+  <defs><pattern id="hatch-v100-flash-next" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" class="hatchbg"/><line x1="0" y1="0" x2="0" y2="6" class="hatchln" stroke-width="2"/></pattern></defs>
+  <rect x="1" y="1" width="958" height="759" rx="14" class="surface" stroke-width="1"/>
+  <text x="32.0" y="48.0" class="t1" font-size="22" font-weight="700" text-anchor="start">Qwen3.8-Flash-Next on one Tesla V100 32 GB</text>
+  <text x="32.0" y="72.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">ashalliants/ninfer-3090 against Lapilli (f9b7dd09) on this card, same five prompts, greedy, a 150-token thinking</text>
+  <text x="32.0" y="91.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">budget. The 512-expert model&#x27;s experts stream from host RAM over a PCIe Gen3 x4 link.</text>
+  <text x="32.0" y="132.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Decode, one request (tok/s)</text>
+  <path class="ours" d="M32.0,150.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours, MTP (#611 settings)</title></path>
+  <text x="52.0" y="160.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours, MTP (#611 settings)</text>
+  <path class="same" d="M251.2,150.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Lapilli, measured on this box 2026-11-23</title></path>
+  <text x="271.2" y="160.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Lapilli, measured on this box 2026-11-23</text>
+  <line x1="152.0" y1="176.0" x2="152.0" y2="376.0" class="base" stroke-width="1"/>
+  <text x="152.0" y="390.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">0</text>
+  <line x1="370.7" y1="176.0" x2="370.7" y2="376.0" class="grid" stroke-width="1"/>
+  <text x="370.7" y="390.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">50</text>
+  <line x1="589.3" y1="176.0" x2="589.3" y2="376.0" class="grid" stroke-width="1"/>
+  <text x="589.3" y="390.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">100</text>
+  <line x1="808.0" y1="176.0" x2="808.0" y2="376.0" class="grid" stroke-width="1"/>
+  <text x="808.0" y="390.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">150</text>
+  <text x="142.0" y="198.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">story</text>
+  <path class="ours" d="M152.0,180.0 h386.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-386.1 z"><title>Ours, MTP (#611 settings): story 89.2 tok/s</title></path>
+  <text x="547.1" y="190.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">89.2</text>
+  <path class="same" d="M152.0,195.0 h375.6 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-375.6 z"><title>Lapilli, measured on this box 2026-11-23: story 86.8 tok/s</title></path>
+  <text x="536.6" y="205.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">86.8</text>
+  <text x="142.0" y="239.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">code</text>
+  <path class="ours" d="M152.0,221.0 h547.0 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-547.0 z"><title>Ours, MTP (#611 settings): code 126 tok/s</title></path>
+  <text x="708.0" y="231.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">126</text>
+  <path class="same" d="M152.0,236.0 h541.4 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-541.4 z"><title>Lapilli, measured on this box 2026-11-23: code 124.7 tok/s</title></path>
+  <text x="702.4" y="246.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">124.7</text>
+  <text x="142.0" y="280.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">Chinese</text>
+  <path class="ours" d="M152.0,262.0 h361.6 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-361.6 z"><title>Ours, MTP (#611 settings): Chinese 83.6 tok/s</title></path>
+  <text x="522.6" y="272.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">83.6</text>
+  <path class="same" d="M152.0,277.0 h360.3 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-360.3 z"><title>Lapilli, measured on this box 2026-11-23: Chinese 83.3 tok/s</title></path>
+  <text x="521.3" y="287.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">83.3</text>
+  <text x="142.0" y="321.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">French</text>
+  <path class="ours" d="M152.0,303.0 h364.7 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-364.7 z"><title>Ours, MTP (#611 settings): French 84.3 tok/s</title></path>
+  <text x="525.7" y="313.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">84.3</text>
+  <path class="same" d="M152.0,318.0 h338.9 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-338.9 z"><title>Lapilli, measured on this box 2026-11-23: French 78.4 tok/s</title></path>
+  <text x="499.9" y="328.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">78.4</text>
+  <text x="142.0" y="362.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">thinking</text>
+  <path class="ours" d="M152.0,344.0 h520.8 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-520.8 z"><title>Ours, MTP (#611 settings): thinking 120 tok/s</title></path>
+  <text x="681.8" y="354.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">120</text>
+  <path class="same" d="M152.0,359.0 h519.9 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-519.9 z"><title>Lapilli, measured on this box 2026-11-23: thinking 119.8 tok/s</title></path>
+  <text x="680.9" y="369.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">119.8</text>
+  <text x="808.0" y="406.0" class="t3" font-size="11" font-weight="400" text-anchor="end">tokens per second, higher is better</text>
+  <text x="32.0" y="428.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Prefill (tok/s)</text>
+  <text x="32.0" y="448.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">No same-box Lapilli prefill figure. The two reported rows are derived by us from time to first token on another box (i9-10940X, 96 GB</text>
+  <text x="32.0" y="463.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">RAM), so they include request overheads.</text>
+  <text x="32.0" y="502.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours</text>
+  <text x="73.0" y="502.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">3.8K-token prompt (250 W, 2026-11-18)</text>
+  <path class="ours" d="M32.0,508.0 h661.0 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-661.0 z"><title>Ours 3.8K-token prompt (250 W, 2026-11-18): 990</title></path>
+  <text x="703.0" y="519.5" class="t1" font-size="12" font-weight="600" text-anchor="start">990</text>
+  <text x="32.0" y="546.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Lapilli (user nebod99)</text>
+  <text x="199.5" y="546.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">7,242-token prompt, IQ3_S, from an 8.7 s TTFT</text>
+  <path class="rep" d="M32.0,552.0 h553.5 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-553.5 z"><title>Lapilli (user nebod99) 7,242-token prompt, IQ3_S, from an 8.7 s TTFT: 830</title></path>
+  <text x="595.5" y="563.5" class="t2" font-size="12" font-weight="400" text-anchor="start">830 reported</text>
+  <text x="32.0" y="590.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Strata (user nebod99)</text>
+  <text x="192.2" y="590.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">same test, from a 22.6 s TTFT</text>
+  <path class="rep" d="M32.0,596.0 h210.9 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-210.9 z"><title>Strata (user nebod99) same test, from a 22.6 s TTFT: 320</title></path>
+  <text x="252.9" y="607.5" class="t2" font-size="12" font-weight="400" text-anchor="start">320 reported</text>
+  <line x1="32" y1="630.0" x2="928" y2="630.0" class="grid" stroke-width="1"/>
+  <text x="32.0" y="648.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Close race: we lead Lapilli on all five prompts, by 0.2% (thinking) to 8% (French). Quants differ but sit in the same size class: ours</text>
+  <text x="32.0" y="663.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">is ISTA-DASLab&#x27;s GSQ-RCO IQ2_XS repacked, Lapilli&#x27;s is Unsloth&#x27;s UD-IQ2_XS. With the router&#x27;s flags ours reaches 129.6 on code.</text>
+  <text x="32.0" y="681.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Hosts with more RAM and a wider link report more: FNFL reports 106.8 tok/s (poetry, IQ3_XXS, 128 GB RAM, PCIe x8), above our story</text>
+  <text x="32.0" y="696.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">figure.</text>
+  <text x="32.0" y="717.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM · 200 W limit · 2026-11-25 · ours: build fdcac347 (#611) ·</text>
+  <text x="32.0" y="732.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">competitors measured on this box unless marked “reported”</text>
+</svg>
