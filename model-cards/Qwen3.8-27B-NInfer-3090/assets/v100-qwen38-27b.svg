@@ -161,8 +161,8 @@
   <text x="32.0" y="1109.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Where we lose: our DFlash2 router configuration is slower than Lapilli on story (61.5 vs 69.0) and Chinese (41.4 vs 48.3); MTP3 wins</text>
   <text x="32.0" y="1124.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">those but is slower than Lapilli on code (110.2 vs 119.9) and JSON (126.1 vs 175.8). Use MTP3 for prose and non-English text, DFlash2</text>
   <text x="32.0" y="1139.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">for code, thinking and structured output.</text>
-  <text x="32.0" y="1157.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Quants differ: ours is NInfer&#x27;s Q4/Q5 group-quant mix (19.0 GB), Lapilli runs its Qwen3.8-27B QUASAR NVFP4 pack (21.1 GB). A second</text>
-  <text x="32.0" y="1172.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Lapilli run agreed: story 69.3, code 123.0, thinking 97.2.</text>
+  <text x="32.0" y="1157.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Quants differ: ours is the Qwen3.8-27B Q4/Q5 group-quant mix (19.0 GB), Lapilli runs its Qwen3.8-27B QUASAR NVFP4 pack (21.1 GB). A</text>
+  <text x="32.0" y="1172.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">second Lapilli run agreed: story 69.3, code 123.0, thinking 97.2.</text>
   <text x="32.0" y="1193.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM · 200 W limit · 2026-11-25 · ours: build d309f3d8 (long context:</text>
   <text x="32.0" y="1208.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">3c6a616d, #608/#609) · competitors measured on this box unless marked “reported”</text>
 </svg>

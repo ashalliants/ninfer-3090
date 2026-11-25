@@ -70,7 +70,7 @@
       ],
       "notes": [
         "Where we lose: our DFlash2 router configuration is slower than Lapilli on story (61.5 vs 69.0) and Chinese (41.4 vs 48.3); MTP3 wins those but is slower than Lapilli on code (110.2 vs 119.9) and JSON (126.1 vs 175.8). Use MTP3 for prose and non-English text, DFlash2 for code, thinking and structured output.",
-        "Quants differ: ours is NInfer's Q4/Q5 group-quant mix (19.0 GB), Lapilli runs its Qwen3.8-27B QUASAR NVFP4 pack (21.1 GB). A second Lapilli run agreed: story 69.3, code 123.0, thinking 97.2."
+        "Quants differ: ours is the Qwen3.8-27B Q4/Q5 group-quant mix (19.0 GB), Lapilli runs its Qwen3.8-27B QUASAR NVFP4 pack (21.1 GB). A second Lapilli run agreed: story 69.3, code 123.0, thinking 97.2."
       ]
     },
     {
