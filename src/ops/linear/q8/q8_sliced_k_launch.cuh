@@ -1,6 +1,7 @@
 #pragma once
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
+#include "ops/linear/common/stream_draft_dp4a.cuh"
 #include "ops/linear/common/stream_gemv.cuh"
 #include "ops/linear/q8/q8_a16_sliced_k_mma.cuh"
 #include "ops/linear/q8/q8_rowsplit_storage.cuh"
@@ -15,8 +16,11 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
     if (operands.k % 8 != 0) throw std::invalid_argument("Q8 sliced-K MMA requires K aligned to 8");
     // T = 1..8 through the identity row map is a GEMV over a few tokens: the streaming GEMV
     // computes it bound by the weight stream where mma.sync is emulated (sm_70 by default;
-    // ops/linear/common/stream_gemv.cuh). Fused row maps keep this schedule.
+    // ops/linear/common/stream_gemv.cuh). Fused row maps keep this schedule. A drafter's launch
+    // inside a ScopedDraftA8 (the MTP layer's linears) takes the int8 dp4a form first
+    // (stream_draft_dp4a.cuh); it declines outside a scope and off sm_70.
     if constexpr (std::is_same_v<RowPolicy, Q8SlicedKIdentityRows>) {
+        if (try_launch_q8_draft_dp4a(operands, output, epilogue, stream)) return;
         if (operands.tokens <= kStreamGemvMaxTokens &&
             try_launch_stream_gemv<Q8StreamFormat>(operands.x, {operands.codes, operands.scales},
                                                    output, epilogue, operands.rows, operands.k,

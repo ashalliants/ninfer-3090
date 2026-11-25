@@ -37,6 +37,11 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     set_tests_properties(ninfer_linear_${format}_a16_stream_a8_test PROPERTIES
       ENVIRONMENT "NINFER_STREAM_DP4A=1" SKIP_RETURN_CODE 77)
   endforeach()
+  # The MTP layer's Q8 linears on the drafter's int8-activation route (ops/linear/common/draft_a8.h):
+  # the Q8 suite inside a ScopedDraftA8 at the same allowance.
+  add_test(NAME ninfer_linear_q8_a16_draft_a8_test COMMAND ninfer_tests ninfer_linear_q8_a16_test)
+  set_tests_properties(ninfer_linear_q8_a16_draft_a8_test PROPERTIES
+    ENVIRONMENT "NINFER_TEST_DRAFT_A8=1" SKIP_RETURN_CODE 77)
 endif()
 
 # The per-stream verify_a8 switch (ops/linear/common/stream_a8.h): two engines keep their own

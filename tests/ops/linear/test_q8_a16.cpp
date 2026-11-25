@@ -1,5 +1,7 @@
+#include "ops/linear/common/draft_a8.h"
 #include "ops/linear/common/sm70_tensor_core.h"
 #include "ops/linear/linear_test_common.h"
+#include "ops/op_tester.h"
 
 #include <algorithm>
 #include <array>
@@ -224,6 +226,9 @@ int main(int argc, char** argv) {
         } else if (argc != 1) {
             throw std::invalid_argument("usage: ninfer_linear_q8_a16_test [--shape N K]");
         }
+        // As the MTP layer calls Q8 linears: inside a ScopedDraftA8 when NINFER_TEST_DRAFT_A8=1
+        // (the `_draft_a8` variant), so calls of 1..64 tokens take the drafter's dp4a route.
+        const ninfer::ops::ScopedDraftA8 draft_a8(ninfer::test::draft_a8_forced());
         const int failures = q8_a16_conformance(n, k) + q8_a16_biased_activation(n, k);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Q8_A16 Linear\n";
         return failures == 0 ? 0 : 1;

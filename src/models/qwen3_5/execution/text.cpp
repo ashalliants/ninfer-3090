@@ -13,6 +13,7 @@
 #include "models/qwen3_5/program/lossy/scout_plan.h"
 
 #include "core/nvtx.h"
+#include "ops/linear/common/draft_a8.h"
 #include "models/qwen3_5/execution/overlay_staging.h"
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -430,6 +431,10 @@ void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
     nvtx::ScopedRange forward_range(nvtx::Name::MtpForward, nvtx::Category::Mtp,
                                     static_cast<std::uint64_t>(ids.numel()));
     auto scratch_scope = work_.scope();
+    // The MTP layer only drafts (the target verifies every proposal), so its Q8 linears take the
+    // int8-activation dp4a route where that is faster (sm_70 by default; NINFER_DRAFT_A8=0 turns
+    // it off). The proposal head runs outside this scope, on its own routes.
+    const ops::ScopedDraftA8 draft_a8;
     Tensor x;
     Tensor ah;
     mtp_forward_stem(ids, hidden, input_embeddings, x, ah);

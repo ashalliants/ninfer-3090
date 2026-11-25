@@ -11,6 +11,7 @@
 
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
+#include "ops/linear/common/draft_a8.h"
 
 #include "core/device.h"
 #include "direct_bf16_weight.cuh"
@@ -130,6 +131,7 @@ struct Sweep {
 };
 
 struct Options {
+    bool draft_a8       = false;
     bool have_qtype     = false;
     bool have_n         = false;
     bool have_k         = false;
@@ -378,6 +380,8 @@ void usage(const char* argv0) {
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
+                 "  --draft-a8         Call as a drafter (inside a ScopedDraftA8): sm_70 Q8 calls of\n"
+                 "                     1..64 tokens take the int8 dp4a route (NINFER_DRAFT_A8=0: not).\n"
                  "  --warmup N         Warmup calls per point (default %d).\n"
                  "  --repeat N         Measured cold-cache samples per point (default %d).\n"
                  "  --flush-mib N      L2 eviction buffer size (default 256 MiB).\n"
@@ -423,6 +427,8 @@ Options parse_args(int argc, char** argv) {
             opt.graph_calls = parse_nonnegative_int(next("graph-calls"), "graph-calls");
         } else if (arg == "--profile") {
             opt.profile = true;
+        } else if (arg == "--draft-a8") {
+            opt.draft_a8 = true;
         } else if (arg == "--warmup") {
             opt.warmup = parse_nonnegative_int(next("warmup"), "warmup");
         } else if (arg == "--repeat") {
@@ -990,6 +996,7 @@ void write_csv(const std::filesystem::path& path, const std::vector<Result>& res
 int main(int argc, char** argv) {
     try {
         const Options opt = parse_args(argc, argv);
+        const ninfer::ops::ScopedDraftA8 draft_a8(opt.draft_a8 && ninfer::ops::draft_a8_enabled());
         int device_count  = 0;
         if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
             std::printf("SKIP: no usable CUDA device\n");
