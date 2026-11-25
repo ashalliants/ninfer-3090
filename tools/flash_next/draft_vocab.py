@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Write Flash-Next's tokenizer-derived MTP draft vocabulary as a file of int32 token ids.
 
-  python tools/flash_next/draft_vocab.py TOKENIZER_JSON OUT.bin
+  python tools/flash_next/draft_vocab.py TOKENIZER_JSON OUT.bin [TOKENIZER_CONFIG_JSON]
 
 ninfer-serve builds the same list itself from the artifact's tokenizer (--mtp-draft-vocab auto on a
 Tesla V100, or tokenizer); this script writes it out for inspection or for another engine. The rule
 (models::qwen4_exp::tokenizer_draft_vocab): every id below 65,536, the ids in [65,536, 120,000)
 whose bytes are CJK text, and every added token; sorted, distinct, padded to an even count by
-repeating the last id. Only tokenizer.json is read.
+repeating the last id. The added tokens are tokenizer.json's added_tokens plus, when
+TOKENIZER_CONFIG_JSON is given, the ids of its added_tokens_decoder, which the runtime's tokenizer
+merges in as well (pass it whenever the artifact was converted with one, or a token only it adds is
+missing from the list).
 """
 import json
 import struct
@@ -55,9 +58,11 @@ def is_cjk(data: bytes) -> bool:
     return continuation_only
 
 
-def draft_vocab(tokenizer: dict) -> list:
+def draft_vocab(tokenizer: dict, tokenizer_config: dict | None = None) -> list:
     vocab = tokenizer["model"]["vocab"]
     added = [t["id"] for t in tokenizer.get("added_tokens", [])]
+    if tokenizer_config:
+        added += [int(k) for k in tokenizer_config.get("added_tokens_decoder", {})]
     public = max(list(vocab.values()) + added) + 1
     dec = byte_decoder()
     by_id = {i: s for s, i in vocab.items()}
@@ -74,11 +79,16 @@ def draft_vocab(tokenizer: dict) -> list:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         print(__doc__, file=sys.stderr)
         return 2
     with open(sys.argv[1], encoding="utf-8") as f:
-        ids = draft_vocab(json.load(f))
+        tokenizer = json.load(f)
+    config = None
+    if len(sys.argv) == 4:
+        with open(sys.argv[3], encoding="utf-8") as f:
+            config = json.load(f)
+    ids = draft_vocab(tokenizer, config)
     with open(sys.argv[2], "wb") as f:
         f.write(struct.pack("<%di" % len(ids), *ids))
     print(f"{sys.argv[2]}: {len(ids)} ids")
