@@ -228,6 +228,7 @@ ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemory
     if (snapshot.lock_limit && !demand.lock_limit_advisory) {
         spare = std::min(spare, saturating_sub(*snapshot.lock_limit, without.pinned_total));
     }
+    out.spare           = spare;
     std::uint64_t bytes = std::min(requested, spare);
     bytes               = bytes / granule * granule;
     if (bytes < minimum) { bytes = 0; }
@@ -240,6 +241,27 @@ ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemory
     }
     out.bytes  = bytes;
     out.shrunk = bytes < requested;
+    return out;
+}
+
+ContextStoreStart decide_context_store(bool store_configured, std::uint64_t requested_cache,
+                                       const ContextCacheFit& fit, std::uint64_t nvme_bytes, std::uint64_t minimum) {
+    ContextStoreStart out;
+    if (!store_configured || fit.bytes != 0 || nvme_bytes != 0) { return out; }
+    out.store_on = false;
+    if (requested_cache == 0) {
+        out.refusal = "the context store restores sessions into the context cache, which is off: give it a Host "
+                      "budget (--host-context-mib) or an NVMe tier (--context-nvme-mib)";
+        return out;
+    }
+    const auto mib = [](std::uint64_t bytes) { return std::to_string(bytes >> 20); };
+    const std::uint64_t short_by = minimum > fit.spare ? minimum - fit.spare : 0;
+    out.warning = "context store: off for this run: it restores sessions into the context cache, and the RAM "
+                  "ledger could spare only " + mib(fit.spare) + " MiB for that cache beside the experts, " +
+                  mib(short_by) + " MiB short of its " + mib(minimum) +
+                  " MiB minimum. Sessions already saved stay on disk for the next start. To keep it on, free RAM "
+                  "(close other programs), lower --ram-headroom-mib, or give the cache an NVMe tier "
+                  "(--context-nvme-mib)";
     return out;
 }
 

@@ -186,7 +186,18 @@ different from the Qwen3.5 models:
 - **Across restarts** (`--context-store DIR`): conversations are written to the context store when
   idle and at shutdown and restored at startup (or when a request for them arrives), exactly as for
   the other models; it needs the host tier or the disk tier. Images are tied to the model file, the
-  MTP setting and `--vision`; a session written under another configuration is not restored.
+  MTP setting and `--vision`; a session written under another configuration is not restored. The
+  RAM ledger settles this before any weight is read. With no cache configured at all
+  (`--host-context-mib 0` and no `--context-nvme-mib`) a store is refused at once. When a cache was
+  asked for but the ledger cannot spare its 512 MiB minimum beside the experts, the model still
+  starts, with the store off for this run, and one warning says how far short it was and what to
+  change (free RAM, a lower `--ram-headroom-mib`, or a disk tier); the saved sessions stay on disk
+  for the next start, and output is unchanged (each prompt is prefilled in full):
+
+  ```text
+  WARN  context store: off for this run: it restores sessions into the context cache, and the RAM ledger could spare only 300 MiB for that cache beside the experts, 212 MiB short of its 512 MiB minimum. ...
+  INFO  context store | /home/me/.cache/ninfer/context-store/router/... | off for this run: no RAM for the context cache it restores into (see the warning above); saved sessions stay on disk
+  ```
 - **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup (with `--vision` also
   the 0.84 GiB tower, and the ledger counts up to 1.4 GiB of decoded media: about 2.2 GiB more in
   all). Before anything is pinned, a RAM ledger checks that the experts, every other planned allocation and a reserve for
@@ -1115,9 +1126,15 @@ fails does the same, so retries of a model that does not fit do not leave less R
 logs one line, such as (the figures here are only an illustration):
 
 ```text
-INFO  unloaded 'Qwen3.6-35B-A3B' | context store: 4 saved in 1.3 s | RAM 9.84 -> 1.02 GiB (8.82 GiB returned to the system)
-INFO  released failed load of 'Qwen3.8-Flash-Next-IQ3' | RAM 1.40 -> 1.02 GiB (0.38 GiB returned to the system)
+INFO  unloaded 'Qwen3.6-35B-A3B' | context store: 4 saved in 1.3 s | RAM 9.84 -> 1.02 GiB (8.82 GiB returned to the system); 0.61 GiB of heap still in use
+INFO  released failed load of 'Qwen3.8-Flash-Next-IQ3' | RAM 1.40 -> 1.02 GiB (0.38 GiB returned to the system); 0.61 GiB of heap still in use
 ```
+
+"Heap still in use" is what the allocator still counts as allocated once the model is gone
+(`mallinfo2`): memory something outside the model still holds, which no trim can return. Nothing
+from the unloaded model is freed later, so the next model's RAM check sees what the line shows; if
+the RAM it needs is tight, the kernel may page that held memory out to swap while the model pins
+its experts, which can make a retry find more RAM than the first attempt did.
 
 `scripts/router-unload-ram-check.sh` measures it on a GPU: it loads one model, builds a conversation,
 switches to a second, and checks the router's RAM after the switch and that the first model's

@@ -653,8 +653,41 @@ void partial_plan_wddm_cap_warning() {
 
 } // namespace
 
+// The context store needs a context cache to restore into. A RAM shortfall (the ledger cannot
+// spare the cache's minimum) starts the model with the store off and says how far short it was; a
+// configuration with no cache at all refuses before anything loads; any cache keeps the store on.
+void test_context_store_start() {
+    const std::uint64_t minimum = 512 * kMiB;
+    const HostMemoryDemand d    = flash_next();
+    const std::uint64_t floor   = need_for_full(d);
+    // Plenty of RAM: the cache fits, so the store runs.
+    const ContextCacheFit roomy = fit_context_cache(snapshot(floor + 8 * kGiB, floor + 8 * kGiB), d, 4 * kGiB, minimum, 64 * kMiB);
+    require(roomy.bytes == 4 * kGiB && roomy.spare >= 4 * kGiB, "a roomy ledger fits the whole cache");
+    require(decide_context_store(true, 4 * kGiB, roomy, 0, minimum).store_on, "a fitted cache keeps the store on");
+    // 300 MiB to spare: below the minimum, so no cache; spare reports the 300 MiB.
+    const ContextCacheFit tight = fit_context_cache(snapshot(floor + 300 * kMiB, floor + 300 * kMiB), d, 4 * kGiB, minimum, 64 * kMiB);
+    require(tight.bytes == 0 && tight.spare > 250 * kMiB && tight.spare <= 300 * kMiB, "a tight ledger has no cache but reports its spare");
+    const ContextStoreStart off = decide_context_store(true, 4 * kGiB, tight, 0, minimum);
+    require(!off.store_on && off.refusal.empty(), "a RAM shortfall starts with the store off, it does not refuse");
+    require(off.warning.find("off for this run") != std::string::npos &&
+                off.warning.find("MiB short of its 512 MiB minimum") != std::string::npos &&
+                off.warning.find("--ram-headroom-mib") != std::string::npos &&
+                off.warning.find("--context-nvme-mib") != std::string::npos,
+            "the warning says why and what to change: " + off.warning);
+    // The same shortfall with an NVMe tier: the cache exists (NVMe only), so the store runs.
+    require(decide_context_store(true, 4 * kGiB, tight, 8 * kGiB, minimum).store_on, "an NVMe tier keeps the store on");
+    // No store configured: nothing to decide, whatever the cache.
+    const ContextStoreStart none = decide_context_store(false, 4 * kGiB, tight, 0, minimum);
+    require(none.store_on && none.warning.empty() && none.refusal.empty(), "no store: nothing to say");
+    // No cache asked for at all (--host-context-mib 0, no NVMe tier) with a store: refused up front.
+    const ContextStoreStart refused = decide_context_store(true, 0, ContextCacheFit{}, 0, minimum);
+    require(!refused.store_on && refused.refusal.find("--host-context-mib") != std::string::npos && refused.warning.empty(),
+            "an explicit no-cache configuration with a store refuses");
+}
+
 int main() {
     try {
+        test_context_store_start();
         test_fit_boundary();
         test_reserve_applied_once();
         test_planned_terms();

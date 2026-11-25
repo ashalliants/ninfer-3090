@@ -115,10 +115,31 @@ void plan_pinned_weights(HostMemoryDemand& demand, std::uint64_t pinned_block, c
 struct ContextCacheFit {
     std::uint64_t bytes = 0;
     bool shrunk         = false; // less than requested
+    // What the ledger could spare for the tier before the minimum and the granule applied (0 when
+    // the experts do not fit at all): how far short of `minimum` an off cache was.
+    std::uint64_t spare = 0;
 };
 [[nodiscard]] ContextCacheFit fit_context_cache(const HostMemorySnapshot& snapshot, HostMemoryDemand demand,
                                                 std::uint64_t requested, std::uint64_t minimum,
                                                 std::uint64_t granule);
+
+// The context store restores saved sessions into the context cache, so a store needs a cache: a
+// RAM (Host) tier or an NVMe tier. Decided with the RAM ledger, before any weight is read:
+// - no store, or a cache exists (`fitted_cache` or `nvme_bytes` nonzero): the store runs;
+// - the configuration asks for no cache at all (`requested_cache` 0, no NVMe tier): `refusal`, the
+//   model does not start (nothing is loaded first);
+// - a cache was asked for but the ledger could not spare its minimum beside the experts (a RAM
+//   shortfall, which another start may not have): the model starts with the store off for this
+//   run, and `warning` says why and what to change. Sessions already on disk stay there for a
+//   later start; output is unchanged, prompts are just prefilled in full.
+struct ContextStoreStart {
+    bool store_on = true;
+    std::string refusal;
+    std::string warning;
+};
+[[nodiscard]] ContextStoreStart decide_context_store(bool store_configured, std::uint64_t requested_cache,
+                                                     const ContextCacheFit& fit, std::uint64_t nvme_bytes,
+                                                     std::uint64_t minimum);
 
 // --ngram-ram-mib: what the n-gram volume's RAM-held blocks (pageable) may take. They come last:
 // the ledger's reserve, every planned allocation, the experts' full need and the context cache

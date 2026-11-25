@@ -621,6 +621,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto cache_fit = models::qwen4_exp::fit_context_cache(snapshot, demand, requested_cache, kMinimumHostContextBytes,
                                                                 kHostContextGranule);
     demand.context_cache = cache_fit.bytes;
+    // The context store needs the cache it restores into: decided here, before any weight is read,
+    // so a refusal costs no load and a RAM shortfall starts the model with the store off.
+    const auto store_start = models::qwen4_exp::decide_context_store(options.context_store.enabled(), requested_cache,
+                                                                     cache_fit, nvme_bytes, kMinimumHostContextBytes);
+    if (!store_start.refusal.empty()) { throw std::invalid_argument(store_start.refusal); }
     // --ngram-ram-mib: the n-gram volume's RAM-held blocks take what is left after everything else
     // (the context cache included) and a margin, never more than the volume.
     if (next.ngram_ram_bytes != 0) {
@@ -752,7 +757,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.weight_formats       = {"ggml_blocks_v1", "ggml_expert_record_v1", "bf16", "fp32"};
-    return {std::move(instance), std::move(summary)};
+    // One WARN line once the engine is ready (the startup log prints load.warnings).
+    if (!store_start.store_on) { summary.warnings.push_back(store_start.warning); }
+    return {.instance = std::move(instance), .load = std::move(summary), .context_store_on = store_start.store_on};
 }
 
 } // namespace ninfer::runtime

@@ -104,6 +104,10 @@ HeapRelease release_freed_heap() noexcept {
     // free() never shrinks.
     (void)malloc_trim(0);
     out.trimmed = true;
+#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33)
+    const struct mallinfo2 info = mallinfo2();
+    out.heap_in_use             = static_cast<std::uint64_t>(info.uordblks) + static_cast<std::uint64_t>(info.hblkhd);
+#endif
 #endif
     out.resident_after = resident_bytes();
     return out;
@@ -146,6 +150,7 @@ std::string describe_unload(const UnloadStoreSave& save, const HeapRelease& heap
             out += " (" + gib(heap.resident_before - heap.resident_after) +
                    " GiB returned to the system)";
         }
+        if (heap.heap_in_use != 0) { out += "; " + gib(heap.heap_in_use) + " GiB of heap still in use"; }
     }
     return out;
 }

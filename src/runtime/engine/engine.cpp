@@ -693,6 +693,13 @@ private:
     // resolved size replaces the requested one, as for the other models.
     void construct_qwen4_exp() {
         auto constructed    = runtime::construct_qwen4_exp(options, device);
+        // A RAM shortfall left no context cache for the store to restore into: the RAM ledger
+        // decided (before the weights loaded) to run without the store this time, and load.warnings
+        // says so. The store is off for this Engine's life; its directory is untouched.
+        if (!constructed.context_store_on) {
+            constructed.load.context_store_off_for_run = options.context_store.directory.string();
+            options.context_store.directory.clear();
+        }
         qwen4               = std::move(constructed.instance);
         load                = std::move(constructed.load);
         load.cuda_sync_mode = device.sync_mode();
