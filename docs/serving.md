@@ -190,8 +190,12 @@ different from the Qwen3.5 models:
 - **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup (with `--vision` also
   the 0.84 GiB tower, and the ledger counts up to 1.4 GiB of decoded media: about 2.2 GiB more in
   all). Before anything is pinned, a RAM ledger checks that the experts, every other planned allocation and a reserve for
-  Windows (`--ram-headroom-mib`, default 2048) fit in the memory available now; if not, startup
-  refuses with the shortfall ("... 2.9 GiB short. Close other programs ..."). Loading takes about
+  the system (`--ram-headroom-mib`, default 2048: the OS and other programs) fit in the memory
+  available now; if not, startup refuses with the shortfall ("... keeps 2.0 GiB free for the
+  system: 2.9 GiB short. Close other programs ..."). The programs it names fit the OS: WSL, Docker
+  and browsers on Windows; other model servers, Docker containers and browsers on Linux. In a
+  router, the RAM a model that unloaded freed is given back first (see [Several models
+  (router)](#several-models-router)). Loading takes about
   two minutes from a SATA SSD, less when the files are in the page cache. With
   `--partial-ram-residency` RAM holds only the experts the VRAM cache does not (see the table
   below), so a pack whose experts exceed RAM can still load.
@@ -253,7 +257,7 @@ These options belong to Flash-Next. A Qwen3.5, 3.6 or 3.8 dense model refuses an
 | `--no-expert-state` | start the expert cache empty and save nothing | off |
 | `--default-expert-state FILE` | a default expert state for a fresh install, read only when the saved state does not load (missing, from another copy of the model, damaged, or of another expert count) and never written; it is matched by artifact id, so it fits every copy of the model; absent file: nothing changes; `--no-expert-state` does not read it either | `<model>.expert-state.default` |
 | `--vram-headroom-mib N` | VRAM left free for the desktop and other programs: what the Flash-Next expert cache leaves, or on Qwen3.8 dense models (with `--fit-context`) what the fitted context leaves | Flash-Next: 512 with a display, 256 without; `--fit-context`: 256 |
-| `--ram-headroom-mib N` | host RAM left free for Windows once every expert is pinned; startup refuses when it cannot be kept | `2048` |
+| `--ram-headroom-mib N` | host RAM left free for the system (the OS, other programs) once every expert is pinned; startup refuses when it cannot be kept | `2048` |
 | `--allow-unlocked-host-memory` | Linux only. Every expert is pinned with `cudaHostAlloc`, and startup normally refuses up front when the process's `RLIMIT_MEMLOCK` is below the pinned total, rather than hitting a raw allocator failure part-way through loading. Some containers (confirmed on a Vast.ai rental) cap it far below what any load needs and give no way to raise it, even as root. This flag skips that refusal and lets the real `cudaHostAlloc` calls decide, the same way the Windows WDDM page-lock cap above is already only a warning: a pin that genuinely cannot be made still fails loudly where it is made, never silently on unlocked memory, since `cudaHostAlloc` has no partial-success return | off (refuses) |
 | `--partial-ram-residency` | keep in host RAM only the routed experts the VRAM expert cache does not hold, plus 16 spare slots per layer, instead of pinning all 24,576: at startup the hottest experts (by the saved expert state, else an equal share of every layer) are read from the model file straight into VRAM and live only there, and every other expert gets a pinned RAM slot. A promoted expert keeps its RAM copy; an expert that lives only in VRAM is copied back into a RAM slot before its VRAM frame is reused. The output is designed to stay bit for bit unchanged. The cost: the expert cache keeps its startup size (it no longer shrinks when the desktop needs VRAM, so the default `--vram-headroom-mib` with a display is 1 GiB instead of 512 MiB), the whole KV of `--max-context` is mapped at startup (fewer frames for short prompts), prompts prefill through static calls without the expert stream (long prompts are slower), and the cache admits experts one victim at a time even when a round could admit every miss (an expert held only in VRAM leaves only when its layer has a RAM slot for it). Designed to work with two lanes, MTP, `--hot-embedding-rows`, `--cpu-verify-misses` and `--prefill-cpu-share` (the CPU computes only experts that are not in VRAM, and each of those has a RAM copy). Refused with `--vision`. RAM needed for the experts, estimated from the packs' expert sizes with about 15 GiB of VRAM frames (not measured): the IQ2_XS pack about 20 GiB (33 GiB whole), the IQ3_XXS pack about 30 GiB (40 GiB), the IQ3_S pack about 37 GiB (46.8 GiB); the context cache, the n-gram row cache and `--ram-headroom-mib` come on top. So the IQ3_XXS pack and probably the IQ3_S pack fit a 64 GB Linux machine, and the IQ2_XS pack a 32 GB one with the context cache shrunk. On Windows, when everything pinned exceeds half the RAM less 8 GiB (24 GiB on 64 GB, 8 GiB on 32 GB), startup prints a warning naming the `--vram-headroom-mib` or `--expert-cache-mib` that would stay under it: Basalt reports WDDM capping page-lock registration (`cudaHostRegister`) there, but NInfer pins with `cudaHostAlloc`, which may still succeed (full mode pins about 35 GiB on a 64 GB Windows machine). If the pin fails, startup stops with an error naming `--vram-headroom-mib` and `--partial-ram-residency`. Startup also refuses when the expert cache comes out smaller than planned. Measured on an RTX 3090 (2026-11-11), `fn-decode-mtp`: bit for bit unchanged, B/A median +1.44%, 6 of 12 positive, range -3.77%..+35.86% -- a wash, with one outlier rep pulling the top of the range; its actual value on this card is sizing headroom for a 64 GB-plus pack, not a decode speedup | off (every expert pinned) |
 | `--expert-cache-mib N` | cap the expert cache (measurement) | what fits |
@@ -670,7 +674,13 @@ once the request ends. A conversation is written to `DIR`
   been written, or changed since, is copied out and queued for the store just before its points are
   released, so it comes back by hydration instead of a full prefill, and
 - at shutdown, for every conversation not already stored, most recently used first, within
-  `--context-store-flush-seconds` (60 s).
+  `--context-store-flush-seconds` (60 s), and
+- when the router unloads the model (a model switch, `--unload-idle-seconds`, `POST
+  /models/unload`): the same write, with the same eligibility and size limits, before the model is
+  torn down, within the smaller of `--context-store-flush-seconds` and 20 s so a switch is not held
+  up. A failed write never stops the unload. One that runs out of time is logged, and the
+  shutdown write above still covers what is left as the Engine stops, as it did before; see
+  [Several models (router)](#several-models-router).
 
 With `--context-store-idle-seconds 0` there are no background writes; eviction and shutdown still
 write. The cache's eviction knows what the store holds: a conversation the store holds as it is now
@@ -1093,6 +1103,25 @@ conversations) and is **unloaded** otherwise. `--sleep-idle-seconds N` and
 `--unload-idle-seconds N` apply the same transitions to idle models. A request for a model that is
 not loaded loads or wakes it, unless `--no-models-autoload`. A model whose Engine failed is unloaded
 once its requests are gone, so the next request loads it again.
+
+An unload leaves the machine as it found it. A model with a [context store](#context-store) first
+writes the conversations it retains that the store lacks (at most 20 s). A model that is asleep
+is not woken for it, neither by this write nor by the shutdown write as its Engine stops (waking
+it would claim the device memory the next model needs), so it loses only what its device alone
+held; a failed model writes nothing. Its Engine then stops, and the process gives the heap its loader and worker threads
+freed back to the system (`malloc_trim` on Linux): without that, glibc kept several GiB of freed
+memory in its per-thread arenas, and a large Flash-Next loaded next failed its RAM check. A load that
+fails does the same, so retries of a model that does not fit do not leave less RAM each time. Each
+logs one line, such as (the figures here are only an illustration):
+
+```text
+INFO  unloaded 'Qwen3.6-35B-A3B' | context store: 4 saved in 1.3 s | RAM 9.84 -> 1.02 GiB (8.82 GiB returned to the system)
+INFO  released failed load of 'Qwen3.8-Flash-Next-IQ3' | RAM 1.40 -> 1.02 GiB (0.38 GiB returned to the system)
+```
+
+`scripts/router-unload-ram-check.sh` measures it on a GPU: it loads one model, builds a conversation,
+switches to a second, and checks the router's RAM after the switch and that the first model's
+conversation was saved to its store and is reused when it loads again.
 
 The router answers llama.cpp's model API itself:
 
@@ -2849,7 +2878,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--context-store-ttl-hours N` | remove sessions unused this long; `0` keeps them until space is needed | `168` |
 | `--context-store-idle-seconds N` | write a session unused this long, and changed since it was last written, in the background; `0` writes only at shutdown | `30` |
 | `--context-store-restore-seconds N` | time budget for restoring sessions at start-up (only those the directory holds; a bucket's are downloaded on request), and the longest a request waits for its stored session to be read back, a download included | `120` |
-| `--context-store-flush-seconds N` | time budget for writing sessions that are not yet stored at shutdown | `60` |
+| `--context-store-flush-seconds N` | time budget for writing sessions that are not yet stored at shutdown; a router unload writes them first within the smaller of this and 20 s | `60` |
 | `--context-store-peer DIR` | import the sessions another engine on this box keeps in its store directory, by hard link (repeatable; same volume; each engine needs its own `--context-store`); see [Two engines on one box](#two-engines-on-one-box). Requires `--context-store` | none |
 | `--context-store-peer-poll-ms N` | how often peer directories are looked at (at least 1) | `250` |
 | `--context-store-compress` | write new chunks zstd-compressed, in the directory and the bucket (about 8 % smaller; chunks of both forms are always read); see [Context store](#context-store). Requires `--context-store` | off |

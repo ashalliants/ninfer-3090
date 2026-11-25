@@ -301,12 +301,17 @@ std::string HostMemoryLedger::summary() const {
         const std::uint64_t need      = demand.reserve + planned + full_need;
         const std::uint64_t available = commit_limited ? snapshot.available_commit : snapshot.available_physical;
         const std::uint64_t short_by  = need > available ? need - available : 0;
+#if defined(_WIN32)
+        constexpr const char* kOthers = "Close other programs (WSL, Docker, browsers) and start again";
+#else
+        constexpr const char* kOthers =
+            "Close other programs (other model servers, Docker containers, browsers) and start again";
+#endif
         std::snprintf(line, sizeof(line),
                       "RAM: %.1f of %.1f GiB free, but Qwen3.8-Flash-Next pins %.1f GiB of experts and weights and keeps %.1f GiB "
-                      "free for Windows: %.1f GiB short%s. Close other programs (WSL, Docker, browsers) and start "
-                      "again",
+                      "free for the system: %.1f GiB short%s. %s",
                       gib(snapshot.available_physical), gib(snapshot.total_physical),
-                      gib(demand.expert_banks + demand.other_pinned), gib(demand.reserve), gib(short_by), commit_limited ? " (the page file is too small)" : "");
+                      gib(demand.expert_banks + demand.other_pinned), gib(demand.reserve), gib(short_by), commit_limited ? " (the page file is too small)" : "", kOthers);
     }
     return line;
 }

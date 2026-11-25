@@ -14,6 +14,8 @@
 #include <spdlog/logger.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -45,6 +47,8 @@ struct Journal {
     std::map<std::string, int> alive;
     // Read by the registry's idle thread: entries exist before a service is loaded.
     std::map<std::string, std::atomic<bool>> failing;
+    // save_before_unload calls, with how many services of that model were alive at the time.
+    std::vector<std::pair<std::string, int>> saves;
 };
 
 class FakeService final : public ModelService {
@@ -75,6 +79,15 @@ public:
     bool failed() const override {
         const auto found = journal_.failing.find(id_);
         return found != journal_.failing.end() && found->second.load();
+    }
+
+    UnloadStoreSave save_before_unload() noexcept override {
+        journal_.saves.emplace_back(id_, journal_.alive[id_]);
+        UnloadStoreSave out;
+        out.attempted = true;
+        out.written   = 2;
+        out.seconds   = 0.25;
+        return out;
     }
 
 private:
@@ -725,8 +738,198 @@ model-suspend = false
 
 } // namespace
 
+// An unload saves the model's context store while its service is alive, then frees it and gives the
+// heap back, and the router hears of it once; a failed load is reported too.
+void unload_saves_then_releases() {
+    Journal journal;
+    std::vector<ModelReleaseEvent> released;
+    ModelRegistry registry(
+        {model("a"), model("broken")}, RegistryPolicy{}, [&](const ModelDefinition& definition)
+            -> std::unique_ptr<ModelService> {
+            if (definition.id == "broken") { throw std::runtime_error("does not fit"); }
+            return std::make_unique<FakeService>(definition.id, false, journal);
+        },
+        true, [&](const ModelReleaseEvent& event) { released.push_back(event); });
+    { auto lease = registry.acquire("a"); }
+    registry.unload("a");
+    expect(journal.saves.size() == 1 && journal.saves[0].first == "a",
+           "the unload asked the model to save its context store once");
+    expect(!journal.saves.empty() && journal.saves[0].second == 1,
+           "the save ran before the service was destroyed");
+    expect(journal.alive["a"] == 0, "the service is gone after the unload");
+    expect(released.size() == 1 && released[0].model == "a" && !released[0].failed_load &&
+               released[0].save.written == 2,
+           "the release event carries the save");
+#if defined(__GLIBC__) && defined(__linux__)
+    expect(!released.empty() && released[0].heap.trimmed && released[0].heap.resident_before != 0,
+           "the heap was released and measured");
+#endif
+    bool threw = false;
+    try {
+        (void)registry.acquire("broken");
+    } catch (const ModelLoadFailed&) { threw = true; }
+    expect(threw, "the failed load still fails the request");
+    expect(released.size() == 2 && released[1].model == "broken" && released[1].failed_load &&
+               !released[1].save.attempted,
+           "a failed load releases the heap and says so, with no save");
+    expect(journal.saves.size() == 1, "a failed load saves nothing");
+}
+
+void unload_description() {
+    UnloadStoreSave save;
+    HeapRelease heap;
+    heap.resident_before = 7ULL << 30;
+    heap.resident_after  = 1ULL << 30;
+    expect(describe_unload(save, heap) == "RAM 7.00 -> 1.00 GiB (6.00 GiB returned to the system)",
+           "no store: only the RAM");
+    save.attempted = true;
+    save.written   = 3;
+    save.unsaved   = 1;
+    save.seconds   = 20.04;
+    expect(describe_unload(save, {}) == "context store: 3 saved in 20.0 s, 1 not saved (out of time)",
+           "a save that ran out of time says so");
+    save.error = "disk full";
+    expect(describe_unload(save, {}).find("save failed after 20.0 s (disk full), unloading anyway") !=
+               std::string::npos,
+           "a failed save says the unload went ahead");
+    UnloadStoreSave skipped;
+    skipped.skipped = "the model is asleep";
+    expect(describe_unload(skipped, {}) == "context store: not saved (the model is asleep)",
+           "a skipped save says why");
+}
+
+// The production save path (save_context_before_unload) through a fake target: what it asks of
+// the model on each path, and what it reports.
+struct FakeTarget final : UnloadStoreTarget {
+    bool enabled = true, is_failed = false, is_asleep = false, throw_on_flush = false,
+         throw_on_enabled = false;
+    std::uint32_t seconds = 60;
+    ninfer::ContextStoreFlushReport report{.written = 3, .unsaved = 0};
+    std::vector<std::string> calls;
+    std::chrono::milliseconds budget{0};
+    bool store_enabled() const override {
+        if (throw_on_enabled) { throw std::runtime_error("options gone"); }
+        return enabled;
+    }
+    bool failed() const override { return is_failed; }
+    bool asleep() const override { return is_asleep; }
+    void hold_asleep() override { calls.push_back("hold asleep"); }
+    std::uint32_t flush_seconds() const override { return seconds; }
+    ninfer::ContextStoreFlushReport flush(std::chrono::milliseconds b) override {
+        calls.push_back("flush");
+        budget = b;
+        if (throw_on_flush) { throw std::runtime_error("disk full"); }
+        return report;
+    }
+};
+
+void save_before_unload_paths() {
+    {
+        FakeTarget t;
+        t.enabled = false;
+        const auto s = save_context_before_unload(t);
+        expect(!s.attempted && s.skipped.empty() && s.error.empty() && t.calls.empty(),
+               "no store: nothing asked, nothing reported");
+    }
+    {
+        FakeTarget t;
+        const auto s = save_context_before_unload(t);
+        expect(s.attempted && s.written == 3 && s.unsaved == 0 && s.error.empty(),
+               "enabled: the flush's counts are reported");
+        expect(t.calls == std::vector<std::string>{"flush"}, "enabled: one flush, no hold");
+        expect(t.budget == std::chrono::milliseconds(kUnloadStoreSaveBudget),
+               "the switch budget caps a longer --context-store-flush-seconds");
+    }
+    {
+        FakeTarget t;
+        t.seconds = 5;
+        t.report  = {.written = 1, .unsaved = 2};
+        const auto s = save_context_before_unload(t);
+        expect(t.budget == std::chrono::seconds(5), "a shorter flush budget is kept");
+        expect(s.attempted && s.unsaved == 2 && s.error.empty(),
+               "a flush that ran out of time reports what it left unsaved");
+    }
+    {
+        FakeTarget t;
+        t.is_failed = true;
+        const auto s = save_context_before_unload(t);
+        expect(!s.attempted && s.skipped == "the model failed" && t.calls.empty(),
+               "failed: skipped without touching the model");
+    }
+    {
+        FakeTarget t;
+        t.is_asleep = true;
+        const auto s = save_context_before_unload(t);
+        expect(!s.attempted && s.skipped == "the model is asleep",
+               "asleep: skipped");
+        expect(t.calls == std::vector<std::string>{"hold asleep"},
+               "asleep: held asleep for teardown, never flushed (which would wake it)");
+    }
+    {
+        FakeTarget t;
+        t.throw_on_flush = true;
+        const auto s = save_context_before_unload(t);
+        expect(s.attempted && s.error == "disk full", "a throwing flush is reported, not thrown");
+    }
+    {
+        FakeTarget t;
+        t.throw_on_enabled = true;
+        const auto s = save_context_before_unload(t);
+        expect(!s.attempted && s.error == "options gone" && t.calls.empty(),
+               "an exception before the flush is reported, not thrown");
+    }
+}
+
+#if defined(__GLIBC__) && defined(__linux__)
+// The mechanism behind the router's retained RAM: blocks freed into per-thread arenas stay
+// resident while a live block sits above them, until the allocator is trimmed.
+void freed_arena_memory_goes_back() {
+    constexpr std::size_t kBlock   = 64 * 1024; // below glibc's mmap threshold: arena memory
+    constexpr std::size_t kPerThread = 1024;    // 64 MiB per thread
+    constexpr int kThreads         = 4;
+    std::vector<std::vector<void*>> kept(kThreads);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            std::vector<void*> blocks;
+            for (std::size_t i = 0; i < kPerThread; ++i) {
+                void* block = std::malloc(kBlock);
+                std::memset(block, 0x5a, kBlock);
+                blocks.push_back(block);
+            }
+            // Free all but every 32nd block: the survivors pin each heap's top, so free() alone
+            // cannot shrink it.
+            for (std::size_t i = 0; i < blocks.size(); ++i) {
+                if (i % 32 == 31) {
+                    kept[t].push_back(blocks[i]);
+                } else {
+                    std::free(blocks[i]);
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    const HeapRelease heap = release_freed_heap();
+    const std::uint64_t returned =
+        heap.resident_before > heap.resident_after ? heap.resident_before - heap.resident_after : 0;
+    expect(heap.trimmed, "glibc trims");
+    expect(returned >= (128ULL << 20),
+           "most of the 248 MiB freed into arenas went back to the system (returned " +
+               std::to_string(returned >> 20) + " MiB)");
+    for (auto& blocks : kept) {
+        for (void* block : blocks) { std::free(block); }
+    }
+}
+#endif
+
 int main() {
     try {
+        unload_saves_then_releases();
+        unload_description();
+        save_before_unload_paths();
+#if defined(__GLIBC__) && defined(__linux__)
+        freed_arena_memory_goes_back();
+#endif
         lifecycle_under_one_slot();
         leases_hold_models();
         idle_sleep_and_events();

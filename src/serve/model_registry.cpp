@@ -114,8 +114,10 @@ void check_model_state_paths(const std::vector<ModelDefinition>& models) {
 }
 
 ModelRegistry::ModelRegistry(std::vector<ModelDefinition> models, RegistryPolicy policy,
-                             ModelServiceFactory factory, bool router)
-    : policy_(policy), factory_(std::move(factory)), router_(router) {
+                             ModelServiceFactory factory, bool router,
+                             ModelReleaseObserver on_release)
+    : policy_(policy), factory_(std::move(factory)), router_(router),
+      on_release_(std::move(on_release)) {
     if (models.empty()) { throw std::invalid_argument("a server needs at least one model"); }
     if (!router && models.size() != 1) {
         throw std::invalid_argument("single-model mode serves exactly one model");
@@ -243,15 +245,29 @@ void ModelRegistry::put_to_sleep_locked(std::unique_lock<std::mutex>& lock, std:
     publish_locked(index);
 }
 
+void ModelRegistry::notify_release(const ModelReleaseEvent& event) const noexcept {
+    if (!on_release_) { return; }
+    try {
+        on_release_(event);
+    } catch (...) {}
+}
+
 void ModelRegistry::unload_locked(std::unique_lock<std::mutex>& lock, std::size_t index) {
     Slot& slot = models_[index];
     slot.state = ModelState::Unloading;
     publish_locked(index);
     std::unique_ptr<ModelService> service = std::move(slot.service);
+    ModelReleaseEvent released;
+    released.model = slot.definition.id;
     lock.unlock();
-    // Destroying the service stops its Engine, which saves what it persists, and frees the model's
-    // device and host memory.
+    // The model's retained conversations go to its context store first (bounded; a failed write
+    // does not stop the unload). Destroying the service then stops its Engine and frees the
+    // model's device and host memory, and the heap its threads freed goes back to the system, so
+    // the next model's RAM check sees what this one held.
+    if (service) { released.save = service->save_before_unload(); }
     service.reset();
+    released.heap = release_freed_heap();
+    notify_release(released);
     lock.lock();
     slot.state = ModelState::Unloaded;
     publish_locked(index);
@@ -343,6 +359,15 @@ void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::
                 created = factory_(definition);
             }
         } catch (...) { failure = std::current_exception(); }
+        if (failure && sleeping == nullptr) {
+            // A failed start unwound whatever it had built: give that heap back too, or each
+            // retry of a model that does not fit leaves less RAM for the next.
+            ModelReleaseEvent released;
+            released.model       = definition.id;
+            released.failed_load = true;
+            released.heap        = release_freed_heap();
+            notify_release(released);
+        }
         lock.lock();
         Slot& done = models_[index];
         if (failure) {

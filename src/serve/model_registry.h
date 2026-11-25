@@ -14,6 +14,7 @@
 // for it loads it again.
 
 #include "serve/generation_service.h"
+#include "serve/unload_memory.h"
 
 #include <algorithm>
 #include <chrono>
@@ -93,6 +94,10 @@ public:
 
     // The context limit the Engine started with, after context fitting; zero when not known.
     [[nodiscard]] virtual std::uint32_t effective_max_context() const { return 0; }
+
+    // Called just before the registry unloads the model: write what its context store lacks
+    // (save_context_before_unload). Must not throw; nothing to do by default.
+    [[nodiscard]] virtual UnloadStoreSave save_before_unload() noexcept { return {}; }
 };
 
 using ModelServiceFactory =
@@ -121,9 +126,23 @@ public:
         return service_->options().max_context;
     }
 
+    [[nodiscard]] UnloadStoreSave save_before_unload() noexcept override {
+        return save_context_before_unload(*service_);
+    }
+
 private:
     std::unique_ptr<GenerationService> service_;
 };
+
+// A model the registry let go of, and what that did: an unload (its context store saved first),
+// or a load that failed (whatever it had built is gone). The heap is released after both.
+struct ModelReleaseEvent {
+    std::string model;
+    bool failed_load = false;
+    UnloadStoreSave save;
+    HeapRelease heap;
+};
+using ModelReleaseObserver = std::function<void(const ModelReleaseEvent&)>;
 
 // One status change, for GET /models/sse.
 struct ModelEvent {
@@ -142,9 +161,10 @@ void check_model_state_paths(const std::vector<ModelDefinition>& models);
 class ModelRegistry {
 public:
     // `router` is router mode (several models, GET /models lists them all); single-model mode has
-    // exactly one model, loaded at startup and never unloaded by policy.
+    // exactly one model, loaded at startup and never unloaded by policy. `on_release` hears of
+    // every unload and failed load, after the heap went back to the system (the router logs it).
     ModelRegistry(std::vector<ModelDefinition> models, RegistryPolicy policy,
-                  ModelServiceFactory factory, bool router);
+                  ModelServiceFactory factory, bool router, ModelReleaseObserver on_release = {});
     ~ModelRegistry();
 
     ModelRegistry(const ModelRegistry&)            = delete;
@@ -279,11 +299,13 @@ private:
     void publish_locked(std::size_t index);
     void release(std::size_t index, bool use) noexcept;
     void idle_loop();
+    void notify_release(const ModelReleaseEvent& event) const noexcept;
     [[nodiscard]] std::size_t loaded_count_locked() const;
 
     const RegistryPolicy policy_;
     const ModelServiceFactory factory_;
     const bool router_;
+    const ModelReleaseObserver on_release_;
     std::vector<Slot> models_;
     mutable std::mutex mutex_;
     std::condition_variable changed_;

@@ -43,6 +43,7 @@ add_library(ninfer_serve STATIC
   serve_options.cpp
   model_catalog.cpp
   model_registry.cpp
+  unload_memory.cpp
   routed_model.cpp
   router_server.cpp
 )
