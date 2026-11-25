@@ -663,6 +663,20 @@ projection's split schedules) faults with `cudaErrorInvalidPc` under nsys on sm_
 so profiles were taken with those schedules disabled in a local build and that kernel's time
 corrected by its op bench (14 us a call at T = 1-4).
 
+### Prefill: Qwen3.6-35B-A3B
+
+A 4K-token prompt took 5.5 s (765 tok/s), of which the routed experts' prefill GEMMs (Q4 gate/up,
+Q5/Q6 down; `sparse_moe_prefill_kernels.cu`) were about 2.4 s: they decode into shared memory as
+BF16 and run Ampere's `mma.sync`, emulated here. `sparse_moe_prefill_hmma_sm70.cu` takes the same
+route-job list (one job per nonempty column tile of one expert), packed activations and outputs,
+and per 64-wide K step dequantises the 64-row weight tile to FP16 in shared memory (code x group
+scale, one rounding) and multiplies with WMMA m16n16k16, FP16 in, FP32 accumulation; the
+activations are staged as FP16 without scaling, exact for BF16 values in FP16's normal range. Gate
+and up rows of one intermediate row sit in one tile so the SwiGLU epilogue pairs them in shared
+memory. Prefill 765 -> 1,160 tok/s at 4.2K, 710 -> 1,000 at 13.4K; prefill-scored PPL (PG-19, 8,192
+context) 6.174 -> 6.173. `NINFER_SM70_MOE_PREFILL_HMMA=0` keeps the old kernels. The shared expert
+(Q8) still runs its `mma.sync` kernels.
+
 ### Prefill
 
 The wide prefill GEMMs run on the tensor cores through cuBLAS, by default. The cuBLAS prefill

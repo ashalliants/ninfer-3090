@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
+#include "ops/sparse_moe/prefill/sparse_moe_prefill_hmma_sm70.h"
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
@@ -1286,7 +1287,15 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 
         const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
         // Same predicate that decided whether packed_token was written above.
-        if (routed_gate_up_q4) {
+        // sm_70: the routed GEMMs on the FP16 tensor cores (sparse_moe_prefill_hmma_sm70.h).
+        const bool hmma = sparse_moe_prefill_hmma_enabled();
+        if (routed_gate_up_q4 && hmma) {
+            sparse_moe_prefill_hmma_q4_gate_up(input, packed_token, offsets, route_job_experts,
+                                               route_job_columns, route_job_count,
+                                               routed_gate_codes, routed_gate_scales,
+                                               routed_activation, route_job_bn,
+                                               routed_gate_blocks, stream);
+        } else if (routed_gate_up_q4) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_kernel<8, 64>
                     <<<routed_gate_blocks, 8 * 32, 0, stream>>>(
@@ -1329,7 +1338,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
-        switch (weights.routed_down.qtype) {
+        if (hmma && (weights.routed_down.qtype == QType::Q5_G64_FP16 ||
+                     weights.routed_down.qtype == QType::Q6_G64_FP16)) {
+            sparse_moe_prefill_hmma_down(weights.routed_down.qtype, routed_activation, offsets,
+                                         route_job_experts, route_job_columns, route_job_count,
+                                         routed_down_codes, routed_down_high, routed_down_scales,
+                                         grouped_io, route_job_bn, routed_down_blocks, stream);
+        } else switch (weights.routed_down.qtype) {
         case QType::Q5_G64_FP16:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>

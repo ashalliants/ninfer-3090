@@ -17,6 +17,13 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Qwen3.6-35B-A3B routed experts' prefill on the tensor cores (2026-11-25)
+
+In a V100 build the 35B-A3B prefills the routed experts' gate/up (Q4) and down (Q5/Q6) prefill GEMMs on FP16 WMMA kernels. One prompt each, 65,536 context, MTP3 flags, 200 W,
+ABBA: **1,160 tok/s at 4.2K tokens** (765 before), 1,000 at 13.4K (710), 685 at 40.2K (536).
+Decode is unchanged. `NINFER_SM70_MOE_PREFILL_HMMA=0` keeps the old kernels; the RTX 3090 does not build the route. Details:
+[tesla-v100.md](tesla-v100.md#qwen36-35b-a3b).
+
 ## Tesla V100 (`sm_70`): Qwen3.6-35B-A3B output head on the streaming GEMV (2026-11-25)
 
 In a V100 build the 35B-A3B's Q6 output head (248,320 x 2,048) runs its 1-32-column calls on the
