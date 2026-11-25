@@ -104,6 +104,7 @@ These are the model defaults it sets:
 | `NINFER_SPEC=mtp`, `NINFER_KV_DTYPE=int8` | 27B | MTP3 with INT8 KV: on this card it beats DFlash2 (`--draft-tokens 7`) on story, Chinese, French and sampled prose (77-81 tok/s); DFlash2 wins on code (136 against 110 tok/s), thinking (125 against 104) and long structured output (177 against 123) |
 | `NINFER_GGML_STAGED=0` | Flash-Next | Returns the GGML dense linears' verify GEMVs (2-8 columns) to the kernel that casts the input in every CTA, instead of the default staged route that casts it once per call: the same output, about 2% slower decode on code |
 | `NINFER_DRAFT_A8=0` | 27B, DFlash2 | Runs the DFlash2 drafter's linears on its A16 kernels instead of the default int8-activation `dp4a` route: about 9 ms slower per K = 7 round, the same acceptance on most measured prompts |
+| `NINFER_SM70_VERIFY_ATTN_HMMA=0` | 27B | Runs the INT8-KV small-T attention on the CUDA-core kernels (two-token launches for a verify) instead of the default FP16 tensor-core kernel: an MTP3 round at 172K tokens takes 110 ms instead of 52, at 43K 50 instead of 36 |
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
 on, so the 27B's wide prefill GEMMs run on the tensor cores through cuBLAS instead of emulated integer
@@ -254,22 +255,44 @@ can reach at most about 57 tok/s; speculation gets past that ceiling. Prefill ru
 tensor cores through cuBLAS, and prompt attention through FP16 flash attention. 1,150 / 2,186 /
 4,392-token prompts prefill at 868 / 959 / 1,020 tok/s.
 
-Decode against context length, MTP3, the same server flags, 256 greedy tokens (`ignore_eos`) on
-exact-hit repeats of a checkpointed prompt (Project Gutenberg text from the PG-19 corpus plus a
-question), one request at a time (2026-11-24, 200 W, ABBA against master, three repeats each, range
-under 0.3%):
+Decode against context length, the same server flags, 256 greedy tokens (`ignore_eos`) on exact-hit
+repeats of a checkpointed prompt (Project Gutenberg text from the PG-19 corpus plus a question), one
+request at a time (2026-11-25, 200 W, no thermal throttling, against master `96b14bca`, which has
+#609's split fix; MTP3 ABBA with three repeats per leg, the legs of each side within 0.05 tok/s;
+DFlash2 one leg each; plain from the same build pair on 2026-11-24):
 
-| Context | Decode | master | Per MTP round | master |
+| Context | MTP3 | master | DFlash2 K7 | master | plain | master |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4,215 | 84.6-84.7 tok/s | 75.9 | **85.4** | 62.3-62.5 | 43.7 | 43.7 |
+| 42,663 | **69.5-69.6** | 53.0 | 50.4 | 37.3 | 36.1 | 34.6 |
+| 172,487 | **56.7** | 26.4 | 34.9 | 14.0 | 24.1-24.2 | 20.7 |
+
+Per speculative round (generation time over rounds, a round emitting its accepted drafts plus one):
+
+| Context | MTP3 | master | DFlash2 K7 | master |
 |---:|---:|---:|---:|---:|
-| 4,215 | **75.7 tok/s** | 57.3-57.4 | 33.0 ms | 43.5 ms |
-| 42,663 | **52.8 tok/s** | 46.5-46.6 | 51.4 ms | 61.1 ms |
-| 172,487 | 20.9 tok/s | 21.6 | 127.1 ms | 136.3 ms |
+| 4,215 | 31.4 ms | 32.3 ms | 40.9 ms | 44.0 ms |
+| 42,663 | 36.3 ms | 50.1 ms | 48.2 ms | 75.9 ms |
+| 172,487 | 52.3 ms | 109.6 ms | 71.0 ms | 184.6 ms |
 
-Attention over the 16 full-attention layers' KV is what slows long-context decode, so the verify
-GEMVs' saving is a smaller share there. At 172K a round is 7% cheaper, but this text's continuation
-accepted fewer drafts than master's (158 of 289 against 168 of 261), so tok/s came out 3% lower;
-acceptance depends on the text, not the context. (The previous figures, 57.9 / 47.9 / 25.0 tok/s at
-4,170 / 40,259 / 162,152 tokens on 2026-11-23, used a different prompt.)
+Long-context decode was attention over the 16 full-attention layers' INT8 KV, and on this card a
+speculative verify used to run it as two-token CUDA-core launches that each re-read the whole cache.
+It now runs on the FP16 tensor cores in one launch per layer (`NINFER_SM70_VERIFY_ATTN_HMMA`, on by
+default in an `sm_70` build; `=0` restores the old kernels): an MTP3 round at 172K costs 52 ms
+instead of 110, and a DFlash2 K7 round 71 ms instead of 185; MTP3 decodes 2.1x faster there and
+DFlash2 2.5x. Three- and four-column verifies take it from 1K keys, two columns from 6K and one
+column (plain decode, the MTP drafter) from 20K, so plain decode is 17% faster at 172K (24.2 against
+20.7 tok/s) and the same at 4K. The change is lossy at the noise floor: on a decode-path KLD gate
+over 16-32K-token contexts it is as far from the FP32 reference as master's own verify reordering
+(KLD 6.2e-4 against 6.2-6.4e-4, 98.8-98.9% the same top-1 token), so greedy text parts from master's
+at near-ties. In this run every context's text differs from master's in its wording (at 172K both
+summarise the same section), and acceptance moved with the text (MTP3 at 172K: 170 of 254 drafts
+against 168 of 259), so the per-round times are the like-for-like measure. (Master before #609 ran
+past its page-id table at 172K, so its 20.9 / 10.8 tok/s there were not a valid baseline.) At 4K
+most of the gain is that acceptance change: MTP3's round is 3% cheaper and DFlash2's 7%, against 12%
+and 37% more tok/s. Details in [volta-port.md](maintainer/volta-port.md#decode). (The previous
+figures, 57.9 / 47.9 / 25.0 tok/s at 4,170 / 40,259 / 162,152 tokens on 2026-11-23, used a different
+prompt.)
 
 **Per-layer KV mixes** (`--kv-dtype rk4v4x12,int8x4` and the like, opt-in, lossy). Same server
 flags, only `--kv-dtype` varied, 200 W, interleaved legs (2026-11-23; the paired legs agreed within

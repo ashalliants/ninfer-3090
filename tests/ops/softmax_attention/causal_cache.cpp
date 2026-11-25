@@ -237,6 +237,9 @@ struct AttentionCase {
     bool graph_replay = false;
     // Half-width of the uniform V distribution, for the cached rows and the appended ones.
     float v_amplitude = 1.0f;
+    // Cached V rows from this key on are scaled by v_step_gain (0: no step).
+    std::int32_t v_step_key = 0;
+    float v_step_gain       = 1.0f;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -953,13 +956,30 @@ void encode_rotated_lloyd4_key_row(std::span<const float> source, std::size_t so
     }
 }
 
+// Scales every cached V row from key v_step_key on by v_step_gain (no-op for key 0), rounded back
+// to BF16 like the rest of the fixture, so a split sees its value scales jump mid-split.
+void apply_v_step(const Geometry& geometry, std::int32_t logical_capacity,
+                  std::vector<float>& logical_v, std::int32_t v_step_key, float v_step_gain) {
+    if (v_step_key <= 0) { return; }
+    for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+        for (std::int32_t position = v_step_key; position < logical_capacity; ++position) {
+            const std::size_t row = cache_index(geometry, logical_capacity, head, position, 0);
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                logical_v[row + static_cast<std::size_t>(d)] *= v_step_gain;
+            }
+        }
+    }
+    round_to_bf16(logical_v);
+}
+
 // CachePlan overload: covers this fork's four originally-registered profiles, including rk8v4
 // (kPlanRk8v4), which the public KvCacheStorage enum did not distinguish from plain INT8 before
 // this fork added RotatedInt8KeyInt4ValueGroup64. cache.storage is still populated here (from
 // plan) so shared consumers below (DeviceCache, verify_cache) can dispatch on it uniformly
 // regardless of which overload built the HostCache.
 HostCache make_cache(const Geometry& geometry, const CachePlan& plan, std::int32_t max_context,
-                     std::uint32_t seed, float v_amplitude = 1.0f) {
+                     std::uint32_t seed, float v_amplitude = 1.0f, std::int32_t v_step_key = 0,
+                     float v_step_gain = 1.0f) {
     const ops::D256KVCacheProfile profile =
         plan.packed_keys ? ops::d256_kv_cache_profile(KvCacheStorage::RotatedLloyd4KeyInt4Value)
                          : ops::d256_kv_cache_profile(plan.dtype, plan.value_code_dtype);
@@ -968,6 +988,7 @@ HostCache make_cache(const Geometry& geometry, const CachePlan& plan, std::int32
     std::vector<float> logical_k        = make_bf16_values(elements, seed, -0.25f, 0.25f);
     std::vector<float> logical_v =
         make_bf16_values(elements, seed + 1u, -v_amplitude, v_amplitude);
+    apply_v_step(geometry, logical_capacity, logical_v, v_step_key, v_step_gain);
 
     const KvCacheStorage storage = cache_plan_storage(plan);
     HostCache cache{.geometry         = geometry,
@@ -1070,16 +1091,20 @@ HostCache make_cache(const Geometry& geometry, const CachePlan& plan, std::int32
 // (BFloat16/Int8Group64/Fp8E4M3Row256), so DeviceCache/verify_cache work identically whichever
 // overload produced the HostCache; nvfp4/k8v4 never read those fields.
 HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int32_t max_context,
-                     std::uint32_t seed, float v_amplitude = 1.0f) {
+                     std::uint32_t seed, float v_amplitude = 1.0f, std::int32_t v_step_key = 0,
+                     float v_step_gain = 1.0f) {
     if (storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64)
-        return make_cache(geometry, kPlanRk8v4, max_context, seed, v_amplitude);
+        return make_cache(geometry, kPlanRk8v4, max_context, seed, v_amplitude, v_step_key,
+                          v_step_gain);
     if (storage == KvCacheStorage::RotatedLloyd4KeyInt4Value)
-        return make_cache(geometry, kPlanRk4v4, max_context, seed, v_amplitude);
+        return make_cache(geometry, kPlanRk4v4, max_context, seed, v_amplitude, v_step_key,
+                          v_step_gain);
     const std::int32_t logical_capacity = align_up_page(max_context);
     const std::size_t elements          = cache_elements(geometry, logical_capacity);
     std::vector<float> logical_k        = make_bf16_values(elements, seed, -0.25f, 0.25f);
     std::vector<float> logical_v =
         make_bf16_values(elements, seed + 1u, -v_amplitude, v_amplitude);
+    apply_v_step(geometry, logical_capacity, logical_v, v_step_key, v_step_gain);
 
     if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         HostCache cache{.geometry         = geometry,
@@ -2503,7 +2528,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
                                                    test_case.envelope_max};
 
     const HostCache initial = make_cache(geometry, storage, max_context, test_case.seed + 10u,
-                                         test_case.v_amplitude);
+                                         test_case.v_amplitude, test_case.v_step_key,
+                                         test_case.v_step_gain);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
     const std::vector<double> reference =
@@ -3371,6 +3397,46 @@ int run_long_split_page_cases() {
         return run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 200000, 200001, 1205u},
                            MappingPattern::Fragmented);
     });
+    return failures;
+}
+
+// The 27B INT8 G64 shapes around the sm_70 tensor-core small-T kernel (small_t_i8_hmma.cuh), which
+// takes one column from 20,480 keys, two from 6,144, three and four from 1,024 and five to eight at
+// any count: each width above its threshold and the CUDA-core route just below one, with loose and
+// exact envelopes, fragmented pages, a split past 64 pages (167,936+ keys over its splits) and
+// values wide enough to move the kernel's value-scale exponent. Other targets run their own routes
+// on the same cases.
+int run_tensor_core_verify_cases() {
+    int failures            = 0;
+    const Geometry& geometry = kGeometries[0];
+    const AttentionCase append_cases[] = {
+        {1, 24576, 24577, 1101u}, {2, 6144, 6146, 1102u},  {3, 1500, 1503, 1103u},
+        {4, 40000, 40004, 1104u}, {5, 100, 8192, 1105u},   {8, 9000, 9008, 1106u},
+        {5, 3, 8, 1107u},         {8, 170000, 170008, 1108u}, {4, 900, 904, 1110u},
+    };
+    for (const AttentionCase& test_case : append_cases) {
+        failures += run_a1_case(geometry, kPlanInt8, test_case, MappingPattern::Fragmented);
+    }
+    AttentionCase wide_values{4, 6000, 6004, 1109u};
+    wide_values.v_amplitude = 300.0f;
+    failures += run_a1_case(geometry, KvCacheStorage::Int8Group64, wide_values,
+                            MappingPattern::Identity);
+    // Value scales that jump 2^10 up, and 2^10 down, part-way through a split: the kernel's value
+    // exponent must move past both ends of its window and carry the running output across.
+    for (const float gain : {1024.0f, 1.0f / 1024.0f}) {
+        AttentionCase step{4, 6000, 6004, 1114u};
+        step.v_amplitude = gain > 1.0f ? 0.25f : 300.0f;
+        step.v_step_key  = 3010;
+        step.v_step_gain = gain;
+        failures += run_a1_case(geometry, KvCacheStorage::Int8Group64, step,
+                                MappingPattern::Fragmented);
+    }
+    const AttentionCase cached_cases[] = {
+        {1, 30000, 30001, 1111u}, {4, 12000, 12004, 1112u}, {8, 2000, 65536, 1113u},
+    };
+    for (const AttentionCase& test_case : cached_cases) {
+        failures += run_a3_case(geometry, kPlanInt8, test_case, MappingPattern::Offset);
+    }
     return failures;
 }
 
@@ -4266,6 +4332,7 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_bf16_small_prefill_cases();
     failures += run_batch_cases();
     failures += run_long_split_page_cases();
+    failures += run_tensor_core_verify_cases();
     const std::array<int, 7> prefill_queries{0, 63, 64, 127, 128, 511, 1023};
     for (const auto& geometry : kGeometries)
         failures += run_a1_case(geometry, KvCacheStorage::BFloat16, {1024, 8192, 9216, 951u},

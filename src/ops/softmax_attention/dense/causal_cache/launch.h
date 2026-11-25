@@ -35,6 +35,28 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                                              CausalAttentionExecutionEnvelope envelope,
                                              std::int32_t batch_size = 1);
 
+// sm_70 small-T attention on the FP16 tensor cores (small_t_i8_hmma.cuh): a 27B-geometry (24
+// query heads) call of 1..8 columns over the INT8 G64 cache runs as one launch of that kernel
+// instead of the CUDA-core path (two-token chunks past two columns). The kernel has a higher fixed
+// cost per CTA, so the narrow widths take it only from the key counts where it measured faster
+// on a V100 (op bench, cold L2, 2026-11-24, tensor cores vs CUDA cores in us): T=1 from 20,480
+// keys (16K: 142 vs 141; 24K: 216 vs 251; 64K: 486 vs 782; 160K: 1,146 vs 1,909; the CUDA-core
+// kernel's split tiers happen to fit 40,960 keys, 325 vs 313 there), T=2 from 6,144 (4K: 80 vs
+// 77; 6K: 89 vs 92; 160K: 1,146 vs 2,720), and T=3..4 (two CUDA-core chunks) from 1,024. In the
+// served model a T=4 call at a few hundred keys took 74 us against the two chunks' 60 (nsys,
+// 300-token code reply; the op bench has them within 3 us there), and at 1K the op bench has 53
+// vs 69. T=5..8 (three or four chunks) take it at every key count (256 keys, T=8: 55 vs 102). On
+// by default in sm_70 builds; NINFER_SM70_VERIFY_ATTN_HMMA=0 restores the previous routes (read
+// once). Always false in other builds. `keys` is the envelope's maximum visible keys.
+inline constexpr std::int32_t kVoltaVerifyHmmaOneTokenKeys = 20480;
+inline constexpr std::int32_t kVoltaVerifyHmmaTwoTokenKeys = 6144;
+inline constexpr std::int32_t kVoltaVerifyHmmaTwoChunkKeys = 1024;
+// Its split capacity per KV head: one wave of one CTA per SM on an 80-SM V100 (4 KV heads).
+inline constexpr std::int32_t kVoltaVerifyHmmaSplits = 20;
+bool causal_sm70_verify_hmma_enabled() noexcept;
+bool causal_sm70_verify_hmma(std::int32_t q_heads, std::int32_t width, KvCacheStorage storage,
+                             std::uint32_t keys) noexcept;
+
 CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                                     std::int32_t batch_size, KvCacheStorage storage,
                                                     CausalAttentionExecutionEnvelope envelope);

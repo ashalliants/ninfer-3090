@@ -10,6 +10,9 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_slices.h"
+#if defined(NINFER_SM70)
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_hmma.cuh"
+#endif
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -17,6 +20,46 @@
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+
+#if defined(NINFER_SM70)
+// The sm_70 tensor-core route (small_t_i8_hmma.cuh); causal_sm70_verify_hmma decides it.
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+void launch_hmma_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                            PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
+                            std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
+                            Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+    // Four key groups up to two row warps (T <= 5); at three (T = 6..8) a fourth group's
+    // registers spilled, so two.
+    constexpr int RowWarps  = VoltaVerifyLayout<Geometry, TokenTile, 1>::RowWarps;
+    constexpr int KeyGroups = RowWarps <= 2 ? 4 : 2;
+    using Layout            = VoltaVerifyLayout<Geometry, TokenTile, KeyGroups>;
+    constexpr int smem      = Layout::SmemBytes;
+    static_assert(smem <= kMaxDynamicSharedBytes);
+    auto* kernel = causal_attention_small_t_i8_hmma_kernel<Geometry, TokenTile, KeyGroups,
+                                                           MultiBatch, Masked, CacheInput>;
+    configure_cuda_device_once([kernel] {
+        return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    });
+    const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+    kernel<<<grid, Layout::Threads, smem, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), input,
+        static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache.k_pages.data),
+        static_cast<std::int8_t*>(cache.v_pages.data),
+        static_cast<__half*>(cache.k_scale_pages.data),
+        static_cast<__half*>(cache.v_scale_pages.data),
+        static_cast<const std::int32_t*>(cache.block_tables.data),
+        invocation.valid_columns == nullptr
+            ? nullptr
+            : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+        invocation.table_rows == nullptr
+            ? nullptr
+            : static_cast<const std::int32_t*>(invocation.table_rows->data),
+        cache.block_tables.ne[0], invocation.full_width, invocation.column_begin, logical_capacity,
+        scale, static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
+        static_cast<float*>(partial_l.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif
 
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
@@ -32,6 +75,17 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     // rk4v4 Lloyd-Max coding.
     const bool packed_values = cache_v.dtype == DType::U8;
     const bool packed_keys   = cache_k.dtype == DType::U8;
+#if defined(NINFER_SM70)
+    if constexpr (Geometry::QHeads == 24) {
+        if (causal_sm70_verify_hmma(Geometry::QHeads, TokenTile, cache.storage,
+                                    static_cast<std::uint32_t>(implementation_window))) {
+            launch_hmma_partial_i8<Geometry, TokenTile, MultiBatch, Masked>(
+                q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,
+                partial_m, partial_l, stream);
+            return;
+        }
+    }
+#endif
     auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         auto issue = [&]<bool PackedValues, bool PackedKeys>() {

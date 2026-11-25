@@ -228,7 +228,10 @@ use the fork's defaults on that card: `--verify-a8` runs the target's decode and
 int8 activations (KLD 7.2e-4 to 7.8e-4 against the FP32 decode path and 98.9-99.2% the same top-1
 token; `--no-verify-a8` turns it off), and the DFlash2 drafter's own linears run on int8
 activations too; the target verifies every draft, and acceptance on most measured prompts is
-unchanged (`NINFER_DRAFT_A8=0` turns it off). Conditions and the full prompt table are in
+unchanged (`NINFER_DRAFT_A8=0` turns it off). At long context MTP3 decodes 69.5 tok/s at a
+42,663-token prompt and 56.7 at 172,487 (DFlash2 K7 50.4 and 34.9): there the verify attention over
+the INT8 KV cache runs on Volta's FP16 tensor cores in one launch per layer, at the same KLD class
+as before (`NINFER_SM70_VERIFY_ATTN_HMMA=0` turns it off). Conditions and the full prompt table are in
 [docs/tesla-v100.md](https://github.com/ashalliants/ninfer-3090/blob/master/docs/tesla-v100.md#qwen38-27b).
 
 ## Evaluation

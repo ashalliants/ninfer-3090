@@ -530,7 +530,13 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
     // ~2.1K keys, an MTP5 verify (T=6): 328 us -> three chunks of 54 us (nsys; see
     // causal_attention_chunk_tokens). A batch of verify rows (two lanes of MTP3: B=2, T=4) does
     // the same per row.
+    //
+    // Unless the FP16 tensor-core verify kernel takes the width (small_t_i8_hmma.cuh): then it is
+    // one small-T launch that reads the cache once.
     if (int8_family && width > kVoltaVerifyChunkTokens && width <= kMaximumVerifyTokens) {
+        if (causal_sm70_verify_hmma(q_heads, width, storage, envelope.max_visible_keys)) {
+            return CausalAttentionRoute::SmallT;
+        }
         return CausalAttentionRoute::ChunkedSmallT;
     }
 #endif
@@ -721,6 +727,11 @@ CausalAttentionLaunchShape causal_softmax_attention_launch_shape(
     // and part of the route, and a launch that splits its keys adds the merge kernel.
     CausalAttentionLaunchShape shape{.route = static_cast<std::uint32_t>(route), .kernel_nodes = 2U};
 #if defined(NINFER_SM70)
+    if (route == detail::CausalAttentionRoute::SmallT &&
+        detail::causal_sm70_verify_hmma(geometry.query_heads, tokens, cache_storage,
+                                        envelope.max_visible_keys)) {
+        shape.route |= 1U << 19U; // the tensor-core verify kernel (its own split capacity)
+    }
     if (route == detail::CausalAttentionRoute::Prompt &&
         volta_flash_route_possible(geometry.query_heads, tokens, batch_size, cache_storage)) {
         shape.route |= 1U << 18U;

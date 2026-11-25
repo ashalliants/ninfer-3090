@@ -17,6 +17,18 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Qwen3.8-27B long-context attention on the tensor cores (2026-11-24)
+
+In a V100 build the 27B's small-T attention over the INT8 KV cache (speculative verify, three and four
+columns from 1K keys, and from 6K / 20K keys the two- and one-column calls) runs on the FP16 tensor cores (`mma.m8n8k4`) in one
+launch per layer, where it ran as two-token CUDA-core launches that each re-read the cache. Router
+flags, 256 greedy tokens on PG-19 prompts, 200 W, against master: **MTP3 56.7 tok/s at a
+172,487-token context** (26.4 before) and 69.5 at 42,663 (53.0); DFlash2 K7 34.9 (14.0) and 50.4
+(37.3). An MTP3 round at 172K takes 52 ms instead of 110. Decode-path KLD at 16-32K tokens is the
+same as master's own verify reordering (6.2e-4, 98.8-98.9% the same top-1), so greedy text parts at
+near-ties. `NINFER_SM70_VERIFY_ATTN_HMMA=0` restores the old kernels; the RTX 3090 does not build
+the kernel. Details: [tesla-v100.md](tesla-v100.md#qwen38-27b).
+
 ## Tesla V100 (`sm_70`): Qwen3.8-27B DFlash2 drafter on int8 activations (2026-11-24)
 
 In a V100 build the DFlash2 block drafter's own linears (the Q8 attention input, SwiGLU, output and
