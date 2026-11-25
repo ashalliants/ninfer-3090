@@ -707,6 +707,16 @@ kernels, which read the device-side job count. 2,409 -> 2,838 tok/s at 4.2K, 1,7
 13.4K; prefill-scored PPL 6.171 -> 6.176. `NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0` keeps the old
 kernels.
 
+All four WMMA kernels then moved from 64-row tiles (one 16 x 16 fragment pair per warp, each
+step's global loads waited on before its MMAs) to 128-row tiles: eight warps in a 4 x 2 grid,
+each 32 rows by 32 columns (four accumulators, two A fragments reused across the B fragments), and
+the next K step's raw codes, high bits, scales and activations loaded into registers before the
+current step's MMAs, decoded to FP16 only when stored to shared memory (`RawEight`). The staging
+and the FP32 result tile share one shared buffer. Each output still sums its 64-wide steps in the
+same order, so the output is bit-identical (`ninfer_sparse_moe_test` errors and prefill-scored PPL
+unchanged). In the 4K profile the routed gate/up took 8.4 ms a call at 2,560 blocks, about 8 TFLOPS.
+Prefill 2,840 -> 3,203 tok/s at 4.2K, 2,017 -> 2,208 at 13.4K.
+
 The Q8 mixer projections ran their own `mma.sync` kernels too. Per call at 4,096 tokens (nsys,
 200 W, before either change): the GDN input projection (12,288 x 2,048) 38.2 ms, the attention input
 projection (9,216 x 2,048) 28.4 ms and the output projections (2,048 x 4,096) 13.3 ms, against 2.55,

@@ -398,9 +398,18 @@ the same top-1 at one token and 2.57e-3 / 97.40% at four, against master's 2.49e
 2.51e-3 / 97.50%.
 
 Prefill, same server flags at 65,536 context with MTP3, one 4.2K / 13.4K / 40.2K-token prompt each,
-2026-11-25, 200 W, no thermal throttling. The shared expert's prefill GEMMs now run FP16 WMMA kernels
-too. ABBA against `NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0` (the shared expert on its emulated
-`mma.sync` kernels, as before):
+2026-11-25, 200 W, no thermal throttling. The experts' WMMA prefill kernels (routed and shared) now
+take 128-row tiles with the next K step's loads in flight; their output is bit-identical (the same
+prefill-scored PPL to every printed digit). ABBA against the build before it:
+
+| Prompt | default | before |
+|---|---:|---:|
+| 4.2K tokens | **3,191.9-3,203.2** | 2,838.2-2,839.9 |
+| 13.4K | **2,207.9** | 2,016.6-2,017.1 |
+| 40.2K | **1,098.1-1,098.2** | 1,049.9 |
+
+The shared expert's prefill GEMMs moved to FP16 WMMA kernels before that. ABBA against
+`NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0` (the shared expert on its emulated `mma.sync` kernels):
 
 | Prompt | default | `NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0` |
 |---|---:|---:|
