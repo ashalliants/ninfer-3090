@@ -101,8 +101,11 @@ public:
 #endif
     }
 
+    // The input projections are the separable half of the trade, as for the split parents: they
+    // also honour --no-prefill-cublas-projections. The output projections follow --prefill-cublas.
     void q8_prefill_route(ops::ProjectionWeights& projection, std::int32_t n,
                           std::int32_t k) const {
+        if (!model_.options().prefill_cublas_projections) { return; }
         if (auto* single = std::get_if<LinearParameters>(&projection)) {
             q8_prefill_route(*single, n, k);
         }
