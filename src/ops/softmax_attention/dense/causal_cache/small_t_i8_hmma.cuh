@@ -527,6 +527,7 @@ __launch_bounds__(VoltaVerifyLayout<Geometry, TokenTile, KeyGroups>::Threads, 1)
             }
             l_run         = __fmaf_rn(l_run, alpha, bl);
             m_run         = nm;
+            // o holds sum(p * v * 2^u_cur); in this tile's units it is o * 2^(u - u_cur).
             alpha_s[lane] = alpha * ldexpf(1.0f, u - u_cur);
         }
         u_cur = u;

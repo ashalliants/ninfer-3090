@@ -65,7 +65,14 @@ struct ContextAttentionExecutionEnvelope {
  * partial to FP32 once; a tile whose largest represented V scale exceeds 8 (INT8 codes) or 127
  * (packed INT4 codes) decodes V with its scales divided by an exact power of two (and multiplies
  * the promoted partial back) so the partial, bounded by 64 * 127 * scale or 64 * 8 * scale,
- * stays finite in FP16. sm_100a/sm_120a use native E4M3FN QK MMA for FP8
+ * stays finite in FP16. sm_70 has no INT8 MMA: there the INT8-G64 small-T route of the [256,24,4]
+ * profile runs on FP16 MMA (mma.m8n8k4, FP32 accumulation) for the widths and key counts
+ * causal_sm70_verify_hmma selects. The rotated query is rounded to FP16 with a power-of-two row
+ * scale, key codes widen exactly to FP16, and each 64-group dot is scaled by its key scale in FP32;
+ * P/V multiplies FP16(p * V scale * 2^u) by the exactly widened V codes, where u is a power-of-two
+ * exponent per split that keeps the product a normal FP16 below 2^15 and is removed in FP32 at
+ * the merge. Other sm_70 small-T calls (and NINFER_SM70_VERIFY_ATTN_HMMA=0) take INT8 dp4a QK and
+ * FP32 FMA P/V on the CUDA cores. sm_100a/sm_120a use native E4M3FN QK MMA for FP8
  * and K8V4's key plane; this fork's sm_86/sm_89 build has no FP8 tensor-core path at all (unlike
  * INT8), so FP8, K8V4, and NVFP4 instead dequantize both K and V to BF16/FP16 up front and run QK
  * on native BF16 MMA, exactly as the BFloat16 profile does. NVFP4 and K8V4 never quantize Q to
