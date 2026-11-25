@@ -4,6 +4,7 @@
 #include "models/inkling2/frontend/constraint.h"
 #include "models/inkling2/frontend/tokens.h"
 
+#include <bit>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -50,7 +51,7 @@ bool allows(const std::vector<std::uint32_t>& w, TokenId id) {
 
 std::size_t count(const std::vector<std::uint32_t>& w) {
     std::size_t n = 0;
-    for (std::uint32_t x : w) { n += static_cast<std::size_t>(__builtin_popcount(x)); }
+    for (std::uint32_t x : w) { n += static_cast<std::size_t>(std::popcount(x)); }
     return n;
 }
 
