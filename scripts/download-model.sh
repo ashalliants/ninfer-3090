@@ -274,15 +274,16 @@ graft_sha_ok() {
   [ "$actual" = "$2" ]
 }
 
-# Flash-Next's MTP draft vocabulary (ninfer-serve reads <model>.draft-vocab on a Tesla V100; --mtp-draft-vocab off ignores it): the
-# 106,299 token ids the drafter of jesdga's Basalt packs proposes from (convert/mtp/rt/draft_vocab.bin in
+# Flash-Next's MTP draft vocabulary from jesdga's Basalt packs, on request only (NINFER_DRAFT_VOCAB=basalt):
+# the 106,299 token ids their drafter proposes from (convert/mtp/rt/draft_vocab.bin in
 # huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt, also used by chris83-dev's Lapilli-V100 port). It is
 # their file, under their licence (Qwen Community License 1.0, the LICENSE in that repo): this script
 # downloads it from their repo, pinned to a revision and sha256, and NInfer does not redistribute it.
-# Best-effort: without it the drafter scores the full head, and the output is the same either way.
-# NINFER_DRAFT_VOCAB=off skips it.
+# ninfer-serve does not need it: its default on a Tesla V100 (--mtp-draft-vocab auto) derives a list from
+# the model's tokenizer, which measured faster. The Basalt list is read only when named:
+# --mtp-draft-vocab <model>.draft-vocab.
 fetch_draft_vocab() {
-  [ -n "${draft_vocab:-}" ] && [ "${NINFER_DRAFT_VOCAB:-}" != 'off' ] || return 0
+  [ -n "${draft_vocab:-}" ] && [ "${NINFER_DRAFT_VOCAB:-}" = 'basalt' ] || return 0
   local rev='fc721830e519ab52012d372e89b90d9a7df30ff2'
   local url="https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt/resolve/$rev/convert/mtp/rt/draft_vocab.bin"
   local sha='b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91'
@@ -295,12 +296,12 @@ fetch_draft_vocab() {
   if ! curl -sSL --fail --output "$path.part" "$url" 2>/dev/null || ! graft_sha_ok "$path.part" "$sha"; then
     # A stale file that failed its check goes too, so the server never reads an unverified list.
     rm -f -- "$path.part" "$path" 2>/dev/null || true
-    printf '%s\n' 'MTP draft vocabulary: skipped (download or sha256 check failed); the drafter uses the full head.' >&2
+    printf '%s\n' 'MTP draft vocabulary: skipped (download or sha256 check failed).' >&2
     return 0
   fi
   if ! mv -f -- "$path.part" "$path" 2>/dev/null; then
     rm -f -- "$path.part" "$path" 2>/dev/null || true
-    printf '%s\n' 'MTP draft vocabulary: skipped (could not save it); the drafter uses the full head.' >&2
+    printf '%s\n' 'MTP draft vocabulary: skipped (could not save it).' >&2
     return 0
   fi
   printf 'MTP draft vocabulary ready: %s\n' "$path"

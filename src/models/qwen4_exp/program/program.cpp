@@ -6572,6 +6572,47 @@ std::uint64_t plan_mtp_draft_head(const ProgramOptions& options) {
     return mtp_draft_head_ids_offset(options) + 4ULL * options.mtp_draft_vocab->size();
 }
 
+bool draft_vocab_cjk_bytes(std::string_view bytes) noexcept {
+    if (bytes.empty()) { return false; }
+    bool continuation_only = true;
+    for (std::size_t i = 0; i < bytes.size();) {
+        const auto b = static_cast<unsigned char>(bytes[i]);
+        if (b >= 0xE3 && b <= 0xE9) { return true; }
+        if ((b & 0xC0) != 0x80) { continuation_only = false; }
+        if (b >= 0xE0 && b <= 0xEF && i + 2 < bytes.size()) {
+            const auto b1 = static_cast<unsigned char>(bytes[i + 1]), b2 = static_cast<unsigned char>(bytes[i + 2]);
+            if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80) {
+                const unsigned cp = ((b & 0x0FU) << 12U) | ((b1 & 0x3FU) << 6U) | (b2 & 0x3FU);
+                if ((cp >= 0xFF00 && cp <= 0xFFEF) || (cp >= 0xAC00 && cp <= 0xD7AF)) { return true; }
+                i += 3;
+                continue;
+            }
+        }
+        ++i;
+    }
+    return continuation_only;
+}
+
+std::vector<std::int32_t> tokenizer_draft_vocab(std::int32_t public_tokens,
+                                                const std::function<std::string_view(std::int32_t)>& token_bytes,
+                                                std::span<const int> added_ids) {
+    std::vector<std::int32_t> ids;
+    const std::int32_t common = std::min(public_tokens, kDraftVocabCommonIds);
+    ids.reserve(static_cast<std::size_t>(common) + 32768);
+    for (std::int32_t id = 0; id < common; ++id) { ids.push_back(id); }
+    for (std::int32_t id = common; id < std::min(public_tokens, kDraftVocabCjkEnd); ++id) {
+        if (draft_vocab_cjk_bytes(token_bytes(id))) { ids.push_back(id); }
+    }
+    for (const int id : added_ids) {
+        if (id >= 0 && id < public_tokens) { ids.push_back(id); }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    if (ids.size() < 2) { throw std::runtime_error("--mtp-draft-vocab: the tokenizer gives fewer than two draft ids"); }
+    if (ids.size() % 2 != 0) { ids.push_back(ids.back()); }
+    return ids;
+}
+
 std::vector<std::int32_t> load_draft_vocab(const std::filesystem::path& path, std::int32_t public_tokens) {
     std::ifstream in(path, std::ios::binary);
     if (!in) { throw std::runtime_error("--mtp-draft-vocab: cannot read " + path.string()); }
