@@ -75,6 +75,10 @@ public:
         return service_->options().max_context;
     }
 
+    [[nodiscard]] UnloadStoreSave save_before_unload() noexcept override {
+        return save_context_before_unload(*service_);
+    }
+
     [[nodiscard]] int port() const noexcept { return port_; }
 
 private:

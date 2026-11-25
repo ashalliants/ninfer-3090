@@ -403,7 +403,7 @@ std::string serve_usage_text(const char* argv0) {
            "shipped for a fresh install, read only when the saved one does not load (missing, another "
            "copy, damaged; default <model>.expert-state.default); --vram-headroom-mib N is the VRAM "
            "the expert cache leaves free for the desktop (default 512 with a display, 256 without); "
-           "--ram-headroom-mib N is the RAM left free for Windows once every expert is pinned "
+           "--ram-headroom-mib N is the RAM left free for the system once every expert is pinned "
            "(default 2048; startup refuses when it cannot be kept); --allow-unlocked-host-memory "
            "(Linux) skips the preflight refusal when RLIMIT_MEMLOCK is below the pinned total, the "
            "same way the Windows WDDM page-lock cap is already only a warning: the real cudaHostAlloc "

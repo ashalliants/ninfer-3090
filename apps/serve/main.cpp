@@ -229,7 +229,13 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
                     throw;
                 }
             },
-            /*router=*/true);
+            /*router=*/true,
+            [&](const ninfer::serve::ModelReleaseEvent& event) {
+                const std::string details =
+                    ninfer::serve::describe_unload(event.save, event.heap);
+                logger->info("{} '{}'{}{}", event.failed_load ? "released failed load of" : "unloaded",
+                             event.model, details.empty() ? "" : " | ", details);
+            });
         ninfer::serve::RouterServer router(options, registry, ports, logger);
         if (!router.bind()) {
             operational_log.bind_failure(options.host, options.port);
