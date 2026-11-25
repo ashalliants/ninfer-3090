@@ -74,7 +74,7 @@ The downloader writes into `models/` beside these files, which is where the laun
 | file | what it is |
 |---|---|
 | `ninfer-serve` | the server (`sm_70`): OpenAI- and Anthropic-compatible HTTP APIs |
-| `ninfer` | one-shot CLI generation, for smoke tests and scripting; a link to `ninfer-serve` (the same binary, which runs as the CLI when started under this name) |
+| `ninfer` | one-shot CLI generation, for smoke tests and scripting; normally a link to `ninfer-serve` (the same binary, which runs as the CLI when started under the name `ninfer`); an archive built from an older tree carries a separate copy instead |
 | `ninfer_bench` | throughput benchmark against the public Engine route |
 | `run-v100.sh` | the V100 launcher: `run-v100.sh <model> [profile]` |
 | `run.sh` | the general launcher `run-v100.sh` starts; every `NINFER_*` variable applies to both |

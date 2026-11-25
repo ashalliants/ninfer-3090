@@ -1265,6 +1265,16 @@ cp -- "$repo_root/src/runtime/engine/compaction/NOTICE" "$pkg/src/runtime/engine
 cp -- "$repo_root/docs/release-archive-linux.md" "$repo_root/docs/release-archive-v100.md" "$pkg/docs/"
 printf '9.9.9-test\n' > "$pkg/VERSION"
 printf 'notes\n' > "$pkg/docs/release-notes/RELEASE_NOTES_9.9.9.md"
+# package-release.sh checks the server for the right card's machine code whenever cuobjdump is on PATH. A stub
+# keeps this test the same on a box with the CUDA toolkit and one without, and lets it prove the check refuses
+# a tree built for the other card.
+stubbin="$tmp/stubbin"
+mkdir -p -- "$stubbin"
+cat > "$stubbin/cuobjdump" <<'STUB'
+#!/usr/bin/env bash
+echo "ELF file    1: fake.${FAKE_ARCH}.cubin"
+STUB
+chmod +x "$stubbin/cuobjdump"
 fake_tree() {  # fake_tree <dir> multicall|legacy
   mkdir -p -- "$1/apps" "$1/bench"
   if [[ "$2" == multicall ]]; then
@@ -1279,8 +1289,9 @@ fake_tree() {  # fake_tree <dir> multicall|legacy
 }
 unpack_archive() {  # unpack_archive <target> <tree> -> prints the unpacked directory
   rm -rf -- "$pkg/dist" "$tmp/unpacked"; mkdir -p -- "$tmp/unpacked"
-  NINFER_PACKAGE_TARGET="$1" NINFER_BUILD_ROOT="$2" "$pkg/scripts/package-release.sh" >/dev/null 2>"$tmp/pkg.err" ||
-    pkg_fail "failed for $1: $(cat -- "$tmp/pkg.err")"
+  local arch=sm_86; [[ "$1" == v100 ]] && arch=sm_70
+  PATH="$stubbin:$PATH" FAKE_ARCH="$arch" NINFER_PACKAGE_TARGET="$1" NINFER_BUILD_ROOT="$2" \
+    "$pkg/scripts/package-release.sh" >/dev/null 2>"$tmp/pkg.err" || pkg_fail "failed for $1: $(cat -- "$tmp/pkg.err")"
   tar -xzf "$pkg"/dist/*.tar.gz -C "$tmp/unpacked"
   printf '%s\n' "$tmp"/unpacked/*/
 }
@@ -1291,7 +1302,7 @@ for target in rtx3090 v100; do
   [[ "$("${out}ninfer" --version)" == 'ninfer 9.9.9' ]] || pkg_fail "$target: the linked ninfer does not run as the CLI"
   [[ "$("${out}ninfer-serve" --version)" == 'ninfer-serve 9.9.9' ]] || pkg_fail "$target: ninfer-serve stopped being the server"
   [[ -x "${out}ninfer_bench" ]] || pkg_fail "$target: ninfer_bench is missing"
-  grep -Eq '  ./ninfer$' "${out}SHA256SUMS.txt" || pkg_fail "$target: SHA256SUMS.txt omits the ninfer link"
+  grep -Eq '  \./ninfer$' "${out}SHA256SUMS.txt" || pkg_fail "$target: SHA256SUMS.txt omits the ninfer link"
   ( cd -- "$out" && sha256sum -c --quiet SHA256SUMS.txt ) >/dev/null 2>&1 || pkg_fail "$target: SHA256SUMS.txt does not verify"
 
   fake_tree "$tmp/pkgtree-legacy" legacy
@@ -1299,6 +1310,34 @@ for target in rtx3090 v100; do
   [[ -f "${out}ninfer" && ! -L "${out}ninfer" ]] || pkg_fail "$target: a build without the CLI mode did not get its own ninfer"
   [[ "$("${out}ninfer" --version)" == 'ninfer 9.9.9' ]] || pkg_fail "$target: the fallback ninfer is the wrong binary"
 done
+# A tree built for the other card is refused, not packaged.
+fake_tree "$tmp/pkgtree-multi" multicall
+if PATH="$stubbin:$PATH" FAKE_ARCH=sm_70 NINFER_PACKAGE_TARGET=rtx3090 NINFER_BUILD_ROOT="$tmp/pkgtree-multi" \
+     "$pkg/scripts/package-release.sh" >/dev/null 2>"$tmp/pkg.err"; then
+  pkg_fail 'an sm_70 tree was packaged as the RTX 3090 archive'
+fi
+grep -q 'holds no sm_86 code' "$tmp/pkg.err" || pkg_fail "the wrong-card refusal did not say why: $(cat -- "$tmp/pkg.err")"
 rm -rf -- "$pkg/dist" "$tmp/unpacked" "$tmp/pkgtree-multi" "$tmp/pkgtree-legacy"
+
+# v100_build.sh turns the benchmarks on when ninfer_bench is asked for (the release builds it) and leaves the
+# setting alone otherwise. Stub cmake and ninja to read the configure line.
+cat > "$stubbin/cmake" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_LOG"
+STUB
+printf '#!/usr/bin/env bash\nexit 0\n' > "$stubbin/ninja"
+chmod +x "$stubbin/cmake" "$stubbin/ninja"
+for targets in 'ninfer-serve ninfer_bench' 'ninfer-serve'; do
+  : > "$tmp/stub.log"
+  # shellcheck disable=SC2086
+  PATH="$stubbin:$PATH" STUB_LOG="$tmp/stub.log" BUILD_DIR="$tmp/v100build" JOBS=2 "$root/v100_build.sh" $targets \
+    >/dev/null 2>&1 || pkg_fail "v100_build.sh $targets failed"
+  if [[ "$targets" == *ninfer_bench* ]]; then
+    grep -q -- -DNINFER_BUILD_BENCHMARKS=ON "$tmp/stub.log" || pkg_fail "v100_build.sh $targets did not configure the benchmarks"
+  elif grep -q -- NINFER_BUILD_BENCHMARKS "$tmp/stub.log"; then
+    pkg_fail "v100_build.sh $targets touched the benchmarks setting"
+  fi
+done
+rm -f -- "$stubbin/cmake" "$stubbin/ninja"
 
 printf '%s\n' 'Linux script checks passed.'
