@@ -3,6 +3,7 @@
 
 #include "core/device.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -269,7 +270,153 @@ __global__ __launch_bounds__(kThreads) void hmma_qx_down_kernel(
     }
 }
 
+// Eight Q8_G32 codes (signed bytes) times their group scale, as FP16.
+__device__ __forceinline__ uint4 q8_eight_f16(uint2 packed, float scale) {
+    uint4 r;
+    auto* out                    = reinterpret_cast<__half2*>(&r);
+    const std::uint32_t lanes[2] = {packed.x, packed.y};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const std::uint32_t word = lanes[i / 2];
+        const int shift          = (i % 2) * 16;
+        const int q0             = static_cast<std::int8_t>((word >> shift) & 0xffu);
+        const int q1             = static_cast<std::int8_t>((word >> (shift + 8)) & 0xffu);
+        out[i] = __floats2half2_rn(static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
+    }
+    return r;
+}
+
+// Eight values of Q8_G32_FP16 row `row` from k = kt * 64 + c * 8 (row-major int8 codes, one FP16
+// scale per 32 values).
+__device__ __forceinline__ uint4 q8_row_eight(const std::uint8_t* codes, const __half* scales,
+                                              std::int64_t row, int k, int kt, int c) {
+    const int k0       = kt * kStepK + c * 8;
+    const uint2 packed = __ldg(reinterpret_cast<const uint2*>(codes + row * k + k0));
+    return q8_eight_f16(packed, __half2float(scales[row * (k / 32) + k0 / 32]));
+}
+
+constexpr int kSharedBN = 64; // token columns per work item
+
+// The shared expert's gate/up, Q8_G32_FP16 [1024, 2048], over every token of the slice: a work item
+// is (64 tokens, 32 intermediate rows) and writes activation[token][512] = silu(gate) * up.
+__global__ __launch_bounds__(kThreads) void hmma_q8_shared_gate_up_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const __half* __restrict__ scales, __nv_bfloat16* __restrict__ activation, int tokens) {
+    using Tile               = HmmaTile<kSharedBN>;
+    constexpr int kRowBlocks = kIntermediate / (kTileRows / 2);
+    __shared__ __align__(32) __half As[kTileRows * kLd];
+    __shared__ __align__(32) __half Bs[kSharedBN * kLd];
+    __shared__ __align__(32) float Cs[kTileRows * Tile::kCLd];
+    const int tid   = static_cast<int>(threadIdx.x);
+    const int total = (tokens + kSharedBN - 1) / kSharedBN * kRowBlocks;
+    for (int work = static_cast<int>(blockIdx.x); work < total;
+         work += static_cast<int>(gridDim.x)) {
+        const int tile     = work / kRowBlocks;
+        const int logical0 = (work - tile * kRowBlocks) * (kTileRows / 2);
+        const int col0     = tile * kSharedBN;
+        const int cols     = min(tokens - col0, kSharedBN);
+        const auto weight_eight = [&](int row, int kt, int c) {
+            const std::int64_t grow = logical0 + (row & (kTileRows / 2 - 1)) +
+                                      (row >= kTileRows / 2 ? kIntermediate : 0);
+            return q8_row_eight(codes, scales, grow, kHidden, kt, c);
+        };
+        const auto act_row = [&](int i) {
+            const int col = (tid + i * kThreads) / (kStepK / 8);
+            return x + static_cast<std::int64_t>(col0 + (col < cols ? col : 0)) * kHidden;
+        };
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+            acc[Tile::kWarpFragments];
+        hmma_tile_gemm<kSharedBN, kHidden / kStepK>(As, Bs, Cs, cols, weight_eight, act_row, acc);
+        for (int item = tid; item < (kTileRows / 2) * kSharedBN; item += kThreads) {
+            const int col = item / (kTileRows / 2);
+            const int row = item - col * (kTileRows / 2);
+            if (col < cols) {
+                const float gate = Cs[row * Tile::kCLd + col];
+                const float up   = Cs[(row + kTileRows / 2) * Tile::kCLd + col];
+                activation[static_cast<std::int64_t>(col0 + col) * kIntermediate + logical0 + row] =
+                    __float2bfloat16_rn(silu(gate) * up);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// The shared expert's down, Q8_G32_FP16 [2048, 512], merged as the default kernel merges it:
+// destination = destination + routed_sum + shared_scale[token] * down, per (64 tokens, 64 rows).
+__global__ __launch_bounds__(kThreads) void hmma_q8_shared_down_kernel(
+    const __nv_bfloat16* __restrict__ activation, const std::uint8_t* __restrict__ codes,
+    const __half* __restrict__ scales, const float* __restrict__ routed_sum,
+    const float* __restrict__ shared_scale, __nv_bfloat16* __restrict__ destination, int tokens) {
+    using Tile               = HmmaTile<kSharedBN>;
+    constexpr int kRowBlocks = kHidden / kTileRows;
+    __shared__ __align__(32) __half As[kTileRows * kLd];
+    __shared__ __align__(32) __half Bs[kSharedBN * kLd];
+    __shared__ __align__(32) float Cs[kTileRows * Tile::kCLd];
+    const int tid   = static_cast<int>(threadIdx.x);
+    const int total = (tokens + kSharedBN - 1) / kSharedBN * kRowBlocks;
+    for (int work = static_cast<int>(blockIdx.x); work < total;
+         work += static_cast<int>(gridDim.x)) {
+        const int tile = work / kRowBlocks;
+        const int row0 = (work - tile * kRowBlocks) * kTileRows;
+        const int col0 = tile * kSharedBN;
+        const int cols = min(tokens - col0, kSharedBN);
+        const auto weight_eight = [&](int row, int kt, int c) {
+            return q8_row_eight(codes, scales, row0 + row, kIntermediate, kt, c);
+        };
+        const auto act_row = [&](int i) {
+            const int col = (tid + i * kThreads) / (kStepK / 8);
+            return activation + static_cast<std::int64_t>(col0 + (col < cols ? col : 0)) *
+                                    kIntermediate;
+        };
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+            acc[Tile::kWarpFragments];
+        hmma_tile_gemm<kSharedBN, kIntermediate / kStepK>(As, Bs, Cs, cols, weight_eight, act_row,
+                                                          acc);
+        for (int item = tid; item < kTileRows * kSharedBN; item += kThreads) {
+            const int col = item / kTileRows;
+            const int row = item - col * kTileRows;
+            if (col < cols) {
+                const std::int64_t at = static_cast<std::int64_t>(col0 + col) * kHidden + row0 + row;
+                const float merged    = __bfloat162float(destination[at]) + routed_sum[at] +
+                                     shared_scale[col0 + col] * Cs[row * Tile::kCLd + col];
+                destination[at] = __float2bfloat16_rn(merged);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 } // namespace
+
+bool sparse_moe_prefill_shared_hmma_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_SM70_MOE_PREFILL_SHARED_HMMA");
+        return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+void sparse_moe_prefill_hmma_shared_gate_up(const __nv_bfloat16* x, const std::uint8_t* codes,
+                                            const std::uint8_t* scales,
+                                            __nv_bfloat16* activation, int tokens, int blocks,
+                                            cudaStream_t stream) {
+    const int work = (tokens + kSharedBN - 1) / kSharedBN * (kIntermediate / (kTileRows / 2));
+    hmma_q8_shared_gate_up_kernel<<<std::min(blocks, work), kThreads, 0, stream>>>(
+        x, codes, reinterpret_cast<const __half*>(scales), activation, tokens);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sparse_moe_prefill_hmma_shared_down(const __nv_bfloat16* activation,
+                                         const std::uint8_t* codes, const std::uint8_t* scales,
+                                         const float* routed_sum, const float* shared_scale,
+                                         __nv_bfloat16* destination, int tokens, int blocks,
+                                         cudaStream_t stream) {
+    const int work = (tokens + kSharedBN - 1) / kSharedBN * (kHidden / kTileRows);
+    hmma_q8_shared_down_kernel<<<std::min(blocks, work), kThreads, 0, stream>>>(
+        activation, codes, reinterpret_cast<const __half*>(scales), routed_sum, shared_scale,
+        destination, tokens);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void sparse_moe_prefill_hmma_q4_gate_up(const __nv_bfloat16* x, const int* packed_token,
                                         const int* expert_offsets, const int* route_job_experts,
@@ -318,6 +465,20 @@ void sparse_moe_prefill_hmma_down(QType qtype, const __nv_bfloat16* activation,
 }
 
 #else
+
+bool sparse_moe_prefill_shared_hmma_enabled() { return false; }
+
+void sparse_moe_prefill_hmma_shared_gate_up(const __nv_bfloat16*, const std::uint8_t*,
+                                            const std::uint8_t*, __nv_bfloat16*, int, int,
+                                            cudaStream_t) {
+    throw std::logic_error("sparse_moe prefill hmma: sm_70 builds only");
+}
+
+void sparse_moe_prefill_hmma_shared_down(const __nv_bfloat16*, const std::uint8_t*,
+                                         const std::uint8_t*, const float*, const float*,
+                                         __nv_bfloat16*, int, int, cudaStream_t) {
+    throw std::logic_error("sparse_moe prefill hmma: sm_70 builds only");
+}
 
 void sparse_moe_prefill_hmma_q4_gate_up(const __nv_bfloat16*, const int*, const int*, const int*,
                                         const int*, const int*, const std::uint8_t*,

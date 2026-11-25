@@ -43,4 +43,24 @@ void sparse_moe_prefill_hmma_down(QType qtype, const __nv_bfloat16* activation,
                                   const std::uint8_t* scales, __nv_bfloat16* output, int job_bn,
                                   int blocks, cudaStream_t stream);
 
+// The shared expert (Q8_G32_FP16 gate/up [1024, 2048] and down [2048, 512]) on the same WMMA tile
+// GEMM, over every token of the slice. The default kernels run emulated mma.sync here too: about
+// 330 ms of a 4,096-token prompt's 1.75 s. NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0 keeps them; false
+// outside sm_70 builds.
+bool sparse_moe_prefill_shared_hmma_enabled();
+
+// activation[token][512] = silu(gate) * up for tokens [0, tokens) of x [tokens][2048].
+void sparse_moe_prefill_hmma_shared_gate_up(const __nv_bfloat16* x, const std::uint8_t* codes,
+                                            const std::uint8_t* scales,
+                                            __nv_bfloat16* activation, int tokens, int blocks,
+                                            cudaStream_t stream);
+
+// destination[token][2048] += routed_sum + shared_scale[token] * down(activation[token]), with
+// the default kernel's merge order.
+void sparse_moe_prefill_hmma_shared_down(const __nv_bfloat16* activation,
+                                         const std::uint8_t* codes, const std::uint8_t* scales,
+                                         const float* routed_sum, const float* shared_scale,
+                                         __nv_bfloat16* destination, int tokens, int blocks,
+                                         cudaStream_t stream);
+
 } // namespace ninfer::ops::detail
