@@ -75,6 +75,12 @@ Flash-Next decode stays flat from 10K to 221K tokens. These are V100 figures onl
 - `run.bat` and `run.sh` explain the `runtime reservation requires ... available for runtime capacity` failure (an explicit `NINFER_CONTEXT` turns `--fit-context` off).
 - Inkling-2-Mini's prefill on the V100 is 3-9% faster at the default chunk.
 
+## The Tesla V100 archive
+
+- `ninfer-v100-linux-x64-0.20.0-rtx3090.tar.gz` (1.5 GB) with `SHA256SUMS-v0.20.0-linux-v100.txt`, Linux only, `sm_70` only: it does not start on an RTX 3090, and the 3090 archives do not start on a V100.
+- **It no longer contains `ninfer_bench`.** Each `sm_70` binary is 1.37 GB, and with three of them the tarball was 2,246,329,497 bytes, over GitHub's 2 GiB (2,147,483,648) limit for one download. It holds `ninfer-serve`, `ninfer` and the launchers. To benchmark on a V100, build it from source: `scripts/v100_build.sh ninfer_bench` (CUDA 12.8). The 3090 archives still ship it.
+- `run-v100.sh` now serves `qwen36-35b-a3b` as well as `qwen38-27b` and `qwen38-flash-next`. It listens on every network interface; **set `NINFER_API_KEY` before you start it** (it warns when you have not).
+
 ## Under the hood
 
 For profiling on a V100 under `nsys`, `NINFER_NO_COOPERATIVE_KERNELS=1` turns off the cooperative launches `nsys` cannot trace. It slows the kernels and is for measurement only. `NINFER_SM70_VERIFY_ATTN_HMMA=0`, `NINFER_GGML_STAGED=0` and `NINFER_INKLING2_BANK_EXPERTS=0` restore the previous V100 routes, for comparison. The 35B's experts and projections, the 27B's drafter and Flash-Next's verify now run on the V100's FP16 tensor cores or on `dp4a` instead of emulated Ampere instructions. The README leads with new Tesla V100 comparison charts; per-model figures and every source are in `docs/tesla-v100.md`.
@@ -85,9 +91,10 @@ Tests: this release builds only the three products (`ninfer`, `ninfer-serve`, `n
 
 What was checked, on the build machine (Windows 11, and Ubuntu 24.04 under WSL), before publishing:
 
-- **Windows zip, Linux RTX 3090 archive:** VERIFICATION_PENDING
-- **Linux Tesla V100 archive: built, not run on a V100 before this release was published.** VERIFICATION_PENDING The V100 figures above come from source builds of master on a V100, not from this archive. If `./run-v100.sh qwen38-27b` from the archive does not start on your card, please open an issue.
-- The Linux archives' `ldd` lists were VERIFICATION_PENDING.
+- **Windows zip:** every file matches its inner `SHA256SUMS.txt`, and the zip matches `SHA256SUMS-v0.20.0-windows.txt`. `ninfer.exe` and `ninfer-serve.exe` start from an extracted copy with only Windows on `PATH` (the cuBLAS DLLs ship in the zip). Its default launcher, `run.bat qwen38-27b`, loaded Qwen3.8-27B and answered a chat completion on the RTX 3090.
+- **Linux RTX 3090 archive:** inner and outer checksums match, `./ninfer-serve --help` and `./run.sh --help` run from a fresh unpack, and `run.sh qwen38-27b` loaded the model under WSL and answered a chat completion on the RTX 3090. The server holds `sm_86` code and no `sm_70` code. No dynamic library is missing, and its `ldd` list is identical to v0.19.0's.
+- **Linux Tesla V100 archive: built and checked, not run on a V100 before this release was published.** Inner and outer checksums match, the server holds `sm_70` code and no `sm_86` code, `--version` and `--help` run, `run-v100.sh` finds the server beside it, and its `ldd` list is identical to the 3090 archive's. Serving a model on a V100 from this archive was **not** done before publishing; the V100 figures above come from source builds of master on a V100. If `./run-v100.sh qwen38-27b` from the archive does not start on your card, please open an issue.
+- **The version string:** the Windows executables report `0.20.0-rtx3090+04d5fc343-dirty` (built from the working tree, with an uncommitted edit to a maintainer file and an untracked scratch file beside it); the Linux ones, built from a clean export, report `0.20.0-rtx3090`.
 
 ## Install and upgrade
 
