@@ -67,7 +67,7 @@ API key blank.
 | file | what it is |
 |---|---|
 | `ninfer-serve` | the server: OpenAI- and Anthropic-compatible HTTP APIs |
-| `ninfer` | one-shot CLI generation, for smoke tests and scripting |
+| `ninfer` | one-shot CLI generation, for smoke tests and scripting; normally a link to `ninfer-serve` (the same binary, which runs as the CLI when started under the name `ninfer`); an archive built from an older tree carries a separate copy instead |
 | `ninfer_bench` | throughput benchmark against the public Engine route |
 | `download-model.sh` | pinned, resumable artifact downloads with verification |
 | `run.sh` | serving profiles: `run.sh <model> [profile]` |

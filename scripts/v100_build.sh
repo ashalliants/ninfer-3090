@@ -3,6 +3,7 @@
 # installed (scripts/setup-ccache.sh installs and configures it; the build works without it).
 # Usage: scripts/v100_build.sh [ninja targets...]   (default: ninfer ninfer-serve)
 #   NINFER_BUILD_TESTS=1   also configure the tests (target ninfer_tests builds all of them)
+#   NINFER_BUILD_BENCHMARKS=1  also configure the benchmarks; asking for the ninfer_bench target does it too
 #   BUILD_DIR              build tree (default build-v100/ inside this checkout, where scripts/run-v100.sh
 #                          looks first; each worktree gets its own tree, which ccache sharing needs)
 #   JOBS                   parallel compile jobs (default: min(cores, RAM GiB / 2); one nvcc job
@@ -33,11 +34,20 @@ fi
 testing=OFF
 [ "${NINFER_BUILD_TESTS:-0}" = "1" ] && testing=ON
 
+# The benchmarks are off by default, so a fresh tree has no ninfer_bench target. Only turn them ON here,
+# never OFF: a tree configured with them keeps them.
+bench_flag=()
+if [ "${NINFER_BUILD_BENCHMARKS:-0}" = "1" ]; then bench_flag=(-DNINFER_BUILD_BENCHMARKS=ON); fi
+for target in "$@"; do
+  if [ "$target" = ninfer_bench ]; then bench_flag=(-DNINFER_BUILD_BENCHMARKS=ON); fi
+done
+
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES=70 \
   -U CMAKE_C_COMPILER_LAUNCHER -U CMAKE_CXX_COMPILER_LAUNCHER -U CMAKE_CUDA_COMPILER_LAUNCHER \
-  -DNINFER_BUILD_APPS=ON -DBUILD_TESTING="$testing"
+  -DNINFER_BUILD_APPS=ON -DBUILD_TESTING="$testing" \
+  ${bench_flag[@]+"${bench_flag[@]}"}
 
 if [ -z "${JOBS:-}" ]; then
   ram_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)

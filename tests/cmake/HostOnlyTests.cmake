@@ -15,6 +15,7 @@ set(NINFER_HOST_ONLY_TESTS
   ninfer_bench_rows_check_test
   ninfer_chat_templates_test
   ninfer_chunked_reservation_test
+  ninfer_cli_dispatch_test
   ninfer_cli_options_test
   ninfer_context_cost_measure_test
   ninfer_context_cost_test

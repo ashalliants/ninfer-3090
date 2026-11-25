@@ -1,3 +1,4 @@
+#include "cli/cli_main.h"
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
 #include "product/version/version.h"
@@ -288,6 +289,8 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
 } // namespace
 
 int main(int argc, char** argv) {
+    // A release archive ships the CLI as a link to this binary, so the kernels are in the download once.
+    if (argc >= 1 && ninfer_started_as_cli(argv[0])) { return ninfer_cli_main(argc, argv); }
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
         std::cout << "ninfer-serve " << ninfer::product::build_version() << '\n';
         return 0;

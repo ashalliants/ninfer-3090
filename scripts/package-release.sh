@@ -32,12 +32,10 @@ release_notes="docs/release-notes/RELEASE_NOTES_$release_version.md"
 target="${NINFER_PACKAGE_TARGET:-rtx3090}"
 case "$target" in
   rtx3090) product_prefix="ninfer-rtx3090-linux-x64"; readme_source="docs/release-archive-linux.md"
-           checksum_suffix="linux"; extra_scripts=(); products=('apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve' 'bench/ninfer_bench:ninfer_bench') ;;
+           checksum_suffix="linux"; extra_scripts=(); products=('apps/ninfer-serve:ninfer-serve' 'bench/ninfer_bench:ninfer_bench') ;;
   v100)    product_prefix="ninfer-v100-linux-x64"; readme_source="docs/release-archive-v100.md"
            checksum_suffix="linux-v100"; extra_scripts=(run-v100.sh)
-           # No ninfer_bench: each sm_70 binary is 1.37 GB, and three of them made the tarball 2,246,329,497 bytes,
-           # over GitHub's 2 GiB (2,147,483,648) asset limit. The bench is built from source on a V100.
-           products=('apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve') ;;
+           products=('apps/ninfer-serve:ninfer-serve' 'bench/ninfer_bench:ninfer_bench') ;;
   *) printf 'NINFER_PACKAGE_TARGET must be rtx3090 or v100, not %s\n' "$target" >&2; exit 1 ;;
 esac
 build_root="${NINFER_BUILD_ROOT:-$repo_root/build-linux}"
@@ -75,6 +73,21 @@ for product in "${products[@]}"; do
   fi
   cp -- "$source_path" "$destination"
 done
+# The CLI. `ninfer-serve` runs it when started under the name `ninfer` (apps/serve/main.cpp), so the archive
+# carries one copy of every kernel and `ninfer` is a link to it: two separate 1.37 GB sm_70 binaries put the V100
+# tarball over GitHub's 2 GiB asset limit (2,246,329,497 bytes with three, v0.20.0). A build from before that
+# change has no such mode, so it still gets its own `ninfer` binary.
+cli_probe="$(mktemp -d)"
+ln -s "$product_root/ninfer-serve" "$cli_probe/ninfer"
+if [[ "$("$cli_probe/ninfer" --version 2>/dev/null | head -n 1)" == "ninfer "[0-9]* ]]; then
+  ln -s ninfer-serve "$product_root/ninfer"
+  printf 'ninfer is a link to ninfer-serve (one copy of the kernels)\n'
+else
+  [[ -f "$build_root/apps/ninfer" ]] || { printf 'Missing release product: %s\n' "$build_root/apps/ninfer" >&2; exit 1; }
+  cp -- "$build_root/apps/ninfer" "$product_root/ninfer"
+  printf 'this build has no CLI mode in ninfer-serve: shipping a separate ninfer\n'
+fi
+rm -rf -- "$cli_probe"
 cp -- "$repo_root/VERSION" "$repo_root/LICENSE" "$repo_root/$release_notes" "$product_root/"
 # Apache-2.0 section 4(d): the conversation projector (lossy prefill's summary strategy) is a port of
 # hermes-vcc-engine, so its NOTICE ships with every binary that contains it. LICENSE above is the
@@ -93,7 +106,7 @@ mkdir -- "$product_root/profiles"
 cp -- "$repo_root"/scripts/profiles/*.json "$product_root/profiles/"
 (
   cd -- "$product_root"
-  mapfile -d '' files < <( { find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -print0
+  mapfile -d '' files < <( { find . -maxdepth 1 \( -type f -o -type l \) ! -name SHA256SUMS.txt -print0
                              find ./profiles -maxdepth 1 -type f -print0; } | LC_ALL=C sort -z)
   sha256sum -- "${files[@]}" > SHA256SUMS.txt
 )

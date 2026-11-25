@@ -74,7 +74,8 @@ The downloader writes into `models/` beside these files, which is where the laun
 | file | what it is |
 |---|---|
 | `ninfer-serve` | the server (`sm_70`): OpenAI- and Anthropic-compatible HTTP APIs |
-| `ninfer` | one-shot CLI generation, for smoke tests and scripting |
+| `ninfer` | one-shot CLI generation, for smoke tests and scripting; normally a link to `ninfer-serve` (the same binary, which runs as the CLI when started under the name `ninfer`); an archive built from an older tree carries a separate copy instead |
+| `ninfer_bench` | throughput benchmark against the public Engine route |
 | `run-v100.sh` | the V100 launcher: `run-v100.sh <model> [profile]` |
 | `run.sh` | the general launcher `run-v100.sh` starts; every `NINFER_*` variable applies to both |
 | `download-model.sh` | pinned, resumable artifact downloads with verification |
@@ -82,8 +83,6 @@ The downloader writes into `models/` beside these files, which is where the laun
 | `LICENSE` | NInfer's licence (Apache-2.0) |
 | `THIRD_PARTY_NOTICES.txt` | the notice for the ported conversation projector (hermes-vcc-engine, Apache-2.0) |
 | `SHA256SUMS.txt` | checksums for every file in this directory and in `profiles/` |
-
-There is no `ninfer_bench` here: each `sm_70` binary is 1.37 GB, and a third one would put this archive over GitHub's 2 GiB asset limit. To benchmark, build it from source (`scripts/v100_build.sh ninfer_bench`, CUDA 12.8).
 
 ## Things worth knowing on a V100
 

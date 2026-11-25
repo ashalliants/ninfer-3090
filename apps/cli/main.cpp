@@ -1,3 +1,4 @@
+#include "cli/cli_main.h"
 #include "options.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
@@ -272,7 +273,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 
 } // namespace
 
-int main(int argc, char** argv) {
+int ninfer_cli_main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
         std::cout << "ninfer " << ninfer::product::build_version() << '\n';
         return 0;
