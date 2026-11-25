@@ -32,9 +32,12 @@ release_notes="docs/release-notes/RELEASE_NOTES_$release_version.md"
 target="${NINFER_PACKAGE_TARGET:-rtx3090}"
 case "$target" in
   rtx3090) product_prefix="ninfer-rtx3090-linux-x64"; readme_source="docs/release-archive-linux.md"
-           checksum_suffix="linux"; extra_scripts=() ;;
+           checksum_suffix="linux"; extra_scripts=(); products=('apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve' 'bench/ninfer_bench:ninfer_bench') ;;
   v100)    product_prefix="ninfer-v100-linux-x64"; readme_source="docs/release-archive-v100.md"
-           checksum_suffix="linux-v100"; extra_scripts=(run-v100.sh) ;;
+           checksum_suffix="linux-v100"; extra_scripts=(run-v100.sh)
+           # No ninfer_bench: each sm_70 binary is 1.37 GB, and three of them made the tarball 2,246,329,497 bytes,
+           # over GitHub's 2 GiB (2,147,483,648) asset limit. The bench is built from source on a V100.
+           products=('apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve') ;;
   *) printf 'NINFER_PACKAGE_TARGET must be rtx3090 or v100, not %s\n' "$target" >&2; exit 1 ;;
 esac
 build_root="${NINFER_BUILD_ROOT:-$repo_root/build-linux}"
@@ -55,7 +58,7 @@ rm -f -- "$archive_path"
 rm -f -- "$checksum_path"
 mkdir -- "$product_root"
 
-for product in 'apps/ninfer:ninfer' 'apps/ninfer-serve:ninfer-serve' 'bench/ninfer_bench:ninfer_bench'; do
+for product in "${products[@]}"; do
   source_path="$build_root/${product%%:*}"
   destination="$product_root/${product#*:}"
   [[ -f "$source_path" ]] || { printf 'Missing release product: %s\n' "$source_path" >&2; exit 1; }

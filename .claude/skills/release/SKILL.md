@@ -1,6 +1,6 @@
 ---
 name: release
-description: Cut a NInfer-3090 GitHub release end to end. Asks for the version (suggests one), builds the Windows and Linux (WSL) binaries from the same commit, packages them, writes customer-facing release notes, and publishes. Use when the user says "cut a release", "build the release", "ship vX.Y.Z" or similar.
+description: Cut a NInfer-3090 GitHub release end to end. Asks for the version (suggests one), builds the Windows, Linux RTX 3090 (WSL) and Linux Tesla V100 (sm_70, also built under WSL) binaries from the same commit, packages all three, writes customer-facing release notes, and publishes. Use when the user says "cut a release", "build the release", "ship vX.Y.Z" or similar.
 ---
 
 # Cut a NInfer-3090 release
@@ -106,6 +106,13 @@ Not the audience: people who want kernel details. Those go in a short "Under the
 - Group by what the reader does, not by PR. List PR numbers once at the top or at the end.
 - Breaking changes and upgrade steps go in a section the reader cannot miss, near the top.
 - Finish with "Also fixed" (one line each, symptom first, not cause) and install/upgrade pointers.
+- **Three archives, named in full** (as in `RELEASE_NOTES_0.19.0.md`): `ninfer-rtx3090-windows-x64-<VERSION>.zip`,
+  `ninfer-rtx3090-linux-x64-<VERSION>.tar.gz`, `ninfer-v100-linux-x64-<VERSION>.tar.gz`, plus
+  `SHA256SUMS-vX.Y.Z-{windows,linux,linux-v100}.txt`. "Install and upgrade" gets one line per archive with
+  its launcher (`.\run.bat`, `./run.sh`, `./run-v100.sh`). "Verification" gets one bullet per archive saying
+  exactly what ran. For V100, say whether it was served on a real V100 or only built and dependency-checked,
+  and that the 3090 archives do not start on a V100 and the V100 archive does not start on a 3090. Add a
+  short "The Tesla V100 archive" section when anything about it changed (requirements, launcher, size).
 - Title for the GitHub release: `NInfer-3090 vX.Y.Z - <the headline outcome in plain words>`.
 - No marketing superlatives, no emoji, no internal jargon (ReplaySSM, cohort, lane) without a gloss.
 
@@ -128,10 +135,14 @@ build tree per `AGENTS.md`). Set `VERSION`, add the notes, refresh the README hi
 number or capability changed. Commit with a conventional subject (`docs: release vX.Y.Z`) and the
 attribution lines from the session. Do not push yet.
 
-## 4. Build both platforms from the same commit
+## 4. Build all three archives from the same commit
+
+Every release ships three archives: Windows (sm_86), Linux RTX 3090 (sm_86) and Linux Tesla V100
+(sm_70). A build holds one architecture, so the V100 is a third build. See "The Tesla V100 archive" in
+the doc.
 
 The binaries do not embed `VERSION`; build from the release branch commit. The GPU is usually
-loaded by the user's server, but compiling needs none.
+loaded by the user's server, but compiling needs none (the V100 build needs no V100 either).
 
 **Windows** (PowerShell): import the VS 2022 BuildTools environment (AGENTS.md), use the existing
 `build-ninja` tree without reconfiguring, ensure `NINFER_BUILD_BENCHMARKS` is ON, then
@@ -145,6 +156,14 @@ commit to `~/.cache/ninfer-release/X.Y.Z/src`, configure with `-DCMAKE_CUDA_ARCH
 `run_in_background` on the `wsl.exe -e bash -lc "..."` call, never `& disown`. If ninja dies with
 `posix_spawn: Resource temporarily unavailable`, use the `systemd-run --scope` recipe in the doc. Verify
 `ccache -s` hits rather than clearing the cache.
+
+**Linux V100** (WSL), from the same `src/` export: configure a second tree, `src/build-v100`, with
+`-DCMAKE_CUDA_ARCHITECTURES=70 -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON` and CUDA 12.8 (13.0
+dropped sm_70, so `CUDACXX` must point at 12.8), then build `ninfer` and `ninfer-serve` only: the V100 archive ships no
+`ninfer_bench` (three 1.37 GB binaries put it over GitHub's 2 GiB limit in v0.20.0). `scripts/v100_build.sh`
+does the configure (`BUILD_DIR=<src>/build-v100 scripts/v100_build.sh ninfer ninfer-serve`).
+Run it **after** the sm_86 build in the same script, not beside it: two nvcc builds at once can exhaust WSL's
+memory at link time. The Windows build can still run alongside. Check `ccache -s` as above.
 
 Write the WSL steps to a script in the (Windows-side) scratchpad; inside it, send logs to
 `~/.cache/ninfer-release/X.Y.Z/checks/`, not `~`. Run it as `wsl.exe -u root -e systemd-run --scope
@@ -165,7 +184,11 @@ touches the instance in its own state file).
   refined and the zip repackaged), then start it in the background; see "Windows without a card, from WSL" in
   `docs/maintainer/release-process.md`.
 - Linux: `scripts/vast/vast-up.sh <repo>` (failures destroy the instance), then `vast-release-linux.sh <repo>`, then `vast-destroy.sh`.
-  Put a backstop (`send_later`) to destroy the instance too.
+  Put a backstop (`send_later`) to destroy the instance too. `vast-release-linux.sh` builds and packages
+  **sm_86 only**; it has no V100 step. Until it gains one, build the V100 archive by hand on the same
+  instance before destroying it (configure `build-v100` with `v100_build.sh`, then
+  `NINFER_PACKAGE_TARGET=v100 NINFER_BUILD_ROOT=<tree> scripts/package-release.sh`, and pull `dist/*v100*`
+  back), and say in the report that it was manual.
 - The Windows archive then cannot be run: the notes' Verification section must say built and
   dependency-checked only, and step 6's stripped-`PATH` and card smoke tests for Windows are unverified.
   Say so in the final report.
@@ -178,21 +201,35 @@ touches the instance in its own state file).
   commit, and the packager refuses without them. Copy `VERSION` and `docs/release-notes/RELEASE_NOTES_X.Y.Z.md` (keep the `docs/release-notes/` folder) from
   `/mnt/c/...` into the export first. Then run `scripts/package-release.sh` inside WSL against the Linux build tree, then copy
   `dist/*linux*` back to `C:\ninfer-fork\ninfer-3090\dist` (or the release worktree's `dist`).
-- Result: two archives and `SHA256SUMS-vX.Y.Z-{windows,linux}.txt`. Asset must be under 2 GiB each
-  (GitHub's limit); report the sizes.
+- Linux V100: in the same export, `NINFER_PACKAGE_TARGET=v100 NINFER_BUILD_ROOT=<src>/build-v100
+  scripts/package-release.sh`. It refuses a tree with no `sm_70` code. It writes
+  `ninfer-v100-linux-x64-<VERSION>.tar.gz` and `SHA256SUMS-vX.Y.Z-linux-v100.txt`; copy both back with the rest.
+- Result: three archives and `SHA256SUMS-vX.Y.Z-{windows,linux,linux-v100}.txt`. Each asset must be under
+  2 GiB (GitHub's limit); report the sizes. The V100 tarball is the one at risk (2,125,147,854 bytes in
+  v0.19.0, 22 MB under; 2,246,329,497 with all three binaries in v0.20.0, so `ninfer_bench` was dropped from it).
+  If it crosses again, tell the user before publishing; the next lever is a build without PTX.
 
 ## 6. Verify before publishing
 
 Run the "Checks before publishing" list in the doc: `scripts/check-linux-scripts.sh`, checksums
-(inner and outer) for both archives, the Windows exes starting with a stripped `PATH` from an
-extracted copy, the Linux archive's `./ninfer-serve --help` and `./run.sh --help` from a fresh unpack,
-and `ldd` for new dynamic dependencies (update `docs/release-archive-linux.md` if they changed). Do the
+(inner and outer) for all three archives, the Windows exes starting with a stripped `PATH` from an
+extracted copy, each Linux archive's `./ninfer-serve --help` and its launcher's `--help` (`./run.sh --help`,
+`./run-v100.sh --help`) from a fresh unpack, and `ldd` for new dynamic dependencies (update
+`docs/release-archive-linux.md` / `docs/release-archive-v100.md` if they changed). Do the
 Linux checks in `~/.cache/ninfer-release/X.Y.Z/checks/`. Unpack each archive into its own folder there
-(`checks/linux-sm86/`, `checks/linux-v100/`), and save each `ldd` list beside it (`checks/ldd-sm86.txt`).
+(`checks/linux-sm86/`, `checks/linux-v100/`), and save each `ldd` list beside it (`checks/ldd-sm86.txt`,
+`checks/ldd-v100.txt`). Also confirm the V100 server really holds sm_70 code and the sm_86 one does not
+(`cuobjdump --list-elf ninfer-serve`): swapped trees would still pass every other check.
 
 The real-card smoke test (default launcher profile serves a chat completion) needs free VRAM: ask the
 user whether the 3090 is free before running it. If they say no, do not skip silently: record it as
 unverified in the final report.
+
+The V100 archive needs a real V100 (`./run-v100.sh qwen38-27b`, one chat completion). The 3090 PC cannot run
+it. Ask the user up front where the V100 host is and whether it is free (it is shared; check the GPU lock
+and `ps` there as `CLAUDE.md` says, and don't compile or run beside someone's timing). If there is no V100
+to hand, the notes' Verification section says the V100 archive was built and dependency-checked only, and
+the report lists it as unverified.
 
 Smoke-test recipe: extract the zip into the scratchpad, make `models\` a directory junction to
 `C:\ninfer-fork\ninfer-3090\models`, set `PATH` to `C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0`
@@ -214,11 +251,11 @@ Wait for explicit approval, then:
 1. Push the branch, open a PR to `master` (`gh pr create -R ashalliants/ninfer-3090`), merge it once
    checks pass. **Always pass `-R ashalliants/ninfer-3090`**; without it `gh` targets the upstream fork.
 2. Update local `master`, create an annotated tag `vX.Y.Z-rtx3090` on the merge commit, push it.
-3. `gh release create vX.Y.Z-rtx3090 <zip> <tar.gz> <both SHA256SUMS> -R ashalliants/ninfer-3090
+3. `gh release create vX.Y.Z-rtx3090 <zip> <linux tar.gz> <v100 tar.gz> <all three SHA256SUMS> -R ashalliants/ninfer-3090
    --notes-file docs/release-notes/RELEASE_NOTES_X.Y.Z.md --title "NInfer-3090 vX.Y.Z - ..." --latest`
 4. Confirm with `gh release view ... --json name,isDraft,assets,tagName -R ashalliants/ninfer-3090` (there
    is no `isLatest` field) and `gh release list -L 2 -R ashalliants/ninfer-3090`, which shows "Latest":
-   four assets, state `uploaded`, sizes equal to the local files.
+   six assets (three archives, three checksum files), state `uploaded`, sizes equal to the local files.
 
 ## 8. Report
 
