@@ -844,6 +844,18 @@ follow-up question to a 37K-token conversation (Qwen3.8-27B, MTP3, INT8 KV) went
 at its third token, a near tie: -1.38 against -1.47), and the matched tokens' logprobs moved by at
 most 0.068.
 
+The packed codings (`rk8v4`, `rk4v4`) take the same route since 2026-11-25. The launcher appends
+through the shared INT8-family append (`kv_cache_append_batch_launch`, the kernel the prompt route
+uses), and `volta_flash_gather_kv_packed_kernel` expands the keys (rk8v4 INT8 codes, or rk4v4
+Lloyd-Max indices through `kv_cache_lloyd4_code`) times their G64 scale and the packed int4 values
+times their G32 scale into the same contiguous FP16 buffers; Q crosses the same normalized Hadamard
+as for INT8 G64. Before, those prompts ran the emulated FA2 kernel: on Qwen3.6-35B-A3B (rk4v4) it
+was 306 ms of a 1.75 s 4.2K prompt. Prefill 3,201 -> 3,984 tok/s at 4.2K, 2,211 -> 3,866 at 13.4K,
+1,098 -> 3,118 at 40.2K (on master before it: 987 -> 2,356 at 40.2K); the 27B with rk4v4 KV 403 ->
+904 at 40.2K. The staging costs 0.81 GiB more runtime reservation at 262,144 context. The op suite's flash-route error is the same as INT8 G64's (relative L2 at
+most 7.0e-3 at 33K keys, every coding); prefill-scored PPL with rk4v4 KV 6.198 -> 6.194.
+`NINFER_SM70_FLASH_PACKED_KV=0` keeps the FA2 kernel for them.
+
 Two costs come with it, both measured in the op suite. The kernel accumulates P x V in FP16 (as
 llama.cpp does on every tensor-core GPU), so its error grows with the key count: relative L2
 3.0e-3 up to 5K keys, 4.0e-3 at 12K, 7.0e-3 at 33K, against 1.75e-3 for the INT8 kernel

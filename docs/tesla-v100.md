@@ -107,6 +107,7 @@ These are the model defaults it sets:
 | `NINFER_SM70_VERIFY_ATTN_HMMA=0` | 27B | Runs the INT8-KV small-T attention on the CUDA-core kernels (two-token launches for a verify) instead of the default FP16 tensor-core kernel: an MTP3 round at 172K tokens takes 110 ms instead of 52, at 43K 50 instead of 36 |
 | `NINFER_SM70_Q6_STREAM_WIDE=0` | 27B, DFlash2 | Runs the Q6 output head of a verify wider than eight columns (DFlash2 at two requests, or `--draft-tokens` 8-15) on the emulated `mma.sync` kernel instead of the default int8-activation `dp4a` passes of eight: 9.9 instead of 2.6 ms per 16-column round |
 | `NINFER_SM70_Q8_PREFILL_CUBLAS=0` | 35B-A3B | Prefills the Q8 mixer projections (GDN and attention input projections, both 2,048 x 4,096 output projections) on their emulated `mma.sync` kernels instead of the default cuBLAS FP16 route: 1,160 instead of 2,411 tok/s at 4.2K tokens |
+| `NINFER_SM70_FLASH_PACKED_KV=0` | 27B, 35B-A3B | Runs prompt attention (17 or more columns, one sequence) over an `rk8v4` or `rk4v4` cache on the emulated FA2 prompt kernel instead of the default FP16 flash route that `int8` KV takes: 35B-A3B 1,098 instead of 3,117 tok/s at 40.2K tokens |
 | `NINFER_SM70_MOE_PREFILL_SHARED_HMMA=0` | 35B-A3B | Prefills the shared expert (Q8 gate/up and down) on its emulated `mma.sync` kernels instead of the default FP16 WMMA kernels: 2,402 instead of 2,836 tok/s at 4.2K tokens |
 | `NINFER_SM70_MOE_PREFILL_HMMA=0` | 35B-A3B | Prefills the routed experts (Q4 gate/up, Q5/Q6 down) on the emulated `mma.sync` kernels instead of the default FP16 WMMA kernels: 765 instead of 1,160 tok/s at 4.2K tokens |
 | `NINFER_SM70_Q8_VERIFY_A8=0` | 35B-A3B | Runs the Q8 mixer projections of an MTP3 verify (the GDN and attention input projections, 12,288 and 9,216 x 2,048, and the 2,048 x 4,096 output projections) on the A16 streaming GEMV instead of the default int8-activation `dp4a` passes under `--verify-a8`: 5-14% slower MTP3, decode-path KLD at four tokens 2.71e-3 instead of 3.37e-3 |
@@ -398,9 +399,26 @@ the same top-1 at one token and 2.57e-3 / 97.40% at four, against master's 2.49e
 2.51e-3 / 97.50%.
 
 Prefill, same server flags at 65,536 context with MTP3, one 4.2K / 13.4K / 40.2K-token prompt each,
-2026-11-25, 200 W, no thermal throttling. The experts' WMMA prefill kernels (routed and shared) now
-take 128-row tiles with the next K step's loads in flight; their output is bit-identical (the same
-prefill-scored PPL to every printed digit). ABBA against the build before it:
+2026-11-25, 200 W, no thermal throttling. Prompt attention over the rk4v4 cache now takes the FP16
+tensor-core flash route that `int8` KV already took, instead of the emulated FA2 prompt kernel.
+ABBA against `NINFER_SM70_FLASH_PACKED_KV=0`:
+
+| Prompt | default | `NINFER_SM70_FLASH_PACKED_KV=0` |
+|---|---:|---:|
+| 4.2K tokens | **3,971.5-3,983.6** | 3,189.0-3,200.8 |
+| 13.4K | **3,858.7-3,866.4** | 2,208.2-2,211.1 |
+| 40.2K | **3,116.1-3,118.2** | 1,098.1 |
+
+llama.cpp prefills 2,745 tok/s at 4.2K on this card at its default batch and 3,280 with `-ub 2048
+-b 4096`. Prefill-scored PPL with rk4v4 KV (PG-19, 8,192 context) is 6.194 against 6.198 with the
+opt-out. The route's staging holds the visible keys in FP16: at 262,144 context the server's runtime
+reservation is 2.92 GiB against 2.11 (8.34 GiB stays free). The 27B with `--kv-dtype rk4v4` gains
+too (same flags as its decode rows, ABBA): 1,082-1,085 tok/s at 4.2K against 924-927, 902-904 at
+40.2K against 402-403.
+
+Before that, the experts' WMMA prefill kernels (routed and shared) moved to 128-row tiles with the
+next K step's loads in flight; their output is bit-identical (the same prefill-scored PPL to every
+printed digit). ABBA against the build before it:
 
 | Prompt | default | before |
 |---|---:|---:|
