@@ -175,6 +175,34 @@ __global__ void dequantise_row_to_fp16(const std::uint8_t* __restrict__ codes,
     }
 }
 
+// The FP16 route's Q8_G32_FP16 weight (sm_70 only; the int8 route has no Q8 form): one block per
+// row, each thread turning eight int8 codes of one 32-value group into eight FP16 values
+// code * group_scale with one rounding (a code has 8 bits, FP16 11, so the product of an FP16 scale
+// and a code rounds once, relative 2^-12), written as one 16-byte store.
+constexpr int kQ8Group = 32;
+__global__ void dequantise_q8_row_to_fp16(const std::int8_t* __restrict__ codes,
+                                          const __half* __restrict__ scales, int k,
+                                          __half* __restrict__ out, float* __restrict__ row_scale) {
+    const int row        = blockIdx.x;
+    const auto* c_row    = reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * k);
+    const __half* s_row  = scales + static_cast<std::size_t>(row) * (k / kQ8Group);
+    __half* o_row        = out + static_cast<std::size_t>(row) * k;
+    if (threadIdx.x == 0) { row_scale[row] = 1.0F; }
+    const int words = k / 8;
+    for (int w = threadIdx.x; w < words; w += kThreads) {
+        const uint2 packed = c_row[w];
+        const float group  = __half2float(s_row[(w * 8) / kQ8Group]);
+        const std::uint32_t lanes[2] = {packed.x, packed.y};
+        __align__(16) __half values[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int code = static_cast<std::int8_t>((lanes[j / 4] >> ((j % 4) * 8)) & 0xffu);
+            values[j]      = __float2half_rn(static_cast<float>(code) * group);
+        }
+        *reinterpret_cast<uint4*>(o_row + w * 8) = *reinterpret_cast<const uint4*>(values);
+    }
+}
+
 // The FP16 route's activations: one block per token, scaled by a power of two chosen so the token's
 // absmax lands in [2^13, 2^14) -- far inside FP16's range, so nothing overflows, and exact, so BF16's
 // eight mantissa bits survive whole in FP16's eleven. token_scale holds the inverse factor for the
@@ -482,7 +510,10 @@ void materialise_weight(const Weight& weight, const Scratch& s, cudaStream_t str
     auto* scales     = static_cast<const __half*>(weight.scales);
     if constexpr (kFp16Route) {
         auto* w16 = static_cast<__half*>(s.w);
-        if (weight.qtype == QType::Q5_G64_FP16) {
+        if (weight.qtype == QType::Q8_G32_FP16) {
+            dequantise_q8_row_to_fp16<<<n, kThreads, 0, stream>>>(
+                static_cast<const std::int8_t*>(weight.qdata), scales, k, w16, s.row_scale);
+        } else if (weight.qtype == QType::Q5_G64_FP16) {
             dequantise_row_to_fp16<true><<<n, kThreads, 0, stream>>>(codes, high, scales, groups,
                                                                      w16, s.row_scale);
         } else {
@@ -536,12 +567,21 @@ void gemm_tile(cublasHandle_t blas, const Scratch& s, std::int32_t n, std::int32
 } // namespace
 
 bool w4_cublas_prefill_supported(const Weight& weight, std::int32_t tokens) {
-    return tokens > 0 && is_row_split(weight.layout) && weight.group == kGroup &&
-           weight.k % kGroup == 0 && weight.qdata != nullptr && weight.scales != nullptr &&
-           weight.scale_dtype == DType::FP16 &&
+    if (tokens <= 0 || !is_row_split(weight.layout) || weight.qdata == nullptr ||
+        weight.scales == nullptr || weight.scale_dtype != DType::FP16) {
+        return false;
+    }
+    if (weight.qtype == QType::Q8_G32_FP16) {
+        // The FP16 route only (cublas_prefill_admits_q8); unpadded rows of whole 8-code words.
+        return kFp16Route && weight.group == kQ8Group && weight.k % kQ8Group == 0 &&
+               weight.padded_shape[1] == weight.k;
+    }
+    return weight.group == kGroup && weight.k % kGroup == 0 &&
            (weight.qtype == QType::Q4_G64_FP16 ||
             (weight.qtype == QType::Q5_G64_FP16 && weight.qhigh != nullptr));
 }
+
+bool cublas_prefill_admits_q8() noexcept { return kFp16Route; }
 
 std::size_t w4_cublas_prefill_workspace_capacity_bytes(std::int32_t rows, std::int32_t cols,
                                                        std::int32_t min_tokens,

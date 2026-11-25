@@ -25,6 +25,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "ops/op_check.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -87,9 +88,10 @@ std::vector<std::uint16_t> make_activation(std::int32_t rows, std::int32_t token
 // the width gate means the call went to the integer or A16 route as documented. Accuracy alone
 // cannot say, since an exact A16 fallback would pass every bound in this file.
 int expect_route(const std::string& label, const WorkspaceArena& workspace,
-                 std::size_t weight_bytes, std::int32_t tokens) {
+                 std::size_t weight_bytes, std::int32_t tokens,
+                 ops::LinearPolicy policy = kPolicy) {
     const bool engaged  = workspace.peak_used() >= weight_bytes;
-    const bool expected = tokens >= ops::kCublasPrefillMinTokens;
+    const bool expected = tokens >= ops::cublas_prefill_min_tokens(policy);
     if (engaged == expected) { return 0; }
     std::cerr << label << ": cuBLAS route " << (engaged ? "ran" : "did not run") << " at T=" << tokens
               << ", expected it to " << (expected ? "run" : "decline") << " (peak workspace "
@@ -411,6 +413,155 @@ int run_attn_input(std::int32_t tokens) {
     return failures + finish(label, s);
 }
 
+// sm_70's Qwen3.6-35B-A3B Q8 projections on the route's FP16 form (the route declines Q8 elsewhere,
+// so these run only where it admits it). One parent each, split into the destinations the Q8
+// kernels write: GDN [0,8192) -> qkv and [8192,12288) -> z; attention q, k, gate, v in parent order.
+// The oracle is the same FP64 dot product; the FP16 route is far inside the A8 allowance.
+std::string narrow_tag(ops::LinearPolicy policy) {
+    return policy == ops::LinearPolicy::AllowPrefillCublasNarrow ? "narrow " : "";
+}
+
+int run_q8_gdn_input(std::int32_t tokens, ops::LinearPolicy policy = kPolicy) {
+    constexpr std::int32_t kHidden = 2048, kQkvRows = 8192, kZRows = 4096;
+    constexpr std::int32_t kParentRows = kQkvRows + kZRows;
+    DeviceWeight w(QType::Q8_G32_FP16, kParentRows, kHidden, 7121U);
+    const std::vector<std::uint16_t> activation = make_activation(kHidden, tokens, 43U);
+    test::GuardedDeviceBuffer device_x(activation.size() * sizeof(std::uint16_t));
+    device_x.copy_from_host(activation.data(), activation.size() * sizeof(std::uint16_t));
+    test::GuardedDeviceBuffer device_qkv(static_cast<std::size_t>(kQkvRows) * tokens * 2);
+    test::GuardedDeviceBuffer device_z(static_cast<std::size_t>(kZRows) * tokens * 2);
+    device_qkv.fill(0xff);
+    device_z.fill(0xff);
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::gdn_input_proj_workspace_capacity_bytes(QType::Q8_G32_FP16, kParentRows, kHidden,
+                                                     policy, tokens, tokens),
+        256));
+    Tensor x(device_x.data(), DType::BF16, {kHidden, tokens});
+    Tensor qkv(device_qkv.data(), DType::BF16, {kQkvRows, tokens});
+    Tensor z(device_z.data(), DType::BF16, {kZRows, tokens});
+    ops::gdn_input_proj(x, w.weight, qkv, z, policy, workspace, nullptr);
+    test::cuda_check(cudaDeviceSynchronize(), "synchronize cublas q8 gdn input");
+
+    const std::string label =
+        narrow_tag(policy) + "GdnInputProj Q8 cuBLAS T=" + std::to_string(tokens);
+    int failures = device_qkv.verify_guards(label) + device_z.verify_guards(label);
+    failures += expect_route(label, workspace, static_cast<std::size_t>(kParentRows) * kHidden * 2,
+                             tokens, policy);
+    const std::vector<double> got_qkv =
+        read_bf16(device_qkv, static_cast<std::size_t>(kQkvRows) * tokens);
+    const std::vector<double> got_z = read_bf16(device_z, static_cast<std::size_t>(kZRows) * tokens);
+    Samples s;
+    for (const std::int32_t token : sample_tokens(tokens, 13U)) {
+        const std::vector<float> input = token_column(activation, kHidden, token);
+        for (const std::int32_t row : {0, kQkvRows - 1, pick_row(0, token, kQkvRows)}) {
+            s.reference.push_back(qw::dot_fp64(w.host, row, input.data(), kHidden));
+            s.actual.push_back(got_qkv[static_cast<std::size_t>(token) * kQkvRows + row]);
+        }
+        for (const std::int32_t row : {0, kZRows - 1, pick_row(1, token, kZRows)}) {
+            s.reference.push_back(qw::dot_fp64(w.host, kQkvRows + row, input.data(), kHidden));
+            s.actual.push_back(got_z[static_cast<std::size_t>(token) * kZRows + row]);
+        }
+    }
+    return failures + finish(label, s);
+}
+
+int run_q8_attn_input(std::int32_t tokens, ops::LinearPolicy policy = kPolicy) {
+    constexpr std::int32_t kHidden = 2048, kQRows = 4096, kKvRows = 512;
+    constexpr std::int32_t kParentRows = 2 * kQRows + 2 * kKvRows;
+    DeviceWeight w(QType::Q8_G32_FP16, kParentRows, kHidden, 6007U);
+    const std::vector<std::uint16_t> activation = make_activation(kHidden, tokens, 61U);
+    test::GuardedDeviceBuffer device_x(activation.size() * sizeof(std::uint16_t));
+    device_x.copy_from_host(activation.data(), activation.size() * sizeof(std::uint16_t));
+    const std::size_t q_elements  = static_cast<std::size_t>(kQRows) * tokens;
+    const std::size_t kv_elements = static_cast<std::size_t>(kKvRows) * tokens;
+    test::GuardedDeviceBuffer device_q(q_elements * 2), device_gate(q_elements * 2);
+    test::GuardedDeviceBuffer device_k(kv_elements * 2), device_v(kv_elements * 2);
+    device_q.fill(0xff);
+    device_gate.fill(0xff);
+    device_k.fill(0xff);
+    device_v.fill(0xff);
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::attn_input_proj_workspace_capacity_bytes(QType::Q8_G32_FP16, kParentRows, kHidden,
+                                                      policy, tokens, tokens),
+        256));
+    Tensor x(device_x.data(), DType::BF16, {kHidden, tokens});
+    Tensor q(device_q.data(), DType::BF16, {kQRows, tokens});
+    Tensor gate(device_gate.data(), DType::BF16, {kQRows, tokens});
+    Tensor k(device_k.data(), DType::BF16, {kKvRows, tokens});
+    Tensor v(device_v.data(), DType::BF16, {kKvRows, tokens});
+    ops::attn_input_proj(x, w.weight, q, gate, k, v, policy, workspace, nullptr);
+    test::cuda_check(cudaDeviceSynchronize(), "synchronize cublas q8 attn input");
+
+    const std::string label =
+        narrow_tag(policy) + "AttnInputProj Q8 cuBLAS T=" + std::to_string(tokens);
+    int failures = device_q.verify_guards(label) + device_gate.verify_guards(label) +
+                   device_k.verify_guards(label) + device_v.verify_guards(label);
+    failures += expect_route(label, workspace, static_cast<std::size_t>(kParentRows) * kHidden * 2,
+                             tokens, policy);
+    const std::vector<double> got_q    = read_bf16(device_q, q_elements);
+    const std::vector<double> got_gate = read_bf16(device_gate, q_elements);
+    const std::vector<double> got_k    = read_bf16(device_k, kv_elements);
+    const std::vector<double> got_v    = read_bf16(device_v, kv_elements);
+    Samples s;
+    for (const std::int32_t token : sample_tokens(tokens, 17U)) {
+        const std::vector<float> input = token_column(activation, kHidden, token);
+        for (const std::int32_t row : {0, kQRows - 1, pick_row(0, token, kQRows)}) {
+            s.reference.push_back(qw::dot_fp64(w.host, row, input.data(), kHidden));
+            s.actual.push_back(got_q[static_cast<std::size_t>(token) * kQRows + row]);
+            s.reference.push_back(
+                qw::dot_fp64(w.host, kQRows + kKvRows + row, input.data(), kHidden));
+            s.actual.push_back(got_gate[static_cast<std::size_t>(token) * kQRows + row]);
+        }
+        for (const std::int32_t row : {0, kKvRows - 1, pick_row(1, token, kKvRows)}) {
+            s.reference.push_back(qw::dot_fp64(w.host, kQRows + row, input.data(), kHidden));
+            s.actual.push_back(got_k[static_cast<std::size_t>(token) * kKvRows + row]);
+            s.reference.push_back(
+                qw::dot_fp64(w.host, 2 * kQRows + kKvRows + row, input.data(), kHidden));
+            s.actual.push_back(got_v[static_cast<std::size_t>(token) * kKvRows + row]);
+        }
+    }
+    return failures + finish(label, s);
+}
+
+int run_q8_out(std::int32_t tokens, ops::LinearPolicy policy = kPolicy) {
+    constexpr std::int32_t kRows = 2048, kCols = 4096;
+    DeviceWeight w(QType::Q8_G32_FP16, kRows, kCols, 3301U);
+    const std::vector<std::uint16_t> activation = make_activation(kCols, tokens, 83U);
+    const std::vector<std::uint16_t> residual0  = make_activation(kRows, tokens, 19U, 64.0F);
+    test::GuardedDeviceBuffer device_x(activation.size() * sizeof(std::uint16_t));
+    device_x.copy_from_host(activation.data(), activation.size() * sizeof(std::uint16_t));
+    const std::size_t res_elements = static_cast<std::size_t>(kRows) * tokens;
+    test::GuardedDeviceBuffer device_residual(res_elements * sizeof(std::uint16_t));
+    device_residual.copy_from_host(residual0.data(), res_elements * sizeof(std::uint16_t));
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::linear_add_workspace_capacity_bytes(QType::Q8_G32_FP16, kRows, kCols, policy, tokens,
+                                                 tokens),
+        256));
+    Tensor x(device_x.data(), DType::BF16, {kCols, tokens});
+    Tensor residual(device_residual.data(), DType::BF16, {kRows, tokens});
+    ops::linear_add(x, w.weight, residual, policy, workspace, nullptr);
+    test::cuda_check(cudaDeviceSynchronize(), "synchronize cublas q8 linear_add");
+
+    const std::string label =
+        narrow_tag(policy) + "LinearAdd Q8 cuBLAS T=" + std::to_string(tokens);
+    int failures = device_residual.verify_guards(label);
+    failures +=
+        expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols * 2, tokens, policy);
+    const std::vector<double> got = read_bf16(device_residual, res_elements);
+    Samples s;
+    for (const std::int32_t token : sample_tokens(tokens, 23U)) {
+        const std::vector<float> input = token_column(activation, kCols, token);
+        for (std::uint32_t r = 0; r < 3; ++r) {
+            const std::int32_t row = pick_row(r, token, kRows);
+            s.reference.push_back(
+                bf16_value(residual0[static_cast<std::size_t>(token) * kRows + row]) +
+                qw::dot_fp64(w.host, row, input.data(), kCols));
+            s.actual.push_back(got[static_cast<std::size_t>(token) * kRows + row]);
+        }
+    }
+    return failures + finish(label, s);
+}
+
 } // namespace
 
 int main() {
@@ -432,6 +583,23 @@ int main() {
         for (const std::int32_t tokens : {gate - 1, gate, gate + 1, 1000, 5377}) {
             failures += run_gdn_input(tokens);
             failures += run_attn_input(tokens);
+        }
+        // The FP16 route's Q8 form (sm_70 builds only; the route declines Q8 elsewhere).
+        if (ops::detail::cublas_prefill_admits_q8()) {
+            for (const std::int32_t tokens : {gate - 1, gate, gate + 1, 1000, 5377}) {
+                failures += run_q8_gdn_input(tokens);
+                failures += run_q8_attn_input(tokens);
+                failures += run_q8_out(tokens);
+            }
+            // Production prefill calls carry prefill_phase_policy's narrow form, whose sm_70 gate
+            // is lower (65): the route and its scratch must engage from there, not from 129.
+            constexpr ops::LinearPolicy narrow = ops::prefill_phase_policy(kPolicy);
+            constexpr std::int32_t narrow_gate = ops::cublas_prefill_min_tokens(narrow);
+            for (const std::int32_t tokens : {narrow_gate - 1, narrow_gate, gate - 1, gate}) {
+                failures += run_q8_gdn_input(tokens, narrow);
+                failures += run_q8_attn_input(tokens, narrow);
+                failures += run_q8_out(tokens, narrow);
+            }
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " cuBLAS prefill route correctness\n";
         return failures == 0 ? 0 : 1;

@@ -6,6 +6,8 @@
 #include "core/weight_view.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -74,6 +76,39 @@ public:
         (void)projection; (void)first_format; (void)first_rows; (void)second_format;
         (void)second_rows; (void)input_rows;
 #endif
+    }
+
+    // sm_70: the Qwen3.6-35B-A3B's Q8 mixer projections (the GDN and attention input parents and
+    // the 2,048 x 4,096 output projections) take the cuBLAS prefill route, which on Volta is FP16:
+    // the weight dequantised to FP16 (one rounding of code x group scale) and an FP16 tensor-core
+    // GEMM with FP32 accumulation, where their own prefill kernels run Ampere mma.sync under
+    // emulation (13-38 ms a call at 4,096 tokens against 1-2.6 ms). Decode and verify keep their
+    // kernels: the route opens only from the prefill gate (ops::cublas_prefill_min_tokens).
+    // NINFER_SM70_Q8_PREFILL_CUBLAS=0 keeps the projections on their own kernels.
+    void q8_prefill_route(LinearParameters& p, std::int32_t n, std::int32_t k) const {
+#if defined(NINFER_SM70)
+        static const bool enabled = [] {
+            const char* value = std::getenv("NINFER_SM70_Q8_PREFILL_CUBLAS");
+            return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+        }();
+        if (!enabled || !model_.options().prefill_a8 || !model_.options().prefill_cublas) { return; }
+        if (p.policy == ops::LinearPolicy::A16Only && p.weight.qtype == QType::Q8_G32_FP16 &&
+            p.weight.n == n && p.weight.k == k) {
+            p.policy = ops::LinearPolicy::AllowPrefillCublas;
+        }
+#else
+        (void)p; (void)n; (void)k;
+#endif
+    }
+
+    // The input projections are the separable half of the trade, as for the split parents: they
+    // also honour --no-prefill-cublas-projections. The output projections follow --prefill-cublas.
+    void q8_prefill_route(ops::ProjectionWeights& projection, std::int32_t n,
+                          std::int32_t k) const {
+        if (!model_.options().prefill_cublas_projections) { return; }
+        if (auto* single = std::get_if<LinearParameters>(&projection)) {
+            q8_prefill_route(*single, n, k);
+        }
     }
 
     LinearParameters linear(WeightId id) const {
@@ -190,6 +225,8 @@ public:
                                7168, 5120);
             integer_route_pair(attention_projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16,
                                7168, 5120);
+            q8_prefill_route(attention_output, 2048, 4096);
+            q8_prefill_route(attention_projection, 9216, 2048);
             out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
                                             tensor(a->key_norm), std::move(attention_output)};
             out.projection_prefetch =
@@ -205,6 +242,8 @@ public:
                                5120);
             integer_route_pair(gdn_projection, QType::T2_G128_FP16, 4096, QType::T2_G128_FP16,
                                12288, 5120);
+            q8_prefill_route(gdn_output, 2048, 4096);
+            q8_prefill_route(gdn_projection, 12288, 2048);
             out.mixer = GdnParameters{
                 std::move(gdn_projection),
                 ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),

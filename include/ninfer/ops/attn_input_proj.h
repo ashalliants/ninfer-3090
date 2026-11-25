@@ -56,7 +56,11 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  * The parent stores rows in physical order query, key, output gate, value while the public output
  * argument order is q, gate, k, v. Every route writes the four independently contiguous final
  * allocations directly; no packed parent output is materialized. The NVFP4 A4 and FP8 A8
- * profiles may use caller-owned transient storage for their private quantized activation.
+ * profiles may use caller-owned transient storage for their private quantized activation. On
+ * sm_70 the Q8 parent under AllowPrefillCublas (or its narrow form) takes the FP16 cuBLAS prefill
+ * route from the policy's token gate (cublas_prefill_min_tokens): the weight is materialised in
+ * the workspace as FP16 (code x group scale, one rounding), FP32 accumulation, and
+ * attn_input_proj_workspace_capacity_bytes() reports that scratch.
  *
  * Registered parent forms are:
  *

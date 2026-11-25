@@ -88,9 +88,10 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::AllowA4:
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
-    // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
-    // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
-    // one engine-wide setting does not have to be threaded per Op.
+    // The cuBLAS prefill route is registered for linear_swiglu and linear_add (Q4/Q5, and Q8 on
+    // sm_70 in its FP16 form). Everywhere else this policy means exactly what AllowA8Int means, and
+    // is accepted rather than rejected so that one engine-wide setting does not have to be threaded
+    // per Op.
     case LinearPolicy::AllowPrefillCublas:
     case LinearPolicy::AllowPrefillCublasNarrow:
     // The scout's int4 route: AllowA8Int, with int4 activations for Q4 wherever the A8 route runs.
@@ -200,6 +201,13 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     if (qtype == QType::Q8_G32_FP16) {
         (void)detail::q8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
         (void)detail::q8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
+        // sm_70's cuBLAS prefill route (the FP16 one) is the only Q8 claimant with scratch.
+        if (allows_cublas_prefill(policy) && detail::cublas_prefill_admits_q8() &&
+            max_tokens >= cublas_prefill_min_tokens(policy)) {
+            return detail::w4_cublas_prefill_workspace_capacity_bytes(
+                output_rows, input_rows, std::max(min_tokens, cublas_prefill_min_tokens(policy)),
+                max_tokens);
+        }
         return 0;
     }
     if (qtype == QType::Q5_G64_FP16) {
@@ -354,7 +362,13 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument(
                 "linear_add: Q8 requires 16-byte x/residual/code/scale alignment");
         }
-        (void)ws;
+        // sm_70's cuBLAS prefill route (the FP16 one; detail::cublas_prefill_admits_q8).
+        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+            detail::cublas_prefill_admits_q8() && detail::w4_cublas_prefill_supported(w, t) &&
+            (t >= kCublasPrefillMinTokens || detail::w4_cublas_prefill_fits(ws, w.n, w.k, t))) {
+            detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);
+            return;
+        }
         detail::q8_linear_add_dispatch(x, w, residual_out, stream);
         return;
     }

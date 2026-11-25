@@ -91,9 +91,10 @@ void validate_policy(LinearPolicy policy) {
     // below, where no such route is registered for their qtypes.
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
-    // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
-    // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
-    // one engine-wide setting does not have to be threaded per Op.
+    // The cuBLAS prefill route is registered for linear_swiglu, linear_add and, on sm_70, this
+    // Op's single Q8 parent (FP16 form, from the policy's token gate, with workspace scratch).
+    // Everywhere else this policy means exactly what AllowA8Int means, and is accepted rather than
+    // rejected so that one engine-wide setting does not have to be threaded per Op.
     case LinearPolicy::AllowPrefillCublas:
     case LinearPolicy::AllowPrefillCublasNarrow:
     // The lossy scout's int4 route, registered for the split Q4/Q5 pair only.
@@ -121,6 +122,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
                             cudaStream_t stream) {
     validate_policy(policy);
     reject_scout_a4(policy);
+    // The Q8 cuBLAS prefill route below reads the policy as given.
+    const LinearPolicy requested = policy;
     policy = without_integer(policy);
     if (weight.qtype == QType::BF16) {
         constexpr std::int32_t kHidden = 5120;
@@ -191,6 +194,23 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_q8_rowsplit(weight, kRows, kHidden, "query/key/gate/value weight");
+    // sm_70's cuBLAS prefill route (the FP16 one; detail::cublas_prefill_admits_q8). The parent's
+    // rows are q, k, gate, v in that order, as the Q8 kernels' segmented output reads them.
+    if (allows_cublas_prefill(requested) && cols >= cublas_prefill_min_tokens(requested) &&
+        workspace != nullptr && detail::cublas_prefill_admits_q8()) {
+        const detail::CublasProjectionDestination dests[] = {
+            {q.data, 0, kQRows, kQRows, 0},
+            {k.data, kQRows, kKvRows, kKvRows, 0},
+            {gate.data, kQRows + kKvRows, kQRows, kQRows, 0},
+            {v.data, 2 * kQRows + kKvRows, kKvRows, kKvRows, 0}};
+        const detail::CublasProjection parent[] = {{&weight, dests, 4}};
+        if (detail::w4_cublas_projection_supported(parent, 1, cols) &&
+            (cols >= kCublasPrefillMinTokens ||
+             detail::w4_cublas_projection_fits(*workspace, parent, 1, cols))) {
+            detail::w4_cublas_projection_launch(x, parent, 1, *workspace, stream);
+            return;
+        }
+    }
     detail::q8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
 }
 
@@ -232,6 +252,13 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             {input_rows, 4096, 512, parent_rows, input_rows, min_tokens});
         (void)detail::q8_attn_input_resolve_plan(
             {input_rows, 4096, 512, parent_rows, input_rows, max_tokens});
+        // The cuBLAS route (sm_70) is the only claimant with scratch; see the dispatch.
+        if (allows_cublas_prefill(policy) && detail::cublas_prefill_admits_q8() &&
+            max_tokens >= cublas_prefill_min_tokens(policy)) {
+            return detail::w4_cublas_projection_workspace_capacity_bytes(
+                parent_rows, input_rows, std::max(min_tokens, cublas_prefill_min_tokens(policy)),
+                max_tokens);
+        }
         return 0;
     case QType::Q4_G64_FP16:
     case QType::Q5_G64_FP16:
