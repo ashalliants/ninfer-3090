@@ -19,12 +19,16 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
     // ops/linear/common/stream_gemv.cuh). Fused row maps keep this schedule.
     if constexpr (std::is_same_v<RowPolicy, Q8SlicedKIdentityRows>) {
         // The 35B-A3B's projections take the int8-activation verify route first
-        // (try_launch_q8_verify_dp4a, sm_70 only).
+        // (try_launch_q8_verify_dp4a, sm_70 only; one pass of at most eight tokens).
         if (operands.tokens <= kStreamGemvMaxTokens &&
             try_launch_q8_verify_dp4a(operands, output, epilogue, stream)) {
             return;
         }
-        if (operands.tokens <= kStreamGemvMaxTokens &&
+        // An epilogue that must see the whole call at once (a fused GDN conv across tokens) takes
+        // the streaming GEMV only where it runs as one pass; wider calls keep the schedule below.
+        constexpr bool whole_call = requires { Epilogue::kWholeCallTokens; };
+        const std::int32_t stream_max = whole_call ? kStreamGemvPassTokens : kStreamGemvMaxTokens;
+        if (operands.tokens <= stream_max &&
             try_launch_stream_gemv<Q8StreamFormat>(operands.x, {operands.codes, operands.scales},
                                                    output, epilogue, operands.rows, operands.k,
                                                    operands.padded_k, stream, operands.tokens)) {

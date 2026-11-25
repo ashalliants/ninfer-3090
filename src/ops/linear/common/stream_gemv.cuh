@@ -487,6 +487,8 @@ bool try_launch_stream_gemv_rows(const __nv_bfloat16* x, std::int64_t x_stride,
 // materialising every weight in FP16 for cuBLAS (see kCublasPrefillNarrowMinTokens). Formats
 // without the tile GEMM stop at kStreamGemvMaxUntiledTokens: four passes of eight still win there.
 inline constexpr std::int32_t kStreamGemvMaxTokens         = 64;
+// The widest call that runs as a single pass, finished in one epilogue call per row.
+inline constexpr std::int32_t kStreamGemvPassTokens        = 8;
 inline constexpr std::int32_t kStreamGemvMaxUntiledTokens  = 32;
 
 // `tokens` (1..kStreamGemvMaxTokens) tokens of `items` items of Rows rows: one launch per eight
