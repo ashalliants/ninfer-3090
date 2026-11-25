@@ -46,11 +46,13 @@ so it is a third build, from the same commit as the other two:
   run `./run-v100.sh qwen38-27b` on a real V100 and serve one chat completion. The notes say so when that was
   not done before publishing.
 - **Size.** v0.19.0's V100 tarball was 2,125,147,854 bytes, 22 MB under GitHub's 2 GiB asset limit (the `sm_70` server
-  carries more kernels than the 3090 one). v0.20.0's, with all three binaries, was 2,246,329,497 bytes, 99 MB over,
-  so the V100 archive no longer ships `ninfer_bench` (`products` in `scripts/package-release.sh`); the archive README
-  says how to build it. Check the size after packaging; each binary is about 750 MB compressed, and each kernel is
-  stored as machine code plus PTX (`70` builds both; a V100 never uses the PTX), so a build that drops the PTX would
-  be the next lever.
+  carries more kernels than the 3090 one). v0.20.0's, with three separate binaries (`ninfer`, `ninfer-serve`,
+  `ninfer_bench`), was 2,246,329,497 bytes, 99 MB over. v0.20.0 shipped without `ninfer_bench`; from the next release
+  `ninfer` is a link to `ninfer-serve` (the server runs as the CLI when started under the name `ninfer`, see
+  `apps/serve/main.cpp`), so the archive holds two real binaries (`ninfer-serve`, `ninfer_bench`), about 750 MB
+  compressed each. `package-release.sh` probes the build and falls back to a separate `ninfer` for one without the CLI
+  mode. Check the size after packaging. The next levers: each kernel is stored as machine code plus PTX (`70` builds
+  both; a V100 never uses the PTX), and `ninfer_bench` could join the same binary.
 - `package-release.sh`'s arch check once failed a good tree because `grep -q` closed the pipe early under `pipefail`;
   it now captures `cuobjdump` output first.
 

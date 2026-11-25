@@ -159,9 +159,10 @@ commit to `~/.cache/ninfer-release/X.Y.Z/src`, configure with `-DCMAKE_CUDA_ARCH
 
 **Linux V100** (WSL), from the same `src/` export: configure a second tree, `src/build-v100`, with
 `-DCMAKE_CUDA_ARCHITECTURES=70 -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON` and CUDA 12.8 (13.0
-dropped sm_70, so `CUDACXX` must point at 12.8), then build `ninfer` and `ninfer-serve` only: the V100 archive ships no
-`ninfer_bench` (three 1.37 GB binaries put it over GitHub's 2 GiB limit in v0.20.0). `scripts/v100_build.sh`
-does the configure (`BUILD_DIR=<src>/build-v100 scripts/v100_build.sh ninfer ninfer-serve`).
+dropped sm_70, so `CUDACXX` must point at 12.8), then build `ninfer-serve` and `ninfer_bench`. The Linux archives ship `ninfer` as a link to `ninfer-serve` (the server
+runs as the CLI when started under the name `ninfer`), so two real binaries, not three: three separate 1.37 GB sm_70
+binaries put the V100 tarball over GitHub's 2 GiB limit in v0.20.0. `scripts/v100_build.sh` does the configure
+(`BUILD_DIR=<src>/build-v100 scripts/v100_build.sh ninfer-serve ninfer_bench`).
 Run it **after** the sm_86 build in the same script, not beside it: two nvcc builds at once can exhaust WSL's
 memory at link time. The Windows build can still run alongside. Check `ccache -s` as above.
 
@@ -206,8 +207,9 @@ touches the instance in its own state file).
   `ninfer-v100-linux-x64-<VERSION>.tar.gz` and `SHA256SUMS-vX.Y.Z-linux-v100.txt`; copy both back with the rest.
 - Result: three archives and `SHA256SUMS-vX.Y.Z-{windows,linux,linux-v100}.txt`. Each asset must be under
   2 GiB (GitHub's limit); report the sizes. The V100 tarball is the one at risk (2,125,147,854 bytes in
-  v0.19.0, 22 MB under; 2,246,329,497 with all three binaries in v0.20.0, so `ninfer_bench` was dropped from it).
-  If it crosses again, tell the user before publishing; the next lever is a build without PTX.
+  v0.19.0, 22 MB under; 2,246,329,497 with three separate binaries in v0.20.0, which shipped without `ninfer_bench`;
+  the link-instead-of-copy `ninfer` brings it back). If it crosses again, tell the user before publishing; the next
+  lever is a build without PTX.
 
 ## 6. Verify before publishing
 

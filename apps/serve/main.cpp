@@ -1,3 +1,4 @@
+#include "cli/cli_main.h"
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
 #include "product/version/version.h"
@@ -16,7 +17,10 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -285,9 +289,21 @@ int run_router(const char* argv0, const ninfer::serve::ServeOptions& options,
     }
 }
 
+// True when the executable was started as `ninfer` (or `ninfer.exe`): a release archive ships the CLI as
+// a link to this binary, so the kernels are in the download once. Only argv[0] decides; a plain
+// `ninfer-serve` never runs the CLI.
+bool started_as_cli(int argc, char** argv) {
+    if (argc < 1 || argv[0] == nullptr) { return false; }
+    std::string name = std::filesystem::path(argv[0]).stem().string();
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return name == "ninfer";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+    if (started_as_cli(argc, argv)) { return ninfer_cli_main(argc, argv); }
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
         std::cout << "ninfer-serve " << ninfer::product::build_version() << '\n';
         return 0;
