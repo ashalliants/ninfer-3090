@@ -56,3 +56,9 @@ ninfer_add_op_test(ninfer_inkling2_engine_batch_test
 ninfer_add_op_test(ninfer_inkling2_lowbit_kv_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_lowbit_kv.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
+# Output constraints through the public Engine: json_schema, json_object (sampled, under a thinking budget) and choice
+# answers parse and match; unconstrained requests are unchanged around them; batched (max_concurrency 4) and --spec
+# dspark give the solo / plain tokens; a custom stop is refused (skips without the artifact).
+ninfer_add_op_test(ninfer_inkling2_engine_constraints_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_constraints.cpp"
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)

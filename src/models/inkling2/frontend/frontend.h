@@ -10,6 +10,7 @@
 // prompt: the model writes its own `<|message_model|>`. An image is `<|content_image|><|unused_200054|>` in the
 // template; the placeholder becomes one token per merged 2 x 2 patches, whose rows the vision tower supplies.
 
+#include "models/inkling2/frontend/tokens.h"
 #include "models/inkling2/program/vision_program.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "ninfer/types.h"
@@ -24,21 +25,6 @@
 #include <vector>
 
 namespace ninfer::models::inkling2 {
-
-// The control tokens the frontend reads (tokenizer_config.json's added_tokens_decoder; checked at load).
-namespace token {
-inline constexpr TokenId kMessageUser       = 200000;
-inline constexpr TokenId kMessageModel      = 200001;
-inline constexpr TokenId kContentText       = 200004;
-inline constexpr TokenId kContentImage      = 200005;
-inline constexpr TokenId kEndSampling       = 200006; // <|content_model_end_sampling|>: the turn's end
-inline constexpr TokenId kContentThinking   = 200008;
-inline constexpr TokenId kEndMessage        = 200010;
-inline constexpr TokenId kContentToolError  = 200022;
-inline constexpr TokenId kInvokeToolJson    = 200049;
-inline constexpr TokenId kImagePlaceholder  = 200054; // <|unused_200054|>
-inline constexpr TokenId kInvokeToolText    = 200057;
-} // namespace token
 
 struct PromptImage {
     std::int32_t column = 0; // the prompt position of its first image token

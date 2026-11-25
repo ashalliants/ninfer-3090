@@ -7,6 +7,7 @@
 // between decode steps ("Batched decode"). Output is sampled on the host from each request's logits column.
 
 #include "core/device.h"
+#include "models/inkling2/frontend/constraint.h"
 #include "models/inkling2/frontend/frontend.h"
 #include "models/inkling2/model.h"
 #include "ninfer/types.h"
@@ -104,6 +105,8 @@ private:
     LoadSummary load_;
     std::unique_ptr<models::inkling2::Model> model_;
     std::unique_ptr<models::inkling2::Frontend> frontend_;
+    // Output constraints' grammars over the vocabulary, built on the first constrained request.
+    std::unique_ptr<models::inkling2::ConstraintCompiler> constraints_;
     cudaStream_t stream_ = nullptr;
     // The prefix-reuse snapshots' device-to-host copies (TextProgram::save_async), beside the forwards on stream_.
     cudaStream_t copy_stream_ = nullptr;

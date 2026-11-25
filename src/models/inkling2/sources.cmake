@@ -5,6 +5,7 @@ target_sources(ninfer_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/load.cpp"
 )
 target_sources(ninfer_model_runtime PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/frontend/constraint.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/frontend.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/adapters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/dense_q8.cpp"

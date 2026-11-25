@@ -15,6 +15,7 @@
 #include "ninfer/ops/sampling.h"
 #include "models/inkling2/program/text_program.h"
 #include "models/inkling2/program/vision_program.h"
+#include "text/grammar.h"
 
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -244,6 +245,14 @@ TokenId sample(std::vector<float>& logits, const ResolvedSamplingParameters& p,
     return ids[keep - 1];
 }
 
+// A constrained request's column: every token its constraint does not allow next weighs nothing (-inf), so sample()
+// (greedy and sampled alike, one uniform a token as before) picks among the allowed. No allowed token is a dead end.
+void restrict_to_constraint(ink::ConstrainedOutput* constraint, std::vector<float>& logits) {
+    if (constraint != nullptr && !constraint->restrict(logits)) {
+        throw RequestError(RequestErrorKind::ConstraintDeadEnd, "grammar has no valid next token");
+    }
+}
+
 } // namespace
 
 struct Inkling2Core::Programs {
@@ -352,6 +361,8 @@ struct Inkling2Core::Job {
     PromptSummary summary;
     double prepare_seconds = 0.0;
     ResolvedRequestOptions options;
+    // The output constraint (response_format, grammar, choice, regex): which token may come next. Null without one.
+    std::unique_ptr<ink::ConstrainedOutput> constraint;
     OutputConsumerMode mode = OutputConsumerMode::Aggregate;
     GenerationObservationOptions observation;
     Clock::time_point submitted, deadline;
@@ -506,6 +517,18 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         for (const LoraSource& source : options_.loras) { frontend_options.lora_names.push_back(source.name); }
         for (const GraftSource& source : options_.grafts) { frontend_options.graft_names.push_back(source.name); }
         frontend_ = std::make_unique<ink::Frontend>(model_->resources(), frontend_options);
+        // Every id of the logits (unpadded_vocab_size) with its text; control tokens and ids past the tokenizer's
+        // carry none, so no grammar admits them (the frame in ConstrainedOutput places the control tokens).
+        constraints_ = std::make_unique<ink::ConstraintCompiler>(
+            [frontend = frontend_.get(), vocab = model_->config().unpadded_vocab_size] {
+                std::vector<std::string> out(static_cast<std::size_t>(vocab));
+                for (std::size_t id = 0; id < out.size(); ++id) {
+                    const auto t = static_cast<TokenId>(id);
+                    if (frontend->is_valid_token(t) && !frontend->is_special(t)) { out[id] = std::string(frontend->token_bytes(t)); }
+                }
+                return out;
+            },
+            options_.grammar_cache_bytes);
         phase.complete();
     }
     check_cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
@@ -871,7 +894,13 @@ void Inkling2Core::check_request(const ResolvedRequestOptions& options) const {
             throw std::invalid_argument("stop token " + std::to_string(id) + " is not a token of Inkling-2");
         }
     }
-    if (options.constraint) { throw std::invalid_argument("Inkling-2 serves no output constraints yet"); }
+    if (options.constraint &&
+        (!options.stop.token_ids.empty() || !options.stop.strings.empty() || !options.stop.include_model_defaults ||
+         options.stop.publish_stop_token || options.output.raw || options.output.preserve_special_tokens)) {
+        // As the Qwen models require: the constrained answer ends at the model's own end, as text.
+        throw RequestError(text::constraint_error_kind(options.constraint->kind),
+                           "constraints require default EOS, text output, no custom stops, and one output language");
+    }
     if (options.tool_choice.mode == ToolChoiceMode::Required || options.tool_choice.allowed_names) {
         throw std::invalid_argument("Inkling-2 serves tool_choice auto or none only");
     }
@@ -903,7 +932,16 @@ Inkling2Core::Submission Inkling2Core::submit(ink::PreparedPrompt prompt, Prompt
         options.execution.thinking.effective_budget =
             limit > frame ? std::optional(std::min(*budget, limit - frame)) : std::nullopt;
     }
+    std::unique_ptr<ink::ConstrainedOutput> constraint;
+    if (options.constraint) {
+        const auto started = Clock::now();
+        constraint         = constraints_->compile(*options.constraint);
+        const double took  = seconds_between(started, Clock::now());
+        constraint->observe(observation.phase_timings, took);
+        prepare_seconds += took;
+    }
     auto job             = std::make_shared<Job>();
+    job->constraint      = std::move(constraint);
     job->id              = next_id_++;
     job->prompt          = std::move(prompt);
     job->summary         = summary;
@@ -1400,8 +1438,9 @@ void Inkling2Core::run(Job& job) {
     };
     // Greedy without penalties reads its tokens off the device (ops::argmax_fp32 is sample()'s argmax: the lowest id
     // among the maxima, NaN never winning) instead of downloading each column's logits.
+    // A constrained request masks each column's logits on the host first (ConstrainedOutput::restrict).
     const bool argmax_on_device = exec.sampling.temperature <= 0.0F && exec.sampling.presence_penalty == 0.0F &&
-                                  exec.sampling.frequency_penalty == 0.0F;
+                                  exec.sampling.frequency_penalty == 0.0F && !job.constraint;
     out.finish_reason = FinishReason::OutputLimit;
     for (;;) {
         if (job.cancelled) {
@@ -1437,6 +1476,7 @@ void Inkling2Core::run(Job& job) {
                 const Tensor last = logits.slice(1, col, 1);
                 check_cuda(cudaMemcpyAsync(host.data(), last.data, host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");
                 check_cuda(cudaStreamSynchronize(stream_), "logits");
+                restrict_to_constraint(job.constraint.get(), host);
                 next = sample(host, exec.sampling, counts, rng);
             }
         }
@@ -1456,6 +1496,7 @@ void Inkling2Core::run(Job& job) {
                                                      .queue_wait_seconds           = out.engine_timing.queue_wait_seconds});
         }
         const bool is_stop = !injected && std::find(stop_ids.begin(), stop_ids.end(), next) != stop_ids.end();
+        if (job.constraint) { job.constraint->accept(next); }
         out.generated_token_ids.push_back(next);
         ++counts[next];
         {
@@ -1539,6 +1580,7 @@ void Inkling2Core::run(Job& job) {
     out.tool_call_parse         = decoder.tool_call_parse();
     out.reasoning_tokens        = decoder.reasoning_tokens();
     out.thinking.model_thinking_tokens = thinking_tokens;
+    if (job.constraint) { out.constraint = job.constraint->observation(); }
     const auto end              = Clock::now();
     out.timings.decode_seconds  = first_token == Clock::time_point{} ? 0.0 : seconds_between(first_token, end);
     out.timings.prompt_wall_seconds     = first_token == Clock::time_point{} ? 0.0 : seconds_between(vision_start, first_token);
@@ -1712,7 +1754,8 @@ bool Inkling2Core::prefill_step(Active& a) {
     if (stop.include_model_defaults) { a.stop_ids.push_back(ink::token::kEndSampling); }
     a.decoder = std::make_unique<ink::OutputDecoder>(*frontend_, stop.strings, job.options.tool_choice.mode != ToolChoiceMode::None, prompt.tools);
     a.rng.seed(exec.sampling.seed);
-    a.argmax_on_device = exec.sampling.temperature <= 0.0F && exec.sampling.presence_penalty == 0.0F && exec.sampling.frequency_penalty == 0.0F;
+    a.argmax_on_device = exec.sampling.temperature <= 0.0F && exec.sampling.presence_penalty == 0.0F && exec.sampling.frequency_penalty == 0.0F &&
+                         !job.constraint;
     out.finish_reason  = FinishReason::OutputLimit;
     TokenId next = 0;
     const Tensor last = logits.slice(1, logits.ne[1] - 1, 1);
@@ -1727,6 +1770,7 @@ bool Inkling2Core::prefill_step(Active& a) {
         a.host.resize(static_cast<std::size_t>(vocab));
         check_cuda(cudaMemcpyAsync(a.host.data(), last.data, a.host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");
         check_cuda(cudaStreamSynchronize(stream_), "logits");
+        restrict_to_constraint(job.constraint.get(), a.host);
         next = sample(a.host, exec.sampling, a.counts, a.rng);
     }
     // A cancellation during the last forward or its logits ends the request before its first token commits.
@@ -1765,6 +1809,7 @@ bool Inkling2Core::commit(Active& a, TokenId next, bool injected) {
                                                  .queue_wait_seconds           = out.engine_timing.queue_wait_seconds});
     }
     const bool is_stop = !injected && std::find(a.stop_ids.begin(), a.stop_ids.end(), next) != a.stop_ids.end();
+    if (job.constraint) { job.constraint->accept(next); }
     out.generated_token_ids.push_back(next);
     ++a.counts[next];
     {
@@ -1845,6 +1890,7 @@ void Inkling2Core::finish(Active& a) {
         out.reasoning_tokens               = a.decoder->reasoning_tokens();
         out.thinking.model_thinking_tokens = a.thinking_tokens;
     }
+    if (job.constraint) { out.constraint = job.constraint->observation(); }
     const auto end                      = Clock::now();
     out.timings.decode_seconds          = a.first_token == Clock::time_point{} ? 0.0 : seconds_between(a.first_token, end);
     out.timings.prompt_wall_seconds     = a.first_token == Clock::time_point{} ? 0.0 : seconds_between(a.vision_start, a.first_token);
@@ -2026,6 +2072,7 @@ void Inkling2Core::worker_batched() {
                         const Tensor col = logits.slice(1, static_cast<std::int32_t>(c), 1);
                         check_cuda(cudaMemcpyAsync(a.host.data(), col.data, a.host.size() * 4, cudaMemcpyDeviceToHost, stream_), "logits");
                         check_cuda(cudaStreamSynchronize(stream_), "logits");
+                        restrict_to_constraint(a.job->constraint.get(), a.host);
                         next = sample(a.host, a.job->options.execution.sampling, a.counts, a.rng);
                     }
                     // A cancellation during the forward or another column's sampling ends this row before its token
