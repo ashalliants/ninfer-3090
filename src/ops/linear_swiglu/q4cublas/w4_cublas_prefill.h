@@ -116,6 +116,10 @@ inline constexpr std::size_t kCublasTileBudgetBytes = 256u << 20;
 [[nodiscard]] std::int32_t cublas_token_tile(std::int32_t rows, std::int32_t tokens);
 
 [[nodiscard]] bool w4_cublas_prefill_supported(const Weight& weight, std::int32_t tokens);
+// Whether the route takes Q8_G32_FP16 weights: on the FP16 route (sm_70) only, where a Q8 code
+// times its group scale is one FP16 rounding; the int8 route has no Q8 form. The Qwen3.6-35B-A3B's
+// Q8 mixer projections take it there (models/qwen3_5/execution/parameters.cpp).
+[[nodiscard]] bool cublas_prefill_admits_q8() noexcept;
 
 [[nodiscard]] std::size_t w4_cublas_prefill_workspace_capacity_bytes(std::int32_t rows,
                                                                     std::int32_t cols,

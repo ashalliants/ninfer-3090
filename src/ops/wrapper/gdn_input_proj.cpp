@@ -324,6 +324,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     validate_policy(policy);
     reject_scout_a4(policy);
+    // The Q8 cuBLAS prefill route below reads the policy as given.
+    const LinearPolicy requested = policy;
     policy = without_integer(policy);
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
@@ -371,6 +373,20 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     require_matrix(z, kZRows, cols, "z");
     require_single_parent_nonoverlap(x, qkv, z);
     require_q8_rowsplit(weight, kRows, "query/key/value/z weight");
+    // sm_70's cuBLAS prefill route (the FP16 one; detail::cublas_prefill_admits_q8): rows
+    // [0, 8192) fill qkv and [8192, 12288) fill z, as the Q8 kernels' segmented output does.
+    if (allows_cublas_prefill(requested) && cols >= cublas_prefill_min_tokens(requested) &&
+        workspace != nullptr && detail::cublas_prefill_admits_q8()) {
+        const detail::CublasProjectionDestination dests[] = {
+            {qkv.data, 0, kQkvRows, kQkvRows, 0}, {z.data, kQkvRows, kZRows, kZRows, 0}};
+        const detail::CublasProjection parent[] = {{&weight, dests, 2}};
+        if (detail::w4_cublas_projection_supported(parent, 1, cols) &&
+            (cols >= kCublasPrefillMinTokens ||
+             detail::w4_cublas_projection_fits(*workspace, parent, 1, cols))) {
+            detail::w4_cublas_projection_launch(x, parent, 1, *workspace, stream);
+            return;
+        }
+    }
     detail::q8_gdn_input_dispatch(x, weight, qkv, z, stream);
 }
 
@@ -967,6 +983,13 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             {input_rows, 8192, 4096, parent_rows, input_rows, min_tokens});
         (void)detail::q8_gdn_input_resolve_plan(
             {input_rows, 8192, 4096, parent_rows, input_rows, max_tokens});
+        // The cuBLAS route (sm_70) is the only claimant with scratch; see dispatch_single_parent.
+        if (allows_cublas_prefill(policy) && detail::cublas_prefill_admits_q8() &&
+            max_tokens >= cublas_prefill_min_tokens(policy)) {
+            return detail::w4_cublas_projection_workspace_capacity_bytes(
+                parent_rows, input_rows, std::max(min_tokens, cublas_prefill_min_tokens(policy)),
+                max_tokens);
+        }
         return 0;
     }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");

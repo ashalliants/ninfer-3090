@@ -677,6 +677,19 @@ memory. Prefill 765 -> 1,160 tok/s at 4.2K, 710 -> 1,000 at 13.4K; prefill-score
 context) 6.174 -> 6.173. `NINFER_SM70_MOE_PREFILL_HMMA=0` keeps the old kernels. The shared expert
 (Q8) still runs its `mma.sync` kernels.
 
+The Q8 mixer projections ran their own `mma.sync` kernels too. Per call at 4,096 tokens (nsys,
+200 W, before either change): the GDN input projection (12,288 x 2,048) 38.2 ms, the attention input
+projection (9,216 x 2,048) 28.4 ms and the output projections (2,048 x 4,096) 13.3 ms, against 2.55,
+1.92 and 1.03 ms for a cuBLAS FP16 GEMM of the same shape on this card. The cuBLAS prefill route's
+FP16 form (`kFp16Route`) now takes `Q8_G32_FP16` weights: `dequantise_q8_row_to_fp16` writes code x
+group scale with one rounding, the single-parent GDN and attention input projections scatter the
+parent's rows to their destinations through `w4_cublas_projection_launch`, and the output
+projections take `w4_cublas_add_launch` from `linear_add`. `models/qwen3_5/execution/parameters.cpp`
+sets `AllowPrefillCublas` on those four weights when `--prefill-cublas` is on (the V100 default), so
+decode and verify keep their kernels. With both changes prefill is 765 -> 2,411 tok/s at 4.2K and
+710 -> 1,794 at 13.4K (ABBA in [tesla-v100.md](../tesla-v100.md#qwen36-35b-a3b)); prefill-scored
+PPL 6.174 -> 6.171. `NINFER_SM70_Q8_PREFILL_CUBLAS=0` keeps the old kernels.
+
 ### Prefill
 
 The wide prefill GEMMs run on the tensor cores through cuBLAS, by default. The cuBLAS prefill
