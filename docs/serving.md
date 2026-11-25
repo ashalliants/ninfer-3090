@@ -3057,7 +3057,9 @@ the current running/prefill/decode-ready composition, nonzero waiting/materializ
 states, average decode batch, and Host-active time plus its fraction of the interval. Use JSONL for
 complete measurement analysis.
 Intervals with context materialization or retention activity are retained even when they contain no
-token execution; only fully idle intervals are omitted. Downstream measurement should prefer the
+token execution; only fully idle intervals are omitted. Host-work timers alone (the engine's idle
+maintenance and device waits, a few microseconds per interval) do not count as activity, so an idle
+server writes no throughput lines. Downstream measurement should prefer the
 raw counters and seconds over rounded stderr rates.
 
 ## Execution behavior
