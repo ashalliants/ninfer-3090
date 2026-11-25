@@ -638,6 +638,31 @@ Never profile the Flash-Next server with `ncu` kernel replay: it backs device me
 RAM (~21 GB beside the 33 GB of pinned experts) and the OOM killer ends the server. Profile the
 kernels in a standalone bench or a test binary instead; `ncu`'s cold caches match the model's.
 
+### Decode: Qwen3.6-35B-A3B
+
+The 35B-A3B (40 layers, 30 GDN and 10 attention; 256 experts, top-8, intermediate 512) decodes
+plain at 6.8 ms a step on master (6.4 after the change below), and an MTP3 round (three draft steps, a T = 4 verify) took 17.5 ms on master.
+nsys over 276 story rounds (2026-11-25, 200 W) put the verify's Q6 output head first: 4.09 ms on
+`q6_a16_sliced_k_mma` (the table's T = 2-32 routes are `mma.sync`, emulated here), then the Q8
+mixer projections on the A16 streaming GEMV (~4.1 ms, 89 calls), the routed experts' small-T path
+(`d3_path_tiled` 3.4 ms, `d4_token` 2.2 ms, FP32 SIMT dequant), the Q4 draft head (3 x 0.30 ms) and
+attention (~1.0 ms). The head now tries `try_launch_q6_stream` first, as the 27B's does
+(`q6/shapes/n248320_k2048.cpp`); `linear_bench`, 200 W, us:
+
+| Tokens | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| master route | 893 | 4,537 | 4,095 | 4,073 |
+| streaming GEMV, A16 (`NINFER_STREAM_DP4A=0`) | 505 | 599 | 834 | 1,319 |
+| streaming GEMV, `dp4a` (the `--verify-a8` default) | 482 | 497 | 512 | 554 |
+
+Serve ABBA and KLD are in [tesla-v100.md](../tesla-v100.md#qwen36-35b-a3b): MTP3 +25-27% on every
+prompt, plain +5.4%. `NINFER_SM70_Q6_35_STREAM=0` keeps master's head.
+
+Profiling this model under nsys needs a workaround: a cooperative `grid.sync` kernel (the GDN gating
+projection's split schedules) faults with `cudaErrorInvalidPc` under nsys on sm_70, master included,
+so profiles were taken with those schedules disabled in a local build and that kernel's time
+corrected by its op bench (14 us a call at T = 1-4).
+
 ### Prefill
 
 The wide prefill GEMMs run on the tensor cores through cuBLAS, by default. The cuBLAS prefill
