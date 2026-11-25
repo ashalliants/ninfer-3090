@@ -26,6 +26,8 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -197,11 +199,30 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
 
 } // namespace
 
+// Up to eight tokens; on the int8-activation verify route (stream_dp4a.cuh) up to
+// kStreamGemvMaxUntiledTokens, as passes of eight. The Q6 output head of a DFlash2 verify wider
+// than eight columns (K = 8..15, or two lanes at K = 7) otherwise ran the emulated small-T mma:
+// 248320 x 5120 at sixteen tokens took 9.98 ms where two dp4a passes take 2.6 ms. Each token's
+// dp4a sum does not depend on the pass width, so every column equals its one-token result.
+// NINFER_SM70_Q6_STREAM_WIDE=0 keeps those widths on the mma kernels.
+static std::int32_t q6_stream_max_tokens(cudaStream_t stream) {
+    static const bool wide = [] {
+        const char* value = std::getenv("NINFER_SM70_Q6_STREAM_WIDE");
+        return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+    }();
+    return wide && kStreamDp4aCompiled && stream_dp4a_enabled(stream)
+               ? kStreamGemvMaxUntiledTokens
+               : 8;
+}
+
 bool try_launch_q6_stream(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     // The streaming GEMV computes the same rows bound by the weight stream where conversions are
     // slow (sm_70 by default; ops/linear/common/stream_gemv.cuh), decoding each weight once for
     // every token of a speculative verify.
-    if (x.ne[1] < 1 || x.ne[1] > 8 || w.padded_shape[1] % kGroupK != 0) return false;
+    if (x.ne[1] < 1 || x.ne[1] > q6_stream_max_tokens(stream) ||
+        w.padded_shape[1] % kGroupK != 0) {
+        return false;
+    }
     return try_launch_stream_gemv<Q6StreamFormat>(
         static_cast<const __nv_bfloat16*>(x.data),
         {static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),

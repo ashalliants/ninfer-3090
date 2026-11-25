@@ -17,6 +17,18 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Qwen3.8-27B output head in verifies past eight columns (2026-11-25)
+
+In a V100 build a verify of 9-32 columns (DFlash2 with two requests at once, or `--draft-tokens`
+8-15) runs the 27B's Q6 output head as int8-activation `dp4a` passes of eight columns instead of an
+`mma.sync` kernel emulated on Volta: 2.6 instead of 9.9 ms per 16-column round, with each column's
+logits equal to the head's one-token result. Router flags, `--ngram-draft-tokens 15`, 200 W, ABBA
+against master: **DFlash2 K7 with two requests at once 94.6-96.0 tok/s total** (89.3-90.9), and
+K = 15 on one request code 101.8 (92.4-92.7) and structured JSON 180.8 (164.8-164.9) with the same
+text. Decode-path KLD at a 16-token window 7.0e-4 against 6.2e-4 (the int8 head's class at one to
+eight tokens). MTP3 and one-request DFlash2 K7 are unchanged; `NINFER_SM70_Q6_STREAM_WIDE=0` restores
+the old head, and the RTX 3090 does not build the route. Details: [tesla-v100.md](tesla-v100.md#qwen38-27b).
+
 ## Tesla V100 (`sm_70`): Qwen3.8-27B long-context attention on the tensor cores (2026-11-24)
 
 In a V100 build the 27B's small-T attention over the INT8 KV cache (speculative verify, three and four

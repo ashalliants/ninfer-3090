@@ -1101,6 +1101,44 @@ the fastest setting measured is DFlash2 K = 7 for code (135.7), thinking (125.2)
 output (177.0), K = 7 adaptive for the long greedy conversation (91.3), and MTP3 for story,
 Chinese, French and sampled prose and conversation (76.9-91.5).
 
+**Verifies past eight columns** (2026-11-25). A DFlash2 round of 9-32 columns (two lanes at K = 7,
+or K = 8-15) ran the target's Q6 output head, 248,320 x 5,120, on `q6_small_t_mma` (Ampere
+`mma.sync`, emulated): 9.86-9.98 ms at 9-16 tokens and 16.5-16.9 ms at 17-32, against 1.31 ms for
+the eight-token `dp4a` GEMV. `try_launch_q6_stream` now takes up to 32 tokens on the int8-activation
+verify route, as `dp4a` passes of eight over the same weights (`linear_bench`, cold, 200 W):
+
+| Tokens | 9 | 12 | 16 | 17 | 24 | 32 |
+|---|---:|---:|---:|---:|---:|---:|
+| before, us | 9,862 | 9,814-9,865 | 9,869-9,982 | 16,504-16,582 | 16,518-16,523 | 16,916-16,919 |
+| passes of eight, us | 2,494-2,495 | 2,573-2,575 | 2,629-2,640 | 3,822-3,829 | 3,958-3,967 | 5,302-5,304 |
+
+A token's `dp4a` sum does not depend on the pass width (stream_dp4a.cuh), so every column of a wide
+verify gets the logits the head computes for that token alone. Decode-path KLD at a 16-token window
+(two 32K-token PG-19 chunks, against the FP32 base): 7.04e-4 and 98.79% the same top-1 (PPL 7.9720)
+against master's 6.24e-4 and 98.90% (7.9707); the same text at one, four and eight tokens measures
+6.16e-4, 5.27e-4 and 6.18e-4. Serve legs, ABBA against master `3c6a616d`, the router's flags,
+`--ngram-draft-tokens 15`, 200 W, no thermal throttling:
+
+| | before | after |
+|---|---:|---:|
+| DFlash2 K7, two requests at once (story + code, 256 tokens each), total tok/s | 89.3-90.9 | **94.6-96.0** |
+| DFlash2 K15, code | 92.4-92.7 | **101.8** |
+| DFlash2 K15, structured JSON | 164.8-164.9 | **180.8** |
+| DFlash2 K15, Chinese / French | 20.8-20.9 / 33.5 | 22.9 / 36.8 |
+| DFlash2 K15, story / thinking / prose (T 0.6) | 31.6 / 59.5 / 37.3 | 35.1 / 68.3 / 39.7 |
+
+Code, Chinese, French and structured output keep their text at K = 15 (9.6-9.9% faster); story,
+thinking and the conversations part at near-ties, since the head's arithmetic at 16 columns changed.
+K = 7 is still the faster window on one request (structured 191.2-191.9 against 181.3-181.4 in the
+same session). `NINFER_SM70_Q6_STREAM_WIDE=0` keeps the old head.
+
+A 16-column form of the `dp4a` kernel itself (one pass instead of the tile GEMM for the Q4/Q5 linears)
+was built and measured first and lost everywhere but the head: 123 registers a thread (no spills),
+one CTA per SM, and K = 5,120 split into two chunks because sixteen tokens' int8 stage does not fit
+96 KB in one. At 16 tokens Q4 34,816 x 5,120 took 316-354 us against the tile GEMM's 261-280,
+Q5 5,120 x 17,408 217-240 against 204-213, Q4 4,096 x 5,120 77 against 57-58; on the head it took
+2.48 ms, no better than two exact passes of eight.
+
 ## Next, in order
 
 1. Run the full op suites (`scripts/v100_validate.sh --tests`); the linear, input-projection,
@@ -1109,10 +1147,10 @@ Chinese, French and sampled prose and conversation (76.9-91.5).
    route loses to a SIMT one on Volta (`docs/maintainer/linear-tuning.md` has the method).
 3. Verify widths past 8 tokens: the int8 streaming GEMV (above) holds 1..8 tokens at the weight
    stream, so MTP up to seven drafts and DFlash2 up to K = 7 verify at about a plain step's GEMV
-   cost; wider DFlash2 windows (12-16 columns) and two-lane DFlash2 rounds still reach the tile GEMM. A
-   16-column form (Lapilli's `dense_mmvq` runs 16) would let deeper drafting pay; it would also
-   serve two-lane DFlash2 drafting, which runs the drafter route above as two passes of eight
-   columns over the same weights.
+   cost. Past eight the Q6 head now runs `dp4a` passes of eight, but the Q4/Q5 linears still take
+   the tile GEMM (1.2-1.9x the eight-token cost), and a 16-column `dp4a` kernel lost to it
+   ("Verifies past eight columns" above): a form that keeps sixteen tokens' int8 stage in one
+   K-chunk (smaller per-slice metadata) and fewer registers would be the next attempt.
 4. Kernel count: a plain decode step is ~700 kernels, and each short GEMV loses ~8 us to fill and
    drain between dependent kernels (Volta has no programmatic dependent launch), ~1-2 ms a token.
    Fusing the norms and small element-wise steps into their neighbours is the remaining decode

@@ -217,9 +217,17 @@ void launch_q6_small_t_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStr
     launch<1>(x, w, out, stream);
 }
 void launch_q6_small_t_c16(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    // Wider verifies too: dp4a passes of eight on the int8-activation route
+    // (try_launch_q6_stream).
+    if (try_launch_q6_stream(x, w, out, stream)) return;
+#endif
     launch<2>(x, w, out, stream);
 }
 void launch_q6_small_t_c32(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    if (try_launch_q6_stream(x, w, out, stream)) return;
+#endif
     launch<4>(x, w, out, stream);
 }
 

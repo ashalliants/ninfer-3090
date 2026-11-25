@@ -105,6 +105,7 @@ These are the model defaults it sets:
 | `NINFER_GGML_STAGED=0` | Flash-Next | Returns the GGML dense linears' verify GEMVs (2-8 columns) to the kernel that casts the input in every CTA, instead of the default staged route that casts it once per call: the same output, about 2% slower decode on code |
 | `NINFER_DRAFT_A8=0` | 27B, DFlash2 | Runs the DFlash2 drafter's linears on its A16 kernels instead of the default int8-activation `dp4a` route: about 9 ms slower per K = 7 round, the same acceptance on most measured prompts |
 | `NINFER_SM70_VERIFY_ATTN_HMMA=0` | 27B | Runs the INT8-KV small-T attention on the CUDA-core kernels (two-token launches for a verify) instead of the default FP16 tensor-core kernel: an MTP3 round at 172K tokens takes 110 ms instead of 52, at 43K 50 instead of 36 |
+| `NINFER_SM70_Q6_STREAM_WIDE=0` | 27B, DFlash2 | Runs the Q6 output head of a verify wider than eight columns (DFlash2 at two requests, or `--draft-tokens` 8-15) on the emulated `mma.sync` kernel instead of the default int8-activation `dp4a` passes of eight: 9.9 instead of 2.6 ms per 16-column round |
 
 One default comes from the build rather than the launcher: in an `sm_70` build `--prefill-cublas` is
 on, so the 27B's wide prefill GEMMs run on the tensor cores through cuBLAS instead of emulated integer
@@ -238,6 +239,19 @@ unchanged at K = 7 (code 246 of 371 drafts with and without it), and greedy text
 code, thinking, Chinese, French and structured output. Story and a long reply part at a near-tie, as
 they also do on master between DFlash2 window settings, because a verify round's arithmetic depends
 on its width. `NINFER_DRAFT_A8=0` turns it off. Details in
+[volta-port.md](maintainer/volta-port.md#decode).
+
+DFlash2 rounds wider than eight columns (two requests at once at K = 7, or K = 8-15 on one) used to
+run the target's Q6 output head (248,320 x 5,120) on an `mma.sync` kernel emulated on Volta: 9.9 ms
+of a 16-column round. It now runs as `dp4a` passes of eight columns on int8 activations, 2.6 ms, and
+each column's logits equal what the head computes for that token alone. Two requests at once on
+DFlash2 K7 (story + code, 256 tokens each) total **94.6-96.0 tok/s** instead of 89.3-90.9, and K = 15
+on one request is 9.6-9.9% faster where its text is unchanged (code 101.8 against 92.4-92.7,
+structured 180.8 against 164.8-164.9; also Chinese and French), though K = 7 stays the
+faster window (structured 191.2-191.9 in the same session). Decode-path KLD at a 16-token window is
+7.0e-4 against master's 6.2e-4 (98.8 against 98.9% the same top-1), the int8 head's own class (6.2e-4
+at one and eight tokens on the same text). MTP3 and one-request DFlash2 K7 verify at most eight
+columns and are unchanged. `NINFER_SM70_Q6_STREAM_WIDE=0` restores the old head. Details in
 [volta-port.md](maintainer/volta-port.md#decode).
 
 The target's own speed-up behind the MTP3 and plain columns is `--verify-a8`, on by default in an
