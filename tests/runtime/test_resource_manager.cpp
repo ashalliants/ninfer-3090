@@ -634,12 +634,12 @@ struct Program {
             return contents.at(handle.index).tokens.size();
         };
         const auto prefix = [this](Handle a, Handle b) { return this->prefix(a, b); };
-        using Table =
-            decltype(ninfer::runtime::RecoveryLossTable(retained, valid, frontier, prefix));
-        auto table  = std::make_shared<const Table>(retained, valid, frontier, prefix);
-        return [this, table](std::span<const Handle> removed, std::span<const Handle> excluded) {
+        auto table =
+            ninfer::runtime::prepare_recovery_loss_table(retained, valid, frontier, prefix);
+        return [this, table = std::move(table)](std::span<const Handle> removed,
+                                                std::span<const Handle> excluded) {
             ++recovery_loss_queries;
-            return table->loss(removed, excluded);
+            return table(removed, excluded);
         };
     }
 

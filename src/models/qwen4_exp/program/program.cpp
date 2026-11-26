@@ -2512,6 +2512,16 @@ public:
         return cache_ ? cache_->recovery_loss(removed, surviving) : 0;
     }
 
+    qwen3_5::PreparedRecoveryLoss
+    prepare_checkpoint_recovery_loss(std::span<const CheckpointHandle> retained) const {
+        if (!cache_) {
+            return [](std::span<const CheckpointHandle>, std::span<const CheckpointHandle>) {
+                return std::uint64_t{0};
+            };
+        }
+        return cache_->prepare_recovery_loss(retained);
+    }
+
     std::size_t host_bytes_released(std::span<const CheckpointHandle> handles) const {
         return cache_ ? cache_->released_bytes(handles) : 0;
     }
@@ -6528,6 +6538,16 @@ std::uint64_t ContextReclaimPlan::recovery_loss(std::span<const CheckpointHandle
     return owner_ ? owner_->checkpoint_recovery_loss(removed, surviving) : 0;
 }
 
+qwen3_5::PreparedRecoveryLoss
+ContextReclaimPlan::prepare_recovery_loss(std::span<const CheckpointHandle> retained) const {
+    if (!owner_) {
+        return [](std::span<const CheckpointHandle>, std::span<const CheckpointHandle>) {
+            return std::uint64_t{0};
+        };
+    }
+    return owner_->prepare_checkpoint_recovery_loss(retained);
+}
+
 ResumeState::ResumeState(std::unique_ptr<detail::ResumeStateImpl> impl) noexcept : impl_(std::move(impl)) {}
 ResumeState::ResumeState(ResumeState&&) noexcept            = default;
 ResumeState& ResumeState::operator=(ResumeState&&) noexcept = default;
@@ -6837,6 +6857,10 @@ std::uint32_t Program::checkpoint_recovery_frontier(CheckpointHandle retained, c
 std::uint64_t Program::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
                                                 std::span<const CheckpointHandle> surviving) const {
     return impl_->checkpoint_recovery_loss(removed, surviving);
+}
+qwen3_5::PreparedRecoveryLoss
+Program::prepare_checkpoint_recovery_loss(std::span<const CheckpointHandle> retained) const {
+    return impl_->prepare_checkpoint_recovery_loss(retained);
 }
 bool Program::valid_checkpoint(CheckpointHandle checkpoint) const noexcept { return impl_->valid_checkpoint(checkpoint); }
 bool Program::release_checkpoint(CheckpointHandle checkpoint) noexcept { return impl_->release_checkpoint(checkpoint); }

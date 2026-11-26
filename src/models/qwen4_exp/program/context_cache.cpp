@@ -443,6 +443,14 @@ bool HostCheckpointStore::prefix(Handle earlier, Handle later) const {
            a.identity->prefix_identity.prefix_equals(b.identity->prefix_identity, a.frontier);
 }
 
+runtime::PreparedRecoveryLoss<HostCheckpointStore::Handle>
+HostCheckpointStore::prepare_recovery_loss(std::span<const Handle> retained) const {
+    return runtime::prepare_recovery_loss_table(
+        retained, [this](Handle handle) { return valid(handle); },
+        [this](Handle handle) { return at(handle).frontier; },
+        [this](Handle earlier, Handle later) { return prefix(earlier, later); });
+}
+
 std::uint64_t HostCheckpointStore::recovery_loss(std::span<const Handle> removed,
                                                  std::span<const Handle> surviving) const {
     return runtime::checkpoint_recovery_loss(

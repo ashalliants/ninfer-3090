@@ -4,6 +4,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/host_placement.h"
 #include "runtime/contract/resources.h"
+#include "runtime/engine/context_cache/recovery_loss.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include <array>
 #include <cstddef>
@@ -250,8 +251,7 @@ private:
 
 // Recovery loss of releasing a set (first span) from a prepared retained set, with further
 // checkpoints (second span) also gone but not counted as lost (runtime::RecoveryLossTable).
-using PreparedRecoveryLoss = std::function<std::uint64_t(std::span<const CheckpointHandle>,
-                                                         std::span<const CheckpointHandle>)>;
+using PreparedRecoveryLoss = runtime::PreparedRecoveryLoss<CheckpointHandle>;
 
 // Read-only facts for one synchronous evaluation. Discard before any Native mutation or yield.
 // start_demote independently revalidates the selected quote before reserving destinations.
