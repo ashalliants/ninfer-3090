@@ -3315,6 +3315,12 @@ int run_batch_cases() {
         kGeometries[1], kPlanRk4v4, {1, {0, 31, 63, 127, 511, 1023, 2047, 4095},
                                      {1, 1, 1, 1, 1, 1, 1, 1}, {7, 0, 5, 2, 6, 1, 4, 3},
                                      MappingPattern::Identity, 509u});
+    // Four MTP3 lanes (B=4, T=4) near 80K keys, one row masked and two far shorter than the
+    // envelope: the multi-row split policy sizes the grid to the device's waves, so each row's
+    // keys spread over a split count no single-row launch uses.
+    failures += run_batch_case(kGeometries[0], kPlanRk4v4,
+                               {4, {79872, 30000, 81000, 9000}, {4, 4, 3, 4}, {2, 0, 3, 1},
+                                MappingPattern::Fragmented, 513u});
     failures += run_case_allowing_arch_skip(
         "causal_softmax_attention FP8 KV cache batched", [&] {
             return run_batch_case(kGeometries[0], kPlanFp8,

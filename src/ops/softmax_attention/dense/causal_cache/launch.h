@@ -28,12 +28,16 @@ struct CausalSmallTInvocation {
     std::int32_t column_begin   = 0;
     std::int32_t width          = 0;
     std::int32_t batch_size     = 1;
+    // The executing device's SM count: the multi-row INT8-family split policy sizes its grid to
+    // the device's waves (causal_attention_split_capacity).
+    std::int32_t multiprocessor_count = 0;
 };
 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                              KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope,
-                                             std::int32_t batch_size = 1);
+                                             std::int32_t batch_size           = 1,
+                                             std::int32_t multiprocessor_count = 0);
 
 // sm_70 small-T attention on the FP16 tensor cores (small_t_i8_hmma.cuh): a 27B-geometry (24
 // query heads) call of 1..8 columns over the INT8 G64 cache runs as one launch of that kernel
@@ -67,7 +71,8 @@ void causal_attention_small_t_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+    std::int32_t multiprocessor_count, Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+    Tensor& out, cudaStream_t stream);
 
 void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
                                             const PagedKVLayerView& cache,

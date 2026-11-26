@@ -513,7 +513,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                            Tensor& out, cudaStream_t stream) {
+                            Tensor& out, DeviceExecutionView execution) {
     for (std::int32_t begin = 0; begin < q.ne[2];
          begin += causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage,
                                                         envelope)) {
@@ -522,12 +522,13 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                                              q.ne[2] - begin);
         auto chunk_scope          = workspace.scope();
         const std::int32_t splits = detail::causal_attention_split_capacity(
-            q.ne[1], count, cache.storage, envelope, q.ne[3]);
+            q.ne[1], count, cache.storage, envelope, q.ne[3], execution.multiprocessor_count);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows,
-                                                scale, cache, envelope, begin, count, partial.acc,
-                                                partial.m, partial.l, out, stream);
+                                                scale, cache, envelope, begin, count,
+                                                execution.multiprocessor_count, partial.acc,
+                                                partial.m, partial.l, out, execution.stream);
     }
 }
 
@@ -672,7 +673,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     };
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits = detail::causal_attention_split_capacity(
-            q_heads, width, cache_storage, envelope, batch_size);
+            q_heads, width, cache_storage, envelope, batch_size, execution.multiprocessor_count);
         WorkspaceLayoutBuilder layout;
         (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
         return layout.peak_bytes(1);
@@ -856,17 +857,17 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 #endif
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                               envelope, workspace, out, stream);
+                               envelope, workspace, out, execution);
         return;
     }
     if (route == detail::CausalAttentionRoute::SmallT) {
-        const std::int32_t splits =
-            detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope, batch);
+        const std::int32_t splits = detail::causal_attention_split_capacity(
+            q.ne[1], width, cache.storage, envelope, batch, execution.multiprocessor_count);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
-        detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
-                                                scale, cache, envelope, 0, width, partial.acc,
-                                                partial.m, partial.l, out, stream);
+        detail::causal_attention_small_t_launch(
+            q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope, 0, width,
+            execution.multiprocessor_count, partial.acc, partial.m, partial.l, out, stream);
         return;
     }
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
