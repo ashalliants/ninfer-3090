@@ -1,0 +1,197 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 1635" width="960" height="1635" role="img" aria-label="Qwen3.8-27B on one RTX 3090, ashalliants/ninfer-3090 against the best published figures. Chat, one request, vs syv-ai HyperQwen: 1.02x decode (133.2 vs 131.2), 1.22x prefill. Code vs open-jet: 1.39x (194.6 vs 140). No drafts vs open-jet: 1.11x (47.7 vs 42.9). 98K-token context vs open-jet: 0.98x (93.9 vs 95.9). Eight requests at once vs syv-ai: 1.03x (421.4 vs 407.3).">
+  <title>Qwen3.8-27B on one RTX 3090: against the best published figures</title>
+  <desc>Qwen3.8-27B on one RTX 3090, ashalliants/ninfer-3090 against the best published figures. Chat, one request, vs syv-ai HyperQwen: 1.02x decode (133.2 vs 131.2), 1.22x prefill. Code vs open-jet: 1.39x (194.6 vs 140). No drafts vs open-jet: 1.11x (47.7 vs 42.9). 98K-token context vs open-jet: 0.98x (93.9 vs 95.9). Eight requests at once vs syv-ai: 1.03x (421.4 vs 407.3).</desc>
+
+  <style>
+    .surface { fill: #fcfcfb; stroke: rgba(11,11,11,0.10); }
+    .t1 { fill: #0b0b0b; } .t2 { fill: #52514e; } .t3 { fill: #6f6e69; }
+    .grid { stroke: #e6e5df; } .base { stroke: #c3c2b7; } .ref { stroke: #52514e; stroke-dasharray: 4 3; }
+    .ours { fill: #2a78d6; } .alt { fill: #1baf7a; } .same { fill: #eb6834; } .prev { fill: #b5b3aa; }
+    .rep { fill: url(#hatch-rtx3090-qwen38-27b); } .hatchbg { fill: #e4e2da; } .hatchln { stroke: #8f8d86; }
+    .win { fill: #1d5fb0; } .loss { fill: #b8471d; }
+    text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    @media (prefers-color-scheme: dark) {
+      .surface { fill: #1a1a19; stroke: rgba(255,255,255,0.12); }
+      .t1 { fill: #f4f3ef; } .t2 { fill: #c3c2b7; } .t3 { fill: #a3a29b; }
+      .grid { stroke: #2e2e2b; } .base { stroke: #4a4a46; } .ref { stroke: #c3c2b7; }
+      .ours { fill: #3987e5; } .alt { fill: #199e70; } .same { fill: #d95926; } .prev { fill: #6f6e69; }
+      .hatchbg { fill: #3a3935; } .hatchln { stroke: #8f8d86; }
+      .win { fill: #79b0f0; } .loss { fill: #f08a5d; }
+    }
+  </style>
+  <defs><pattern id="hatch-rtx3090-qwen38-27b" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" class="hatchbg"/><line x1="0" y1="0" x2="0" y2="6" class="hatchln" stroke-width="2"/></pattern></defs>
+  <rect x="1" y="1" width="958" height="1633" rx="14" class="surface" stroke-width="1"/>
+  <text x="32.0" y="48.0" class="t1" font-size="22" font-weight="700" text-anchor="start">Qwen3.8-27B on one RTX 3090: against the best published figures</text>
+  <text x="32.0" y="72.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">ashalliants/ninfer-3090 against the fastest figure any other engine publishes for this model on one RTX 3090, per</text>
+  <text x="32.0" y="91.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">workload. Above 1.0x means ours is faster. Every other figure is the author&#x27;s own, from a different machine, quant</text>
+  <text x="32.0" y="110.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">and power limit, so read the ratios as indicative.</text>
+  <text x="302.0" y="163.0" class="t1" font-size="14" font-weight="700" text-anchor="start">Decode</text>
+  <text x="629.0" y="163.0" class="t1" font-size="14" font-weight="700" text-anchor="start">Prefill</text>
+  <text x="928.0" y="163.0" class="t3" font-size="11" font-weight="400" text-anchor="end">dashed line: 1.0x, same speed</text>
+  <text x="32.0" y="193.0" class="t3" font-size="11.5" font-weight="600" text-anchor="start">Reported by their authors (hatched): different machines, quants, prompts and power limits; not re-run here</text>
+  <text x="32.0" y="228.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Chat, one request</text>
+  <text x="32.0" y="247.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs syv-ai HyperQwen (patched vLLM,</text>
+  <text x="32.0" y="262.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">W4A16 + int8 Marlin, 250 W), greedy,</text>
+  <text x="32.0" y="277.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">on its own eight prompts</text>
+  <path class="rep" d="M302.0,217.0 h141.3 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-141.3 z"><title>Chat, one request, Decode: 1.02x</title></path>
+  <line x1="445.1" y1="212.0" x2="445.1" y2="240.0" class="ref" stroke-width="1.5"/>
+  <text x="454.3" y="232.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.02x</text>
+  <text x="302.0" y="253.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: the launcher default (DFlash2 K7 +</text>
+  <text x="302.0" y="267.0" class="t3" font-size="11" font-weight="400" text-anchor="start">n-gram copies, rk4v4 KV), 1,024 tokens per</text>
+  <text x="302.0" y="281.0" class="t3" font-size="11" font-weight="400" text-anchor="start">prompt</text>
+  <path class="rep" d="M629.0,217.0 h170.6 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-170.6 z"><title>Chat, one request, Prefill: 1.22x</title></path>
+  <line x1="772.1" y1="212.0" x2="772.1" y2="240.0" class="ref" stroke-width="1.5"/>
+  <text x="810.6" y="232.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.22x</text>
+  <text x="629.0" y="253.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours at a 1.2K-token prompt, theirs at 1K</text>
+  <line x1="32" y1="299.0" x2="928" y2="299.0" class="grid" stroke-width="1"/>
+  <text x="32.0" y="326.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Code, one request</text>
+  <text x="32.0" y="345.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs the open-jet megakernel (Q4_K_M, 4</text>
+  <text x="32.0" y="360.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">drafts)</text>
+  <path class="rep" d="M302.0,315.0 h194.9 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-194.9 z"><title>Code, one request, Decode: 1.39x</title></path>
+  <line x1="445.1" y1="310.0" x2="445.1" y2="338.0" class="ref" stroke-width="1.5"/>
+  <text x="507.9" y="330.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.39x</text>
+  <text x="302.0" y="351.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: six code-writing prompts, 1,024 tokens</text>
+  <text x="302.0" y="365.0" class="t3" font-size="11" font-weight="400" text-anchor="start">each, 64.5% of drafts accepted</text>
+  <text x="629.0" y="328.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">open-jet publishes no prefill figure for</text>
+  <text x="629.0" y="343.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">this run</text>
+  <line x1="32" y1="383.0" x2="928" y2="383.0" class="grid" stroke-width="1"/>
+  <text x="32.0" y="410.0" class="t1" font-size="15" font-weight="700" text-anchor="start">No drafts, one request</text>
+  <text x="32.0" y="429.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs the open-jet megakernel (Q4_K_M)</text>
+  <path class="rep" d="M302.0,399.0 h155.1 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-155.1 z"><title>No drafts, one request, Decode: 1.11x</title></path>
+  <line x1="445.1" y1="394.0" x2="445.1" y2="422.0" class="ref" stroke-width="1.5"/>
+  <text x="468.1" y="414.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.11x</text>
+  <text x="302.0" y="435.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: ninfer_bench tg128, INT8 KV (46.7 with</text>
+  <text x="302.0" y="449.0" class="t3" font-size="11" font-weight="400" text-anchor="start">rk4v4); llama.cpp reports 41.5</text>
+  <text x="629.0" y="412.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">not compared at matching lengths</text>
+  <line x1="32" y1="467.0" x2="928" y2="467.0" class="grid" stroke-width="1"/>
+  <text x="32.0" y="494.0" class="t1" font-size="15" font-weight="700" text-anchor="start">98K-token context</text>
+  <text x="32.0" y="513.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs the open-jet megakernel (7 drafts)</text>
+  <path class="rep" d="M302.0,483.0 h136.1 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-136.1 z"><title>98K-token context, Decode: 0.98x</title></path>
+  <line x1="445.1" y1="478.0" x2="445.1" y2="506.0" class="ref" stroke-width="1.5"/>
+  <text x="452.1" y="498.0" class="loss" font-size="17" font-weight="700" text-anchor="start">0.98x</text>
+  <text x="302.0" y="519.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: 98,362-token prompt, 512 tokens out</text>
+  <text x="302.0" y="533.0" class="t3" font-size="11" font-weight="400" text-anchor="start">(93.1-93.9 over two runs); syv-ai reports 78.5</text>
+  <text x="302.0" y="547.0" class="t3" font-size="11" font-weight="400" text-anchor="start">at 100K</text>
+  <text x="629.0" y="496.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">open-jet publishes none; ours reads the 98K</text>
+  <text x="629.0" y="511.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">prompt at 1,899 tok/s</text>
+  <line x1="32" y1="565.0" x2="928" y2="565.0" class="grid" stroke-width="1"/>
+  <text x="32.0" y="592.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Eight requests at once</text>
+  <text x="32.0" y="611.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs syv-ai HyperQwen&#x27;s single-user mode</text>
+  <text x="32.0" y="626.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">(MTP), the same eight prompts</text>
+  <path class="rep" d="M302.0,581.0 h144.1 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-144.1 z"><title>Eight requests at once, Decode: 1.03x</title></path>
+  <line x1="445.1" y1="576.0" x2="445.1" y2="604.0" class="ref" stroke-width="1.5"/>
+  <text x="457.1" y="596.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.03x</text>
+  <text x="302.0" y="617.0" class="t3" font-size="11" font-weight="400" text-anchor="start">aggregate; ours MTP3, INT8 KV, the launcher&#x27;s</text>
+  <text x="302.0" y="631.0" class="t3" font-size="11" font-weight="400" text-anchor="start">c8 settings</text>
+  <text x="629.0" y="594.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">not compared</text>
+  <text x="32.0" y="669.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Decode, one request (tok/s)</text>
+  <text x="32.0" y="689.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">Greedy, thinking off. &quot;File rewrite&quot; asks for a supplied file back with small edits, so most of the answer is copied from the prompt;</text>
+  <text x="32.0" y="704.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">syv-ai&#x27;s 381 is its figure for answers that quote the prompt, at 25K context.</text>
+  <path class="ours" d="M32.0,725.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours, launcher settings</title></path>
+  <text x="52.0" y="735.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours, launcher settings</text>
+  <path class="rep" d="M236.8,725.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Best other published figure (reported)</title></path>
+  <text x="256.8" y="735.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Best other published figure (reported)</text>
+  <line x1="182.0" y1="751.0" x2="182.0" y2="951.0" class="base" stroke-width="1"/>
+  <text x="182.0" y="965.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">0</text>
+  <line x1="338.5" y1="751.0" x2="338.5" y2="951.0" class="grid" stroke-width="1"/>
+  <text x="338.5" y="965.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">100</text>
+  <line x1="495.0" y1="751.0" x2="495.0" y2="951.0" class="grid" stroke-width="1"/>
+  <text x="495.0" y="965.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">200</text>
+  <line x1="651.5" y1="751.0" x2="651.5" y2="951.0" class="grid" stroke-width="1"/>
+  <text x="651.5" y="965.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">300</text>
+  <line x1="808.0" y1="751.0" x2="808.0" y2="951.0" class="grid" stroke-width="1"/>
+  <text x="808.0" y="965.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">400</text>
+  <text x="172.0" y="773.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">no drafts</text>
+  <path class="ours" d="M182.0,755.0 h70.7 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-70.7 z"><title>Ours, launcher settings: no drafts 47.7 tok/s</title></path>
+  <text x="261.7" y="765.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">47.7</text>
+  <path class="rep" d="M182.0,770.0 h63.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-63.1 z"><title>Best other published figure (reported): no drafts 42.9 tok/s (open-jet)</title></path>
+  <text x="254.1" y="780.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">42.9</text>
+  <text x="284.8" y="780.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">open-jet</text>
+  <text x="172.0" y="814.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">chat (syv-ai&#x27;s prompts)</text>
+  <path class="ours" d="M182.0,796.0 h204.5 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-204.5 z"><title>Ours, launcher settings: chat (syv-ai&#x27;s prompts) 133.2 tok/s</title></path>
+  <text x="395.5" y="806.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">133.2</text>
+  <path class="rep" d="M182.0,811.0 h201.3 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-201.3 z"><title>Best other published figure (reported): chat (syv-ai&#x27;s prompts) 131.2 tok/s (syv-ai, greedy)</title></path>
+  <text x="392.3" y="821.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">131.2</text>
+  <text x="429.7" y="821.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">syv-ai, greedy</text>
+  <text x="172.0" y="855.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">code</text>
+  <path class="ours" d="M182.0,837.0 h300.5 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-300.5 z"><title>Ours, launcher settings: code 194.6 tok/s</title></path>
+  <text x="491.5" y="847.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">194.6</text>
+  <path class="rep" d="M182.0,852.0 h215.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-215.1 z"><title>Best other published figure (reported): code 140 tok/s (open-jet)</title></path>
+  <text x="406.1" y="862.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">140</text>
+  <text x="430.1" y="862.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">open-jet</text>
+  <text x="172.0" y="896.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">file rewrite</text>
+  <path class="ours" d="M182.0,878.0 h597.6 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-597.6 z"><title>Ours, launcher settings: file rewrite 384.4 tok/s</title></path>
+  <text x="788.6" y="888.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">384.4</text>
+  <path class="rep" d="M182.0,893.0 h592.3 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-592.3 z"><title>Best other published figure (reported): file rewrite 381 tok/s (syv-ai, 25K)</title></path>
+  <text x="783.3" y="903.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">381</text>
+  <text x="807.3" y="903.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">syv-ai, 25K</text>
+  <text x="172.0" y="937.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">98K-token context</text>
+  <path class="ours" d="M182.0,919.0 h143.0 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-143.0 z"><title>Ours, launcher settings: 98K-token context 93.9 tok/s</title></path>
+  <text x="334.0" y="929.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">93.9</text>
+  <path class="rep" d="M182.0,934.0 h146.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-146.1 z"><title>Best other published figure (reported): 98K-token context 95.9 tok/s (open-jet)</title></path>
+  <text x="337.1" y="944.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">95.9</text>
+  <text x="367.8" y="944.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">open-jet</text>
+  <text x="808.0" y="981.0" class="t3" font-size="11" font-weight="400" text-anchor="end">tokens per second, higher is better</text>
+  <text x="32.0" y="1003.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Several requests at once, aggregate decode (tok/s)</text>
+  <text x="32.0" y="1023.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">syv-ai&#x27;s eight prompts, 1,024 tokens each, greedy. NInfer serves at most eight requests at once; syv-ai&#x27;s batch mode reports about</text>
+  <text x="32.0" y="1038.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">1,035 tok/s at 64.</text>
+  <path class="ours" d="M32.0,1059.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours, MTP3, INT8 KV</title></path>
+  <text x="52.0" y="1069.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours, MTP3, INT8 KV</text>
+  <path class="alt" d="M207.8,1059.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>Ours, DFlash2 K7, rk4v4 KV</title></path>
+  <text x="227.8" y="1069.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Ours, DFlash2 K7, rk4v4 KV</text>
+  <path class="rep" d="M434.2,1059.0 h10.0 a4,4 0 0 1 4,4 v4.0 a4,4 0 0 1 -4,4 h-10.0 z"><title>syv-ai HyperQwen, MTP (reported)</title></path>
+  <text x="454.2" y="1069.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">syv-ai HyperQwen, MTP (reported)</text>
+  <line x1="182.0" y1="1085.0" x2="182.0" y2="1162.0" class="base" stroke-width="1"/>
+  <text x="182.0" y="1176.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">0</text>
+  <line x1="307.2" y1="1085.0" x2="307.2" y2="1162.0" class="grid" stroke-width="1"/>
+  <text x="307.2" y="1176.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">100</text>
+  <line x1="432.4" y1="1085.0" x2="432.4" y2="1162.0" class="grid" stroke-width="1"/>
+  <text x="432.4" y="1176.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">200</text>
+  <line x1="557.6" y1="1085.0" x2="557.6" y2="1162.0" class="grid" stroke-width="1"/>
+  <text x="557.6" y="1176.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">300</text>
+  <line x1="682.8" y1="1085.0" x2="682.8" y2="1162.0" class="grid" stroke-width="1"/>
+  <text x="682.8" y="1176.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">400</text>
+  <line x1="808.0" y1="1085.0" x2="808.0" y2="1162.0" class="grid" stroke-width="1"/>
+  <text x="808.0" y="1176.0" class="t3" font-size="11" font-weight="400" text-anchor="middle">500</text>
+  <text x="172.0" y="1107.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">4 requests</text>
+  <path class="ours" d="M182.0,1089.0 h397.0 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-397.0 z"><title>Ours, MTP3, INT8 KV: 4 requests 320.3 tok/s</title></path>
+  <text x="588.0" y="1099.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">320.3</text>
+  <path class="alt" d="M182.0,1104.0 h326.0 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-326.0 z"><title>Ours, DFlash2 K7, rk4v4 KV: 4 requests 263.6 tok/s</title></path>
+  <text x="517.0" y="1114.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">263.6</text>
+  <text x="172.0" y="1148.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">8 requests</text>
+  <path class="ours" d="M182.0,1130.0 h523.6 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-523.6 z"><title>Ours, MTP3, INT8 KV: 8 requests 421.4 tok/s</title></path>
+  <text x="714.6" y="1140.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">421.4</text>
+  <path class="rep" d="M182.0,1145.0 h505.9 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-505.9 z"><title>syv-ai HyperQwen, MTP (reported): 8 requests 407.3 tok/s</title></path>
+  <text x="696.9" y="1155.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">407.3</text>
+  <text x="808.0" y="1192.0" class="t3" font-size="11" font-weight="400" text-anchor="end">tokens per second, higher is better</text>
+  <text x="32.0" y="1214.0" class="t1" font-size="15" font-weight="600" text-anchor="start">Prefill (tok/s)</text>
+  <text x="32.0" y="1234.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">Server-side prefill time of one fresh prompt, no prefix reused. The 10K report does not name its engine (probably syv-ai&#x27;s).</text>
+  <text x="32.0" y="1273.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours</text>
+  <text x="73.0" y="1273.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">1.2K-token prompt</text>
+  <path class="ours" d="M32.0,1279.0 h631.9 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-631.9 z"><title>Ours 1.2K-token prompt: 2,367</title></path>
+  <text x="673.9" y="1290.5" class="t1" font-size="12" font-weight="600" text-anchor="start">2,367</text>
+  <text x="32.0" y="1317.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">syv-ai HyperQwen</text>
+  <text x="156.0" y="1317.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">1K prompt, int8 activations</text>
+  <path class="rep" d="M32.0,1323.0 h517.2 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-517.2 z"><title>syv-ai HyperQwen 1K prompt, int8 activations: 1,940</title></path>
+  <text x="559.2" y="1334.5" class="t2" font-size="12" font-weight="400" text-anchor="start">1,940 reported</text>
+  <text x="32.0" y="1361.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours</text>
+  <text x="73.0" y="1361.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">9.8K-token prompt</text>
+  <path class="ours" d="M32.0,1367.0 h777.3 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-777.3 z"><title>Ours 9.8K-token prompt: 2,908</title></path>
+  <text x="819.3" y="1378.5" class="t1" font-size="12" font-weight="600" text-anchor="start">2,908</text>
+  <text x="32.0" y="1405.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">club-3090 #1053</text>
+  <text x="148.8" y="1405.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">10K prompt, engine not named</text>
+  <path class="rep" d="M32.0,1411.0 h664.4 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-664.4 z"><title>club-3090 #1053 10K prompt, engine not named: 2,488</title></path>
+  <text x="706.4" y="1422.5" class="t2" font-size="12" font-weight="400" text-anchor="start">2,488 reported</text>
+  <text x="32.0" y="1449.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours</text>
+  <text x="73.0" y="1449.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">98K-token prompt</text>
+  <path class="ours" d="M32.0,1455.0 h506.2 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-506.2 z"><title>Ours 98K-token prompt: 1,899</title></path>
+  <text x="548.2" y="1466.5" class="t1" font-size="12" font-weight="600" text-anchor="start">1,899</text>
+  <line x1="32" y1="1489.0" x2="928" y2="1489.0" class="grid" stroke-width="1"/>
+  <text x="32.0" y="1507.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Where we lose: at 98K tokens of context open-jet reports 95.9 tok/s against our 93.9 (0.98x). syv-ai&#x27;s batch mode reports about 1,035</text>
+  <text x="32.0" y="1522.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">tok/s at 64 requests; NInfer is built for one to eight.</text>
+  <text x="32.0" y="1540.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Quants differ: ours is this fork&#x27;s Q4/Q5 group-quant mix (17.0 GiB), syv-ai runs W4A16 AutoRound with int8 Marlin layers, open-jet</text>
+  <text x="32.0" y="1555.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Unsloth&#x27;s Q4_K_M. Conditions and sources for every figure: docs/performance.md, &quot;Qwen3.8-27B against the best published RTX 3090</text>
+  <text x="32.0" y="1570.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">figures&quot;.</text>
+  <text x="32.0" y="1591.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One RTX 3090 24 GB, Windows 11, CUDA 12.8 · 315 W limit · 2026-11-26 · ours: master 178d3b5e (Release, launcher settings) ·</text>
+  <text x="32.0" y="1606.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">competitors measured on this box unless marked “reported”</text>
+</svg>

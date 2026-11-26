@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Render the Tesla V100 comparison charts (docs/assets/v100-*.svg) from tools/docs/v100_charts.json.
+"""Render the comparison charts in docs/assets/ from a chart data file.
 
-  python tools/docs/v100_charts.py                 write the SVGs into docs/assets/
+  python tools/docs/v100_charts.py                 the Tesla V100 charts (v100-*.svg, v100_charts.json)
+  python tools/docs/v100_charts.py --data tools/docs/rtx3090_charts.json
+                                                   the RTX 3090 chart (rtx3090-*.svg)
   python tools/docs/v100_charts.py --out DIR       write them somewhere else
 
 Every number comes from the JSON, which names the build, PR or pinned source behind it
