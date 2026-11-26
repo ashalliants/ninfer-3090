@@ -46,6 +46,14 @@ archive_name="$product_name.tar.gz"
 archive_path="$dist_root/$archive_name"
 checksum_path="$dist_root/SHA256SUMS-v$release_version-$checksum_suffix.txt"
 
+# Release binaries carry no -lineinfo: it makes every kernel image about 4x larger, and the CUDA
+# driver keeps each image it loads in host RAM (NINFER_CUDA_LINEINFO in CMakeLists.txt). A profiling
+# tree configured with it on is refused before anything is written.
+if grep -qx 'NINFER_CUDA_LINEINFO:BOOL=ON' "$build_root/CMakeCache.txt" 2>/dev/null; then
+  printf '%s was configured with -DNINFER_CUDA_LINEINFO=ON (a profiling build): reconfigure it with =OFF and rebuild before packaging\n' "$build_root" >&2
+  exit 1
+fi
+
 mkdir -p -- "$dist_root"
 case "$product_root" in "$dist_root/$product_name") ;; *) exit 1 ;; esac
 rm -rf -- "$product_root"

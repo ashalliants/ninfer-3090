@@ -51,8 +51,10 @@ so it is a third build, from the same commit as the other two:
   `ninfer` is a link to `ninfer-serve` (the server runs as the CLI when started under the name `ninfer`, see
   `apps/serve/main.cpp`), so the archive holds two real binaries (`ninfer-serve`, `ninfer_bench`), about 750 MB
   compressed each. `package-release.sh` probes the build and falls back to a separate `ninfer` for one without the CLI
-  mode. Check the size after packaging. The next levers: each kernel is stored as machine code plus PTX (`70` builds
-  both; a V100 never uses the PTX), and `ninfer_bench` could join the same binary.
+  mode. Check the size after packaging. Release trees build without `-lineinfo` (`NINFER_CUDA_LINEINFO`, OFF by
+  default; the packagers refuse a tree configured with it on), which took the V100 `ninfer-serve` from 1,473 MB to
+  841 MB. The next levers: each kernel is stored as machine code plus PTX (`70` builds both; a V100 never uses the
+  PTX), and `ninfer_bench` could join the same binary.
 - `package-release.sh`'s arch check once failed a good tree because `grep -q` closed the pipe early under `pipefail`;
   it now captures `cuobjdump` output first.
 
@@ -95,7 +97,8 @@ Lt library alone is about 500 MB), so `docs/release-archive-linux.md` states the
 or newer (built on Ubuntu 24.04), the CUDA 12.8 runtime libraries including cuBLAS, FFmpeg 6, libcurl and libzstd.
 Check them with `ldd` on the new binaries and update the guide if they change.
 
-**Asset sizes.** Each executable is about 460-490 MB (every kernel is linked in). The Windows zip is about
+**Asset sizes.** Each executable was about 460-490 MB with `-lineinfo` (every kernel is linked in); release
+trees now build without it (`NINFER_CUDA_LINEINFO`, OFF by default), which makes them markedly smaller. The Windows zip is about
 1.5 GB with the cuBLAS DLLs and the Linux tar.gz about 1 GB. GitHub rejects release assets over 2 GiB, so
 watch the Windows zip if more DLLs are added.
 

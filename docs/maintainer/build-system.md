@@ -219,6 +219,15 @@ process exits, debug sections included: loading that one object costs about 300 
 its kernels runs, so a long-running router pays this once per object it has used: after one
 Qwen3.6-35B-A3B request and an unload, about 0.9 GiB of heap was the driver's copies of these images.
 
+Measured on the V100 (router, one Qwen3.6-35B-A3B request then an unload, three cycles each):
+
+| `ninfer-serve` | binary | RSS empty | RSS loaded | RSS after unload | heap still in use |
+|---|---|---|---|---|---|
+| with `-lineinfo` | 1,473 MB | 0.59 GiB | 10.20 GiB | 1.98 GiB | 1.49 GiB |
+| without | 841 MB | 0.43 GiB | 9.07 GiB | 0.86 GiB | 0.53 GiB |
+
+Neither grows from one cycle to the next; the difference is what each image costs once loaded.
+
 The library targets therefore build without it by default. Pass `-DNINFER_CUDA_LINEINFO=ON` for a
 profiling build (Nsight Compute source view, compute-sanitizer line numbers). The microbenchmarks
 (`bench/cmake/NinferBenchmarks.cmake`) keep `-lineinfo` for their own sources either way. Nsight

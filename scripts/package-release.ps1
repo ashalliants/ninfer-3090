@@ -38,6 +38,14 @@ $Products = @(
     @{ Source = 'bench\ninfer_bench.exe'; Destination = 'ninfer_bench.exe' }
 )
 
+# Release binaries carry no -lineinfo: it makes every kernel image about 4x larger, and the CUDA
+# driver keeps each image it loads in host RAM (NINFER_CUDA_LINEINFO in CMakeLists.txt). A profiling
+# tree configured with it on is refused before anything is written.
+$CMakeCache = Join-Path $BuildRoot 'CMakeCache.txt'
+if ((Test-Path -LiteralPath $CMakeCache) -and (Select-String -LiteralPath $CMakeCache -Pattern '^NINFER_CUDA_LINEINFO:BOOL=ON$' -Quiet)) {
+    throw "$BuildRoot was configured with -DNINFER_CUDA_LINEINFO=ON (a profiling build): reconfigure it with =OFF and rebuild before packaging"
+}
+
 New-Item -ItemType Directory -Force -Path $DistRoot | Out-Null
 $resolvedDist = (Resolve-Path -LiteralPath $DistRoot).Path
 $resolvedProductParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $ProductRoot))
