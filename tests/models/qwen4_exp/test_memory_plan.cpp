@@ -653,8 +653,144 @@ void partial_plan_wddm_cap_warning() {
 
 } // namespace
 
+// The context store needs a context cache to restore into. Each reason a cache cannot be had this
+// time starts the model with the store off and a warning whose remedy fits that reason; a
+// configuration with no cache at all refuses before anything loads; any usable cache keeps it on.
+void test_context_store_start() {
+    const std::uint64_t minimum = 512 * kMiB;
+    const std::uint64_t granule = 64 * kMiB;
+    const HostMemoryDemand d    = flash_next();
+    const std::uint64_t floor   = need_for_full(d);
+    const NvmeTierStatus no_nvme;
+    const auto has = [](const std::string& text, const char* part) { return text.find(part) != std::string::npos; };
+
+    // Plenty of RAM: the cache fits, so the store runs.
+    const ContextCacheFit roomy = fit_context_cache(snapshot(floor + 8 * kGiB, floor + 8 * kGiB), d, 4 * kGiB, minimum, granule);
+    require(roomy.bytes == 4 * kGiB && roomy.spare >= 4 * kGiB && roomy.off == ContextCacheOff::None, "a roomy ledger fits the whole cache");
+    require(decide_context_store(true, 4 * kGiB, roomy, true, no_nvme, minimum).store_on, "a fitted cache keeps the store on");
+    // ... unless that tier cannot hold two checkpoints (the Program would not open it).
+    const ContextStoreStart too_few = decide_context_store(true, 4 * kGiB, roomy, false, no_nvme, minimum);
+    require(!too_few.store_on && has(too_few.warning, "cannot hold two checkpoints") && has(too_few.warning, "--host-context-mib"),
+            "a Host tier too small for two checkpoints: " + too_few.warning);
+
+    // RAM: 300 MiB to spare, under the minimum; spare reports it, and the remedy is about RAM.
+    const ContextCacheFit ram = fit_context_cache(snapshot(floor + 300 * kMiB, floor + 300 * kMiB), d, 4 * kGiB, minimum, granule);
+    require(ram.bytes == 0 && ram.off == ContextCacheOff::Ram && ram.spare > 250 * kMiB && ram.spare <= 300 * kMiB,
+            "a RAM shortfall is named and its spare reported");
+    const ContextStoreStart off = decide_context_store(true, 4 * kGiB, ram, false, no_nvme, minimum);
+    require(!off.store_on && off.refusal.empty(), "a RAM shortfall starts with the store off, it does not refuse");
+    require(has(off.warning, "off for this run") && has(off.warning, "MiB short of its 512 MiB minimum") &&
+                has(off.warning, "free RAM") && has(off.warning, "--ram-headroom-mib") && has(off.warning, "--context-nvme-mib"),
+            "the RAM warning gives the RAM remedies: " + off.warning);
+
+    // Configured too small: a 256 MiB budget with RAM to spare; the remedy is the budget itself.
+    const ContextCacheFit small = fit_context_cache(snapshot(floor + 8 * kGiB, floor + 8 * kGiB), d, 256 * kMiB, minimum, granule);
+    require(small.bytes == 0 && small.off == ContextCacheOff::BelowMinimum, "a budget under the minimum is named as such");
+    const ContextStoreStart below = decide_context_store(true, 256 * kMiB, small, false, no_nvme, minimum);
+    require(!below.store_on && has(below.warning, "under the 512 MiB minimum") && has(below.warning, "Raise --host-context-mib") &&
+                !has(below.warning, "free RAM"),
+            "the too-small warning names the budget, not RAM: " + below.warning);
+
+    // Memory-lock limit: RAM to spare, but RLIMIT_MEMLOCK leaves under the minimum to pin.
+    HostMemorySnapshot locked = snapshot(floor + 8 * kGiB, floor + 8 * kGiB);
+    const HostMemoryLedger probe = plan_host_memory(locked, d);
+    locked.lock_limit            = probe.pinned_total + 200 * kMiB;
+    const ContextCacheFit lock = fit_context_cache(locked, d, 4 * kGiB, minimum, granule);
+    require(lock.bytes == 0 && lock.off == ContextCacheOff::LockLimit, "a memory-lock limit is named as such");
+    const ContextStoreStart limited = decide_context_store(true, 4 * kGiB, lock, false, no_nvme, minimum);
+    require(!limited.store_on && has(limited.warning, "RLIMIT_MEMLOCK") && has(limited.warning, "ulimit -l") &&
+                has(limited.warning, "--context-nvme-mib") && !has(limited.warning, "--ram-headroom-mib"),
+            "the lock-limit warning gives the lock remedies: " + limited.warning);
+
+    // A usable NVMe tier keeps the store on whatever the Host tier did.
+    NvmeTierStatus nvme{.configured = true, .usable = true};
+    require(decide_context_store(true, 4 * kGiB, ram, false, nvme, minimum).store_on, "a usable NVMe tier keeps the store on");
+    // An NVMe tier that cannot be used (too small for two checkpoints, or its file not created) with
+    // no Host cache: store off for this run, saying why, not a refusal and not a late failure.
+    nvme = {.configured = true, .usable = false, .issue = NvmeTierIssue::TooSmall, .detail = "600 MiB, a checkpoint takes 340 MiB"};
+    const ContextStoreStart nvme_off = decide_context_store(true, 0, ContextCacheFit{.off = ContextCacheOff::NotRequested}, false, nvme, minimum);
+    require(!nvme_off.store_on && nvme_off.refusal.empty() && has(nvme_off.warning, "its NVMe tier cannot be used: ") &&
+                has(nvme_off.warning, "cannot hold two checkpoints (600 MiB, a checkpoint takes 340 MiB)"),
+            "an unusable NVMe tier turns the store off with its reason: " + nvme_off.warning);
+
+    // No store configured: nothing to decide, whatever the cache.
+    const ContextStoreStart none = decide_context_store(false, 4 * kGiB, ram, false, no_nvme, minimum);
+    require(none.store_on && none.warning.empty() && none.refusal.empty(), "no store: nothing to say");
+    // No cache asked for at all (--host-context-mib 0, no NVMe tier) with a store: refused up front.
+    const ContextStoreStart refused = decide_context_store(true, 0, ContextCacheFit{.off = ContextCacheOff::NotRequested}, false, no_nvme, minimum);
+    require(!refused.store_on && has(refused.refusal, "--host-context-mib") && refused.warning.empty(),
+            "an explicit no-cache configuration with a store refuses");
+    // Every off-for-run cause has its own short reason for the startup line (one source for both).
+    for (const ContextStoreOff cause : {ContextStoreOff::Ram, ContextStoreOff::BelowMinimum, ContextStoreOff::HostTooSmall,
+                                        ContextStoreOff::LockLimit, ContextStoreOff::NvmeUnusable, ContextStoreOff::TierSetupFailed}) {
+        require(std::string(context_store_off_summary(cause)).size() > 10, "each cause has a summary");
+    }
+    require(std::string(context_store_off_summary(ContextStoreOff::Ram)).find("RAM") != std::string::npos &&
+                std::string(context_store_off_summary(ContextStoreOff::LockLimit)).find("memory-lock") != std::string::npos &&
+                std::string(context_store_off_summary(ContextStoreOff::NvmeUnusable)).find("NVMe") != std::string::npos &&
+                std::string(context_store_off_summary(ContextStoreOff::BelowMinimum)).find("RAM") == std::string::npos,
+            "the summaries name their own cause, not RAM for all");
+    require(off.cause == ContextStoreOff::Ram && below.cause == ContextStoreOff::BelowMinimum &&
+                limited.cause == ContextStoreOff::LockLimit && too_few.cause == ContextStoreOff::HostTooSmall &&
+                nvme_off.cause == ContextStoreOff::NvmeUnusable,
+            "each decision carries its cause");
+    // Each NVMe issue reaches the warning in its own words, with its figures.
+    const struct {
+        NvmeTierIssue issue;
+        const char* words;
+    } issues[] = {{NvmeTierIssue::FreeSpaceUnreadable, "free space could not be read"},
+                  {NvmeTierIssue::BelowMinimum, "under the NVMe tier's minimum"},
+                  {NvmeTierIssue::TooSmall, "cannot hold two checkpoints"},
+                  {NvmeTierIssue::FileFailed, "could not be created"}};
+    for (const auto& item : issues) {
+        const NvmeTierStatus st{.configured = true, .usable = false, .issue = item.issue, .detail = "DETAIL"};
+        const ContextStoreStart r = decide_context_store(true, 0, ContextCacheFit{.off = ContextCacheOff::NotRequested}, false, st, minimum);
+        require(!r.store_on && r.cause == ContextStoreOff::NvmeUnusable && has(r.warning, item.words) && has(r.warning, "(DETAIL)"),
+                std::string("the NVMe issue is named: ") + r.warning);
+        // Beside a Host cause, the NVMe issue is added to that cause's warning.
+        const ContextStoreStart both = decide_context_store(true, 4 * kGiB, ram, false, st, minimum);
+        require(both.cause == ContextStoreOff::Ram && has(both.warning, "NVMe tier cannot be used either") && has(both.warning, item.words),
+                "a Host cause keeps its own remedy and adds the NVMe issue");
+    }
+    // Only a usable NVMe tier charges its bounce buffer to the RAM ledger.
+    require(nvme_bounce_demand(NvmeTierStatus{.configured = true, .usable = true}, 128 * kMiB) == 128 * kMiB &&
+                nvme_bounce_demand(NvmeTierStatus{.configured = true, .usable = false, .issue = NvmeTierIssue::TooSmall}, 128 * kMiB) == 0 &&
+                nvme_bounce_demand(NvmeTierStatus{}, 128 * kMiB) == 0,
+            "an unusable or absent NVMe tier charges no bounce buffer");
+    {
+        // ... so the Host tier is fitted without it: 600 MiB to spare fits the minimum without the
+        // bounce buffer, and would not with it.
+        HostMemoryDemand with_bounce = d;
+        with_bounce.later_pinned += nvme_bounce_demand(NvmeTierStatus{.configured = true, .usable = true}, 128 * kMiB);
+        const HostMemorySnapshot tight = snapshot(floor + 600 * kMiB, floor + 600 * kMiB);
+        require(fit_context_cache(tight, d, 4 * kGiB, minimum, granule).bytes >= minimum &&
+                    fit_context_cache(tight, with_bounce, 4 * kGiB, minimum, granule).bytes == 0,
+                "a bounce buffer that is never allocated would have cost the Host tier");
+    }
+    // The cause comes from the final exact check when it refused the tier the spare rounded to.
+    require(context_cache_off_cause(4 * kGiB, minimum, granule, 8 * kGiB, 512 * kMiB, 512 * kMiB, true) == ContextCacheOff::LockLimit,
+            "a final check refused under the lock limit is a lock-limit cause, whatever the pre-check spare");
+    require(context_cache_off_cause(4 * kGiB, minimum, granule, 520 * kMiB, 520 * kMiB, 512 * kMiB, false) == ContextCacheOff::Ram,
+            "a final check refused for RAM is a RAM cause");
+    require(context_cache_off_cause(4 * kGiB, minimum, granule, 8 * kGiB, 300 * kMiB, 0, false) == ContextCacheOff::LockLimit &&
+                context_cache_off_cause(4 * kGiB, minimum, granule, 300 * kMiB, 300 * kMiB, 0, false) == ContextCacheOff::Ram &&
+                context_cache_off_cause(256 * kMiB, minimum, granule, 8 * kGiB, 8 * kGiB, 0, false) == ContextCacheOff::BelowMinimum &&
+                context_cache_off_cause(0, minimum, granule, 8 * kGiB, 8 * kGiB, 0, false) == ContextCacheOff::NotRequested,
+            "without a candidate the pre-check figures decide");
+    // A RAM cause whose spare reached the minimum (the final check refused it) names no zero shortfall.
+    const ContextStoreStart edge = decide_context_store(true, 4 * kGiB, ContextCacheFit{.spare = 520 * kMiB, .off = ContextCacheOff::Ram},
+                                                        false, no_nvme, minimum);
+    require(!has(edge.warning, " 0 MiB short") && has(edge.warning, "page-lock bookkeeping"),
+            "a refused candidate is not reported as 0 MiB short: " + edge.warning);
+    // The rule after the Program opened its tiers says the same thing.
+    require(has(context_store_off_after_setup("a pin failed"), "off for this run") &&
+                has(context_store_off_after_setup("a pin failed"), "a pin failed"),
+            "a cache that did not open after the ledger turns the store off with its cause");
+}
+
 int main() {
     try {
+        test_context_store_start();
         test_fit_boundary();
         test_reserve_applied_once();
         test_planned_terms();

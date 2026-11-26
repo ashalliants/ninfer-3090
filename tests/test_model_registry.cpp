@@ -782,6 +782,11 @@ void unload_description() {
     heap.resident_after  = 1ULL << 30;
     expect(describe_unload(save, heap) == "RAM 7.00 -> 1.00 GiB (6.00 GiB returned to the system)",
            "no store: only the RAM");
+    HeapRelease held = heap;
+    held.heap_in_use = 3ULL << 30;
+    expect(describe_unload(save, held) ==
+               "RAM 7.00 -> 1.00 GiB (6.00 GiB returned to the system); 3.00 GiB of heap still in use",
+           "heap the allocator still counts as allocated is named");
     save.attempted = true;
     save.written   = 3;
     save.unsaved   = 1;

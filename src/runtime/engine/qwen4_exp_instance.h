@@ -47,6 +47,10 @@ struct Qwen4ExpInstance {
 struct ConstructedQwen4Exp {
     std::unique_ptr<Qwen4ExpInstance> instance;
     LoadSummary load;
+    // False when a configured context store is off for this run: the RAM ledger could not spare the
+    // context cache it restores into (models::qwen4_exp::decide_context_store; load.warnings says why).
+    bool context_store_on = true;
+    models::qwen4_exp::ContextStoreOff context_store_off_cause = models::qwen4_exp::ContextStoreOff::None;
 };
 
 // True when the artifact's text component is Qwen4ExpForCausalLM. False for anything unreadable

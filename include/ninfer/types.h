@@ -2462,6 +2462,11 @@ struct LoadSummary {
     std::vector<std::string> warnings;
     // Choices made at load the operator may want to see (Inkling-2's prefill chunk, say), logged as information.
     std::vector<std::string> notes;
+    // The configured context store's directory when the store is off for this run (Qwen3.8-Flash-Next: the
+    // RAM ledger could not spare the context cache it restores into; `warnings` says why). Empty otherwise.
+    std::string context_store_off_for_run;
+    // Why, in a few words (the same cause the warning names), for the startup context store line.
+    std::string context_store_off_reason;
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;

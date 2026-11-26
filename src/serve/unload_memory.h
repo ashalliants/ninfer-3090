@@ -58,6 +58,10 @@ struct HeapRelease {
     std::uint64_t resident_before = 0; // bytes; 0 when not measurable on this platform
     std::uint64_t resident_after  = 0;
     bool trimmed                  = false; // the allocator was asked to give memory back
+    // What the allocator still counts as allocated after the trim (glibc mallinfo2: arena blocks
+    // in use plus mmapped blocks); 0 when not measurable. Memory still in use once a model is gone
+    // is held by something that outlived it, which no trim can return; the unload line says so.
+    std::uint64_t heap_in_use = 0;
 };
 [[nodiscard]] HeapRelease release_freed_heap() noexcept;
 

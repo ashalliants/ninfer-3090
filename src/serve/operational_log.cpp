@@ -554,6 +554,13 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
                   product::format_pretty_bytes(memory.host_context_capacity_bytes));
 
+    if (const ninfer::LoadSummary load = service.load_summary(); !load.context_store_off_for_run.empty()) {
+        logger_->info("context store | {} | off for this run: {} (see the warning above); saved sessions "
+                      "stay on disk",
+                      product::format_pretty_text(load.context_store_off_for_run),
+                      load.context_store_off_reason.empty() ? std::string("no context cache")
+                                                            : load.context_store_off_reason);
+    }
     if (engine.context_store.enabled()) {
         const ninfer::RuntimeStats stats = service.runtime_stats();
         logger_->info("context store | {} | {} sessions, {} held | restored {} sessions, {} in "

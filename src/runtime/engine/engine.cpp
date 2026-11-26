@@ -693,6 +693,15 @@ private:
     // resolved size replaces the requested one, as for the other models.
     void construct_qwen4_exp() {
         auto constructed    = runtime::construct_qwen4_exp(options, device);
+        // A RAM shortfall left no context cache for the store to restore into: the RAM ledger
+        // decided (before the weights loaded) to run without the store this time, and load.warnings
+        // says so. The store is off for this Engine's life; its directory is untouched.
+        if (!constructed.context_store_on) {
+            constructed.load.context_store_off_for_run = options.context_store.directory.string();
+            constructed.load.context_store_off_reason =
+                models::qwen4_exp::context_store_off_summary(constructed.context_store_off_cause);
+            options.context_store.directory.clear();
+        }
         qwen4               = std::move(constructed.instance);
         load                = std::move(constructed.load);
         load.cuda_sync_mode = device.sync_mode();
@@ -710,14 +719,19 @@ private:
             options.context_cost.preset_path);
         load.context_cost = std::move(context_cost.summary);
         auto generation   = std::make_unique<Qwen4ExpCore>(*qwen4, device, options, std::move(context_cost.model));
-        if (options.context_store.enabled()) {
-            if (!options.context_cache.enabled) {
-                throw std::invalid_argument(
-                    "the context store restores sessions into the context cache, which is off: give it a Host "
-                    "budget (--host-context-mib) or an NVMe tier (--context-nvme-mib)");
-            }
-            attach_context_store(*generation);
+        if (options.context_store.enabled() && !options.context_cache.enabled) {
+            // The RAM ledger saw a cache the Program then could not open (a tier that failed to pin,
+            // say; its context cache line says why): the same rule as a shortfall at the ledger, the
+            // store is off for this run, not a failed start after the weights loaded.
+            const std::string warning = models::qwen4_exp::context_store_off_after_setup(
+                "its tiers did not open; see the context cache line above");
+            load.warnings.push_back(warning);
+            load.context_store_off_for_run = options.context_store.directory.string();
+            load.context_store_off_reason =
+                models::qwen4_exp::context_store_off_summary(models::qwen4_exp::ContextStoreOff::TierSetupFailed);
+            options.context_store.directory.clear();
         }
+        if (options.context_store.enabled()) { attach_context_store(*generation); }
         core = std::move(generation);
         if (store) { restore_from_store(); }
         finalize_phase.complete();

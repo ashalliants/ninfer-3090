@@ -186,7 +186,32 @@ different from the Qwen3.5 models:
 - **Across restarts** (`--context-store DIR`): conversations are written to the context store when
   idle and at shutdown and restored at startup (or when a request for them arrives), exactly as for
   the other models; it needs the host tier or the disk tier. Images are tied to the model file, the
-  MTP setting and `--vision`; a session written under another configuration is not restored.
+  MTP setting and `--vision`; a session written under another configuration is not restored. The
+  RAM ledger settles this before any weight is read, using the same checkpoint layout the cache
+  opens its tiers with (a tier must hold two checkpoints), and it creates the disk tier's file there
+  and then. With no cache configured at all (`--host-context-mib 0` and no `--context-nvme-mib`) a
+  store is refused at once. When a cache was asked for but cannot be had this time, the model still
+  starts, with the store off for this run, and one warning names the cause and its remedy:
+
+  | Cause | Remedy the warning gives |
+  |---|---|
+  | the RAM ledger cannot spare the Host tier's 512 MiB minimum beside the experts | free RAM, a lower `--ram-headroom-mib`, or a disk tier (`--context-nvme-mib`) |
+  | `--host-context-mib` is set under the 512 MiB minimum, or the tier it gives cannot hold two checkpoints | raise `--host-context-mib` |
+  | the memory-lock limit (`RLIMIT_MEMLOCK`) cannot pin the minimum though RAM could | raise the lock limit (`ulimit -l`), or a disk tier |
+  | only a disk tier is configured and it cannot be used: its drive's free space cannot be read, it is under the tier minimum once capped at half the free space, it cannot hold two checkpoints, or its file cannot be created | fix the disk tier (`--context-nvme-mib`, `--context-nvme-dir`), or a Host budget |
+  | a disk tier beside a Host cause cannot be used either | its reason is added to that cause's line |
+
+  A disk tier that cannot be used is dropped before the ledger, so it never charges the RAM ledger
+  for its bounce buffer. A tier that still fails to open after the ledger (pinning it fails, say) is
+  handled the same way rather than failing the start. The saved sessions stay on disk for the next
+  start, output is unchanged (each prompt is prefilled in full), and the startup line repeats the
+  cause in a few words (here a RAM shortfall; a lock-limit one says "the memory-lock limit cannot
+  pin the context cache", and so on):
+
+  ```text
+  WARN  context store: off for this run: it restores sessions into the context cache, and the RAM ledger could spare only 300 MiB for that cache beside the experts, 212 MiB short of its 512 MiB minimum. ...
+  INFO  context store | /home/me/.cache/ninfer/context-store/router/... | off for this run: no RAM for the context cache it restores into (see the warning above); saved sessions stay on disk
+  ```
 - **Host RAM.** All 33 GiB of routed experts are pinned in host RAM at startup (with `--vision` also
   the 0.84 GiB tower, and the ledger counts up to 1.4 GiB of decoded media: about 2.2 GiB more in
   all). Before anything is pinned, a RAM ledger checks that the experts, every other planned allocation and a reserve for
@@ -1115,9 +1140,15 @@ fails does the same, so retries of a model that does not fit do not leave less R
 logs one line, such as (the figures here are only an illustration):
 
 ```text
-INFO  unloaded 'Qwen3.6-35B-A3B' | context store: 4 saved in 1.3 s | RAM 9.84 -> 1.02 GiB (8.82 GiB returned to the system)
-INFO  released failed load of 'Qwen3.8-Flash-Next-IQ3' | RAM 1.40 -> 1.02 GiB (0.38 GiB returned to the system)
+INFO  unloaded 'Qwen3.6-35B-A3B' | context store: 4 saved in 1.3 s | RAM 9.84 -> 1.02 GiB (8.82 GiB returned to the system); 0.61 GiB of heap still in use
+INFO  released failed load of 'Qwen3.8-Flash-Next-IQ3' | RAM 1.40 -> 1.02 GiB (0.38 GiB returned to the system); 0.61 GiB of heap still in use
 ```
+
+"Heap still in use" is what the allocator still counts as allocated once the model is gone
+(`mallinfo2`): memory something outside the model still holds, which no trim can return. Nothing
+from the unloaded model is freed later, so the next model's RAM check sees what the line shows; if
+the RAM it needs is tight, the kernel may page that held memory out to swap while the model pins
+its experts, which can make a retry find more RAM than the first attempt did.
 
 `scripts/router-unload-ram-check.sh` measures it on a GPU: it loads one model, builds a conversation,
 switches to a second, and checks the router's RAM after the switch and that the first model's

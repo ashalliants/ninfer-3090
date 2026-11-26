@@ -19,6 +19,7 @@
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen4_exp/program/nvme_tier.h"
 #include "models/registry.h"
 #include "runtime/engine/validate_options.h"
 
@@ -87,9 +88,16 @@ unsigned long process_id() noexcept {
 
 // The NVMe tier's file and size: in --context-nvme-dir (else beside the artifact), named for the
 // artifact and this process, at most half the volume's free space. Zero bytes: no NVMe tier.
-std::pair<std::filesystem::path, std::uint64_t> plan_nvme_tier(const EngineOptions& options) {
+struct PlannedNvmeTier {
+    std::filesystem::path path;
+    std::uint64_t bytes = 0;                                         // 0: no tier
+    models::qwen4_exp::NvmeTierIssue issue = models::qwen4_exp::NvmeTierIssue::None; // why a configured one is 0
+    std::string detail;
+};
+
+PlannedNvmeTier plan_nvme_tier(const EngineOptions& options) {
     const auto& next = options.flash_next;
-    if (!options.context_cache.enabled || next.context_nvme_bytes == 0) { return {{}, 0}; }
+    if (!options.context_cache.enabled || next.context_nvme_bytes == 0) { return {}; }
     const std::filesystem::path artifact = std::filesystem::absolute(options.artifact_path);
     const std::filesystem::path dir      = next.context_nvme_dir.empty() ? artifact.parent_path() : next.context_nvme_dir;
     std::error_code error;
@@ -102,7 +110,7 @@ std::pair<std::filesystem::path, std::uint64_t> plan_nvme_tier(const EngineOptio
         // Without the free space there is no cap to apply, and an uncapped scratch file could fill the volume.
         report("context cache: no NVMe tier: the free space on " + dir.string() + " could not be read (" + error.message() +
                "); checkpoints stay in RAM only");
-        return {{}, 0};
+        return {.issue = models::qwen4_exp::NvmeTierIssue::FreeSpaceUnreadable, .detail = dir.string() + ": " + error.message()};
     }
     if (space.available / kNvmeFreeSpaceDivisor < bytes) {
         bytes = space.available / kNvmeFreeSpaceDivisor;
@@ -113,9 +121,10 @@ std::pair<std::filesystem::path, std::uint64_t> plan_nvme_tier(const EngineOptio
         // Too small to open: the ledger would charge nothing for it, so none may be built.
         report("context cache: no NVMe tier: " + std::to_string(mib(bytes)) + " MiB is below the " +
                std::to_string(mib(kMinimumNvmeTierBytes)) + " MiB minimum; checkpoints stay in RAM only");
-        return {{}, 0};
+        return {.issue  = models::qwen4_exp::NvmeTierIssue::BelowMinimum,
+                .detail = std::to_string(mib(bytes)) + " MiB, minimum " + std::to_string(mib(kMinimumNvmeTierBytes)) + " MiB"};
     }
-    return {dir / (artifact.filename().string() + ".context-" + std::to_string(process_id()) + ".tier"), bytes};
+    return {.path = dir / (artifact.filename().string() + ".context-" + std::to_string(process_id()) + ".tier"), .bytes = bytes};
 }
 
 // What this release of the model serves: one request at a time by default, two lanes on request (text, or text and images with
@@ -555,9 +564,43 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     demand.load_staging = kLoadStagingBytes;
     // The context cache's NVMe tier (--context-nvme-mib): checkpoints in a scratch file, the Host tier
     // below as its RAM cache, moved through a pinned bounce buffer.
-    const auto [nvme_path, nvme_bytes] = plan_nvme_tier(options);
-    const bool nvme_tier               = nvme_bytes != 0; // plan_nvme_tier returns zero below the minimum
-    if (nvme_tier) { demand.later_pinned += kNvmeBounceBytes; }
+    // The NVMe tier is settled here, once: planned (size, free space), checked against the checkpoint
+    // layout the Program will size its tiers with (Program::setup_context_cache uses the same
+    // CheckpointGeometry), and its file created and handed to the Program. Everything after -- the
+    // bounce buffer in the RAM ledger, the Host tier's cap, the context store decision and the
+    // Program's options -- follows this one usability result.
+    const PlannedNvmeTier planned_nvme = plan_nvme_tier(options);
+    const auto geometry                = models::qwen4_exp::Program::plan_checkpoint(
+        program_options, config, plan.resources().public_token_count, plan.expert_record_strides());
+    models::qwen4_exp::NvmeTierStatus nvme_status;
+    nvme_status.configured = options.context_cache.enabled && next.context_nvme_bytes != 0;
+    if (nvme_status.configured && planned_nvme.bytes == 0) {
+        nvme_status.issue  = planned_nvme.issue; // plan_nvme_tier reported it
+        nvme_status.detail = planned_nvme.detail;
+    } else if (planned_nvme.bytes != 0) {
+        if (!geometry.holds_two_checkpoints(planned_nvme.bytes)) {
+            nvme_status.issue  = models::qwen4_exp::NvmeTierIssue::TooSmall;
+            nvme_status.detail = std::to_string(mib(planned_nvme.bytes)) + " MiB, a checkpoint takes " +
+                                 std::to_string(mib(static_cast<std::uint64_t>(geometry.image_slabs) * geometry.record)) + " MiB";
+        } else {
+            try {
+                program_options.context_nvme_file = models::qwen4_exp::open_scratch_tier_file(
+                    planned_nvme.path, static_cast<std::uint64_t>(geometry.slabs(planned_nvme.bytes)) * geometry.record);
+                nvme_status.usable = true;
+            } catch (const std::exception& error) {
+                nvme_status.issue  = models::qwen4_exp::NvmeTierIssue::FileFailed;
+                nvme_status.detail = error.what();
+            }
+        }
+        if (!nvme_status.usable) {
+            report("context cache: no NVMe tier: " + models::qwen4_exp::describe_nvme_issue(nvme_status) +
+                   "; checkpoints stay in RAM only");
+        }
+    }
+    const bool nvme_usable              = nvme_status.usable;
+    const std::filesystem::path nvme_path = nvme_usable ? planned_nvme.path : std::filesystem::path{};
+    const std::uint64_t nvme_bytes      = nvme_usable ? planned_nvme.bytes : 0;
+    demand.later_pinned += models::qwen4_exp::nvme_bounce_demand(nvme_status, kNvmeBounceBytes);
     // The context cache's Host tier (prefix reuse) is pinned beside the experts: it gets what the
     // ledger can spare above the reserve, up to the requested size, and is off below a minimum.
     const auto snapshot = host_memory_snapshot();
@@ -617,10 +660,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     std::uint64_t requested_cache =
         options.context_cache.enabled ? options.context_cache.host_capacity_bytes.value_or(kDefaultHostContextBytes) : 0;
     // The tier's RAM frames address only the file's slabs: RAM beyond the NVMe size would be pinned for nothing.
-    if (nvme_tier) { requested_cache = std::min(requested_cache, nvme_bytes); }
+    if (nvme_usable) { requested_cache = std::min(requested_cache, nvme_bytes); }
     const auto cache_fit = models::qwen4_exp::fit_context_cache(snapshot, demand, requested_cache, kMinimumHostContextBytes,
                                                                 kHostContextGranule);
     demand.context_cache = cache_fit.bytes;
+    // The context store needs the cache it restores into: decided here, before any weight is read,
+    // so a refusal costs no load and a shortfall starts the model with the store off for this run.
+    const auto store_start = models::qwen4_exp::decide_context_store(
+        options.context_store.enabled(), requested_cache, cache_fit, geometry.holds_two_checkpoints(cache_fit.bytes),
+        nvme_status, kMinimumHostContextBytes);
+    if (!store_start.refusal.empty()) { throw std::invalid_argument(store_start.refusal); }
     // --ngram-ram-mib: the n-gram volume's RAM-held blocks take what is left after everything else
     // (the context cache included) and a margin, never more than the volume.
     if (next.ngram_ram_bytes != 0) {
@@ -662,11 +711,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         if (!warning.empty()) { report("warning: " + warning); }
     }
 #endif
-    if (requested_cache == 0 && nvme_bytes != 0) {
+    if (requested_cache == 0 && nvme_usable) {
         report("context cache: on NVMe only (no RAM cache: --host-context-mib 0)");
     } else if (requested_cache == 0) {
         report("context cache: off (prefix reuse disabled); every request prefills its whole prompt");
-    } else if (cache_fit.bytes == 0 && nvme_bytes != 0) {
+    } else if (cache_fit.bytes == 0 && nvme_usable) {
         report("context cache: on NVMe only: the RAM ledger has no " + std::to_string(mib(kMinimumHostContextBytes)) +
                " MiB to spare beside the experts for its RAM cache (asked " + std::to_string(mib(requested_cache)) + " MiB)");
     } else if (cache_fit.bytes == 0) {
@@ -752,7 +801,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.weight_formats       = {"ggml_blocks_v1", "ggml_expert_record_v1", "bf16", "fp32"};
-    return {std::move(instance), std::move(summary)};
+    // One WARN line once the engine is ready (the startup log prints load.warnings).
+    if (!store_start.store_on) { summary.warnings.push_back(store_start.warning); }
+    return {.instance = std::move(instance), .load = std::move(summary), .context_store_on = store_start.store_on,
+            .context_store_off_cause = store_start.cause};
 }
 
 } // namespace ninfer::runtime
