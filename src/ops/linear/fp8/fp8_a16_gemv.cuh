@@ -11,6 +11,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
+#include "ops/linear/fp8/fp8_a16_codec.cuh"
 #include "ops/linear/fp8/fp8_operands.h"
 
 #include <cuda_bf16.h>
@@ -73,9 +74,13 @@ __device__ __forceinline__ Fp8CodePack<Values> load_fp8_codes(const std::uint8_t
 }
 
 __device__ __forceinline__ float2 decode_fp8_e4m3x2(std::uint16_t storage) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    return fp8_e4m3x2_to_float2_exact(storage); // no FP8 conversion instruction (fp8_a16_codec.cuh)
+#else
     __nv_fp8x2_e4m3 value;
     value.__x = storage;
     return static_cast<float2>(value);
+#endif
 }
 
 template <int Values, int Rows, int AccumulatorChains>
