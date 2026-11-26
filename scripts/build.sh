@@ -51,6 +51,11 @@ done
 # to be kept consistent by hand.
 if (( package )); then benchmarks=1; fi
 
+# The build runs from the repo root (cmake -S . below), so a relative NINFER_BUILD_DIR or --build-dir
+# means a tree under the repo root. Resolve it once here, so --clean removes that same tree and the
+# ccache note checks it, wherever the script was started from.
+if [[ -n "$build_dir" && "$build_dir" != /* ]]; then build_dir="$repo_root/$build_dir"; fi
+
 case "$arch" in 80|86|89) ;; *) printf 'CUDA arch must be 80, 86 or 89, got %s\n' "$arch" >&2; exit 2 ;; esac
 
 # --- locate the toolchain ---------------------------------------------------------------------
