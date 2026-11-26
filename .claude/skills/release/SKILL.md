@@ -141,7 +141,17 @@ Every release ships three archives: Windows (sm_86), Linux RTX 3090 (sm_86) and 
 (sm_70). A build holds one architecture, so the V100 is a third build. See "The Tesla V100 archive" in
 the doc.
 
-The binaries do not embed `VERSION`; build from the release branch commit. The GPU is usually
+The binaries do not embed `VERSION`; build from the release branch commit.
+
+**No `-lineinfo` in release builds.** The library targets build without it by default
+(`NINFER_CUDA_LINEINFO`, OFF): it changes no machine code, but it made every kernel image about 4x larger,
+the binaries about 75% bigger, and the CUDA driver keeps each loaded image in host RAM for the life of the
+server. Never pass `-DNINFER_CUDA_LINEINFO=ON` to a release tree; both packagers refuse a tree configured with
+it on (any value CMake treats as true). **The V100 tree also builds without PTX** (`NINFER_CUDA_PTX`, `AUTO` by
+default, which is off for `CMAKE_CUDA_ARCHITECTURES=70` even in a tree first configured for 86; a V100 never runs
+the PTX), and `package-release.sh` refuses a V100 tree that embeds it. Leave `NINFER_CUDA_PTX` at `AUTO`. The sm_86 trees keep PTX so they still run on newer cards. V100 `ninfer-serve`: 1,473 MB with
+both, 448 MB without. The first build of each tree after the switch recompiles
+every CUDA object (the flags changed, so ccache misses): allow about twice the usual build time once. The GPU is usually
 loaded by the user's server, but compiling needs none (the V100 build needs no V100 either).
 
 **Windows** (PowerShell): import the VS 2022 BuildTools environment (AGENTS.md), use the existing
@@ -206,10 +216,11 @@ touches the instance in its own state file).
   scripts/package-release.sh`. It refuses a tree with no `sm_70` code. It writes
   `ninfer-v100-linux-x64-<VERSION>.tar.gz` and `SHA256SUMS-vX.Y.Z-linux-v100.txt`; copy both back with the rest.
 - Result: three archives and `SHA256SUMS-vX.Y.Z-{windows,linux,linux-v100}.txt`. Each asset must be under
-  2 GiB (GitHub's limit); report the sizes. The V100 tarball is the one at risk (2,125,147,854 bytes in
-  v0.19.0, 22 MB under; 2,246,329,497 with three separate binaries in v0.20.0, which shipped without `ninfer_bench`;
-  the link-instead-of-copy `ninfer` brings it back). If it crosses again, tell the user before publishing; the next
-  lever is a build without PTX.
+  2 GiB (GitHub's limit); report the sizes, and compare them with the previous release's. The V100 tarball used
+  to be the one at risk (2,125,147,854 bytes in v0.19.0, 22 MB under; 2,246,329,497 with three separate binaries
+  in v0.20.0). Without `-lineinfo` and PTX its binaries are about 70% smaller, so it should now sit far under the
+  limit. Archives about as large as the previous release's mean the tree was built with `-lineinfo` (or, for the
+  V100, with PTX): check `NINFER_CUDA_LINEINFO` and `NINFER_CUDA_PTX_EFFECTIVE` in its `CMakeCache.txt` before publishing.
 
 ## 6. Verify before publishing
 

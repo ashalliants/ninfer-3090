@@ -1317,6 +1317,52 @@ if PATH="$stubbin:$PATH" FAKE_ARCH=sm_70 NINFER_PACKAGE_TARGET=rtx3090 NINFER_BU
   pkg_fail 'an sm_70 tree was packaged as the RTX 3090 archive'
 fi
 grep -q 'holds no sm_86 code' "$tmp/pkg.err" || pkg_fail "the wrong-card refusal did not say why: $(cat -- "$tmp/pkg.err")"
+
+# Release trees carry no -lineinfo, and the V100 tree no PTX: package-release.sh reads both from the tree's
+# CMakeCache.txt the way CMake's if(<variable>) does. First its reader, against what CMake itself makes of each
+# value (tests/release/cmake-truth-values.txt, generated with `cmake -P`).
+(
+  build_root="$tmp/cachetree"; mkdir -p -- "$build_root"
+  eval "$(sed -n '/^cache_option_on() {/,/^}/p' "$root/package-release.sh")"
+  declare -F cache_option_on >/dev/null || pkg_fail 'cache_option_on is missing from package-release.sh'
+  while IFS=$'\t' read -r want value; do
+    [[ "$want" == '#'* ]] && continue
+    printf 'NINFER_CUDA_LINEINFO:BOOL=%s\n' "$value" > "$build_root/CMakeCache.txt"
+    if cache_option_on NINFER_CUDA_LINEINFO; then got=on; else got=off; fi
+    [[ "$got" == "$want" ]] || pkg_fail "the cache reader says '$value' is $got; CMake says $want"
+  done < "$repo_root/tests/release/cmake-truth-values.txt"
+  printf 'FOO:BOOL=OFF\nNINFER_CUDA_LINEINFO:STRING=TRUE\nBAR:BOOL=ON\n' > "$build_root/CMakeCache.txt"
+  cache_option_on NINFER_CUDA_LINEINFO || pkg_fail 'the cache reader missed a STRING entry among others'
+  printf 'NINFER_CUDA_LINEINFO_X:BOOL=ON\n' > "$build_root/CMakeCache.txt"
+  ! cache_option_on NINFER_CUDA_LINEINFO || pkg_fail 'the cache reader matched a longer name with the same prefix'
+  printf 'ninfer_cuda_lineinfo:BOOL=ON\n' > "$build_root/CMakeCache.txt"
+  ! cache_option_on NINFER_CUDA_LINEINFO || pkg_fail 'the cache reader matched the name in another case'
+  rm -f -- "$build_root/CMakeCache.txt"
+  ! cache_option_on NINFER_CUDA_LINEINFO || pkg_fail 'the cache reader counted a tree with no cache as on'
+  rm -rf -- "$build_root"
+) || exit 1
+# Then the refusals themselves, on fake trees: nothing may reach dist/.
+pkg_cache() {  # pkg_cache <target> <cache lines...>: package a fake multicall tree with that CMakeCache.txt
+  local target="$1" arch=sm_86; shift; [[ "$target" == v100 ]] && arch=sm_70
+  rm -rf -- "$pkg/dist" "$tmp/pkgtree-cache"; fake_tree "$tmp/pkgtree-cache" multicall
+  printf '%s\n' "$@" > "$tmp/pkgtree-cache/CMakeCache.txt"
+  PATH="$stubbin:$PATH" FAKE_ARCH="$arch" NINFER_PACKAGE_TARGET="$target" NINFER_BUILD_ROOT="$tmp/pkgtree-cache" \
+    "$pkg/scripts/package-release.sh" >/dev/null 2>"$tmp/pkg.err"
+}
+for target in rtx3090 v100; do
+  ! pkg_cache "$target" 'NINFER_CUDA_LINEINFO:BOOL=TRUE' || pkg_fail "$target: a -lineinfo tree (=TRUE) was packaged"
+  grep -q 'NINFER_CUDA_LINEINFO on' "$tmp/pkg.err" || pkg_fail "$target: the -lineinfo refusal did not say why: $(cat -- "$tmp/pkg.err")"
+  [[ ! -e "$pkg/dist" ]] || pkg_fail "$target: the -lineinfo refusal wrote to dist/ first"
+done
+! pkg_cache v100 'NINFER_CUDA_LINEINFO:BOOL=OFF' 'NINFER_CUDA_PTX:STRING=ON' 'NINFER_CUDA_PTX_EFFECTIVE:INTERNAL=ON' ||
+  pkg_fail 'v100: a tree with PTX was packaged'
+grep -q 'NINFER_CUDA_PTX on' "$tmp/pkg.err" || pkg_fail "v100: the PTX refusal did not say why: $(cat -- "$tmp/pkg.err")"
+[[ ! -e "$pkg/dist" ]] || pkg_fail 'v100: the PTX refusal wrote to dist/ first'
+pkg_cache rtx3090 'NINFER_CUDA_LINEINFO:BOOL=OFF' 'NINFER_CUDA_PTX:STRING=AUTO' 'NINFER_CUDA_PTX_EFFECTIVE:INTERNAL=ON' ||
+  pkg_fail "rtx3090: a tree with PTX (which it keeps) was refused: $(cat -- "$tmp/pkg.err")"
+pkg_cache v100 'NINFER_CUDA_LINEINFO:BOOL=OFF' 'NINFER_CUDA_PTX:STRING=AUTO' 'NINFER_CUDA_PTX_EFFECTIVE:INTERNAL=OFF' ||
+  pkg_fail "v100: a machine-code-only tree was refused: $(cat -- "$tmp/pkg.err")"
+rm -rf -- "$tmp/pkgtree-cache"
 rm -rf -- "$pkg/dist" "$tmp/unpacked" "$tmp/pkgtree-multi" "$tmp/pkgtree-legacy"
 
 # v100_build.sh turns the benchmarks on when ninfer_bench is asked for (the release builds it) and leaves the

@@ -51,6 +51,35 @@ option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 # build. Nothing in src/ needs RDC, so the default is whole-program compilation. Turn it back on
 # with -DNINFER_CUDA_RDC=ON; see "CUDA compilation boundaries" in docs/maintainer/build-system.md.
 option(NINFER_CUDA_RDC "Build ninfer_core and ninfer_ops with relocatable device code" OFF)
+# -lineinfo maps each kernel's SASS back to source lines for Nsight Compute's source view and
+# compute-sanitizer reports. It does not change the generated code, but it makes every kernel image
+# about 4x larger, and the CUDA driver keeps a loaded image in host RAM for the life of the process:
+# a router that has served the 35B once holds about 0.9 GiB of it with no model loaded. Off by
+# default; turn it on for profiling builds. The microbenchmarks always keep it.
+option(NINFER_CUDA_LINEINFO "Build ninfer_core and ninfer_ops with -lineinfo (for Nsight Compute source view)" OFF)
+# PTX beside the machine code lets the driver JIT-compile kernels for a newer card than the build
+# targets. A V100 build (70) only ever runs on a V100, which uses the sm_70 machine code, so there
+# the PTX is dead weight (about three quarters of each kernel image without -lineinfo) and the
+# library targets build machine code only. Other architectures keep it. AUTO is resolved on every
+# configure, so a tree reconfigured from 86 to 70 drops the PTX; ON or OFF overrides it.
+set(NINFER_CUDA_PTX AUTO CACHE STRING
+    "Embed PTX beside the machine code in ninfer_core and ninfer_ops: AUTO (off for 70, on otherwise), ON or OFF")
+set_property(CACHE NINFER_CUDA_PTX PROPERTY STRINGS AUTO ON OFF)
+if(NINFER_CUDA_PTX STREQUAL "AUTO")
+  if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+    set(ninfer_cuda_ptx_effective OFF)
+  else()
+    set(ninfer_cuda_ptx_effective ON)
+  endif()
+elseif(NINFER_CUDA_PTX)
+  set(ninfer_cuda_ptx_effective ON)
+else()
+  set(ninfer_cuda_ptx_effective OFF)
+endif()
+# Recorded in the cache for scripts/package-release.sh, which refuses a V100 tree that embeds PTX.
+# Rewritten on every configure: INTERNAL already implies FORCE; it is spelled out so a reused tree
+# (86 then 70, or ON then OFF) visibly cannot keep the value of an earlier configure.
+set(NINFER_CUDA_PTX_EFFECTIVE ${ninfer_cuda_ptx_effective} CACHE INTERNAL "NINFER_CUDA_PTX as resolved for this configure" FORCE)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

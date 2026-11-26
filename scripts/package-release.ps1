@@ -38,6 +38,15 @@ $Products = @(
     @{ Source = 'bench\ninfer_bench.exe'; Destination = 'ninfer_bench.exe' }
 )
 
+# Release binaries carry no -lineinfo: it makes every kernel image about 4x larger, and the CUDA
+# driver keeps each image it loads in host RAM (NINFER_CUDA_LINEINFO in CMakeLists.txt). A profiling
+# tree configured with it on is refused before anything is written.
+# Test-CacheOptionOn is in lib/package-release-cache.ps1, where tests\release can drive it.
+. (Join-Path $PSScriptRoot 'lib/package-release-cache.ps1')
+if (Test-CacheOptionOn $BuildRoot 'NINFER_CUDA_LINEINFO') {
+    throw "$BuildRoot was configured with NINFER_CUDA_LINEINFO on (a profiling build): reconfigure it with -DNINFER_CUDA_LINEINFO=OFF and rebuild before packaging"
+}
+
 New-Item -ItemType Directory -Force -Path $DistRoot | Out-Null
 $resolvedDist = (Resolve-Path -LiteralPath $DistRoot).Path
 $resolvedProductParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $ProductRoot))

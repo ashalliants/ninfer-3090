@@ -204,8 +204,54 @@ numbers carry the calling-convention ABI and no static shared memory yet.
 `ninfer_nvfp4_non_rdc` disables separable compilation and device-symbol resolution. It contains
 the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend on
 `setmaxnreg` register transfer. Their owning family manifests register these sources into the
-non-RDC target; host launchers connect them to the normal Ops. All three CUDA archive targets
-retain `-lineinfo`.
+non-RDC target; host launchers connect them to the normal Ops. All three CUDA archive targets take
+`-lineinfo` only with `-DNINFER_CUDA_LINEINFO=ON`.
+
+### Line info (`NINFER_CUDA_LINEINFO`)
+
+`-lineinfo` adds source-line tables and the PTX text to every kernel image, so Nsight Compute can
+show source and compute-sanitizer can name lines. It does not change the generated code: compiled
+both ways, the largest object (`q8_attn_input_gemm_splitk.cu`, 308 kernels) has identical SASS and
+identical register, stack and shared-memory use. It does change size. Debug sections are 73% of the
+sm_70 cubins (1,625 of 2,227 MiB), and the CUDA driver keeps a loaded image in host RAM until the
+process exits, debug sections included: loading that one object costs about 300 MiB of RSS with
+`-lineinfo` and 66 MiB without. With lazy module loading, an object is loaded the first time any of
+its kernels runs, so a long-running router pays this once per object it has used: after one
+Qwen3.6-35B-A3B request and an unload, about 0.9 GiB of heap was the driver's copies of these images.
+
+Measured on the V100 (router, one Qwen3.6-35B-A3B request then an unload, three cycles each):
+
+| `ninfer-serve` | binary | RSS empty | RSS loaded | RSS after unload | heap still in use |
+|---|---|---|---|---|---|
+| with `-lineinfo` | 1,473 MB | 0.59 GiB | 10.20 GiB | 1.98 GiB | 1.49 GiB |
+| without | 841 MB | 0.43 GiB | 9.07 GiB | 0.86 GiB | 0.53 GiB |
+
+Neither grows from one cycle to the next; the difference is what each image costs once loaded.
+
+### PTX (`NINFER_CUDA_PTX`)
+
+`CMAKE_CUDA_ARCHITECTURES=70` alone builds each kernel as sm_70 machine code plus compute_70 PTX. The
+PTX only matters on a card newer than the build targets, where the driver JIT-compiles it; a V100
+build runs only on a V100, which uses the machine code. So for 70 the library targets build machine
+code only. `NINFER_CUDA_PTX` is `AUTO` (the default), `ON` or `OFF`. `AUTO` is resolved on every
+configure, off for 70 and on for every other architecture (so sm_86 builds still run on newer
+cards), so a tree reconfigured from 86 to 70 drops the PTX rather than keeping the cached choice of
+its first configure. `ON` or `OFF` overrides it. The configure records the result as the internal
+cache entry `NINFER_CUDA_PTX_EFFECTIVE`. `CMAKE_CUDA_ARCHITECTURES` stays `70`, because the source
+lists and tests key on it; `ninfer_cuda_ptx()` in `cmake/NinferTargets.cmake` sets the targets'
+`CUDA_ARCHITECTURES` to `70-real` instead. The driver keeps only the machine code once loaded, so
+dropping PTX saves disk and download, not RAM: the largest object's image went from 33 MiB to 8 MiB
+with identical SASS. The V100 `ninfer-serve` is 1,473 MB with `-lineinfo` and PTX, 841 MB without
+`-lineinfo`, and 448 MB without either; `package-release.sh` refuses a V100 tree whose
+`NINFER_CUDA_PTX_EFFECTIVE` is on. Both packagers read these cache entries the way CMake's
+`if(<variable>)` does; `tests/release/cmake-truth-values.txt` holds what `cmake -P` makes of each test
+value, and `scripts/check-linux-scripts.sh` and `tests/release/test-package-release-cache.ps1` check
+the two readers against it.
+
+The library targets therefore build without it by default. Pass `-DNINFER_CUDA_LINEINFO=ON` for a
+profiling build (Nsight Compute source view, compute-sanitizer line numbers). The microbenchmarks
+(`bench/cmake/NinferBenchmarks.cmake`) keep `-lineinfo` for their own sources either way. Nsight
+Systems traces need only kernel names and work on the default build.
 
 Source-list maintenance must preserve language, architecture, RDC mode, device-link ownership
 and numerical compiler options. Splitting a manifest does not reduce kernel instantiation work

@@ -46,6 +46,35 @@ archive_name="$product_name.tar.gz"
 archive_path="$dist_root/$archive_name"
 checksum_path="$dist_root/SHA256SUMS-v$release_version-$checksum_suffix.txt"
 
+# cache_option_on NAME: whether the build tree's CMakeCache.txt sets NAME to a value that the
+# CMakeLists' `if(NAME)` treats as true. For a variable that is any value but CMake's false
+# constants: empty, 0, OFF, NO, FALSE, N or IGNORE in any case, or NOTFOUND or *-NOTFOUND in
+# uppercase only (checked with `cmake -P`). So -DNAME=TRUE, =1 or =0.0 is caught as well as =ON.
+# A tree with no cache, or no such entry, counts as off.
+cache_option_on() {
+  local value
+  [[ -f "$build_root/CMakeCache.txt" ]] || return 1
+  grep -q "^$1:[A-Za-z]*=" "$build_root/CMakeCache.txt" || return 1
+  value="$(sed -n "/^$1:[A-Za-z]*=/{s/^[^=]*=//p;q}" "$build_root/CMakeCache.txt")"
+  case "$value" in NOTFOUND | *-NOTFOUND) return 1 ;; esac
+  case "${value^^}" in '' | 0 | OFF | NO | FALSE | N | IGNORE) return 1 ;; esac
+  return 0
+}
+
+# Release binaries carry no -lineinfo: it makes every kernel image about 4x larger, and the CUDA
+# driver keeps each image it loads in host RAM (NINFER_CUDA_LINEINFO in CMakeLists.txt). A profiling
+# tree configured with it on is refused before anything is written.
+if cache_option_on NINFER_CUDA_LINEINFO; then
+  printf '%s was configured with NINFER_CUDA_LINEINFO on (a profiling build): reconfigure it with -DNINFER_CUDA_LINEINFO=OFF and rebuild before packaging\n' "$build_root" >&2
+  exit 1
+fi
+# The V100 archive carries machine code only: a V100 never runs the PTX. NINFER_CUDA_PTX is AUTO, ON
+# or OFF; the configure records what it resolved to as NINFER_CUDA_PTX_EFFECTIVE.
+if [[ "$target" == v100 ]] && cache_option_on NINFER_CUDA_PTX_EFFECTIVE; then
+  printf '%s was configured with NINFER_CUDA_PTX on: the V100 archive ships machine code only; reconfigure it with -DNINFER_CUDA_PTX=OFF and rebuild before packaging\n' "$build_root" >&2
+  exit 1
+fi
+
 mkdir -p -- "$dist_root"
 case "$product_root" in "$dist_root/$product_name") ;; *) exit 1 ;; esac
 rm -rf -- "$product_root"
