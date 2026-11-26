@@ -181,7 +181,7 @@ at 315 W, master `178d3b5e`:
 | Code, six prompts, 1,024 tokens each | **194.6 tok/s** | 140 (open-jet megakernel, Q4_K_M) |
 | Chat, syv-ai's eight prompts | **133.2 tok/s** | 131.2 (syv-ai HyperQwen, greedy) |
 | No speculation (`ninfer_bench` tg128, INT8 KV) | **47.7 tok/s** | 42.9 (open-jet) |
-| 98K-token context | 93.9 tok/s | **95.9** (open-jet) |
+| 98K-token context | 94.0 tok/s | **95.9** (open-jet) |
 | Eight requests at once (MTP3, INT8 KV) | **421.4 tok/s** | 407.3 (syv-ai HyperQwen) |
 | Prefill, 1.2K-token prompt | **2,367 tok/s** | 1,940 at 1K (syv-ai HyperQwen) |
 

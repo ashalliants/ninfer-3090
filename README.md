@@ -22,7 +22,7 @@ different machine and prompt set, so read the ratio as indicative. The measureme
 **On one RTX 3090, ahead of every other engine's published Qwen3.8-27B figure but one:**
 194.6 tok/s on code against open-jet's 140 (1.39x), 133.2 on chat against syv-ai HyperQwen's 131.2,
 47.7 without speculation against 42.9, 421 tok/s at eight requests against 407, and 1.2x the prefill
-speed. The loss: at 98K tokens of context we decode 93.9 tok/s against open-jet's 95.9. Their figures
+speed. The loss: at 98K tokens of context we decode 94.0 tok/s against open-jet's 95.9. Their figures
 are their own, from other machines; sources and conditions:
 [RTX 3090 comparison](docs/performance.md#qwen38-27b-against-the-best-published-rtx-3090-figures-2026-11-26).
 
@@ -90,7 +90,7 @@ Decode is one stream unless the column says otherwise.
 
 | Model | Card | Max context | Prefill | Decode, one stream | Decode, all lanes |
 |---|---|---:|---:|---:|---:|
-| **Qwen3.8-27B** (dense) | RTX 3090 | **262,144** | **3,222 tok/s** at 4K | **194.6 tok/s** on code, 133 on chat, 93.9 at 98K context (DFlash2 + n-gram copies, 315 W); 140 on chat in an earlier session | **477 tok/s** at C8 (MTP3; 421 at 315 W) |
+| **Qwen3.8-27B** (dense) | RTX 3090 | **262,144** | **3,222 tok/s** at 4K | **194.6 tok/s** on code, 133 on chat, 94.0 at 98K context (DFlash2 + n-gram copies, 315 W); 140 on chat in an earlier session | **477 tok/s** at C8 (MTP3; 421 at 315 W) |
 | Qwen3.6-35B-A3B (MoE) | RTX 3090 | 262,144, shared by 3 lanes | 8,848 tok/s at 4K | 313 tok/s (MTP3 + draft head) | 453 tok/s at C6 (MTP3) |
 | Ternary Bonsai 2 27B | RTX 3090 | **262,144** (with DFlash2, 9.6 GiB free) | 2.8-2.9K tok/s | 88-90 plain; **238** mean over 12 chats, 372 maths (DFlash2, 7 drafts, Windows; 235 and 364 under WSL); 74 after a 245K-token document | **573 tok/s** at C8 (MTP3; 572.5 under WSL) |
 | Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | ~115 tok/s at C2 (MTP; 103-125, Linux) |
@@ -880,7 +880,7 @@ Method, the KV-format comparison and the tests run:
 launcher's settings, NInfer decodes 194.6 tok/s on code (open-jet reports 140), 133.2 on syv-ai's
 eight chat prompts (HyperQwen reports 131.2 greedy), 47.7 without speculation (open-jet 42.9,
 llama.cpp 41.5) and 421 tok/s at eight requests (HyperQwen 407), and prefills 2,367 tok/s at 1.2K
-tokens (HyperQwen 1,940 at 1K). At 98K tokens of context it decodes 93.9 tok/s against open-jet's
+tokens (HyperQwen 1,940 at 1K). At 98K tokens of context it decodes 94.0 tok/s against open-jet's
 95.9, the one workload where another engine reports more. The other figures are their authors' own;
 chart, method and sources: [RTX 3090 comparison](docs/performance.md#qwen38-27b-against-the-best-published-rtx-3090-figures-2026-11-26).
 
