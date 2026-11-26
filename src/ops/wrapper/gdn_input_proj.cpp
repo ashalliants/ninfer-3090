@@ -327,7 +327,7 @@ LinearPolicy without_integer(LinearPolicy policy) {
 bool fp_cublas_projection(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                           LinearPolicy requested, WorkspaceArena* workspace, cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
-    if (!allows_cublas_prefill(requested) || cols < detail::cublas_prefill_fp_min_tokens(requested, weight.qtype) ||
+    if (!allows_cublas_prefill(requested) || cols < cublas_prefill_min_tokens(requested) ||
         workspace == nullptr || !detail::cublas_prefill_admits_fp()) {
         return false;
     }
@@ -346,7 +346,7 @@ bool fp_cublas_projection(const Tensor& x, const Weight& weight, Tensor& qkv, Te
 // Whether a single-parent NVFP4 / FP8 snapshot of `columns` columns projects on the cuBLAS route
 // (composed: projection into scratch, then the conv), as its workspace capacity reserves for.
 bool fp_snapshot_takes_cublas(const Weight& weight, LinearPolicy policy, std::int32_t columns) {
-    return allows_cublas_prefill(policy) && columns >= detail::cublas_prefill_fp_min_tokens(policy, weight.qtype) &&
+    return allows_cublas_prefill(policy) && columns >= cublas_prefill_min_tokens(policy) &&
            detail::cublas_prefill_admits_fp() &&
            detail::w4_cublas_prefill_supported(weight, columns);
 }
@@ -1013,16 +1013,16 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
 
 namespace {
 // An NVFP4 / FP8 projection's own scratch, or the FP16 cuBLAS route's where it admits the interval.
-std::size_t fp_projection_with_cublas_bytes(std::size_t own, QType qtype, std::int32_t parent_rows,
+std::size_t fp_projection_with_cublas_bytes(std::size_t own, std::int32_t parent_rows,
                                             std::int32_t input_rows, LinearPolicy policy,
                                             std::int32_t min_tokens, std::int32_t max_tokens) {
     if (!allows_cublas_prefill(policy) || !detail::cublas_prefill_admits_fp() ||
-        max_tokens < detail::cublas_prefill_fp_min_tokens(policy, qtype)) {
+        max_tokens < cublas_prefill_min_tokens(policy)) {
         return own;
     }
     return std::max(own, detail::w4_cublas_projection_workspace_capacity_bytes(
                              parent_rows, input_rows,
-                             std::max(min_tokens, detail::cublas_prefill_fp_min_tokens(policy, qtype)), max_tokens));
+                             std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
 }
 
 std::size_t gdn_projection_capacity(QType parent_qtype, std::int32_t parent_rows,
@@ -1036,7 +1036,7 @@ std::size_t fp_snapshot_cublas_bytes(QType parent_qtype, std::int32_t parent_row
                                      std::int32_t input_rows, LinearPolicy policy,
                                      std::int32_t batch_size, std::int32_t min_width,
                                      std::int32_t max_width) {
-    const std::int32_t gate = detail::cublas_prefill_fp_min_tokens(policy, parent_qtype);
+    const std::int32_t gate = cublas_prefill_min_tokens(policy);
     const std::int32_t aggregate = batch_size * max_width;
     if (!allows_cublas_prefill(policy) || !detail::cublas_prefill_admits_fp() || aggregate < gate) {
         return 0;
@@ -1063,7 +1063,7 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             throw std::invalid_argument("gdn_input_proj workspace: unsupported NVFP4 profile");
         }
         return fp_projection_with_cublas_bytes(
-            detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens), parent_qtype,
+            detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens),
             parent_rows, input_rows, policy, min_tokens, max_tokens);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16) {
@@ -1072,7 +1072,7 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             throw std::invalid_argument("gdn_input_proj workspace: unsupported FP8 profile");
         }
         return fp_projection_with_cublas_bytes(
-            detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens), parent_qtype,
+            detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens),
             parent_rows, input_rows, policy, min_tokens, max_tokens);
     }
     if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 12288 && input_rows == 2048) {

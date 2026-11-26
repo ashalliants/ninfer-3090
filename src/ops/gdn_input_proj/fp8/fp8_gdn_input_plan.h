@@ -19,6 +19,10 @@ namespace ninfer::ops::detail {
                                                                  std::int32_t min_tokens,
                                                                  std::int32_t max_tokens);
 
+// sm_70: 2..64 tokens on the short-prompt tensor-core tiles (fp8_stream_format.cuh). False where
+// they do not apply, and the caller runs its own plan.
+bool fp8_gdn_input_stream_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                 cudaStream_t stream);
 void fp8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  cudaStream_t stream);
 

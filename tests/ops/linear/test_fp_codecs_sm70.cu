@@ -5,12 +5,15 @@
 //     pairs (NaN codes excluded: weights never hold them);
 //   * nvfp4_scaled_pair_bf16 and fp8_e4m3x2_to_bf16x2_bits (the A16 tensor-core kernels' BF16
 //     widenings) for every code/scale and code pair;
+//   * Fp8StreamFormat::gemm_decode (the short-prompt tiles' FP16 widening) for every code in every
+//     byte position, at row scale 1;
 //   * Nvfp4StreamFormat::dp4a_word against 2 x the vendor E2M1 decode, for every code in every
 //     nibble position, and its half_scales against the vendor E4M3 decode of every scale pair.
 //
 // Bit-exact equality, not a tolerance: both decodes are claimed exact.
 
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
+#include "ops/linear/fp8/fp8_stream_format.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_stream_format.cuh"
 
@@ -104,6 +107,38 @@ __global__ void bf16_widen_kernel(int* bad) {
     }
 }
 
+// Code c alone in byte b of a half's 32: only the pair holding k = b (pair 4q + b % 4 of eight-k
+// group q, low lane for b % 8 < 4) may be nonzero, and it must be the vendor value. One thread per
+// (code, byte), so every code meets every position.
+__global__ void fp8_tile_kernel(int* bad) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= 256 * 32) return;
+    const int code = i & 0xff, byte = i >> 8;
+    if ((code & 0x7f) == 0x7f) return; // NaN
+    std::uint32_t words[8] = {};
+    words[byte >> 2]       = static_cast<std::uint32_t>(code) << (8 * (byte & 3));
+    Fp8StreamFormat::GemmRaw raw{{make_uint4(words[0], words[1], words[2], words[3]),
+                                  make_uint4(words[4], words[5], words[6], words[7])},
+                                 256.0f};
+    __half2 w[16];
+    Fp8StreamFormat::gemm_decode(raw, w);
+    __nv_fp8x2_e4m3 v;
+    v.__x            = static_cast<std::uint16_t>(code);
+    const float want = static_cast<float2>(v).x;
+    // k = byte: group q = k / 8, j = k % 8; pair i = j % 4, lane j / 4.
+    const int q = byte >> 3, j = byte & 7;
+    for (int p = 0; p < 16; ++p) {
+        const float2 got = __half22float2(w[p]);
+        const bool here  = p == 4 * q + (j & 3);
+        const float gx = got.x, gy = got.y;
+        const float ex = (here && j < 4) ? want : 0.0f, ey = (here && j >= 4) ? want : 0.0f;
+        if (gx != ex || gy != ey) {
+            atomicAdd(bad, 1);
+            return;
+        }
+    }
+}
+
 bool is_nan_code(int code) { return (code & 0x7f) == 0x7f; }
 
 int check(cudaError_t error, const char* what) {
@@ -186,6 +221,17 @@ int main() {
     if (widen[1]) std::fprintf(stderr, "FP8 BF16 widening: %d code pairs differ\n", widen[1]);
     failures += widen[0] != 0;
     failures += widen[1] != 0;
+
+    int* tile_bad = nullptr;
+    failures += check(cudaMalloc(&tile_bad, sizeof(int)), "malloc");
+    failures += check(cudaMemset(tile_bad, 0, sizeof(int)), "memset");
+    fp8_tile_kernel<<<32, 256>>>(tile_bad);
+    failures += check(cudaDeviceSynchronize(), "fp8 tile kernel");
+    int tile = 0;
+    failures += check(cudaMemcpy(&tile, tile_bad, sizeof(int), cudaMemcpyDeviceToHost), "copy");
+    cudaFree(tile_bad);
+    if (tile) std::fprintf(stderr, "FP8 tile decode: %d code/position pairs differ\n", tile);
+    failures += tile != 0;
 
     std::printf("%s FP8 / NVFP4 bit-level decodes\n", failures == 0 ? "OK" : "FAIL");
     return failures == 0 ? 0 : 1;

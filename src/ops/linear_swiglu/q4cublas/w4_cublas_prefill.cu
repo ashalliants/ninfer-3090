@@ -661,29 +661,12 @@ bool w4_cublas_prefill_supported(const Weight& weight, std::int32_t tokens) {
 bool cublas_prefill_admits_q8() noexcept { return kFp16Route; }
 bool cublas_prefill_admits_fp() noexcept { return kFp16Route; }
 
-// Prefill-phase (narrow) gates for the FP formats on a V100, nvidia/Qwen3.8-27B-NVFP4-QAD,
-// whole-prompt prefill tok/s.
-//
-// FP8 has no streaming tiles, so below the route it runs its small-T kernels to 16 tokens and the
-// emulated A16 MMA kernel above; the route wins from 17 (FP8 gate 65 -> 9 to locate it, with
-// NVFP4 also on the route):
-//   prompt tokens   14     18     21     28     50
-//   gate 65       74.7   36.1   36.1   57.4   66.8
-//   gate 9        64.9   85.3   70.6  126.7  139.5
-//
-// NVFP4 runs 9..64 tokens on the streaming tensor-core tiles (nvfp4_stream_format.cuh), which
-// beat the route throughout, so it keeps the Q4 / Q5 narrow gate (NVFP4 gate 17 -> 65; FP8 at 17):
-//   prompt tokens   11     14     18     28     47     93
-//   own kernels   58.6   74.7      -      -      -      -   (tiles off)
-//   gate 17          -      -   85.2  127.3  173.7  282.9
-//   gate 65      151.6  180.2  160.6  226.2  253.0  281.1
-constexpr std::int32_t kCublasPrefillFp8NarrowMinTokens = 17;
-
-std::int32_t cublas_prefill_fp_min_tokens(LinearPolicy policy, QType qtype) noexcept {
-    if (policy != LinearPolicy::AllowPrefillCublasNarrow) return kCublasPrefillMinTokens;
-    return qtype == QType::NVFP4 ? kCublasPrefillNarrowMinTokens
-                                 : kCublasPrefillFp8NarrowMinTokens;
-}
+// The FP formats share the Q4 / Q5 gates: below the narrow gate (65) NVFP4 and FP8 run 2..64 tokens
+// on the streaming tensor-core tiles (nvfp4_stream_format.cuh, fp8_stream_format.cuh), which beat
+// the route's FP16 expansion there. V100, nvidia/Qwen3.8-27B-NVFP4-QAD, whole-prompt prefill tok/s:
+//   prompt tokens            11     18     28     47     93
+//   FP8 from 17 (no tiles) 185.1  155.9  224.0  248.0  282.7
+//   FP8 tiles to 64        182.9  236.4  322.5  304.6  284.0
 
 std::size_t w4_cublas_prefill_workspace_capacity_bytes(std::int32_t rows, std::int32_t cols,
                                                        std::int32_t min_tokens,

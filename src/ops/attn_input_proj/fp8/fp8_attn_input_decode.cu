@@ -1,3 +1,4 @@
+#include "ops/linear/fp8/fp8_stream_format.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "core/weight.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
@@ -24,6 +25,18 @@ void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor&
     };
     launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
         fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+}
+
+bool fp8_attn_input_stream_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                  Tensor& k, Tensor& v, cudaStream_t stream) {
+    const Fp8AttentionInputOutput output{
+        static_cast<__nv_bfloat16*>(q.data),
+        static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(gate.data),
+        static_cast<__nv_bfloat16*>(v.data),
+    };
+    return try_launch_fp8_stream_tiles(fp8_a16_operands(x, weight), output,
+                                       LinearIdentityEpilogue{}, stream);
 }
 
 } // namespace ninfer::ops::detail

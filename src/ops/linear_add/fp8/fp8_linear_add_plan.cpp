@@ -57,6 +57,7 @@ void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& resi
                              LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
     const Fp8LinearAddRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
     if (route == Fp8LinearAddRoute::A16) {
+        if (x.ne[1] >= 2 && fp8_linear_add_stream_launch(x, weight, residual, stream)) return;
         launch_a16(x, weight, residual, stream);
         return;
     }

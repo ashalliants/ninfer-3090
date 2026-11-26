@@ -425,26 +425,23 @@ on routes that widen the weights exactly in software:
 
 - **Decode and short prompts (1-64 tokens):** NVFP4 codes become int8 by a byte permute and run on
   the same dp4a streaming GEMV as the Q4/Q5 mix up to 8 tokens (`--verify-a8`, on by default), and
-  on its streaming tensor-core tiles from 9 to 64, reading the 4-bit weights directly. FP8 widens
-  to FP16 bit for bit.
-- **Longer prompts:** NVFP4 weights from 65 tokens and FP8 weights from 17 are expanded to FP16 and
-  multiplied by cuBLAS on the tensor cores, the route the Q8 projections already take.
-  `NINFER_SM70_FP_PREFILL_CUBLAS=0` turns it off. FP8 starts lower because it has no streaming
-  tiles, only emulated Ampere kernels.
+  on its streaming tensor-core tiles from 9 to 64, reading the 4-bit weights directly. FP8 runs
+  2-64 tokens on those tiles too, its codes widened to FP16 bit for bit.
+- **Longer prompts (65+ tokens):** NVFP4 and FP8 weights are expanded to FP16 and multiplied by
+  cuBLAS on the tensor cores, the route the Q8 projections already take.
+  `NINFER_SM70_FP_PREFILL_CUBLAS=0` turns it off.
 
 Same binary, `apps/ninfer` single request (not serve-level), no drafter, BF16 KV, 200 W, two repeats
 per leg agreeing within 0.5% (2026-11-26; no thermal throttle sampled):
 
 | Artifact | Weights | Prefill, 3,754-token prompt | Decode after it | Decode, 22-token prompt | Prefill, 22-token prompt |
 |---|---:|---:|---:|---:|---:|
-| Q4/Q5 mix (`qwen3_8_27b`) | 14.6 GiB | 741.5 tok/s | 40.3 tok/s | 42.2 tok/s | 206.1 tok/s |
-| NVFP4 QAD | 15.9 GiB | 744.7 tok/s | 38.8 tok/s | 40.6 tok/s | 148.2 tok/s |
+| Q4/Q5 mix (`qwen3_8_27b`) | 14.6 GiB | 741.9 tok/s | 40.3 tok/s | 42.2 tok/s | 206.0 tok/s |
+| NVFP4 QAD | 15.9 GiB | 745.8 tok/s | 38.9 tok/s | 40.6 tok/s | 203.6 tok/s |
 
 Before these routes, the QAD artifact decoded at 8.6 tok/s and prefilled the long prompt at about
-25 tok/s. Short prompts still trail a little: with a plain template, 11 / 18 / 28 / 47 prompt tokens
-prefill at 152.5 / 159.1 / 228.3 / 255.0 tok/s against the Q4/Q5 mix's 189.5 / 227.7 / 315.2 /
-323.8. The FP8 attention and GDN layers are most of the difference (cuBLAS's FP16 expansion, or the
-emulated kernels below 17 tokens).
+25 tok/s. Short prompts now match the Q4/Q5 mix: with a plain template, 11 / 18 / 28 / 47 prompt
+tokens prefill at 184.8 / 235.8 / 324.2 / 305.6 tok/s against its 189.6 / 229.8 / 315.0 / 324.1.
 
 **Quality.** On the held-out corpus (quick set, 4,096 context, stride 2,048, BF16 KV), the QAD artifact
 scored lower perplexity than the Q4/Q5 mix on all three domains measured: wikipedia_en 5.520
@@ -809,7 +806,7 @@ come over the PCIe link when needed.
 - **Ampere instructions are emulated.** `cp.async`, `ldmatrix` and BF16/INT8 `mma` are emulated on
   Volta. Paths that have not been moved to cuBLAS, to the V100's FP16 tensor cores, or to a
   CUDA-core kernel run correctly but slowly; these are mainly prompt tails under 129 tokens for the
-  27B, and the FP8 layers of the NVFP4 QAD artifact below 17 tokens.
+  27B.
 - **One request at a time** has been measured for Flash-Next. Two lanes (`NINFER_CONCURRENCY=2`)
   are allowed but have not been tuned on the V100. Inkling-2-Mini batches up to 8 requests
   (`--max-concurrency 8`), without DSpark or adapters at N > 1.

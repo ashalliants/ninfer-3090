@@ -53,6 +53,7 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Fp8AttnInputRoute::A16) {
+        if (x.ne[1] >= 2 && fp8_attn_input_stream_launch(x, weight, q, gate, k, v, stream)) return;
         launch_a16(x, weight, q, gate, k, v, stream);
         return;
     }

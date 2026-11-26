@@ -26,6 +26,10 @@ void fp8_attn_input_a16_small_mma_launch(const Tensor& x, const Weight& weight, 
 void fp8_attn_input_a16_gemm_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                     Tensor& k, Tensor& v, cudaStream_t stream);
 
+// sm_70: 2..64 tokens on the short-prompt tensor-core tiles (fp8_stream_format.cuh). False where
+// they do not apply, and the caller runs its own plan.
+bool fp8_attn_input_stream_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                  Tensor& k, Tensor& v, cudaStream_t stream);
 void fp8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, cudaStream_t stream);
 

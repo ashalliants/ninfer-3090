@@ -42,7 +42,7 @@ void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& q
                                 cudaStream_t stream) {
     if (x.ne[1] == 1) {
         fp8_gdn_input_decode_launch(x, weight, qkv, z, stream);
-    } else {
+    } else if (!fp8_gdn_input_stream_launch(x, weight, qkv, z, stream)) {
         fp8_gdn_input_matrix_launch(x, weight, qkv, z, stream);
     }
 }
