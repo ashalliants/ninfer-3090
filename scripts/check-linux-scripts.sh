@@ -1386,4 +1386,41 @@ for targets in 'ninfer-serve ninfer_bench' 'ninfer-serve'; do
 done
 rm -f -- "$stubbin/cmake" "$stubbin/ninja"
 
+# The build scripts note a build tree whose real location is not directly inside the checkout (ccache
+# cannot share it with other worktrees). Checked on the helper both scripts call after their options.
+# shellcheck source=scripts/lib/build-dir-note.sh
+. "$root/lib/build-dir-note.sh"
+mkdir -p "$tmp/note-checkout/inside" "$tmp/note-elsewhere"
+ln -s "$tmp/note-elsewhere" "$tmp/note-checkout/linked"
+note_fail() { printf 'build-dir note: %s\n' "$1" >&2; exit 1; }
+note_case() { # expect(yes|no) build_dir
+  local out
+  out="$(note_build_dir_outside_checkout "$2" "$tmp/note-checkout" BUILD_DIR build-v100 2>&1)"
+  if [[ "$1" == yes && "$out" != note:* ]]; then note_fail "none for $2"; fi
+  if [[ "$1" == no && -n "$out" ]]; then note_fail "unexpected for $2: $out"; fi
+}
+note_case no "$tmp/note-checkout/inside"
+note_case no "$tmp/note-checkout/not-created-yet"
+note_case yes "$tmp/note-elsewhere"
+note_case yes "$tmp/note-checkout/nested/build-v100"
+note_case yes "$tmp/note-checkout/linked"
+ln -s "$tmp/note-not-created" "$tmp/note-checkout/dangling"
+note_case yes "$tmp/note-checkout/dangling"
+# build.sh resolves a relative --build-dir against the repo root (where cmake runs), not the caller's
+# directory: started from elsewhere with --build-dir build-linux, it builds and notes nothing.
+cat > "$stubbin/cmake" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_LOG"
+STUB
+printf '#!/usr/bin/env bash\nexit 0\n' > "$stubbin/ninja"
+chmod +x "$stubbin/cmake" "$stubbin/ninja"
+: > "$tmp/stub.log"
+out="$(cd "$tmp" && PATH="$stubbin:$PATH" STUB_LOG="$tmp/stub.log" CUDACXX="$(command -v true)" \
+  "$root/build.sh" --build-dir build-linux 2>&1)" || note_fail "build.sh --build-dir build-linux failed: $out"
+if [[ "$out" == *"note: the build tree"* ]]; then note_fail "relative --build-dir was checked against the caller's directory"; fi
+grep -q -- "-B $(cd "$root/.." && pwd)/build-linux " "$tmp/stub.log" ||
+  note_fail "relative --build-dir did not configure <repo>/build-linux: $(cat -- "$tmp/stub.log")"
+rm -f -- "$stubbin/cmake" "$stubbin/ninja"
+rm -rf -- "$tmp/note-checkout" "$tmp/note-elsewhere"
+
 printf '%s\n' 'Linux script checks passed.'
