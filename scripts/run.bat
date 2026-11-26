@@ -74,7 +74,7 @@ rem weights are why it stops short of 262,144. Re-measured 2026-11-26 with the d
 rem 188,416 starts with 1.48-1.61 GiB free with the hot embedding rows below and fits to 182,272
 rem without them; 196,608 started once in two tries. The mtp set starts at 262,144 with two lanes and 1.90 GiB to spare. `none` is the mtp set without speculation.
 rem
-rem Every 27B profile but `none` keeps only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in
+rem Every qwen38-27b profile but `none` (not qwen38-27b-qad: its embedding is Q8) keeps only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in
 rem the profile file): the rest of the table is read from pinned RAM, with the same output bit for bit
 rem and no measured speed change, and the 622 MiB freed goes to the KV cache. NINFER_HOT_EMBEDDING_ROWS=0
 rem keeps the whole table in VRAM; NINFER_EMBEDDING_Q4/Q6 turn it off (the server refuses the pair).
@@ -136,7 +136,7 @@ rem           TEMPERATURE TOP_P TOP_K FREQUENCY_PENALTY SEED NGRAM_MIN_MATCH
 rem           MAX_REQUEST_MIB MEDIA_CACHE_MIB MEDIA_LIVE_MIB MEDIA_PREPROCESS_THREADS VISION_MAX_MERGED
 rem           RESPONSE_STORE_MAX_RECORDS RESPONSE_STORE_MAX_MIB CONTEXT_COST_PRESETS
 rem           PREFILL_STALL_BUDGET_MS YIELD_LONG_PREFILL_MS PREFILL_DECODE_SHARE PREFILL_LAYER_SLICES
-rem           HOT_EMBEDDING_ROWS (the 27B profiles keep 8192 of the token embedding's rows in VRAM; 0: all)
+rem           HOT_EMBEDDING_ROWS (the qwen38-27b profiles keep 8192 of the token embedding's rows in VRAM; 0: all)
 rem           PROGRESS_ANCHOR_TOKENS SLEEP_IDLE_SECONDS SUSPEND_SNAPSHOT SUSPEND_WEIGHTS
 rem           CONTEXT_STORE_TTL_HOURS CONTEXT_STORE_IDLE_SECONDS CONTEXT_STORE_RESTORE_SECONDS
 rem           CONTEXT_STORE_FLUSH_SECONDS CONTEXT_STORE_PEER_POLL_MS CONTEXT_STORE_S3_ENDPOINT
@@ -873,7 +873,7 @@ call :pass_switch NO_EXPERT_STATE --no-expert-state
 call :pass_switch LOSSY_PREFILL_SCOUT_A4 --lossy-prefill-scout-a4
 call :pass_switch REQUEST_LOG_LOSSY_DETAIL --request-log-lossy-detail
 if defined EXTRA_FAIL exit /b 2
-rem The 27B profiles keep only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in the
+rem The qwen38-27b profiles keep only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in the
 rem profile file; NINFER_HOT_EMBEDDING_ROWS=0 keeps the whole table there). The server refuses it with a
 rem load-time embedding transcode or more than one device, so those turn it off unless the caller asked
 rem for both, which is refused here. Branches use goto so no value sits inside a parenthesised block.

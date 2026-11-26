@@ -34,7 +34,7 @@ plus what the launcher adds (`--ngram-draft-tokens 15` and vision):
 | `mtp` | `--spec mtp --draft-tokens 3 --lm-head-draft --prefill-cublas --prefill-chunk 2048 --kv-dtype rk4v4 --gdn-state-fp16 --vision --vision-residency overlay` | 262,144 / 262,144 | 2 / 2 |
 | `none` | the `mtp` set without speculation | 262,144 / 262,144 | 2 / 2 |
 
-Every variant but `none`, and `int8` and `c8`, also passes `--hot-embedding-rows 8192` (in the
+Every variant but `none`, and `int8` and `c8`, also passes (the `qwen38-27b-qad` profile does not: its token embedding is Q8) `--hot-embedding-rows 8192` (in the
 profile file): the token embedding moves to pinned RAM and only its first 8,192 rows stay in VRAM,
 622 MiB more for the KV cache with the same output. `none` leaves it off because its overlay Vision
 window borrows from the output head and the embedding alone, and without the embedding that tail

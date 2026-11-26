@@ -340,7 +340,7 @@ more) it caps each request at 131,072 tokens instead and sizes the lanes' shared
 (`--kv-capacity auto --device-state-slots 0`): four long agent sessions then run at once rather than
 two: 114.5 tok/s aggregate against 98.7 (+16%), and the worst first-token wait 14 s instead of 41 s.
 
-Every 27B profile except `none` keeps only the token embedding's first 8,192 rows in VRAM
+Every `qwen38-27b` profile except `none` (not `qwen38-27b-qad`, whose token embedding is Q8) keeps only the token embedding's first 8,192 rows in VRAM
 (`--hot-embedding-rows 8192`; the rest is read from pinned RAM): the same output bit for bit, no
 measured speed change, and 622 MiB more for the KV cache. `NINFER_HOT_EMBEDDING_ROWS=0` turns it
 off. Measurements are in [performance](docs/performance.md#qwen38-27b-hot-embedding-rows-and-a-shared-kv-pool-for-long-agent-sessions-2026-11-26).

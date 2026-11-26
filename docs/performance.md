@@ -191,7 +191,7 @@ before), 100.3 thinking (97.1), 80.5 story (80.1) and 78.8 Chinese (78.6). **Fre
 Two launcher changes, measured on the desktop RTX 3090 (Windows 11, the desktop holding 1.4-1.9 GiB)
 with `rk4v4` KV, vision in overlay residency and the 8 GiB Host context budget:
 
-- **`--hot-embedding-rows 8192`** in every 27B profile except `none` (below). The Q4 token embedding
+- **`--hot-embedding-rows 8192`** in every `qwen38-27b` profile except `none` (below; `qwen38-27b-qad` stores a Q8 embedding the option does not take). The Q4 token embedding
   (644 MiB) moves to pinned RAM and only its first 8,192 rows (21 MiB) stay in VRAM, so 622 MiB more
   goes to the KV cache. The output is the same bit for bit (a greedy chat answer byte-identical with
   and without it, MTP and DFlash2). `NINFER_HOT_EMBEDDING_ROWS=0` turns it off.

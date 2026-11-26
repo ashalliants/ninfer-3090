@@ -76,7 +76,7 @@
 # desktop.
 # `none` is the mtp set without speculation.
 #
-# Every 27B profile but `none` keeps only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in
+# Every qwen38-27b profile but `none` (not qwen38-27b-qad: its embedding is Q8) keeps only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in
 # the profile file): the rest of the table is read from pinned RAM, with the same output bit for bit
 # and no measured speed change, and the 622 MiB freed goes to the KV cache. NINFER_HOT_EMBEDDING_ROWS=0
 # keeps the whole table in VRAM; NINFER_EMBEDDING_Q4/Q6 turn it off (the server refuses the pair).
@@ -763,7 +763,7 @@ for flag in "${passthrough_switch_flags[@]}"; do
     *) printf '%s must be on or off, got %s\n' "$var" "${!var}" >&2; exit 2 ;;
   esac
 done
-# The 27B profiles keep only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in
+# The qwen38-27b profiles keep only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in
 # the profile file; NINFER_HOT_EMBEDDING_ROWS=0 keeps the whole table there). The server refuses it
 # with a load-time embedding transcode or more than one device, so those turn it off unless the
 # caller asked for both, which is refused here.
