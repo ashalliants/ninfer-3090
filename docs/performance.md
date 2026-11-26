@@ -208,16 +208,29 @@ with `rk4v4` KV, vision in overlay residency and the 8 GiB Host context budget:
 
 Acceptance was identical (39.37%, 3.757 tokens a round) and the long prompt's output identical.
 
-**Four concurrent agent sessions** (the target workload): 75-84K-token contexts, follow-ups ~95%
-prefix-cached with 2.5-5.8K new tokens, 1,700 tokens out each, MTP3, `rk4v4`, prefill chunk 2048,
-`--max-concurrency 4`, WSL build beside the Windows desktop:
+**Four concurrent agent sessions** (the target workload): four sessions of 75-84K tokens,
+follow-ups ~95% prefix-cached with 2.5-5.8K new tokens, 1,700 tokens out each, greedy, MTP3,
+`rk4v4`, prefill chunk 2048, 8 GiB Host context budget, `--max-concurrency 4`. Best clean run first:
+the Windows build of this branch on Windows 11, 315 W power limit, throttle reasons power cap only,
+two runs:
+
+| Launcher at `NINFER_CONCURRENCY=4` | KV pool | running at once | worst wait for a first token | batch | aggregate |
+|---|---:|---|---:|---:|---:|
+| before (`--max-context 212992 --kv-capacity 212992 --fit-context 32768`) | 212,992 | 2 of 4 | 41.0 s | 68.9 s | 98.7 tok/s |
+| **now** (`--max-context 131072 --kv-capacity auto --device-state-slots 0 --hot-embedding-rows 8192`) | 330,240 | **4 of 4** | **13.4 / 13.8 s** | **59.4 / 59.4 s** | **114.5 / 114.4 tok/s** |
+
+That is +16% aggregate decode, a batch 14% shorter and the worst first-token wait down from 41 s to
+about 14 s; each session decoded at 41-52 tok/s. The pool started with 931.8 / 927.8 MiB free and
+nothing spilled to system RAM. The "before" row was measured in the earlier session below.
+
+How the pool grows, step by step (the WSL build beside the same Windows desktop, one run each):
 
 | Configuration | KV pool | running at once | worst wait for a first token | batch | aggregate |
 |---|---:|---|---|---:|---:|
-| launcher before (`--max-context 212992 --kv-capacity 212992 --fit-context 32768`) | 212,992 | 2 of 4 | 34-41 s (two waiting) | 68.9 s | 98.7 tok/s |
+| `--max-context 212992 --kv-capacity 212992 --fit-context 32768` | 212,992 | 2 of 4 | 34-41 s (two waiting) | 68.9 s | 98.7 tok/s |
 | `--max-context 131072 --kv-capacity auto` | 279,488 | 3 of 4 | 47 s (one waiting) | 70.3 s | 96.8 tok/s |
-| same + `--device-state-slots 0` | 296,000 | 3 of 4 | | | |
-| same + `--hot-embedding-rows 8192` (the new launcher) | 328,512 | **4 of 4** | 13.7 s | **63.2 s** | **107.7 tok/s** (+9%) |
+| same + `--device-state-slots 0` | 296,000 | 3 of 4 | not run | not run | not run |
+| same + `--hot-embedding-rows 8192` | 328,512 | 4 of 4 | 13.7 s | 63.2 s | 107.7 tok/s |
 
 The automatic pool started with 932 MiB free. An explicit `--kv-capacity 335,872` (200 MiB free at
 startup) or 344,064 made Windows page VRAM to system RAM and decode collapsed to 1-5 tok/s aggregate,
@@ -230,7 +243,7 @@ with each profile's exact flags; each line is one start):
 |---|---|---|
 | `mtp`, two lanes, 262,144 | starts, 1.17 GiB free | starts, 1.90 GiB free |
 | `mtp`, three lanes, shared pool | | pool 337,728 tokens, 718 MiB free |
-| `mtp`, four lanes, shared pool | | pool 328,256 tokens, 592 MiB free (WSL build: 326,528, 800 MiB) |
+| `mtp`, four lanes, shared pool | | pool 328,256 tokens, 592 MiB free (a later start: 330,240, 932 MiB; WSL build: 326,528, 800 MiB) |
 | `dflash2` as the launcher starts it (188,416, `--fit-context 32768`) | fitted to 182,272, 1.10 GiB free | starts at 188,416, 1.61 GiB free |
 | `dflash2`, one lane, explicit 188,416 | refused (5.30 GB available, 5.62 needed) | starts, 1.48 GiB free |
 | `dflash2`, explicit 196,608 | refused | refused once (5.45 GB available, 5.76 needed), started once (1.48 GiB free) |

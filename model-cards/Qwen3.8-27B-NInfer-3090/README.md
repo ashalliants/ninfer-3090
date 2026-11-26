@@ -225,8 +225,10 @@ bit, no measured speed change, 622 MiB more for the KV cache. That day, on a des
 1.5 GiB, the DFlash2 profile started at 188,416 with 1.48-1.61 GiB free with them and fitted to
 182,272 without them; the MTP profile's two lanes at 262,144 started with 1.90 GiB free (1.17 GiB
 without). With `NINFER_SPEC=mtp` and three or more lanes, each request is capped at 131,072 tokens
-and the shared pool is sized to the card: 328,256 tokens at four lanes, enough for four 75-84K-token
-agent sessions at once (+9% aggregate decode against the earlier one-context pool).
+and the shared pool is sized to the card: on Windows 11 at the 315 W limit, 330,240 tokens at four
+lanes (932 MiB free), so four 75-84K-token agent sessions with ~95% cached follow-ups all ran at
+once: 114.5 tok/s aggregate against 98.7 with the earlier one-context pool (+16%), a batch of 59.4 s
+against 68.9 s, and the worst first-token wait 13.8 s against 41.0 s.
 
 **Smoke tests.** These all completed coherently:
 
