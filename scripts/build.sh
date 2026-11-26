@@ -21,6 +21,15 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${NINFER_BUILD_DIR:-$repo_root/build-linux}"
 arch="${NINFER_CUDA_ARCH:-86}"
+
+# ccache (base_dir) hashes paths relative to the build directory, so a tree shares cache entries with
+# other worktrees' builds only when it sits directly in its checkout like the default. Anywhere else it
+# still builds, but misses every object another worktree compiled (see scripts/v100_build.sh).
+build_parent="$(cd -- "$(dirname -- "$build_dir")" 2>/dev/null && pwd -P || true)"
+if [[ "$build_parent" != "$(cd -- "$repo_root" && pwd -P)" ]]; then
+  printf 'note: NINFER_BUILD_DIR=%s is not directly inside this checkout (%s), so ccache cannot share\n' "$build_dir" "$repo_root" >&2
+  printf '      objects with other worktrees'"'"' builds; leave NINFER_BUILD_DIR unset to build in %s/build-linux\n' "$repo_root" >&2
+fi
 run_tests=0
 clean=0
 package=0

@@ -365,9 +365,13 @@ Put each kind of file here instead:
   `<tree>/build-v100` and so on. `build-*/` is gitignored, the tree is removed together with its
   worktree, and ccache still shares, because the base covers every worktree (the main checkout, or
   the directory holding both when worktrees sit beside it). A tree in `~` outlives its worktree,
-  nobody can tell what it was built from, and it misses the cache.
+  nobody can tell what it was built from, and it misses the cache: ccache's base_dir hashes paths
+  relative to the build directory, so only trees directly inside their checkout hash the same
+  `-I../include` and share objects. A tree in `~` hashed `-I../ninfer-merge/include` instead, and a
+  rebuild after a flag change took about 25 minutes there against 12 seconds in `<tree>/build-v100`.
   `scripts/v100_build.sh` defaults to `<tree>/build-v100`, and `scripts/run-v100.sh` looks there
-  first. Set `BUILD_DIR` only to override that deliberately.
+  first. Set `BUILD_DIR` only to override that deliberately; both build scripts print a note when the
+  tree is not directly inside its checkout.
 - **One-off scripts, logs, patches, commit and PR message files** go in `<tree>/tmp/` (gitignored) or the
   session's scratchpad, never loose in `~` or the repository root. Delete them before the session
   ends; anything worth keeping belongs in the repo (a test, a tool under `tools/`, a doc).

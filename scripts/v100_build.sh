@@ -5,7 +5,8 @@
 #   NINFER_BUILD_TESTS=1   also configure the tests (target ninfer_tests builds all of them)
 #   NINFER_BUILD_BENCHMARKS=1  also configure the benchmarks; asking for the ninfer_bench target does it too
 #   BUILD_DIR              build tree (default build-v100/ inside this checkout, where scripts/run-v100.sh
-#                          looks first; each worktree gets its own tree, which ccache sharing needs)
+#                          looks first; each worktree gets its own tree, which ccache sharing needs: a
+#                          tree that is not directly inside its checkout misses the cache, and gets a note)
 #   JOBS                   parallel compile jobs (default: min(cores, RAM GiB / 2); one nvcc job
 #                          peaks at 1.5-2 GiB, and an OOM-killed container cannot be restarted)
 # CUDA 12.8 is the newest toolkit that still compiles for Volta (13.0 dropped sm_70); it warns that
@@ -14,6 +15,17 @@ set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${BUILD_DIR:-$SRC/build-v100}"
+
+# ccache (base_dir) hashes paths relative to the build directory, so a tree shares cache entries with
+# other worktrees' builds only when it sits directly in its checkout like the default: every such
+# tree hashes `-I../include`. A tree anywhere else (~/build-v100, say) still builds, but misses
+# every object another worktree compiled -- measured on the V100 box, a rebuild after a flag change
+# took about 25 minutes there and 12 seconds in <checkout>/build-v100.
+build_parent="$(cd -- "$(dirname -- "$BUILD")" 2>/dev/null && pwd -P || true)"
+if [[ "$build_parent" != "$(cd -- "$SRC" && pwd -P)" ]]; then
+  printf 'note: BUILD_DIR=%s is not directly inside this checkout (%s), so ccache cannot share\n' "$BUILD" "$SRC" >&2
+  printf '      objects with other worktrees'"'"' builds; leave BUILD_DIR unset to build in %s/build-v100\n' "$SRC" >&2
+fi
 
 # ccache, when installed. cmake/CompilerCache.cmake sets the compiler launchers itself, with the
 # settings that let worktrees share entries (CCACHE_BASEDIR, CCACHE_NOHASHDIR, and ignoring the
