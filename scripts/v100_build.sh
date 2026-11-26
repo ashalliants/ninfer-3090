@@ -15,17 +15,9 @@ set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${BUILD_DIR:-$SRC/build-v100}"
-
-# ccache (base_dir) hashes paths relative to the build directory, so a tree shares cache entries with
-# other worktrees' builds only when it sits directly in its checkout like the default: every such
-# tree hashes `-I../include`. A tree anywhere else (~/build-v100, say) still builds, but misses
-# every object another worktree compiled -- measured on the V100 box, a rebuild after a flag change
-# took about 25 minutes there and 12 seconds in <checkout>/build-v100.
-build_parent="$(cd -- "$(dirname -- "$BUILD")" 2>/dev/null && pwd -P || true)"
-if [[ "$build_parent" != "$(cd -- "$SRC" && pwd -P)" ]]; then
-  printf 'note: BUILD_DIR=%s is not directly inside this checkout (%s), so ccache cannot share\n' "$BUILD" "$SRC" >&2
-  printf '      objects with other worktrees'"'"' builds; leave BUILD_DIR unset to build in %s/build-v100\n' "$SRC" >&2
-fi
+# shellcheck source=scripts/lib/build-dir-note.sh
+. "$SRC/scripts/lib/build-dir-note.sh"
+note_build_dir_outside_checkout "$BUILD" "$SRC" BUILD_DIR build-v100
 
 # ccache, when installed. cmake/CompilerCache.cmake sets the compiler launchers itself, with the
 # settings that let worktrees share entries (CCACHE_BASEDIR, CCACHE_NOHASHDIR, and ignoring the

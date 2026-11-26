@@ -1386,4 +1386,24 @@ for targets in 'ninfer-serve ninfer_bench' 'ninfer-serve'; do
 done
 rm -f -- "$stubbin/cmake" "$stubbin/ninja"
 
+# The build scripts note a build tree whose real location is not directly inside the checkout (ccache
+# cannot share it with other worktrees). Checked on the helper both scripts call after their options.
+# shellcheck source=scripts/lib/build-dir-note.sh
+. "$root/lib/build-dir-note.sh"
+mkdir -p "$tmp/note-checkout/inside" "$tmp/note-elsewhere"
+ln -s "$tmp/note-elsewhere" "$tmp/note-checkout/linked"
+note_fail() { printf 'build-dir note: %s\n' "$1" >&2; exit 1; }
+note_case() { # expect(yes|no) build_dir
+  local out
+  out="$(note_build_dir_outside_checkout "$2" "$tmp/note-checkout" BUILD_DIR build-v100 2>&1)"
+  if [[ "$1" == yes && "$out" != note:* ]]; then note_fail "none for $2"; fi
+  if [[ "$1" == no && -n "$out" ]]; then note_fail "unexpected for $2: $out"; fi
+}
+note_case no "$tmp/note-checkout/inside"
+note_case no "$tmp/note-checkout/not-created-yet"
+note_case yes "$tmp/note-elsewhere"
+note_case yes "$tmp/note-checkout/nested/build-v100"
+note_case yes "$tmp/note-checkout/linked"
+rm -rf -- "$tmp/note-checkout" "$tmp/note-elsewhere"
+
 printf '%s\n' 'Linux script checks passed.'
