@@ -5,6 +5,7 @@
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/prefix_index.h"
+#include "runtime/engine/context_cache/recovery_loss.h"
 #include "runtime/engine/context_cache/types.h"
 
 #include <algorithm>
@@ -1510,8 +1511,7 @@ private:
 
     // Recovery loss of releasing a set from an evaluation's retained checkpoints (action_loss).
     // The second span names further checkpoints that are gone but not counted as lost.
-    using PreparedLoss =
-        std::function<std::uint64_t(std::span<const Handle>, std::span<const Handle>)>;
+    using PreparedLoss = PreparedRecoveryLoss<Handle>;
 
     struct GainFrontiers {
         const Base* base       = nullptr;

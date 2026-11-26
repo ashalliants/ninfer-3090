@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <type_traits>
 #include <span>
 #include <utility>
@@ -132,6 +133,28 @@ private:
     Prefix prefix_;
     std::vector<Point> fallbacks_;
 };
+
+// Recovery loss of releasing a set (first span) from a prepared retained set, with further
+// checkpoints (second span) also gone but not counted as lost. A Program's
+// prepare_checkpoint_recovery_loss hook returns one (see ResourceManager::retained_loss).
+template <class Handle>
+using PreparedRecoveryLoss =
+    std::function<std::uint64_t(std::span<const Handle>, std::span<const Handle>)>;
+
+// The shared implementation of that hook: one RecoveryLossTable over `retained`. The callables
+// (and whatever they capture) must stay valid while the result is used, which is the caller's
+// synchronous evaluation.
+template <class Handle, class Valid, class Frontier, class Prefix>
+[[nodiscard]] PreparedRecoveryLoss<Handle>
+prepare_recovery_loss_table(std::span<const Handle> retained, Valid valid, Frontier frontier,
+                            Prefix prefix) {
+    using Table = RecoveryLossTable<Handle, Valid, Frontier, Prefix>;
+    auto table  = std::make_shared<const Table>(retained, std::move(valid), std::move(frontier),
+                                               std::move(prefix));
+    return [table](std::span<const Handle> removed, std::span<const Handle> excluded) {
+        return table->loss(removed, excluded);
+    };
+}
 
 // Prompt tokens to recompute when the `removed` checkpoints are released and a later request
 // restarts from the deepest `surviving` checkpoint that is a prefix of each one. Removed

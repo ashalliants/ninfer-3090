@@ -638,20 +638,15 @@ ProgramImpl::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
     });
 }
 
-// One RecoveryLossTable over `retained`; `prefix` must stay valid while the result is used (the
-// caller's synchronous evaluation).
+// The shared table over `retained`; `prefix` must stay valid while the result is used.
 template <typename Prefix>
 PreparedRecoveryLoss prepare_recovery_loss(const ProgramImpl& program,
                                            std::span<const CheckpointHandle> retained,
                                            Prefix prefix) {
-    const auto valid    = [&program](CheckpointHandle h) { return program.valid_checkpoint(h); };
-    const auto frontier = [&program](CheckpointHandle h) { return program.checkpoint(h).frontier; };
-    using Table = decltype(runtime::RecoveryLossTable(retained, valid, frontier, prefix));
-    auto table  = std::make_shared<const Table>(retained, valid, frontier, std::move(prefix));
-    return [table](std::span<const CheckpointHandle> removed,
-                   std::span<const CheckpointHandle> excluded) {
-        return table->loss(removed, excluded);
-    };
+    return runtime::prepare_recovery_loss_table(
+        retained, [&program](CheckpointHandle h) { return program.valid_checkpoint(h); },
+        [&program](CheckpointHandle h) { return program.checkpoint(h).frontier; },
+        std::move(prefix));
 }
 
 PreparedRecoveryLoss

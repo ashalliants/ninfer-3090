@@ -152,6 +152,8 @@ struct ContextReclaimPlan {
     [[nodiscard]] ContextDemotionBatch begin_kv_batch(runtime::ContextResourceUsage) const { return {}; }
     [[nodiscard]] std::uint64_t recovery_loss(std::span<const CheckpointHandle> removed,
                                               std::span<const CheckpointHandle> surviving) const;
+    [[nodiscard]] qwen3_5::PreparedRecoveryLoss
+    prepare_recovery_loss(std::span<const CheckpointHandle> retained) const;
 
 private:
     const detail::ProgramImpl* owner_ = nullptr;
@@ -765,6 +767,8 @@ public:
                                                              std::uint32_t target) const;
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
                                                          std::span<const CheckpointHandle> surviving) const;
+    [[nodiscard]] qwen3_5::PreparedRecoveryLoss
+    prepare_checkpoint_recovery_loss(std::span<const CheckpointHandle> retained) const;
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle checkpoint) const noexcept;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle checkpoint) noexcept;
     // No pause, so no snapshot.
