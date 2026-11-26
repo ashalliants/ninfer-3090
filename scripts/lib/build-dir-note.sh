@@ -8,20 +8,17 @@
 #
 # note_build_dir_outside_checkout BUILD_DIR CHECKOUT OPTION DEFAULT_NAME
 # prints a note on stderr when BUILD_DIR's real location is not directly inside CHECKOUT. Symlinks
-# are resolved (ccache sees the compiler's physical working directory), so a link at
-# <checkout>/build-v100 that points elsewhere is noted too. Call it after every override is parsed.
+# are resolved, dangling ones included (ccache sees the compiler's physical working directory), so a
+# link at <checkout>/build-v100 that points elsewhere is noted too. Call it after every override is parsed.
 note_build_dir_outside_checkout() {
-  local build_dir="$1" checkout="$2" option="$3" default_name="$4" real_parent real_checkout shown
+  local build_dir="$1" checkout="$2" option="$3" default_name="$4" real real_parent real_checkout shown
+  # realpath -m follows symlinks even when the target (or the tree itself) does not exist yet, so a
+  # link to a directory cmake has not created is resolved too.
+  real="$(realpath -m -- "$build_dir")"
+  real_parent="$(dirname -- "$real")"
   shown="$build_dir"
-  if [[ -d "$build_dir" ]]; then
-    local real
-    real="$(cd -- "$build_dir" && pwd -P)"
-    real_parent="$(dirname -- "$real")"
-    [[ "$real" != "$(cd -- "$build_dir" && pwd -L)" ]] && shown="$build_dir -> $real"
-  else
-    real_parent="$(cd -- "$(dirname -- "$build_dir")" 2>/dev/null && pwd -P || true)"
-  fi
-  real_checkout="$(cd -- "$checkout" && pwd -P)"
+  [[ "$real" != "$(realpath -ms -- "$build_dir")" ]] && shown="$build_dir -> $real"
+  real_checkout="$(realpath -- "$checkout")"
   if [[ "$real_parent" != "$real_checkout" ]]; then
     printf 'note: the build tree %s (%s) is not directly inside this checkout (%s), so ccache\n' \
       "$shown" "$option" "$checkout" >&2

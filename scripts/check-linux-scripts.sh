@@ -1404,6 +1404,8 @@ note_case no "$tmp/note-checkout/not-created-yet"
 note_case yes "$tmp/note-elsewhere"
 note_case yes "$tmp/note-checkout/nested/build-v100"
 note_case yes "$tmp/note-checkout/linked"
+ln -s "$tmp/note-not-created" "$tmp/note-checkout/dangling"
+note_case yes "$tmp/note-checkout/dangling"
 # build.sh resolves a relative --build-dir against the repo root (where cmake runs), not the caller's
 # directory: started from elsewhere with --build-dir build-linux, it builds and notes nothing.
 cat > "$stubbin/cmake" <<'STUB'
