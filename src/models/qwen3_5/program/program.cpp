@@ -211,6 +211,11 @@ std::uint64_t Program::checkpoint_recovery_loss(std::span<const CheckpointHandle
     return impl_->checkpoint_recovery_loss(removed, surviving);
 }
 
+PreparedRecoveryLoss
+Program::prepare_checkpoint_recovery_loss(std::span<const CheckpointHandle> retained) const {
+    return impl_->prepare_checkpoint_recovery_loss(retained);
+}
+
 bool Program::valid_checkpoint(CheckpointHandle h) const noexcept {
     return impl_->valid_checkpoint(h);
 }

@@ -385,6 +385,8 @@ public:
                                                              std::uint32_t target) const;
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle>,
                                                          std::span<const CheckpointHandle>) const;
+    [[nodiscard]] PreparedRecoveryLoss
+    prepare_checkpoint_recovery_loss(std::span<const CheckpointHandle> retained) const;
     [[nodiscard]] bool can_release_checkpoint(CheckpointHandle) const noexcept;
     [[nodiscard]] std::optional<runtime::ContextResourceUsage>
         checkpoint_release_resources(std::span<const CheckpointHandle>,

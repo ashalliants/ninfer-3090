@@ -1,10 +1,13 @@
+#include "runtime/engine/context_cache/recovery_loss.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <random>
 #include <span>
@@ -131,6 +134,11 @@ struct Program {
     // pays O(checkpoints) for each, so a drop in these counts is a drop in Engine-thread time.
     mutable std::uint64_t host_bytes_released_calls = 0;
     mutable std::uint64_t recovery_loss_calls       = 0;
+    // Survivors handed to those calls: the real Program sorts and scans each list.
+    mutable std::uint64_t recovery_loss_survivors = 0;
+    mutable std::uint64_t recovery_frontier_calls = 0;
+    mutable std::uint64_t recovery_loss_tables    = 0;
+    mutable std::uint64_t recovery_loss_queries   = 0;
 
     // Host state images of image_bytes each take one contiguous run (0: no such model). Free runs
     // that fit one are image_runs plus those released images leave, less images placed since.
@@ -425,6 +433,10 @@ struct Program {
                                                   std::span<const Handle> surviving) const {
             return program->checkpoint_recovery_loss(removed, surviving);
         }
+
+        [[nodiscard]] auto prepare_recovery_loss(std::span<const Handle> retained) const {
+            return program->prepare_checkpoint_recovery_loss(retained);
+        }
     };
 
     [[nodiscard]] ReclaimPlan plan_reclaim(std::span<const Handle> allowed,
@@ -581,6 +593,7 @@ struct Program {
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const Handle> removed,
                                                          std::span<const Handle> surviving) const {
         ++recovery_loss_calls;
+        recovery_loss_survivors += surviving.size();
         std::vector<Handle> deepest;
         for (const auto handle : removed) {
             const auto deeper = std::any_of(removed.begin(), removed.end(), [&](auto other) {
@@ -610,8 +623,29 @@ struct Program {
         return loss;
     }
 
+    // The production table (recovery_loss.h) over this fixture's prefixes. The memo-equivalence
+    // tests compare its answers with checkpoint_recovery_loss above, an independent reference.
+    [[nodiscard]] std::function<std::uint64_t(std::span<const Handle>, std::span<const Handle>)>
+    prepare_checkpoint_recovery_loss(std::span<const Handle> retained) const {
+        ++recovery_loss_tables;
+        recovery_loss_survivors += retained.size();
+        const auto valid    = [this](Handle handle) { return valid_checkpoint(handle); };
+        const auto frontier = [this](Handle handle) {
+            return contents.at(handle.index).tokens.size();
+        };
+        const auto prefix = [this](Handle a, Handle b) { return this->prefix(a, b); };
+        using Table =
+            decltype(ninfer::runtime::RecoveryLossTable(retained, valid, frontier, prefix));
+        auto table  = std::make_shared<const Table>(retained, valid, frontier, prefix);
+        return [this, table](std::span<const Handle> removed, std::span<const Handle> excluded) {
+            ++recovery_loss_queries;
+            return table->loss(removed, excluded);
+        };
+    }
+
     [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(Handle retained, const Base& base,
                                                              std::uint32_t target) const {
+        ++recovery_frontier_calls;
         const auto& tokens = contents.at(retained.index).tokens;
         return tokens.size() <= target && base.prefix_shortlist_key(tokens.size()) == tokens
                    ? static_cast<std::uint32_t>(tokens.size())
@@ -2920,11 +2954,28 @@ Decisions decide(std::uint32_t seed, bool memoize, bool images = false) {
         }
         out.victims.push_back(f.cache.host_victims(f.program, bytes, incoming));
     }
+    // Optional captures: a new request on one of the cached lines asks for room for its own
+    // checkpoint, priced against the gain it would bring (base_recovery_gain).
+    for (const std::size_t bytes : {std::size_t{1}, total / 4 + 1, total / 2 + 1}) {
+        const Base base{.tokens = tokens(pick(3, 25), 1 + pick(0, 4) * 100)};
+        try {
+            const auto owner     = f.begin(base);
+            const auto admission = f.cache.capture_admission(
+                f.program, owner, base, static_cast<std::uint32_t>(base.tokens.size()));
+            auto cursor = f.cache.begin_reclaim(f.program, admission);
+            out.victims.push_back(f.cache.host_victims(f.program, bytes, std::nullopt, {}, {},
+                                                       admission, &cursor));
+            f.cache.abandon(f.program, owner);
+        } catch (const std::exception&) {
+            out.victims.push_back(std::vector<Handle>{Handle{UINT32_MAX}});
+        }
+    }
     return out;
 }
 
 void test_candidate_memo_changes_no_decision() {
-    std::size_t reclaimed = 0, demoted = 0, with_victims = 0, image_victims = 0;
+    std::size_t reclaimed = 0, demoted = 0, with_victims = 0, image_victims = 0,
+                capture_victims = 0;
     for (std::uint32_t seed = 1; seed <= 900; ++seed) {
         const bool images = seed > 600; // the last 300 price state demotions by whole images
         const auto plain  = decide(seed, false, images);
@@ -2935,15 +2986,20 @@ void test_candidate_memo_changes_no_decision() {
         }
         reclaimed += plain.released.size();
         demoted += plain.demoted.size();
-        for (const auto& victims : plain.victims) {
+        for (std::size_t i = 0; i < plain.victims.size(); ++i) {
+            const auto& victims = plain.victims[i];
             with_victims += victims && !victims->empty();
             image_victims += images && victims && !victims->empty();
+            capture_victims += i >= 4 && victims && !victims->empty() &&
+                               (*victims)[0].index != UINT32_MAX;
         }
     }
     // The comparison is only worth anything if the scenarios actually exercise the code.
     std::cout << "memo equivalence: 900 seeds, " << reclaimed << " releases, " << demoted
-              << " demotions, " << with_victims << " non-empty victim sets\n";
-    require(reclaimed > 200 && demoted > 100 && with_victims > 100 && image_victims > 20,
+              << " demotions, " << with_victims << " non-empty victim sets (" << capture_victims
+              << " for captures)\n";
+    require(reclaimed > 200 && demoted > 100 && with_victims > 100 && image_victims > 20 &&
+                capture_victims > 50,
             "randomized scenarios did not exercise release, demotion and Host victims");
 }
 
@@ -3079,6 +3135,76 @@ void test_direct_victim_release_offers_the_continuation_first() {
             "the directly released continuation was not offered before its release");
 }
 
+// The labelling workload measured on the V100 router (2026-11-26): every request shares one hot
+// instruction prefix, adds a short unique item, and asks to keep its own end-of-prompt state.
+// The Host tier is full of earlier requests' one-off states. Each new request's optional capture
+// is refused, and the refusal must stay cheap.
+struct OneShotOutcome {
+    bool saved;
+    std::uint64_t recovery_loss_calls, recovery_loss_survivors, recovery_frontier_calls,
+        host_bytes_released_calls;
+    double seconds;
+};
+
+OneShotOutcome run_one_shot_capture(std::size_t residents, std::uint32_t item_tokens) {
+    constexpr std::size_t image = 64;
+    Fixture f((residents + 1) * image);
+    const auto prefix_tokens = tokens(400, 1);
+    const auto shared        = f.program.add(prefix_tokens, {f.program.host_block(image)});
+    f.publish(shared);
+    std::uint32_t next = 1'000'000;
+    for (std::size_t i = 0; i < residents; ++i) {
+        auto key        = prefix_tokens;
+        const auto item = tokens(200 + static_cast<std::uint32_t>(i % 60), next);
+        next += 1000;
+        key.insert(key.end(), item.begin(), item.end());
+        f.use_shared(shared);
+        f.publish(f.program.add(key, {f.program.host_block(image)}, Role::Continuation));
+    }
+    Base base{.tokens = prefix_tokens};
+    const auto item = tokens(item_tokens, next);
+    base.tokens.insert(base.tokens.end(), item.begin(), item.end());
+    const auto frontier = static_cast<std::uint32_t>(base.tokens.size());
+    auto& p = f.program;
+    p.recovery_loss_calls = p.recovery_loss_survivors = p.recovery_frontier_calls = 0;
+    p.host_bytes_released_calls = 0;
+    const auto begin     = std::chrono::steady_clock::now();
+    const auto owner     = f.begin(base, shared);
+    const auto admission = f.cache.capture_admission(p, owner, base, frontier);
+    auto cursor          = f.cache.begin_reclaim(p, admission);
+    auto victims = f.cache.host_victims(p, image, std::nullopt, {}, {}, admission, &cursor);
+    bool saved   = victims && !victims->empty();
+    if (!saved) {
+        saved = f.cache.reclaim(p, {.host_bytes = image}, {}, cursor) ==
+                ninfer::runtime::ReclaimProgress::Changed;
+    }
+    const auto end = std::chrono::steady_clock::now();
+    f.cache.abandon(p, owner);
+    return {saved, p.recovery_loss_calls, p.recovery_loss_survivors, p.recovery_frontier_calls,
+            p.host_bytes_released_calls, std::chrono::duration<double>(end - begin).count()};
+}
+
+void test_one_shot_capture_into_a_full_host_tier() {
+    for (const auto residents : {65, 130, 260}) {
+        for (const auto item : {230U, 300U}) {
+            const auto out = run_one_shot_capture(residents, item);
+            std::cout << "one-shot capture " << residents << " entries, item " << item
+                      << ": saved=" << out.saved << " recovery_loss=" << out.recovery_loss_calls
+                      << " survivors_scanned=" << out.recovery_loss_survivors
+                      << " recovery_frontier=" << out.recovery_frontier_calls
+                      << " host_bytes_released=" << out.host_bytes_released_calls
+                      << " seconds=" << out.seconds << std::endl;
+            // Measured before the per-evaluation tables: 135,461 recovery-frontier calls and one
+            // survivor sort per candidate at 260 entries. Now each retained checkpoint is asked
+            // once per evaluation (twice here: the cursor's gain limit and the search).
+            require(out.recovery_frontier_calls <= 2 * (residents + 1) + 2,
+                    "a capture's gain is priced per candidate again, not once per evaluation");
+            require(out.recovery_loss_calls == 0,
+                    "a capture's victim search rebuilt the survivor set for a candidate");
+        }
+    }
+}
+
 int main() {
     try {
         test_direct_victim_release_offers_the_continuation_first();
@@ -3088,6 +3214,7 @@ int main() {
         test_held_progress_anchor_is_retired_when_the_hold_ends();
         test_candidate_memo_cuts_victim_selection_work();
         test_saturated_host_reclaim_work_stays_bounded();
+        test_one_shot_capture_into_a_full_host_tier();
         test_reclaim_pricing_cap_stops_a_long_search_once_an_action_is_found();
         test_reclaim_pricing_cap_bounds_the_first_search();
         test_reclaim_pricing_cap_never_costs_progress();
