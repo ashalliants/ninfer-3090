@@ -68,6 +68,18 @@ template <class Format>
 concept StreamDp4aVerifyFormat =
     StreamDp4aFormat<Format> && !requires { requires Format::kDp4aDrafterOnly; };
 
+// A format whose slice of 32 values carries two scales, one per 16 (NVFP4), sets
+// `kDp4aHalfScales` and provides `half_scales(slice)`; its codes must be signed (`kDp4aBias` 0),
+// since the bias correction is formed per 32 values.
+template <class Format>
+concept StreamDp4aHalfScaleFormat =
+    StreamDp4aFormat<Format> && requires { requires Format::kDp4aHalfScales; };
+
+// A format with only the dp4a form (no FP32 stream, tensor-core or tile form) sets `kDp4aOnly`:
+// the streaming GEMV then declines whatever dp4a declines, and the caller keeps its own kernels.
+template <class Format>
+concept StreamDp4aOnlyFormat = StreamDp4aFormat<Format> && requires { requires Format::kDp4aOnly; };
+
 inline constexpr int kStreamDp4aMaxCols = 8;
 
 // Shared memory per token and K value: one int8 plus a (scale, bias sum) pair per 32 values.
@@ -165,6 +177,8 @@ void stream_dp4a_kernel(const __nv_bfloat16* __restrict__ x, std::int64_t x_stri
                         typename Format::Planes planes, Sink sink, std::int32_t items,
                         std::int32_t row_offset, std::int32_t k, std::int32_t padded_k,
                         std::int32_t chunk_k) {
+    static_assert(!StreamDp4aHalfScaleFormat<Format> || Format::kDp4aBias == 0,
+                  "a half-scale dp4a format needs signed codes");
     extern __shared__ __align__(16) unsigned char stream_dp4a_shared[];
     const int chunk_slices = chunk_k / 32;
     auto* q8               = reinterpret_cast<uint4*>(stream_dp4a_shared);
@@ -233,13 +247,20 @@ void stream_dp4a_kernel(const __nv_bfloat16* __restrict__ x, std::int64_t x_stri
                 if (v < slices) {
                     std::uint32_t even[Rows][4], odd[Rows][4];
                     float scale[Rows];
+                    [[maybe_unused]] float scale_hi[Rows];
 #pragma unroll
                     for (int r = 0; r < Rows; ++r) {
                         Format::template dp4a_word<0>(current[r][u], even[r][0], odd[r][0]);
                         Format::template dp4a_word<1>(current[r][u], even[r][1], odd[r][1]);
                         Format::template dp4a_word<2>(current[r][u], even[r][2], odd[r][2]);
                         Format::template dp4a_word<3>(current[r][u], even[r][3], odd[r][3]);
-                        scale[r] = Format::scale(current[r][u]);
+                        if constexpr (StreamDp4aHalfScaleFormat<Format>) {
+                            const float2 halves = Format::half_scales(current[r][u]);
+                            scale[r]            = halves.x;
+                            scale_hi[r]         = halves.y;
+                        } else {
+                            scale[r] = Format::scale(current[r][u]);
+                        }
                     }
                     const int swap = (v >> 2) & 1;
 #pragma unroll
@@ -250,6 +271,23 @@ void stream_dp4a_kernel(const __nv_bfloat16* __restrict__ x, std::int64_t x_stri
                         const float2 m     = meta[t * chunk_slices + v];
 #pragma unroll
                         for (int r = 0; r < Rows; ++r) {
+                            if constexpr (StreamDp4aHalfScaleFormat<Format>) {
+                                // Words 0, 1 are the slice's first 16 values (one scale), words
+                                // 2, 3 the second; the bias is zero, so neither starts from m.y.
+                                int lo = 0, hi = 0;
+                                lo = __dp4a(static_cast<int>(even[r][0]), static_cast<int>(first.x), lo);
+                                lo = __dp4a(static_cast<int>(odd[r][0]), static_cast<int>(first.y), lo);
+                                lo = __dp4a(static_cast<int>(even[r][1]), static_cast<int>(first.z), lo);
+                                lo = __dp4a(static_cast<int>(odd[r][1]), static_cast<int>(first.w), lo);
+                                hi = __dp4a(static_cast<int>(even[r][2]), static_cast<int>(second.x), hi);
+                                hi = __dp4a(static_cast<int>(odd[r][2]), static_cast<int>(second.y), hi);
+                                hi = __dp4a(static_cast<int>(even[r][3]), static_cast<int>(second.z), hi);
+                                hi = __dp4a(static_cast<int>(odd[r][3]), static_cast<int>(second.w), hi);
+                                const float sum = fmaf(scale[r], static_cast<float>(lo),
+                                                       scale_hi[r] * static_cast<float>(hi));
+                                acc[r][t] = fmaf(m.x, sum, acc[r][t]);
+                                continue;
+                            }
                             int s = __float_as_int(m.y);
                             s     = __dp4a(static_cast<int>(even[r][0]), static_cast<int>(first.x), s);
                             s     = __dp4a(static_cast<int>(odd[r][0]), static_cast<int>(first.y), s);

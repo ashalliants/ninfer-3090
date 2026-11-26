@@ -8,8 +8,76 @@
 #include "ops/linear/nvfp4/nvfp4_a16_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_stream_format.cuh"
+#include "ops/linear/common/stream_gemv.cuh"
+#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_epilogue.cuh"
 
 namespace ninfer::ops::detail {
+// SwiGLU's gate and up rows (Nvfp4SwiGluRows: row r and r + rows / 2) streamed as one item.
+template <class Output, class Epilogue>
+struct Nvfp4StreamPairSink {
+    Output output;
+    Epilogue epilogue;
+    std::int32_t token_begin = 0;
+
+    template <int Rows, int Cols>
+    __device__ __forceinline__ void finish(int item, const float (&acc)[Rows][Cols]) const {
+        static_assert(Rows == 2);
+#pragma unroll
+        for (int t = 0; t < Cols; ++t)
+            epilogue.apply_pair(output, item, token_begin + t, acc[0][t], acc[1][t]);
+    }
+    Nvfp4StreamPairSink with_token_offset(std::int32_t begin) const {
+        Nvfp4StreamPairSink sink = *this;
+        sink.token_begin += begin;
+        return sink;
+    }
+};
+
+template <class Rows>
+inline constexpr bool kNvfp4StreamSwiGluRows = false;
+template <>
+inline constexpr bool kNvfp4StreamSwiGluRows<Nvfp4SwiGluRows<1>> = true;
+
+// The dp4a streaming GEMV (Nvfp4StreamFormat) where it serves the call: sm_70 under
+// EngineOptions::verify_a8, 1..8 tokens. Returns false, and the caller runs its own kernel,
+// everywhere else.
+template <class Output, class Epilogue, class Rows>
+bool try_launch_nvfp4_stream(const Nvfp4A16Operands& p, Output output, Epilogue epilogue,
+                             cudaStream_t stream) {
+    if constexpr (!kStreamDp4aCompiled) {
+        return false;
+    } else {
+        if (p.tokens < 1 || p.tokens > kStreamDp4aMaxCols || !stream_dp4a_enabled(stream))
+            return false;
+        const auto planes = nvfp4_stream_planes(p.codes, p.scales, p.alpha);
+        if constexpr (Rows::kPaired) {
+            if constexpr (!kNvfp4StreamSwiGluRows<Rows>) {
+                return false;
+            } else {
+                if (p.rows % 2) return false;
+                return try_launch_stream_gemv_passes<Nvfp4StreamFormat, 2>(
+                    p.x, p.k, planes, Nvfp4StreamPairSink<Output, Epilogue>{output, epilogue},
+                    p.rows / 2, p.rows / 2, p.k, p.k, stream, p.tokens);
+            }
+        } else if constexpr (requires { Epilogue::kRowTokens; }) {
+            // A row epilogue (the GDN conv) takes exactly its token count: one width, one pass.
+            constexpr int kTokens = Epilogue::kRowTokens;
+            if constexpr (kTokens < 1 || kTokens > kStreamDp4aMaxCols) {
+                return false;
+            } else {
+                if (p.tokens != kTokens) return false;
+                return try_launch_stream_gemv_rows<Nvfp4StreamFormat, 1, kTokens>(
+                    p.x, p.k, planes, StreamGemvRowSink<Output, Epilogue>{output, epilogue, 0},
+                    p.rows, 0, p.k, p.k, stream);
+            }
+        } else {
+            return try_launch_stream_gemv<Nvfp4StreamFormat>(p.x, planes, output, epilogue, p.rows,
+                                                             p.k, p.k, stream, p.tokens);
+        }
+    }
+}
+
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a16_gemv(const Nvfp4A16Operands& p, Output output, Epilogue epilogue,
                            cudaStream_t stream, Rows rows = {}) {
@@ -17,6 +85,7 @@ void launch_nvfp4_a16_gemv(const Nvfp4A16Operands& p, Output output, Epilogue ep
     if (p.tokens != 1 || p.rows % Schedule::kBlockRows || (Rows::kPaired && p.rows % 256) ||
         p.k % (32 * Schedule::kValuesPerLane))
         throw std::invalid_argument("NVFP4 GEMV requires T=1 and complete row/K tiles");
+    if (try_launch_nvfp4_stream<Output, Epilogue, Rows>(p, output, epilogue, stream)) return;
     static_assert(Schedule::kStaticK > 0, "SIMT phase specialization requires a static K instance");
     nvfp4_a16_gemv_kernel<Schedule>
         <<<p.rows / Schedule::kBlockRows, Schedule::kThreads, 0, stream>>>(
@@ -38,6 +107,7 @@ void launch_nvfp4_a16_simt(const Nvfp4A16Operands& p, Output output, Epilogue ep
         if (p.tokens != Epilogue::kRowTokens)
             throw std::invalid_argument("NVFP4 row epilogue requires its complete token interval");
     }
+    if (try_launch_nvfp4_stream<Output, Epilogue, Rows>(p, output, epilogue, stream)) return;
     static_assert(Schedule::kStaticK > 0 && Schedule::kTokenCapacity > 0);
     const int capacity = Schedule::kTokenCapacity;
     const int blocks   = p.rows / Schedule::kBlockRows * div_up(capacity, Schedule::kBlockTokens);

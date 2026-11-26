@@ -414,3 +414,14 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   set_tests_properties(ninfer_attn_input_proj_draft_a8_test PROPERTIES
     ENVIRONMENT "NINFER_TEST_DRAFT_A8=1" SKIP_RETURN_CODE 77)
 endif()
+
+# sm_70: the int8-activation streaming GEMV forced on for the NVFP4 projections' decode widths
+# (Nvfp4StreamFormat), and every other format these suites run, at the stream_a8 allowance.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  foreach(test ninfer_attn_input_proj_test ninfer_gdn_input_proj_test
+               ninfer_gdn_input_proj_conv_snapshot_test)
+    add_test(NAME ${test}_stream_a8 COMMAND ninfer_tests ${test})
+    set_tests_properties(${test}_stream_a8 PROPERTIES
+      ENVIRONMENT "NINFER_STREAM_DP4A=1" SKIP_RETURN_CODE 77)
+  endforeach()
+endif()

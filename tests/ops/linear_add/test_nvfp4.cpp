@@ -222,7 +222,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
                 expected.push_back(sum + static_cast<double>(bf16_to_f32(initial_residual[index])));
             }
         }
-        failures += verify_reduction(label, actual, expected, a4 ? kA4Tolerance : kA16Tolerance);
+        failures += verify_reduction(label, actual, expected, a4 ? kA4Tolerance : with_stream_a8_allowance(kA16Tolerance));
     }
 
     failures += device_activation.verify_guards("NVFP4 linear_add activation");

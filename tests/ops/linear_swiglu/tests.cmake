@@ -41,4 +41,8 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     COMMAND ninfer_tests ninfer_linear_swiglu_q4_a16_test)
   set_tests_properties(ninfer_linear_swiglu_q4_a16_stream_a8_test PROPERTIES
     ENVIRONMENT "NINFER_STREAM_DP4A=1" SKIP_RETURN_CODE 77)
+  add_test(NAME ninfer_linear_swiglu_nvfp4_stream_a8_test
+    COMMAND ninfer_tests ninfer_linear_swiglu_nvfp4_test)
+  set_tests_properties(ninfer_linear_swiglu_nvfp4_stream_a8_test PROPERTIES
+    ENVIRONMENT "NINFER_STREAM_DP4A=1" SKIP_RETURN_CODE 77)
 endif()

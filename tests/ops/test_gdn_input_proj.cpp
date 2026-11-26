@@ -20,7 +20,9 @@ using namespace ninfer::test::input_projection;
 namespace {
 
 // This criterion belongs to the complete A16 GDN-input-projection Op.
-constexpr ReductionCriterion kGdnInputProjA16Tolerance{3.0e-3, 4.0e-3, kBf16GrossRelativeFloor};
+// Widened under NINFER_STREAM_DP4A=1 (the _stream_a8 variant), like the other A16 suites.
+const ReductionCriterion kGdnInputProjA16Tolerance =
+    with_stream_a8_allowance({3.0e-3, 4.0e-3, kBf16GrossRelativeFloor});
 constexpr ReductionCriterion kFp8GdnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 constexpr ReductionCriterion kGdnInputProjA4Tolerance{0.16, 4.0e-3, 0.16};
