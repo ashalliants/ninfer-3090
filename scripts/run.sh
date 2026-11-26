@@ -6,6 +6,8 @@
 #
 #   model             profiles
 #   qwen38-27b        tuned (default), int8, c8   <- recommended
+#   qwen38-27b-qad    tuned (default)      <- NVIDIA's NVFP4 QAD build of the same model: closer to
+#                                             full precision, slower decode (V100-measured; preview here)
 #   qwen36-35b-a3b    tuned (default)
 #   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_XS GGUF (preview)
 #   qwen38-flash-next-iq3 tuned (default)  <- the same model from Unsloth's UD-IQ3_XXS GGUF (preview)
@@ -161,6 +163,7 @@ set -euo pipefail
 usage() {
   printf 'usage: %s <model> [profile]\n' "${0##*/}"
   printf '  qwen38-27b       tuned (default), int8, c8   (recommended)\n'
+  printf '  qwen38-27b-qad   tuned (default)      (NVIDIA NVFP4 QAD: higher accuracy, slower; preview)\n'
   printf '  qwen36-35b-a3b   tuned (default)\n'
   printf '  qwen38-flash-next tuned (default)      (preview)\n'
   printf '  qwen38-flash-next-iq3 tuned (default)   (preview, Unsloth UD-IQ3_XXS)\n'
@@ -171,6 +174,7 @@ profile="${2:-tuned}"
 case "$model_key" in
   -h|--help) usage; exit 0 ;;
   qwen38-27b)        artifact='qwen3_8_27b.ninfer';     title='Qwen3.8-27B' ;;
+  qwen38-27b-qad)    artifact='qwen3_8_27b_nvfp4_qad.ninfer'; title='Qwen3.8-27B (NVIDIA NVFP4 QAD)' ;;
   qwen36-35b-a3b)     artifact='qwen3_6_35b_a3b.ninfer'; title='Qwen3.6-35B-A3B' ;;
   qwen38-flash-next)  artifact='qwen4exp-iq2xs.ninfer';  title='Qwen3.8-Flash-Next (IQ2_XS)' ;;
   qwen38-flash-next-iq3) artifact='qwen4exp-ud-iq3xxs-mtp-vision.ninfer'; title='Qwen3.8-Flash-Next (Unsloth UD-IQ3_XXS)' ;;
@@ -318,6 +322,34 @@ case "$model_key/$profile" in
     if [[ "$SPEC" == 'dflash2' ]]; then
       hint="Need a second lane?  NINFER_SPEC=mtp ${0##*/} $model_key  (slower decode)"
     fi ;;
+
+  qwen38-27b-qad/tuned)
+    # NVIDIA's quantization-aware-distilled NVFP4/FP8 weights: closer to BF16 than the Q4/Q5 mix, and
+    # slower to decode. The artifact has no DFlash2 bundle, so MTP is the only speculation. Overlay
+    # vision borrows its encode window from the MTP weights, so speculation stays on (NINFER_SPEC=none
+    # would need NINFER_VISION_RESIDENCY=resident). Measured on the Tesla V100 only (docs/tesla-v100.md);
+    # not yet measured on the RTX 3090.
+    SPEC="${NINFER_SPEC:-mtp}"
+    case "$SPEC" in
+      mtp) ;;
+      *) printf 'NINFER_SPEC must be mtp for qwen38-27b-qad, got %s\n' "$SPEC" >&2; exit 2 ;;
+    esac
+    case "${NINFER_NGRAM:-off}" in
+      off) ;;
+      on) printf 'NINFER_NGRAM=on needs NINFER_SPEC=dflash2, which only qwen38-27b has\n' >&2; exit 2 ;;
+      *) printf 'NINFER_NGRAM must be on or off, got %s\n' "$NINFER_NGRAM" >&2; exit 2 ;;
+    esac
+    use_profile qwen38-27b-qad-tuned-mtp
+    DRAFT_TOKENS="${NINFER_DRAFT_TOKENS:-$(profile_value draft-tokens)}"
+    CONTEXT="${NINFER_CONTEXT:-262144}"
+    CONCURRENCY="${NINFER_CONCURRENCY:-2}"
+    KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
+    KV_DTYPE="${NINFER_KV_DTYPE:-$(profile_value kv-dtype)}"
+    PREFILL_CHUNK="${NINFER_PREFILL_CHUNK:-$(profile_value prefill-chunk)}"
+    profile_args=(--max-concurrency "$CONCURRENCY" --max-context "$CONTEXT" --kv-capacity "$KV_CAPACITY")
+    tuned_overrides
+    label="C$CONCURRENCY  |  context $CONTEXT  |  KV pool $KV_CAPACITY  |  $KV_DTYPE  |  MTP$DRAFT_TOKENS + draft head, two lanes"
+    prefill_note="Prefill: cuBLAS route, chunk $PREFILL_CHUNK" ;;
 
   qwen36-35b-a3b/tuned)
     SPEC="${NINFER_SPEC:-mtp}"

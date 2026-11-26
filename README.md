@@ -86,6 +86,7 @@ Decode is one stream unless the column says otherwise.
 | Ternary Bonsai 2 27B | RTX 3090 | **262,144** (with DFlash2, 9.6 GiB free) | 2.8-2.9K tok/s | 88-90 plain; **238** mean over 12 chats, 372 maths (DFlash2, 7 drafts, Windows; 235 and 364 under WSL); 74 after a 245K-token document | **573 tok/s** at C8 (MTP3; 572.5 under WSL) |
 | Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | ~115 tok/s at C2 (MTP; 103-125, Linux) |
 | **Qwen3.8-27B** | Tesla V100 32 GB | 262,144 | ~1,020 tok/s at 4.4K | **147 tok/s** on code (DFlash2 K7 + n-gram 15, 200 W, master `d309f3d8`); 116.5 thinking and 190 on structured JSON (DFlash2); 72-79 story, Chinese and French (MTP3); **69.5 at 43K and 56.7 at 172K context** (MTP3; 53.0 and 26.4 before) | **122 tok/s** at C2 (MTP3, 200 W); 95 with DFlash2 K7 (90 before) |
+| **Qwen3.8-27B, NVIDIA NVFP4 QAD** (new: higher accuracy) | Tesla V100 32 GB | **262,144**, two lanes, with vision | 746 tok/s at 3.8K; 204 at 22 tokens (one request, `ninfer`) | **90 tok/s** on code, 59 story (MTP3, served, 200 W); 40.6 plain (one request, `ninfer`) | |
 | Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K (250 W) | **129.6 tok/s** (MTP7 + draft vocabulary, code); 103-106 thinking, 82-83 story, 81 Chinese, 77 French (200 W); flat from 10K to 221K context | |
 | Qwen3.6-35B-A3B (MoE) | Tesla V100 32 GB | 65,536 tested | **3,984 tok/s** at 4.2K, 3,118 at 40.2K (200 W) | **253.7 tok/s** on code, 265 thinking, 303 structured JSON, 172.6-192.7 story, Chinese, French and conversation (MTP3 + draft head, 200 W); **319 structured JSON** with DFlash K7; 155 plain | 197-200 tok/s at C2 (MTP3, story + code) |
 | **Inkling-2-Mini** (new) | RTX 3090 | **137,216** plain, 89,088 with DSpark and vision; **262,144** with both on `--kv-dtype rk4v4` (lossy, opt-in) | **2,421 tok/s** at 8.4K, 65,536 context with vision (Windows; 2,410 under WSL); 2,416 at 1.2K | **104 tok/s** plain (12 chats, WSL; 101.8 on Windows); 115.5 best with DSpark (code) | **282 tok/s** at C8 (plain, WSL; 277 on Windows) |
@@ -101,6 +102,17 @@ Ternary Bonsai 2 27B's context and C8 figures: 2026-11-23, WSL and Windows, 315 
 A blank cell has not been measured.
 Full methods: [RTX 3090 benchmarks](#performance-on-an-rtx-3090), [V100 guide](docs/tesla-v100.md),
 [Inkling-2-Mini spec](docs/maintainer/inkling2-model.md).
+
+**Two Qwen3.8-27B builds, so you can pick.** `qwen38-27b` (the default) is this fork's own Q4/Q5
+conversion and the fastest. `qwen38-27b-qad` is [NVIDIA's quantization-aware-distilled NVFP4
+checkpoint](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD), which NVIDIA trained to match the
+BF16 model (within half a point on GPQA Diamond, IFBench and MMMU Pro by NVIDIA's own evaluation),
+and it reads closer to full precision than the default here too (lower perplexity on every domain
+measured). It is slower: served on a Tesla V100 with MTP3 it decodes 90 tok/s on code and 59 on
+prose against the default's 110 and 77 with MTP3, and it has no DFlash2 for the default's faster
+code decode. Measured on the V100 only so
+far. [Model card](model-cards/Qwen3.8-27B-NVFP4-QAD-NInfer-V100/README.md) ·
+[V100 numbers](docs/tesla-v100.md#qwen38-27b-nvidias-nvfp4-qad-checkpoint)
 
 **Qwen3.8-Flash-Next (preview, Windows)** runs on the same card too: a 512-expert MoE at 2 bits per
 weight with its experts pinned in host RAM, at **1.15-1.18x Strata's plain decode** and
@@ -179,13 +191,16 @@ tar -xzf ninfer-v100-linux-x64-*.tar.gz && cd ninfer-v100-linux-x64-*/
 NINFER_API_KEY=<a secret> ./run-v100.sh qwen38-27b   # MTP3 with INT8 KV, 262,144 tokens; also qwen38-flash-next, qwen36-35b-a3b
 ```
 
+For NVIDIA's higher-accuracy NVFP4 QAD build of the same 27B (slower decode), use `qwen38-27b-qad` in
+both commands.
+
 [V100 guide](docs/tesla-v100.md) for Flash-Next, Inkling-2-Mini and the measurements.
 
 Then point your harness at `http://127.0.0.1:8080/v1`. It is an OpenAI-compatible endpoint (the
 Anthropic Messages API is served too), so anything that speaks `/v1/chat/completions` works; leave
 the API key blank.
 
-The downloaders fetch `qwen38-27b`, `qwen36-35b-a3b` or `qwen36-27b`. Each pins a HuggingFace
+The downloaders fetch `qwen38-27b`, `qwen38-27b-qad`, `qwen36-35b-a3b` or `qwen36-27b`. Each pins a HuggingFace
 revision, stages under a revision-scoped name so a resume can only ever continue the same artifact,
 and verifies size and SHA-256 before promoting it.
 
@@ -198,6 +213,7 @@ The platform guides cover GPU checks, Docker, native builds and model mounts:
 |---|---|
 | `run qwen38-27b` | **Recommended.** Qwen3.8-27B, one user, DFlash2, cuBLAS prefill; 188K on Windows, 262K headless |
 | `NINFER_SPEC=mtp` + `run qwen38-27b` | Qwen3.8-27B at the full 262K with two lanes, MTP3 instead of DFlash2 |
+| `run qwen38-27b-qad` | NVIDIA's NVFP4 QAD build of Qwen3.8-27B: closer to full precision, slower decode; MTP3, two lanes, 262K (preview: measured on the V100, not yet on the RTX 3090) |
 | `run qwen36-35b-a3b` | Qwen3.6-35B-A3B, MTP3, cuBLAS prefill, vision; 213K with two lanes on Windows, 262K with three on Linux |
 | `run qwen38-27b int8` | Reference profile: one user, INT8 KV (the quality default), 64K context |
 | `run qwen38-27b c8` | Reference profile: eight lanes at 8K, highest aggregate throughput |
@@ -613,6 +629,7 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | Model | Artifact | Size | Notes |
 |---|---|---:|---|
 | **Qwen3.8-27B** | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090/tree/349987303604180bef448d0accbb838b4465d862) | 17.68 GiB | **Recommended.** Validated at C1–C8 with ReplaySSM. This fork's [3090 conversion](model-cards/Qwen3.8-27B-NInfer-3090/README.md): imatrix-weighted encoder, 4-bit embedding, 6-bit head. Carries vision, MTP and the DFlash2 bundle for `--spec dflash2` |
+| **Qwen3.8-27B, NVIDIA NVFP4 QAD** (new) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-27B-NVFP4-QAD-NInfer-V100/tree/2cd93ef54b0a68b33f5d1a10abad68fef2cbbd2f) | 16.91 GiB | **Higher accuracy, slower.** NVIDIA's [quantization-aware-distilled NVFP4/FP8 checkpoint](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD) imported exactly ([model card](model-cards/Qwen3.8-27B-NVFP4-QAD-NInfer-V100/README.md)), with vision and MTP (no DFlash2). Lower perplexity than the row above on every domain measured; on a V100 MTP3 decodes 90 tok/s on code against its 110. Measured on the Tesla V100; not yet on the RTX 3090 |
 | Ternary Bonsai 2 27B | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Ternary-Bonsai-2-27B-NInfer-3090/tree/983a9be22f3623f3a2799655741d2a92db86d37d) | 8.87 GiB | Prism ML's ternary Qwen3.8-27B (2.125 bits per weight), this fork's [3090 conversion](model-cards/Ternary-Bonsai-2-27B-NInfer-3090/README.md) with vision, MTP, DFlash2 and a proposal head. 6.7 GiB of weights; on one RTX 3090 about 88-90 tok/s plain and 235 on average over 12 chats with `--spec dflash2 --draft-tokens 7` (250-300 on code and arithmetic), 572 tok/s aggregate at 8 requests with MTP3, the full 262,144-token context, prefill 2.8-2.9k tok/s, quick-corpus perplexity 5.627. Run it with `ninfer` or `ninfer-serve` directly: it has no `run.bat` profile yet |
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
@@ -620,7 +637,7 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | **Inkling-2-Mini** (new, V100 and RTX 3090) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Inkling-2-Mini-NInfer-V100/tree/e348ad671599db1db110447b9d9ebfb898070f67) | 22.27 GiB with DSpark and vision | Tesla V100 32 GB (Linux, up to 8 requests at once) or RTX 3090 (measured under WSL and on Windows). This fork's [exact conversion](model-cards/Inkling-2-Mini-NInfer-V100/README.md) of Unsloth's UD-Q8_K_XL GGUF: lossless, unpacking the expert records reproduces every source tensor byte for byte. See [Inkling-2-Mini](#inkling-2-mini-new-v100-and-rtx-3090) |
 | Qwen3.8-Flash-Next, UD-IQ3_XXS (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/tree/196f11834dfe4fc21342f0255bcee034a5120ae7) | 53.17 GiB in two files + the 27.13 GiB n-gram volume of the row above | Windows, one request at a time, 64 GB RAM (about 42 GiB available), text only. This fork's [conversion](model-cards/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/README.md) of Unsloth's Dynamic v3.1 UD-IQ3_XXS GGUF with the MTP drafter: lower perplexity than the row above, about half the speed |
 
-`download-model qwen38-27b`, `bonsai2-27b`, `qwen36-35b-a3b`, `qwen36-27b` or `inkling2-mini` (`.bat` on Windows, `.sh` on Linux)
+`download-model qwen38-27b`, `qwen38-27b-qad`, `bonsai2-27b`, `qwen36-35b-a3b`, `qwen36-27b` or `inkling2-mini` (`.bat` on Windows, `.sh` on Linux)
 fetches the pinned revision into `models/` and verifies it. `download-model qwen38-flash-next`
 fetches the Flash-Next model, its second file and the n-gram volume the same way (`qwen38-flash-next-iq3`
 fetches the UD-IQ3_XXS build, which reuses the same volume if it is already there); it asks which folder the volume goes in (`NINFER_NGRAM_DIR` answers in advance), because the volume is

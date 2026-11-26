@@ -443,6 +443,23 @@ Before these routes, the QAD artifact decoded at 8.6 tok/s and prefilled the lon
 25 tok/s. Short prompts now match the Q4/Q5 mix: with a plain template, 11 / 18 / 28 / 47 prompt
 tokens prefill at 184.8 / 235.8 / 324.2 / 305.6 tok/s against its 189.6 / 229.8 / 315.0 / 324.1.
 
+**Serving it.** `download-model.sh qwen38-27b-qad`, then `run-v100.sh qwen38-27b-qad`: MTP3 with the
+draft head, INT8 KV, two lanes sharing the full 262,144-token context, vision in overlay residency.
+It starts with 3.9 GiB of VRAM free. Speculation stays on because overlay vision borrows its encode
+window from the MTP weights (`NINFER_SPEC=none` is refused rather than started without images).
+`ninfer-serve` on 127.0.0.1, MTP3, INT8 KV, `--prefill-cublas --prefill-chunk 2048 --gdn-state-fp16`,
+greedy, thinking off, 400-token answers, 200 W (2026-11-26):
+
+| Prompt | NVFP4 QAD | Q4/Q5 mix, MTP3 (2026-11-24) |
+|---|---:|---:|
+| Code (ISO 8601 parser with tests) | 90.0 tok/s | 110 tok/s |
+| Story | 59.0 tok/s | 77 tok/s |
+
+Single-request decode without speculation is within 4% (40.6 against 42.2, the table above); with
+MTP3 the gap widens to about 20% (the QAD accepted 287 drafts for its 400 code tokens; the Q4/Q5
+mix's acceptance was not recorded in the same run). The Q4/Q5 column is from the router's comments for that build, on the same
+card and settings, not from this session's run.
+
 **Quality.** On the held-out corpus (quick set, 4,096 context, stride 2,048, BF16 KV), the QAD artifact
 scored lower perplexity than the Q4/Q5 mix on all three domains measured: wikipedia_en 5.520
 against 5.547, wikipedia_zh 8.961 against 9.287, arxiv 6.401 against 6.425. The other three domains
