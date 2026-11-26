@@ -604,7 +604,8 @@ The difference is victim selection for the Host tier. Each candidate eviction us
 against every retained checkpoint, rebuilt per candidate; the retained set is now prepared once per
 decision (#644), and an unproven one-off write now takes a single release action from unproven
 history instead of a full search (#645). #644 alone measured 6.09-6.14 requests/s against
-6.10 with both: on this workload, nearly all the gain is #644's. Cache decisions are unchanged: the same saves failed (0.89 per request) and the same bytes
+6.10 with both: on this workload, nearly all the gain is #644's. Cache decisions are unchanged:
+the same saves failed (0.89 per request) and the same bytes
 moved (21.6 MB per request) in both builds. 1,187-1,194 of the 1,200 labels matched between any two
 runs, of one build or both: run-to-run variation from batch timing, the same size within a build as
 across builds. RTX 3090 NOT RUN.
