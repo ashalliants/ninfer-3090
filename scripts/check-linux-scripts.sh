@@ -846,10 +846,11 @@ chmod +x "$tmp/bin/sha256sum"
 # model's own expected_size and skip the hash, which proves the promotion path without needing a real
 # 19 GB payload.
 downloader="$root/download-model.sh"
-models=(qwen38-27b qwen36-27b qwen36-35b-a3b)
+models=(qwen38-27b qwen38-27b-qad qwen36-27b qwen36-35b-a3b)
 artifact_of() {
   case "$1" in
     qwen38-27b) printf 'qwen3_8_27b.ninfer' ;;
+    qwen38-27b-qad) printf 'qwen3_8_27b_nvfp4_qad.ninfer' ;;
     qwen36-27b) printf 'qwen3_6_27b.ninfer' ;;
     qwen36-35b-a3b) printf 'qwen3_6_35b_a3b.ninfer' ;;
   esac
