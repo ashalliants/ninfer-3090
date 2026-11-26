@@ -186,6 +186,33 @@ before), 100.3 thinking (97.1), 80.5 story (80.1) and 78.8 Chinese (78.6). **Fre
 
 ## RTX 3090 (`sm_86`) findings — this fork
 
+### Qwen3.8-27B: four-session verify attention fills the 3090's waves (2026-11-26)
+
+With two or more sequences in one MTP verify, the INT8-family small-T attention chose its split
+count from CTA targets tuned for a 170-SM card. On the 3090 these kernels run two CTAs per SM (164
+per wave), so four 27B sequences past 79,360 keys got 21 splits: 336 CTAs, two full waves and 8 CTAs
+in a third. Above 8,198 keys a multi-row launch now takes the smallest split count, at or above the
+page limit, that keeps its waves at least 97% full (30 splits for four sequences at 80K). One
+sequence, windows of 8,198 keys or fewer, fp8, nvfp4, k8v4 and the V100 build keep the old rule.
+
+**Op bench** (`ninfer_causal_softmax_attention_bench`, d256-h24-kv4, append, 4 columns, graph,
+exact envelope, ABBA in one lock hold, WSL build): four `rk4v4` sequences take 1,374 µs a call at
+79,872 keys against 1,710 (-19.6%), -19.3% at 81,920, -8.6% at 98,304 and -6.6% at 131,072. One
+sequence is unchanged (within ±3%).
+
+**Four concurrent agent sessions**: the workload, flags and machine of the next section (four
+75-84K-token sessions, ~95% cached follow-ups, 1,700 tokens out each, MTP3, `rk4v4`, the
+`NINFER_CONCURRENCY=4` launcher flags). Windows 11, 315 W limit, ABBA in one lock hold, throttle
+reasons power cap only:
+
+| Build | batch | aggregate | worst wait for a first token |
+|---|---:|---:|---:|
+| before (#642) | 59.4 / 59.6 s | 114.6 / 114.1 tok/s | 13.5 / 13.6 s |
+| **this change** | **56.7 / 56.9 s** | **119.9 / 119.5 tok/s** | 13.4 / 13.4 s |
+
+That is +4.6% aggregate and 2.7 s off each four-session batch. Against the one-context pool of the
+earlier launcher (98.7 tok/s, 68.9 s) the four sessions now finish 21% faster in aggregate.
+
 ### Qwen3.8-27B: hot embedding rows and a shared KV pool for long agent sessions (2026-11-26)
 
 Two launcher changes, measured on the desktop RTX 3090 (Windows 11, the desktop holding 1.4-1.9 GiB)

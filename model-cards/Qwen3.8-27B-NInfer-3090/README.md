@@ -227,8 +227,8 @@ bit, no measured speed change, 622 MiB more for the KV cache. That day, on a des
 without). With `NINFER_SPEC=mtp` and three or more lanes, each request is capped at 131,072 tokens
 and the shared pool is sized to the card: on Windows 11 at the 315 W limit, 330,240 tokens at four
 lanes (932 MiB free), so four 75-84K-token agent sessions with ~95% cached follow-ups all ran at
-once: 114.5 tok/s aggregate against 98.7 with the earlier one-context pool (+16%), a batch of 59.4 s
-against 68.9 s, and the worst first-token wait 13.8 s against 41.0 s.
+once: 119.9 tok/s aggregate against 98.7 with the earlier one-context pool (+21%), a batch of 56.7 s
+against 68.9 s, and the worst first-token wait 13.4 s against 41.0 s.
 
 **Smoke tests.** These all completed coherently:
 
