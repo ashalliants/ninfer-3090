@@ -40,7 +40,7 @@ template <>
 inline constexpr bool kNvfp4StreamSwiGluRows<Nvfp4SwiGluRows<1>> = true;
 
 // The dp4a streaming GEMV (Nvfp4StreamFormat) where it serves the call: sm_70 under
-// EngineOptions::verify_a8, 1..8 tokens. Returns false, and the caller runs its own kernel,
+// EngineOptions::verify_a8, 1..64 tokens (9..64 on the tensor-core tiles). Returns false, and the caller runs its own kernel,
 // everywhere else.
 template <class Output, class Epilogue, class Rows>
 bool try_launch_nvfp4_stream(const Nvfp4A16Operands& p, Output output, Epilogue epilogue,
@@ -48,7 +48,12 @@ bool try_launch_nvfp4_stream(const Nvfp4A16Operands& p, Output output, Epilogue 
     if constexpr (!kStreamDp4aCompiled) {
         return false;
     } else {
-        if (p.tokens < 1 || p.tokens > kStreamDp4aMaxCols || !stream_dp4a_enabled(stream))
+        // 1..8 tokens on dp4a; 9..64 as tensor-core tile passes (stream_tile_gemm.cuh) with any
+        // last pass of up to eight on dp4a, so both need the int8 route enabled.
+        if (p.tokens < 1 || !stream_dp4a_enabled(stream)) return false;
+        if (p.tokens > kStreamDp4aMaxCols &&
+            (p.tokens > kStreamGemvMaxTokens ||
+             !stream_tile_gemm_supported<Nvfp4StreamFormat>(p.k, p.k, p.k)))
             return false;
         const auto planes = nvfp4_stream_planes(p.codes, p.scales, p.alpha);
         if constexpr (Rows::kPaired) {

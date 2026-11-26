@@ -29,4 +29,17 @@ void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tenso
         nvfp4_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
+bool nvfp4_attn_input_stream_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                    Tensor& k, Tensor& v, cudaStream_t stream) {
+    const Nvfp4AttentionInputOutput output{
+        static_cast<__nv_bfloat16*>(q.data),
+        static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(gate.data),
+        static_cast<__nv_bfloat16*>(v.data),
+    };
+    return try_launch_nvfp4_stream<Nvfp4AttentionInputOutput, LinearIdentityEpilogue,
+                                   Nvfp4IdentityRows>(nvfp4_a16_operands(x, weight), output,
+                                                      LinearIdentityEpilogue{}, stream);
+}
+
 } // namespace ninfer::ops::detail

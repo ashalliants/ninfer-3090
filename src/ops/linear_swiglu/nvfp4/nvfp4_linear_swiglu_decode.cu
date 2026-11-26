@@ -12,4 +12,11 @@ void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& w, Tensor&
                              LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), w.n / 2},
                              Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<1>{});
 }
+
+bool nvfp4_linear_swiglu_stream_launch(const Tensor& x, const Weight& w, Tensor& y,
+                                       cudaStream_t stream) {
+    return try_launch_nvfp4_stream<LinearBf16Output, Nvfp4SwiGluEpilogue, Nvfp4SwiGluRows<1>>(
+        nvfp4_a16_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), w.n / 2},
+        Nvfp4SwiGluEpilogue{}, stream);
+}
 } // namespace ninfer::ops::detail

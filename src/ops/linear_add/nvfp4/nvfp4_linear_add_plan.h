@@ -22,6 +22,10 @@ namespace ninfer::ops::detail {
 void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                  cudaStream_t stream);
 
+// sm_70: 1..64 tokens as the dp4a / tensor-core streaming passes (nvfp4_stream_format.cuh). False
+// where that route does not apply, and the caller runs its own plan.
+bool nvfp4_linear_add_stream_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                    cudaStream_t stream);
 void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                     cudaStream_t stream);
 

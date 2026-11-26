@@ -18,6 +18,7 @@
 // swizzle (nvfp4_scale_byte_offset): the two groups of a slice are adjacent bytes.
 
 #include "ops/linear/common/stream_dp4a.cuh"
+#include "ops/linear/common/stream_hmma.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include <cuda_fp16.h>
@@ -100,6 +101,72 @@ struct Nvfp4StreamFormat {
             ((spread & 0x00800080u) << 8) | ((spread & 0x007f007fu) << 7);
         const float2 values = __half22float2(*reinterpret_cast<const __half2*>(&bits));
         return {values.x * slice.scale_factor, values.y * slice.scale_factor};
+    }
+
+    // Short-prompt GEMM form (ops/linear/common/stream_tile_gemm.cuh): a 64-k step is 32 code
+    // bytes, as for Q4, and four E4M3 groups whose scales are one aligned word of the swizzle. A
+    // half step (32 k, groups 2h and 2h + 1) decodes to the FP16 pairs (k 8w + i, 8w + i + 4).
+    // Each weight is 2 x E2M1 (an exact FP16 from a byte table) times the FP16 rounding of
+    // E4M3 x alpha / 2: at most two roundings, as Q4's code x FP16 scale has one.
+    static constexpr bool kTileGemm = true;
+    using GemmRow                   = Row;
+    struct GemmRaw {
+        uint4 codes;
+        std::uint32_t scales; // the half's two E4M3 scales in bytes 0 and 1
+        float scale_factor;
+    };
+    // FP16 high bytes of 0, 1, 2, 3, 4, 6, 8, 12 (2 x E2M1 for codes 0..7).
+    static constexpr std::uint32_t kHalfHigh0 = 0x42403c00u, kHalfHigh1 = 0x4a484644u;
+
+    __device__ static __forceinline__ GemmRow gemm_row(const Planes& planes, int r, int padded_k) {
+        return row(planes, r, padded_k);
+    }
+    __device__ static __forceinline__ GemmRaw gemm_fetch(const GemmRow& r, int step, int half) {
+        const auto* scales =
+            reinterpret_cast<const std::uint16_t*>(r.scales + step * 512 + half * 2);
+        return {__ldg(&r.codes[2 * step + half]), __ldg(scales), r.scale_factor};
+    }
+    __device__ static __forceinline__ GemmRaw gemm_empty() {
+        return {make_uint4(0u, 0u, 0u, 0u), 0u, 0.0f};
+    }
+    // Both halves of one step of this lane's row, the lane pair (lane, lane ^ 1) owning rows
+    // `even` and `odd` and reading each 32-byte sector whole (stream_hmma_pair_fetch).
+    __device__ static __forceinline__ void gemm_fetch_pair(const GemmRow& even, const GemmRow& odd,
+                                                           bool is_odd, int step,
+                                                           GemmRaw (&out)[2]) {
+        const StreamHmmaPair pair =
+            stream_hmma_pair_fetch(even.codes + 2 * step, odd.codes + 2 * step, is_odd);
+        const GemmRow& own = is_odd ? odd : even;
+        const std::uint32_t scales =
+            __ldg(reinterpret_cast<const std::uint32_t*>(own.scales + step * 512));
+        stream_hmma_pair_swap(pair, is_odd, out[0].codes, out[1].codes);
+        out[0].scales       = scales & 0xffffu;
+        out[1].scales       = scales >> 16;
+        out[0].scale_factor = own.scale_factor;
+        out[1].scale_factor = own.scale_factor;
+    }
+    __device__ static __forceinline__ void gemm_decode(const GemmRaw& raw, __half2 (&w)[16]) {
+        const float2 group = half_scales({raw.codes, raw.scales, raw.scale_factor});
+        const __half2 scale[2] = {__float2half2_rn(group.x), __float2half2_rn(group.y)};
+        const std::uint32_t words[4] = {raw.codes.x, raw.codes.y, raw.codes.z, raw.codes.w};
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const std::uint32_t word      = words[q];
+            const std::uint32_t magnitude = word & 0x77777777u;
+            const std::uint32_t sign      = (word >> 3) & 0x11111111u;
+            // FP16 high bytes of k 8q + 0..3 and 8q + 4..7; a set sign selects 0x80.
+            const std::uint32_t low = __byte_perm(kHalfHigh0, kHalfHigh1, magnitude) |
+                                      __byte_perm(0x00008000u, 0u, sign);
+            const std::uint32_t high = __byte_perm(kHalfHigh0, kHalfHigh1, magnitude >> 16) |
+                                       __byte_perm(0x00008000u, 0u, sign >> 16);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const std::uint32_t bits =
+                    __byte_perm(low, high, i | (i << 4) | ((4 + i) << 8) | ((4 + i) << 12)) &
+                    0xff00ff00u;
+                w[4 * q + i] = __hmul2(*reinterpret_cast<const __half2*>(&bits), scale[q >> 1]);
+            }
+        }
     }
 };
 

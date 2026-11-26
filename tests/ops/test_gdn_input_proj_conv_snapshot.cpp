@@ -1196,8 +1196,20 @@ int main() {
     }
     const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0 ||
+    // sm_70 composes A16 calls from two tokens (the streaming projection), so it reserves their
+    // projection there; elsewhere the fused small-T kernel needs none to 16.
+#if defined(NINFER_SM70)
+    const bool nvfp4_a16_small_ok =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 1) == 0 &&
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0;
+#else
+    const bool nvfp4_a16_small_ok =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) == 0;
+#endif
+    if (!nvfp4_a16_small_ok ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 3) != 0 ||
         nvfp4_a4_4 == 0 ||

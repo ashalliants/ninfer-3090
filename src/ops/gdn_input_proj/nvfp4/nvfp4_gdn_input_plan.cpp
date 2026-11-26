@@ -43,6 +43,7 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
+        if (nvfp4_gdn_input_stream_launch(x, weight, qkv, z, stream)) return;
         nvfp4_gdn_input_a16_launch(x, weight, qkv, z, stream);
         return;
     }

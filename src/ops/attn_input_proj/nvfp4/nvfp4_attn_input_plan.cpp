@@ -47,6 +47,7 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
+        if (nvfp4_attn_input_stream_launch(x, weight, q, gate, k, v, stream)) return;
         nvfp4_attn_input_a16_launch(x, weight, q, gate, k, v, stream);
         return;
     }

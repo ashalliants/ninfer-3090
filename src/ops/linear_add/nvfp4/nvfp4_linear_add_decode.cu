@@ -21,6 +21,15 @@ void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_
 
 } // namespace
 
+bool nvfp4_linear_add_stream_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                    cudaStream_t stream) {
+    auto* data = static_cast<__nv_bfloat16*>(residual.data);
+    return try_launch_nvfp4_stream<LinearBf16Output, LinearResidualAddEpilogue,
+                                   Nvfp4IdentityRows>(
+        nvfp4_a16_operands(x, weight), LinearBf16Output{data, weight.n},
+        LinearResidualAddEpilogue{{data, weight.n}}, stream);
+}
+
 void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                     cudaStream_t stream) {
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {

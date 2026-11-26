@@ -16,6 +16,10 @@ namespace ninfer::ops::detail {
                                                                        std::int32_t min_tokens,
                                                                        std::int32_t max_tokens);
 
+// sm_70: 1..64 tokens as the dp4a / tensor-core streaming passes (nvfp4_stream_format.cuh). False
+// where that route does not apply, and the caller runs its own plan.
+bool nvfp4_linear_swiglu_stream_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                       cudaStream_t stream);
 void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                        cudaStream_t stream);
 void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,

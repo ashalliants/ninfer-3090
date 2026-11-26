@@ -37,6 +37,7 @@
 #include <exception>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -602,7 +603,7 @@ int run_fp_swiglu(QType qtype, std::int32_t tokens, ops::LinearPolicy policy) {
                               " cuBLAS T=" + std::to_string(tokens);
     int failures = output.verify_guards(label);
     failures += expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols * 2, tokens,
-                             policy, ops::detail::cublas_prefill_fp_min_tokens(policy));
+                             policy, ops::detail::cublas_prefill_fp_min_tokens(policy, qtype));
     const std::vector<double> got = read_bf16(output, out_elements);
     Samples s;
     for (const std::int32_t token : sample_tokens(tokens, 29U)) {
@@ -640,7 +641,7 @@ int run_fp_add(QType qtype, std::int32_t tokens, std::int32_t kCols, ops::Linear
                               " cuBLAS K=" + std::to_string(kCols) + " T=" + std::to_string(tokens);
     int failures = device_residual.verify_guards(label);
     failures += expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols * 2, tokens,
-                             policy, ops::detail::cublas_prefill_fp_min_tokens(policy));
+                             policy, ops::detail::cublas_prefill_fp_min_tokens(policy, qtype));
     const std::vector<double> got = read_bf16(device_residual, res_elements);
     Samples s;
     for (const std::int32_t token : sample_tokens(tokens, 37U)) {
@@ -682,7 +683,7 @@ int run_fp_gdn_input(QType qtype, std::int32_t tokens, ops::LinearPolicy policy)
     int failures = device_qkv.verify_guards(label) + device_z.verify_guards(label);
     failures += expect_route(label, workspace, static_cast<std::size_t>(kParentRows) * kHidden * 2,
                              tokens, policy,
-                             ops::detail::cublas_prefill_fp_min_tokens(policy));
+                             ops::detail::cublas_prefill_fp_min_tokens(policy, qtype));
     const std::vector<double> got_qkv =
         read_bf16(device_qkv, static_cast<std::size_t>(kQkvRows) * tokens);
     const std::vector<double> got_z = read_bf16(device_z, static_cast<std::size_t>(kZRows) * tokens);
@@ -734,7 +735,7 @@ int run_fp_attn_input(QType qtype, std::int32_t tokens, ops::LinearPolicy policy
                    device_k.verify_guards(label) + device_v.verify_guards(label);
     failures += expect_route(label, workspace, static_cast<std::size_t>(kParentRows) * kHidden * 2,
                              tokens, policy,
-                             ops::detail::cublas_prefill_fp_min_tokens(policy));
+                             ops::detail::cublas_prefill_fp_min_tokens(policy, qtype));
     const std::vector<double> got_q    = read_bf16(device_q, q_elements);
     const std::vector<double> got_gate = read_bf16(device_gate, q_elements);
     const std::vector<double> got_k    = read_bf16(device_k, kv_elements);
@@ -804,10 +805,18 @@ int main() {
         // below each gate the formats' own plans must still answer.
         if (ops::detail::cublas_prefill_admits_fp()) {
             constexpr ops::LinearPolicy narrow = ops::prefill_phase_policy(kPolicy);
-            for (const ops::LinearPolicy policy : {kPolicy, narrow}) {
-                const std::int32_t g = ops::detail::cublas_prefill_fp_min_tokens(policy);
-                for (const std::int32_t tokens : {g - 1, g, 1000}) {
-                    if (policy == narrow && tokens == 1000) continue;
+            // Each case judges the route against its own format's gate (NVFP4's sits above its
+            // streaming tiles, FP8's at 17), so the widths straddle both narrow gates.
+            const std::int32_t wide_gate = ops::cublas_prefill_min_tokens(kPolicy);
+            const std::int32_t fp8_gate =
+                ops::detail::cublas_prefill_fp_min_tokens(narrow, QType::FP8_E4M3FN_ROW_BF16);
+            const std::int32_t nvfp4_gate =
+                ops::detail::cublas_prefill_fp_min_tokens(narrow, QType::NVFP4);
+            const std::pair<ops::LinearPolicy, std::vector<std::int32_t>> sweeps[] = {
+                {kPolicy, {wide_gate - 1, wide_gate, 1000}},
+                {narrow, {fp8_gate - 1, fp8_gate, nvfp4_gate - 1, nvfp4_gate}}};
+            for (const auto& [policy, widths] : sweeps) {
+                for (const std::int32_t tokens : widths) {
                     failures += run_fp_swiglu(QType::NVFP4, tokens, policy);
                     failures += run_fp_add(QType::NVFP4, tokens, 17408, policy);
                     failures += run_fp_add(QType::NVFP4, tokens, 6144, policy);

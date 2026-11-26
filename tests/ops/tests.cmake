@@ -419,7 +419,7 @@ endif()
 # (Nvfp4StreamFormat), and every other format these suites run, at the stream_a8 allowance.
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   foreach(test ninfer_attn_input_proj_test ninfer_gdn_input_proj_test
-               ninfer_gdn_input_proj_conv_snapshot_test)
+               ninfer_gdn_input_proj_conv_snapshot_test ninfer_gdn_input_proj_conv_record_test)
     add_test(NAME ${test}_stream_a8 COMMAND ninfer_tests ${test})
     set_tests_properties(${test}_stream_a8 PROPERTIES
       ENVIRONMENT "NINFER_STREAM_DP4A=1" SKIP_RETURN_CODE 77)
