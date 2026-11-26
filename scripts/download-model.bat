@@ -20,6 +20,10 @@ rem                    vision, MTP and DFlash2 weights, so one file serves --vis
 rem                    --spec dflash2. Executables older than the 5120x17408 Q4 linear_add route refuse
 rem                    it at startup. Figures published before 2026-10 were measured against the
 rem                    upstream neroued pin 1cbd84e7 (v2 18dfc887), 19.0 GiB.
+rem   qwen38-27b-qad   Qwen3.8-27B from NVIDIA's NVFP4 QAD checkpoint, 16.9 GiB
+rem                    (WarlaxZ/Qwen3.8-27B-NVFP4-QAD-NInfer-V100): the same model, quantization-aware
+rem                    distilled so its weights track BF16 more closely, but slower to decode. Vision and
+rem                    MTP, no DFlash2. Measured on the Tesla V100; not yet on the RTX 3090.
 rem   qwen36-27b       Qwen3.6-27B groupwise-int, 16.3 GiB, target_key qwen3_6_27b. A different model
 rem                    family from qwen3_8_27b, which is why having the latter does not satisfy the
 rem                    former: four real-model tests -- ninfer_qwen3_6_27b_prefix_real_test,
@@ -64,6 +68,7 @@ set "NGRAM_REPO="
 
 if "%~1"=="" goto :menu
 if /i "%~1"=="qwen38-27b" goto :model_qwen38_27b
+if /i "%~1"=="qwen38-27b-qad" goto :model_qwen38_27b_qad
 if /i "%~1"=="bonsai2-27b" goto :model_bonsai2_27b
 if /i "%~1"=="qwen36-27b" goto :model_qwen36_27b
 if /i "%~1"=="qwen36-35b-a3b" goto :model_qwen36_35b_a3b
@@ -84,11 +89,13 @@ echo   4 = Qwen3.8-Flash-Next (preview)    qwen38-flash-next   (needs 64 GB of R
 echo   5 = Ternary Bonsai 2 27B            bonsai2-27b
 echo   6 = Qwen3.8-Flash-Next UD-IQ3_XXS    qwen38-flash-next-iq3   (preview, needs 64 GB of RAM)
 echo   7 = Inkling-2-Mini                  inkling2-mini
+echo   8 = Qwen3.8-27B, NVIDIA NVFP4 QAD    qwen38-27b-qad   (higher accuracy, slower; preview)
 echo.
-choice /c 1234567 /n /m "Choose 1-7: "
+choice /c 12345678 /n /m "Choose 1-8: "
 rem choice reports 255 when it cannot read a key (no console, closed stdin). Refuse rather than
 rem let that fall through and pick a model nobody chose.
 if errorlevel 255 exit /b 2
+if errorlevel 8 goto :model_qwen38_27b_qad
 if errorlevel 7 goto :model_inkling2_mini
 if errorlevel 6 goto :model_qwen38_flash_next_iq3
 if errorlevel 5 goto :model_bonsai2_27b
@@ -110,6 +117,7 @@ exit /b 2
 echo usage: %~nx0 ^<model^>
 echo.
 echo   qwen38-27b (recommended)
+echo   qwen38-27b-qad (NVIDIA NVFP4 QAD: higher accuracy, slower)
 echo   bonsai2-27b
 echo   qwen36-27b
 echo   qwen36-35b-a3b
@@ -127,6 +135,17 @@ set "EXPECTED_SIZE=18979828480"
 set "EXPECTED_SHA256=38304957e3e8b43122ef109e05bad1e18600f8f300e3347fda3092fc51acc381"
 set "LABEL=the Qwen3.8-27B model (17.7 GiB)"
 set "TESTS_VARIABLE=NINFER_QWEN3_8_27B_WEIGHTS"
+goto :model_selected
+
+:model_qwen38_27b_qad
+set "ARTIFACT=qwen3_8_27b_nvfp4_qad.ninfer"
+set "OWNER=WarlaxZ"
+set "REPO=Qwen3.8-27B-NVFP4-QAD-NInfer-V100"
+set "REVISION=2cd93ef54b0a68b33f5d1a10abad68fef2cbbd2f"
+set "EXPECTED_SIZE=18159548164"
+set "EXPECTED_SHA256=c79ff2d1f9b3c0f729327d073bfd0b9dbf085c5c300a53d51f260a0fd634de0d"
+set "LABEL=the Qwen3.8-27B NVIDIA NVFP4 QAD model (16.9 GiB)"
+set "TESTS_VARIABLE="
 goto :model_selected
 
 :model_bonsai2_27b
@@ -254,7 +273,7 @@ if defined NGRAM_NAME if not "!FETCH_OK!"=="1" exit /b 1
 
 echo Model ready: !MODEL!
 if defined NGRAM_NAME call :ngram_summary
-echo Point the tests at it with:  set %TESTS_VARIABLE%=!MODEL!
+if defined TESTS_VARIABLE echo Point the tests at it with:  set %TESTS_VARIABLE%=!MODEL!
 call :fetch_graft
 exit /b 0
 :model_dir_rejected

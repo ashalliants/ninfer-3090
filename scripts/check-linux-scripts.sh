@@ -79,7 +79,7 @@ cat > "$tmp/ninfer-serve" <<'SERVER'
 printf '%s\n' "$@" > "$NINFER_TEST_ARGS"
 SERVER
 chmod +x "$tmp/ninfer-serve"
-touch "$tmp/qwen3_8_27b.ninfer" "$tmp/qwen3_6_35b_a3b.ninfer" "$tmp/qwen4exp-iq2xs.ninfer"
+touch "$tmp/qwen3_8_27b.ninfer" "$tmp/qwen3_8_27b_nvfp4_qad.ninfer" "$tmp/qwen3_6_35b_a3b.ninfer" "$tmp/qwen4exp-iq2xs.ninfer"
 
 # Hermetic fixtures. A developer's shell may already export NINFER_MODEL, NINFER_HOST and friends
 # -- the machine this was written on exports both -- and inheriting them makes every assertion below
@@ -254,6 +254,11 @@ recorded="$(record whole_none NINFER_SPEC=none -- qwen38-27b)"
 expect_config '27B NINFER_SPEC=none' "$recorded" qwen38-27b-tuned-none
 expect_options '27B NINFER_SPEC=none' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
   --max-concurrency 2 --max-context 262144 --kv-capacity 262144 --prefill-chunk 2048
+recorded="$(record whole_qad -- qwen38-27b-qad)"
+expect_config '27B QAD default' "$recorded" qwen38-27b-qad-tuned-mtp
+expect_options '27B QAD default' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
+  --max-concurrency 2 --max-context 262144 --kv-capacity 262144 \
+  --spec mtp --draft-tokens 3 --lm-head-draft --prefill-chunk 2048
 recorded="$(record whole_35b -- qwen36-35b-a3b)"
 expect_config '35B default' "$recorded" qwen36-35b-a3b-tuned-mtp
 expect_options '35B default' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
@@ -841,10 +846,11 @@ chmod +x "$tmp/bin/sha256sum"
 # model's own expected_size and skip the hash, which proves the promotion path without needing a real
 # 19 GB payload.
 downloader="$root/download-model.sh"
-models=(qwen38-27b qwen36-27b qwen36-35b-a3b)
+models=(qwen38-27b qwen38-27b-qad qwen36-27b qwen36-35b-a3b)
 artifact_of() {
   case "$1" in
     qwen38-27b) printf 'qwen3_8_27b.ninfer' ;;
+    qwen38-27b-qad) printf 'qwen3_8_27b_nvfp4_qad.ninfer' ;;
     qwen36-27b) printf 'qwen3_6_27b.ninfer' ;;
     qwen36-35b-a3b) printf 'qwen3_6_35b_a3b.ninfer' ;;
   esac

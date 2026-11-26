@@ -7,6 +7,7 @@ rem   run.bat [model] [profile]     (double-click it and it asks for the model)
 rem
 rem   model             profiles
 rem   qwen38-27b        tuned (default), int8, c8   <- recommended
+rem   qwen38-27b-qad    tuned (default)      <- NVIDIA's NVFP4 QAD build: higher accuracy, slower (preview)
 rem   qwen36-35b-a3b    tuned (default)
 rem   qwen38-flash-next tuned (default)      <- Qwen3.8-Flash-Next from the IQ2_XS GGUF (preview)
 rem   qwen38-flash-next-iq3 tuned (default)  <- the same model from Unsloth's UD-IQ3_XXS GGUF (preview)
@@ -193,6 +194,11 @@ if /i "%MODEL_KEY%"=="qwen38-27b" (
   set "GRAFT_FILE=godmode_q38_trained.bin"
   goto :model_known
 )
+if /i "%MODEL_KEY%"=="qwen38-27b-qad" (
+  set "ARTIFACT=qwen3_8_27b_nvfp4_qad.ninfer"
+  set "TITLE=Qwen3.8-27B (NVIDIA NVFP4 QAD)"
+  goto :model_known
+)
 if /i "%MODEL_KEY%"=="qwen36-35b-a3b" (
   set "ARTIFACT=qwen3_6_35b_a3b.ninfer"
   set "TITLE=Qwen3.6-35B-A3B"
@@ -220,9 +226,12 @@ echo   1  Qwen3.8-27B  (recommended)
 echo   2  Qwen3.6-35B-A3B
 echo   3  Qwen3.8-Flash-Next  (preview: one request at a time, 32K context; NINFER_CONCURRENCY=2 for two)
 echo   4  Qwen3.8-Flash-Next, Unsloth UD-IQ3_XXS  (preview: better text quality, about half the speed, no images)
-choice /c 1234 /n /m "Choose 1, 2, 3 or 4: "
+echo   5  Qwen3.8-27B, NVIDIA NVFP4 QAD  (preview: closer to full precision, slower; not yet measured on the RTX 3090)
+choice /c 12345 /n /m "Choose 1-5: "
 if errorlevel 255 exit /b 2
-if errorlevel 4 (
+if errorlevel 5 (
+  set "MODEL_KEY=qwen38-27b-qad"
+) else if errorlevel 4 (
   set "MODEL_KEY=qwen38-flash-next-iq3"
 ) else if errorlevel 3 (
   set "MODEL_KEY=qwen38-flash-next"
@@ -305,6 +314,7 @@ set "REASONING_LOOP="
 set "LOOP_NOTE="
 set "FN_SAMPLING_ARGS="
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b/tuned" goto :profile_27b_tuned
+if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-27b-qad/tuned" goto :profile_27b_qad_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen36-35b-a3b/tuned" goto :profile_35b_tuned
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-flash-next/tuned" goto :profile_flash_next
 if /i "%MODEL_KEY%/%PROFILE%"=="qwen38-flash-next-iq3/tuned" goto :profile_flash_next
@@ -379,6 +389,42 @@ set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-c
 set "LABEL=C%CONCURRENCY%  ^|  %CONTEXT_WORD% %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
 set "PREFILL_NOTE=Prefill: cuBLAS route, chunk %PREFILL_CHUNK%"
 if /i "%SPEC%"=="dflash2" set "HINT=Need the full 262K context or a second lane? Set NINFER_SPEC=mtp: slower decode."
+goto :profile_tuned_common
+
+:profile_27b_qad_tuned
+rem NVIDIA's quantization-aware-distilled NVFP4/FP8 weights: closer to BF16, slower to decode. No
+rem DFlash2 bundle, so MTP is the only speculation, and overlay vision borrows its window from the MTP
+rem weights. Measured on the Tesla V100 only; not yet on the RTX 3090.
+set "SPEC=mtp"
+if not "%NINFER_SPEC%"=="" set "SPEC=%NINFER_SPEC%"
+if /i not "%SPEC%"=="mtp" (
+  echo NINFER_SPEC must be mtp for qwen38-27b-qad, got %SPEC% 1>&2
+  exit /b 2
+)
+rem As run.sh: off (or unset) is the only value; on needs DFlash2, anything else is a typo.
+if /i "%NINFER_NGRAM%"=="on" (
+  echo NINFER_NGRAM=on needs NINFER_SPEC=dflash2, which only qwen38-27b has 1>&2
+  exit /b 2
+)
+if not "%NINFER_NGRAM%"=="" if /i not "%NINFER_NGRAM%"=="off" (
+  echo NINFER_NGRAM must be on or off, got %NINFER_NGRAM% 1>&2
+  exit /b 2
+)
+set "CONTEXT=262144"
+set "CONCURRENCY=2"
+set "PROFILE_FILE=%PROFILES_DIR%\qwen38-27b-qad-tuned-mtp.json"
+call :read_profile || exit /b 1
+if not "%NINFER_DRAFT_TOKENS%"=="" set "DRAFT_TOKENS=%NINFER_DRAFT_TOKENS%"
+if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
+if not "%NINFER_CONCURRENCY%"=="" set "CONCURRENCY=%NINFER_CONCURRENCY%"
+if not "%NINFER_KV_DTYPE%"=="" set "KV_DTYPE=%NINFER_KV_DTYPE%"
+if not "%NINFER_PREFILL_CHUNK%"=="" set "PREFILL_CHUNK=%NINFER_PREFILL_CHUNK%"
+set "SPEC_ARGS="
+call :tuned_overrides
+set "SPEC_LABEL=MTP%DRAFT_TOKENS% + draft head, full context"
+set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %CONTEXT%%OVERRIDE_ARGS%%SPEC_ARGS%"
+set "LABEL=C%CONCURRENCY%  ^|  %CONTEXT_WORD% %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
+set "PREFILL_NOTE=Prefill: cuBLAS route, chunk %PREFILL_CHUNK%"
 goto :profile_tuned_common
 
 :profile_35b_tuned
@@ -1000,6 +1046,7 @@ exit /b 2
 :usage
 echo usage: run.bat ^<model^> [profile]
 echo   qwen38-27b       tuned (default), int8, c8   (recommended)
+echo   qwen38-27b-qad   tuned (default)   (NVIDIA NVFP4 QAD: higher accuracy, slower; preview)
 echo   qwen36-35b-a3b   tuned (default)
 echo   qwen38-flash-next tuned (default)   (preview)
 echo   qwen38-flash-next-iq3 tuned (default)   (preview, Unsloth UD-IQ3_XXS)
