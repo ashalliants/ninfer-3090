@@ -260,6 +260,58 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
+def _encoded_format(parameter):
+    """The encoded format a parameter's own source provides, or None for plain tensors."""
+    if parameter.source.read_encoded is None:
+        return None
+    try:
+        return parameter.source.read_encoded(0, 1).format
+    except ValueError as error:
+        if "does not provide encoded rows" in str(error):
+            return None
+        raise
+
+
+def qwen3_8_27b_nvfp4_qad(model, recipe, sources):
+    """nvidia/Qwen3.8-27B-NVFP4-QAD: NVIDIA's quantization-aware-distilled checkpoint, imported word
+    for word in the mix ModelOpt chose per matrix (``hf_quant_config.json``).
+
+    NVFP4 (all MLP matrices, the head, and GDN input/output projections in 38 of the 48 GDN layers)
+    keeps its codes and E4M3 group scales; its FP32 multiplier becomes the artifact's divisor, within
+    one FP32 ULP (``modelopt_matrix_source``). FP8 (every full-attention projection and the other
+    ten GDN layers' projections) keeps its codes, with the per-matrix FP32 scale rounded to the
+    format's per-row BF16 multiplier: a gain error within 2**-8 per matrix (mean 0.13%, at most
+    0.33% in this checkpoint). The BF16 embedding, which ModelOpt left unquantized, becomes
+    ``q8_g32_fp16``; GDN a/b projections stay BF16. Vision and MTP use ``_optional``'s formats.
+
+    ModelOpt's export keeps only 11 of the 15 MTP tensors, so ``--components ...,mtp`` needs
+    ``--source mtp=DIR`` holding Qwen/Qwen3.8-27B's MTP tensors (its last shard); the 11 shared
+    tensors are byte-identical to NVIDIA's.
+    """
+
+    if "num_experts" in model.config:
+        raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+    _optional(model, recipe)
+    _assign(recipe, "text/token_embedding", Q8)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/") or not parameter.projection:
+            continue
+        if name == "text/token_embedding":
+            continue
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            recipe.separate(name)
+            continue
+        format = _encoded_format(parameter)
+        if format not in ("nvfp4", FP8):
+            raise ValueError(f"{name}: expected a ModelOpt NVFP4 or FP8 matrix, got {format}")
+        recipe.assign(
+            name,
+            format=format,
+            method=import_encoded,
+            activation_policy="AllowA4" if format == "nvfp4" else "AllowA8",
+        )
+
+
 def qwen4_exp_gguf(model, recipe, sources):
     """Qwen3.8-Flash-Next from its GGUF, with every tensor stored exactly as in the GGUF.
 
@@ -301,6 +353,7 @@ RECIPES = {
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
+    "qwen3_8_27b_nvfp4_qad": qwen3_8_27b_nvfp4_qad,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen4_exp_gguf": qwen4_exp_gguf,
     "dsv4_gguf": dsv4_gguf,
