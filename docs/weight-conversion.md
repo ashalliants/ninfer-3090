@@ -65,6 +65,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
+| `qwen3_8_27b_nvfp4_qad` | NVIDIA's quantization-aware-distilled NVFP4/FP8 mix ([nvidia/Qwen3.8-27B-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD)) imported from ModelOpt naming: NVFP4 codes and scales word for word, FP8 codes word for word with the per-matrix scale rounded to BF16 rows (gain within 2^-8); Q8 embedding generated from its BF16 | `mtp` (Qwen/Qwen3.8-27B's MTP tensors; the export keeps only 11 of 15) |
 | `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses; the embedding is T2 too, stored inverse-rotated and restored to the primal basis by the runtime on gather | `ternary` (GGUF) |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
@@ -84,6 +85,21 @@ python3 -m tools.convert \
   --proposal \
   --name qwen3.8-27b \
   --out models/qwen3_8_27b_nvfp4.ninfer
+```
+
+For NVIDIA's QAD checkpoint, MTP needs the original model's last shard
+(`model-00018-of-00018.safetensors`, with its `config.json` and an index naming that shard's tensors):
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B-NVFP4-QAD \
+  --recipe qwen3_8_27b_nvfp4_qad \
+  --source mtp=/path/to/Qwen3.8-27B-mtp-shard \
+  --components text,vision,mtp \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --proposal \
+  --name qwen3.8-27b-nvfp4-qad \
+  --out models/qwen3_8_27b_nvfp4_qad.ninfer
 ```
 
 Vision uses the main source, and so does MTP unless `--source mtp=PATH` supplies a separately trained
