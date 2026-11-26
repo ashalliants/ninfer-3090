@@ -401,8 +401,13 @@ if /i not "%SPEC%"=="mtp" (
   echo NINFER_SPEC must be mtp for qwen38-27b-qad, got %SPEC% 1>&2
   exit /b 2
 )
+rem As run.sh: off (or unset) is the only value; on needs DFlash2, anything else is a typo.
 if /i "%NINFER_NGRAM%"=="on" (
   echo NINFER_NGRAM=on needs NINFER_SPEC=dflash2, which only qwen38-27b has 1>&2
+  exit /b 2
+)
+if not "%NINFER_NGRAM%"=="" if /i not "%NINFER_NGRAM%"=="off" (
+  echo NINFER_NGRAM must be on or off, got %NINFER_NGRAM% 1>&2
   exit /b 2
 )
 set "CONTEXT=262144"
