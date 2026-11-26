@@ -77,7 +77,9 @@ else()
   set(ninfer_cuda_ptx_effective OFF)
 endif()
 # Recorded in the cache for scripts/package-release.sh, which refuses a V100 tree that embeds PTX.
-set(NINFER_CUDA_PTX_EFFECTIVE ${ninfer_cuda_ptx_effective} CACHE INTERNAL "NINFER_CUDA_PTX as resolved for this configure")
+# Rewritten on every configure: INTERNAL already implies FORCE; it is spelled out so a reused tree
+# (86 then 70, or ON then OFF) visibly cannot keep the value of an earlier configure.
+set(NINFER_CUDA_PTX_EFFECTIVE ${ninfer_cuda_ptx_effective} CACHE INTERNAL "NINFER_CUDA_PTX as resolved for this configure" FORCE)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
