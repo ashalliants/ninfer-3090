@@ -243,6 +243,10 @@ public:
     // prefix (the Qwen3.5 Program's arithmetic).
     [[nodiscard]] std::uint64_t recovery_loss(std::span<const Handle> removed,
                                               std::span<const Handle> surviving) const;
+    // recovery_loss against `retained` less the removed set, prepared once for many queries
+    // (runtime::RecoveryLossTable). Valid while this store is unchanged.
+    [[nodiscard]] runtime::PreparedRecoveryLoss<Handle>
+    prepare_recovery_loss(std::span<const Handle> retained) const;
 
 private:
     struct Slot {

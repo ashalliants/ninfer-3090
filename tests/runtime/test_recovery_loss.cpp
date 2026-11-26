@@ -207,12 +207,67 @@ int test_full_host_tier_scales() {
     return failures;
 }
 
+// One prepared table answers many releases against a single retained set, each with its own
+// removed and excluded checkpoints: every answer must match the reference against the retained
+// set less both (what the reclaim planner used to rebuild and sort per candidate).
+int test_table_matches_reference() {
+    std::mt19937 rng(640);
+    std::uint64_t queries = 0;
+    for (int seed = 0; seed < 600; ++seed) {
+        Cache cache;
+        cache.shared        = std::uniform_int_distribution<std::uint32_t>(0, 40)(rng);
+        const auto sessions = std::uniform_int_distribution<std::uint32_t>(1, 6)(rng);
+        const auto count    = std::uniform_int_distribution<int>(1, 40)(rng);
+        std::vector<Handle> handles;
+        for (int i = 0; i < count; ++i) {
+            const auto session = std::uniform_int_distribution<std::uint32_t>(0, sessions - 1)(rng);
+            const auto frontier = std::uniform_int_distribution<std::uint32_t>(0, 120)(rng);
+            handles.push_back(cache.add(session, frontier, rng() % 8 != 0));
+        }
+        const auto pick = [&](int n) {
+            std::vector<Handle> out;
+            for (int i = 0; i < n; ++i) {
+                auto h = handles[rng() % handles.size()];
+                if (rng() % 16 == 0) { h.generation = 2; }
+                out.push_back(h);
+            }
+            return out;
+        };
+        const auto retained = pick(std::uniform_int_distribution<int>(0, 2 * count)(rng));
+        const auto valid    = [&](Handle h) { return cache.valid(h); };
+        const auto frontier = [&](Handle h) { return cache.frontier(h); };
+        const auto prefix   = [&](Handle a, Handle b) { return cache.prefix(a, b); };
+        const ninfer::runtime::RecoveryLossTable table(std::span<const Handle>(retained), valid,
+                                                       frontier, prefix);
+        for (int query = 0; query < 8; ++query, ++queries) {
+            const auto removed  = pick(std::uniform_int_distribution<int>(0, 4)(rng));
+            const auto excluded = pick(std::uniform_int_distribution<int>(0, 3)(rng));
+            std::vector<Handle> surviving;
+            for (const auto handle : retained) {
+                if (std::find(excluded.begin(), excluded.end(), handle) == excluded.end()) {
+                    surviving.push_back(handle);
+                }
+            }
+            const auto expected = cache.reference(removed, surviving);
+            const auto actual   = table.loss(removed, excluded);
+            if (expected != actual) {
+                std::cerr << "table seed " << seed << " query " << query << ": expected "
+                          << expected << ", got " << actual << '\n';
+                return 1;
+            }
+        }
+    }
+    std::cout << "prepared table: " << queries << " queries match the reference\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += test_lineages();
     failures += test_matches_reference();
+    failures += test_table_matches_reference();
     failures += test_full_host_tier_scales();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

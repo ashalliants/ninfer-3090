@@ -638,6 +638,24 @@ ProgramImpl::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
     });
 }
 
+// The shared table over `retained`; `prefix` must stay valid while the result is used.
+template <typename Prefix>
+PreparedRecoveryLoss prepare_recovery_loss(const ProgramImpl& program,
+                                           std::span<const CheckpointHandle> retained,
+                                           Prefix prefix) {
+    return runtime::prepare_recovery_loss_table(
+        retained, [&program](CheckpointHandle h) { return program.valid_checkpoint(h); },
+        [&program](CheckpointHandle h) { return program.checkpoint(h).frontier; },
+        std::move(prefix));
+}
+
+PreparedRecoveryLoss
+ProgramImpl::prepare_checkpoint_recovery_loss(std::span<const CheckpointHandle> retained) const {
+    return prepare_recovery_loss(*this, retained, [this](CheckpointHandle a, CheckpointHandle b) {
+        return checkpoint_prefix(checkpoint(a), checkpoint(b));
+    });
+}
+
 std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
                                               const PhysicalOwners& owners,
                                               std::span<const CheckpointHandle> excluded,
@@ -1201,6 +1219,15 @@ std::uint64_t ContextReclaimPlan::recovery_loss(std::span<const CheckpointHandle
     if (!impl_) { throw std::logic_error("recovery query has no Native evaluation"); }
     return detail::recovery_loss(*impl_->owner, removed, surviving,
                                  [&](auto a, auto b) { return impl_->prefix(a, b); });
+}
+
+PreparedRecoveryLoss
+ContextReclaimPlan::prepare_recovery_loss(std::span<const CheckpointHandle> retained) const {
+    if (!impl_) { throw std::logic_error("recovery query has no Native evaluation"); }
+    return detail::prepare_recovery_loss(*impl_->owner, retained,
+                                         [plan = impl_](CheckpointHandle a, CheckpointHandle b) {
+                                             return plan->prefix(a, b);
+                                         });
 }
 
 } // namespace ninfer::models::qwen3_5

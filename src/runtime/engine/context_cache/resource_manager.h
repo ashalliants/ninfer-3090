@@ -5,6 +5,7 @@
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/prefix_index.h"
+#include "runtime/engine/context_cache/recovery_loss.h"
 #include "runtime/engine/context_cache/types.h"
 
 #include <algorithm>
@@ -1502,6 +1503,16 @@ private:
         std::optional<ActionFacts> facts;
     };
 
+    // Recovery loss of releasing a set from an evaluation's retained checkpoints (action_loss).
+    // The second span names further checkpoints that are gone but not counted as lost.
+    using PreparedLoss = PreparedRecoveryLoss<Handle>;
+
+    struct GainFrontiers {
+        const Base* base       = nullptr;
+        std::uint32_t frontier = 0;
+        std::vector<std::pair<std::uint32_t, Handle>> deepest_first;
+    };
+
     // These facts live only until this synchronous evaluation mutates resources or yields.
     // The fixed victim cursor may outlive them; newly published points still count as fallback.
     struct Evaluation {
@@ -1516,6 +1527,12 @@ private:
         // (host_victims_in_order).
         std::uint64_t work_limit = UINT64_MAX;
         bool exhausted           = false;
+        // Per capture admission: each retained checkpoint's recovery frontier, deepest first
+        // (base_recovery_gain). An evaluation sees at most a couple of admissions.
+        std::vector<GainFrontiers> gain_frontiers;
+        // The retained set's recovery-loss table (retained_loss).
+        PreparedLoss prepared_loss;
+        bool prepared_loss_tried = false;
     };
 
     // Each entry holds a copy of its source set, and the greedy loop offers a new union for every
@@ -1584,15 +1601,40 @@ private:
     [[nodiscard]] std::uint64_t action_loss(Program& program, std::span<const Handle> sources,
                                             ActionFacts& facts, Evaluation& evaluation) const {
         if (!facts.loss) {
-            facts.loss = sources.empty()
-                             ? 0
-                             : stored_loss(sources,
-                                           recovery_loss(program, sources,
-                                                         action_survivors(program, sources, facts,
-                                                                          evaluation),
-                                                         evaluation));
+            if (sources.empty()) {
+                facts.loss = 0;
+            } else if (const auto* prepared = retained_loss(program, evaluation)) {
+                // The survivors here are the retained set less `sources`, which is what the
+                // prepared table answers without rebuilding and sorting the set per candidate.
+                facts.loss = stored_loss(sources, (*prepared)(sources, {}));
+            } else {
+                facts.loss = stored_loss(
+                    sources, recovery_loss(program, sources,
+                                           action_survivors(program, sources, facts, evaluation),
+                                           evaluation));
+            }
         }
         return *facts.loss;
+    }
+
+    // The recovery loss of releasing a set from the retained checkpoints, prepared once per
+    // evaluation when the Program (or its Native plan) can prepare one; nullptr otherwise, and
+    // when the tests turn the memo off to compare the answers.
+    [[nodiscard]] const PreparedLoss* retained_loss(Program& program,
+                                                    Evaluation& evaluation) const {
+        if (!candidate_memo_) { return nullptr; }
+        if (!evaluation.prepared_loss_tried) {
+            evaluation.prepared_loss_tried = true;
+            const auto all                 = retained(program, evaluation);
+            if (evaluation.native) {
+                if constexpr (requires { evaluation.native->prepare_recovery_loss(all); }) {
+                    evaluation.prepared_loss = evaluation.native->prepare_recovery_loss(all);
+                }
+            } else if constexpr (requires { program.prepare_checkpoint_recovery_loss(all); }) {
+                evaluation.prepared_loss = program.prepare_checkpoint_recovery_loss(all);
+            }
+        }
+        return evaluation.prepared_loss ? &evaluation.prepared_loss : nullptr;
     }
 
     // The store's image size when every catalog holder of every source is a continuation or
@@ -1831,9 +1873,61 @@ private:
             return false;
         }
         if (admission->demand.reused) { return true; }
+        // The tests turn the memo off to check that the answers are the same either way.
+        const auto gone = preserving ? std::span<const Handle>{} : removed;
+        if (admission->base && candidate_memo_) {
+            return base_recovery_gain(program, *admission, gone, evaluation) > loss;
+        }
+        // A preservation (a checkpoint moving tiers): what keeping it saves is its own loss
+        // against the survivors of this release, which the prepared table answers directly.
+        if (!admission->base && admission->checkpoint &&
+            program.valid_checkpoint(*admission->checkpoint)) {
+            if (const auto* prepared = retained_loss(program, evaluation)) {
+                auto sources = admission->sources;
+                if (sources.empty()) { sources.push_back(*admission->checkpoint); }
+                return (*prepared)(sources, gone) > loss;
+            }
+        }
         const auto kept = preserving ? retained(program, evaluation)
                                      : action_survivors(program, removed, facts, evaluation);
         return recovery_gain(program, *admission, kept, evaluation) > loss;
+    }
+
+    // recovery_gain of a capture (an admission with a base) against the retained checkpoints less
+    // `removed`, which is what every candidate the victim search prices asks. Each retained
+    // checkpoint's recovery frontier for the capture does not depend on the candidate, so it is
+    // asked of the Program once per evaluation and kept deepest first: a candidate then costs a
+    // scan past its own few sources, not one Program call per retained checkpoint. Pricing every
+    // candidate against every survivor made a capture into a full Host tier cost about 2N^2 calls
+    // (135,461 at 260 checkpoints), several times per request (test_one_shot_capture_...).
+    [[nodiscard]] std::uint64_t base_recovery_gain(Program& program, const Admission& admission,
+                                                   std::span<const Handle> removed,
+                                                   Evaluation& evaluation) const {
+        auto found = std::find_if(evaluation.gain_frontiers.begin(),
+                                  evaluation.gain_frontiers.end(), [&](const auto& entry) {
+                                      return entry.base == admission.base &&
+                                             entry.frontier == admission.frontier;
+                                  });
+        if (found == evaluation.gain_frontiers.end()) {
+            GainFrontiers entry{.base = admission.base, .frontier = admission.frontier};
+            for (const auto handle : retained(program, evaluation)) {
+                const auto depth = program.checkpoint_recovery_frontier(handle, *admission.base,
+                                                                        admission.frontier);
+                if (depth) { entry.deepest_first.push_back({depth, handle}); }
+            }
+            std::stable_sort(entry.deepest_first.begin(), entry.deepest_first.end(),
+                             [](const auto& a, const auto& b) { return a.first > b.first; });
+            evaluation.gain_frontiers.push_back(std::move(entry));
+            found = std::prev(evaluation.gain_frontiers.end());
+        }
+        std::uint32_t fallback = 0;
+        for (const auto& [depth, handle] : found->deepest_first) {
+            if (!contains(removed, handle)) {
+                fallback = depth;
+                break;
+            }
+        }
+        return admission.frontier - fallback;
     }
 
     void commit_release(Program& program, std::span<const Handle> handles, ReclaimCursor& cursor,
