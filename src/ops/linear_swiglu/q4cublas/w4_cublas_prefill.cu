@@ -2,6 +2,8 @@
 
 #include "core/device.h"
 #include "core/weight_view.h"
+#include "ops/linear/fp8/fp8_a16_codec.cuh"
+#include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -172,6 +174,61 @@ __global__ void dequantise_row_to_fp16(const std::uint8_t* __restrict__ codes,
             values[j]      = __float2half_rn(static_cast<float>((code ^ half) - half) * group);
         }
         *reinterpret_cast<uint4*>(o_row + base) = *reinterpret_cast<const uint4*>(values);
+    }
+}
+
+// The FP16 route's NVFP4 weight (sm_70 only): one block per row, each thread turning one 16-value
+// group (eight code bytes and its E4M3 scale, M128-swizzled) into sixteen FP16 values code * scale.
+// Exact: E2M1 times E4M3 has at most six significant bits and lies inside FP16's normal range
+// (2^-10 .. 2688). The tensor's global multiplier (1 / weight_scale_divisor) is the row scale the
+// epilogues apply in FP32.
+__global__ void dequantise_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes,
+                                             const std::uint8_t* __restrict__ scales, int k,
+                                             float alpha, __half* __restrict__ out,
+                                             float* __restrict__ row_scale) {
+    const int row     = blockIdx.x;
+    const auto* c_row = reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * (k / 2));
+    __half* o_row     = out + static_cast<std::size_t>(row) * k;
+    if (threadIdx.x == 0) { row_scale[row] = alpha; }
+    const int groups = k / 16;
+    for (int g = threadIdx.x; g < groups; g += kThreads) {
+        const uint2 packed      = c_row[g];
+        const std::uint8_t sc   = scales[nvfp4_scale_byte_offset(row, g, k)];
+        const std::uint32_t w[2] = {packed.x, packed.y};
+        __align__(16) __half2 values[8];
+#pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            const auto byte = static_cast<std::uint8_t>((w[b / 4] >> ((b % 4) * 8)) & 0xffu);
+            const unsigned bf16 = nvfp4_scaled_pair_bf16(byte, sc); // exact, so the FP16 is too
+            values[b] = __floats2half2_rn(__uint_as_float(bf16 << 16),
+                                          __uint_as_float(bf16 & 0xffff0000u));
+        }
+        *reinterpret_cast<uint4*>(o_row + g * 16)     = *reinterpret_cast<const uint4*>(values);
+        *reinterpret_cast<uint4*>(o_row + g * 16 + 8) = *reinterpret_cast<const uint4*>(values + 4);
+    }
+}
+
+// The FP16 route's FP8_E4M3FN_ROW_BF16 weight (sm_70 only): eight codes per thread to eight FP16
+// values, exactly (an E4M3 value has four significant bits and lies inside FP16's range); the BF16
+// row scale is the epilogues' row scale.
+__global__ void dequantise_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes,
+                                           const __nv_bfloat16* __restrict__ scales, int k,
+                                           __half* __restrict__ out, float* __restrict__ row_scale) {
+    const int row     = blockIdx.x;
+    const auto* c_row = reinterpret_cast<const uint2*>(codes + static_cast<std::size_t>(row) * k);
+    __half* o_row     = out + static_cast<std::size_t>(row) * k;
+    if (threadIdx.x == 0) { row_scale[row] = __bfloat162float(scales[row]); }
+    const int words = k / 8;
+    for (int w = threadIdx.x; w < words; w += kThreads) {
+        const uint2 packed       = c_row[w];
+        const std::uint32_t q[2] = {packed.x, packed.y};
+        __align__(16) __half2 values[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const float2 v = fp8_e4m3x2_to_float2_exact((q[p / 2] >> ((p % 2) * 16)) & 0xffffu);
+            values[p]      = __floats2half2_rn(v.x, v.y);
+        }
+        *reinterpret_cast<uint4*>(o_row + w * 8) = *reinterpret_cast<const uint4*>(values);
     }
 }
 
@@ -510,7 +567,14 @@ void materialise_weight(const Weight& weight, const Scratch& s, cudaStream_t str
     auto* scales     = static_cast<const __half*>(weight.scales);
     if constexpr (kFp16Route) {
         auto* w16 = static_cast<__half*>(s.w);
-        if (weight.qtype == QType::Q8_G32_FP16) {
+        if (weight.qtype == QType::NVFP4) {
+            dequantise_nvfp4_row_to_fp16<<<n, kThreads, 0, stream>>>(
+                codes, static_cast<const std::uint8_t*>(weight.scales), k,
+                1.0F / weight.weight_scale_divisor, w16, s.row_scale);
+        } else if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+            dequantise_fp8_row_to_fp16<<<n, kThreads, 0, stream>>>(
+                codes, static_cast<const __nv_bfloat16*>(weight.scales), k, w16, s.row_scale);
+        } else if (weight.qtype == QType::Q8_G32_FP16) {
             dequantise_q8_row_to_fp16<<<n, kThreads, 0, stream>>>(
                 static_cast<const std::int8_t*>(weight.qdata), scales, k, w16, s.row_scale);
         } else if (weight.qtype == QType::Q5_G64_FP16) {
@@ -567,6 +631,19 @@ void gemm_tile(cublasHandle_t blas, const Scratch& s, std::int32_t n, std::int32
 } // namespace
 
 bool w4_cublas_prefill_supported(const Weight& weight, std::int32_t tokens) {
+    // NVFP4 and FP8 take the FP16 route only (cublas_prefill_admits_fp), where both materialise
+    // exactly; the validators of their own formats have already fixed the planes' geometry.
+    if (weight.qtype == QType::NVFP4) {
+        return kFp16Route && tokens > 0 && weight.qdata != nullptr && weight.scales != nullptr &&
+               weight.layout == QuantLayout::BlockScaleK16M128x4 && weight.n % 128 == 0 &&
+               weight.k % 64 == 0 && weight.padded_shape[1] == weight.k &&
+               weight.weight_scale_divisor > 0.0F;
+    }
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+        return kFp16Route && tokens > 0 && weight.qdata != nullptr && weight.scales != nullptr &&
+               weight.layout == QuantLayout::RowScale && weight.scale_dtype == DType::BF16 &&
+               weight.k % 8 == 0 && weight.padded_shape[1] == weight.k;
+    }
     if (tokens <= 0 || !is_row_split(weight.layout) || weight.qdata == nullptr ||
         weight.scales == nullptr || weight.scale_dtype != DType::FP16) {
         return false;
@@ -582,6 +659,7 @@ bool w4_cublas_prefill_supported(const Weight& weight, std::int32_t tokens) {
 }
 
 bool cublas_prefill_admits_q8() noexcept { return kFp16Route; }
+bool cublas_prefill_admits_fp() noexcept { return kFp16Route; }
 
 std::size_t w4_cublas_prefill_workspace_capacity_bytes(std::int32_t rows, std::int32_t cols,
                                                        std::int32_t min_tokens,

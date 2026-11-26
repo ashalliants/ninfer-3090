@@ -111,6 +111,33 @@ public:
         }
     }
 
+    // sm_70: NVFP4 and FP8 weights (NVIDIA's Qwen3.8-27B-NVFP4-QAD) take the cuBLAS prefill route,
+    // which on Volta materialises them exactly as FP16 and runs an FP16 tensor-core GEMM with FP32
+    // accumulation; their own prefill kernels run Ampere mma.sync under emulation there. Decode and
+    // verify keep their kernels: the route opens only from the prefill gate. Covers the MLP and the
+    // output projections; NINFER_SM70_FP_PREFILL_CUBLAS=0 keeps them on their own kernels.
+    void fp_prefill_route(LinearParameters& p) const {
+#if defined(NINFER_SM70)
+        static const bool enabled = [] {
+            const char* value = std::getenv("NINFER_SM70_FP_PREFILL_CUBLAS");
+            return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+        }();
+        if (!enabled || !model_.options().prefill_a8 || !model_.options().prefill_cublas) { return; }
+        if (p.policy == ops::LinearPolicy::A16Only &&
+            (p.weight.qtype == QType::NVFP4 || p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16)) {
+            p.policy = ops::LinearPolicy::AllowPrefillCublas;
+        }
+#else
+        (void)p;
+#endif
+    }
+
+    // The attention and GDN input parents, which also honour --no-prefill-cublas-projections.
+    void fp_prefill_route(ops::ProjectionWeights& projection) const {
+        if (!model_.options().prefill_cublas_projections) { return; }
+        if (auto* single = std::get_if<LinearParameters>(&projection)) { fp_prefill_route(*single); }
+    }
+
     LinearParameters linear(WeightId id) const {
         return with_context(model_.weight(id).name,
                             [&] { return ops::prepare_linear_weight(model_.input(id)); });
@@ -175,6 +202,8 @@ public:
                             rotated_linear(w.down)};
         integer_route(out.gate_up, {QType::Q4_G64_FP16, QType::T2_G128_FP16}, 34816, 5120);
         integer_route(out.down, {QType::Q4_G64_FP16, QType::Q5_G64_FP16, QType::T2_G128_FP16}, 5120, 17408);
+        fp_prefill_route(out.gate_up);
+        fp_prefill_route(out.down);
         // --mlp-a8-decode is a separate verify-phase trade from --prefill-a8: it must admit the
         // decode route by this profile's own format/shape, not by whether prefill promotion
         // already ran, so the two flags stay orthogonal as documented.
@@ -226,6 +255,8 @@ public:
             integer_route_pair(attention_projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16,
                                7168, 5120);
             q8_prefill_route(attention_output, 2048, 4096);
+            fp_prefill_route(attention_output);
+            fp_prefill_route(attention_projection);
             q8_prefill_route(attention_projection, 9216, 2048);
             out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
                                             tensor(a->key_norm), std::move(attention_output)};
@@ -243,6 +274,8 @@ public:
             integer_route_pair(gdn_projection, QType::T2_G128_FP16, 4096, QType::T2_G128_FP16,
                                12288, 5120);
             q8_prefill_route(gdn_output, 2048, 4096);
+            fp_prefill_route(gdn_output);
+            fp_prefill_route(gdn_projection);
             q8_prefill_route(gdn_projection, 12288, 2048);
             out.mixer = GdnParameters{
                 std::move(gdn_projection),

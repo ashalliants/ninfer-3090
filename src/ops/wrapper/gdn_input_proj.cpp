@@ -321,6 +321,36 @@ LinearPolicy without_integer(LinearPolicy policy) {
     return allows_a8_int(policy) ? LinearPolicy::A16Only : policy;
 }
 
+// sm_70's FP16 cuBLAS prefill route for an NVFP4 or FP8 parent (detail::cublas_prefill_admits_fp):
+// rows [0, 10240) fill qkv and [10240, 16384) fill z, as their segmented outputs do. False when the
+// route does not take the call, which then runs the format's own plan.
+bool fp_cublas_projection(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                          LinearPolicy requested, WorkspaceArena* workspace, cudaStream_t stream) {
+    const std::int32_t cols = x.ne[1];
+    if (!allows_cublas_prefill(requested) || cols < cublas_prefill_min_tokens(requested) ||
+        workspace == nullptr || !detail::cublas_prefill_admits_fp()) {
+        return false;
+    }
+    const detail::CublasProjectionDestination dests[] = {{qkv.data, 0, 10240, 10240, 0},
+                                                         {z.data, 10240, 6144, 6144, 0}};
+    const detail::CublasProjection parent[] = {{&weight, dests, 2}};
+    if (!detail::w4_cublas_projection_supported(parent, 1, cols) ||
+        (cols < kCublasPrefillMinTokens &&
+         !detail::w4_cublas_projection_fits(*workspace, parent, 1, cols))) {
+        return false;
+    }
+    detail::w4_cublas_projection_launch(x, parent, 1, *workspace, stream);
+    return true;
+}
+
+// Whether a single-parent NVFP4 / FP8 snapshot of `columns` columns projects on the cuBLAS route
+// (composed: projection into scratch, then the conv), as its workspace capacity reserves for.
+bool fp_snapshot_takes_cublas(const Weight& weight, LinearPolicy policy, std::int32_t columns) {
+    return allows_cublas_prefill(policy) && columns >= cublas_prefill_min_tokens(policy) &&
+           detail::cublas_prefill_admits_fp() &&
+           detail::w4_cublas_prefill_supported(weight, columns);
+}
+
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     validate_policy(policy);
@@ -344,6 +374,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported weight shape");
         }
+        if (fp_cublas_projection(x, weight, qkv, z, requested, workspace, stream)) return;
         detail::nvfp4_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
     }
@@ -361,6 +392,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("fp8 gdn_input_proj: unsupported weight shape");
         }
+        if (fp_cublas_projection(x, weight, qkv, z, requested, workspace, stream)) return;
         detail::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
     }
@@ -505,6 +537,16 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                             "gdn_input_proj_conv_snapshot", "value");
         require_conv_tensor(z, kZRows, geometry.width, geometry.batch,
                             "gdn_input_proj_conv_snapshot", "z");
+        if (fp_snapshot_takes_cublas(weight, policy, geometry.aggregate_columns)) {
+            compose_batched_snapshot(x, conv_weight, conv_states, valid_columns,
+                                     initial_state_slots, snapshot_base_slots, query, key, value, z,
+                                     kQueryRows, kKeyRows, kValueRows, geometry, workspace, stream,
+                                     [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
+                                         gdn_input_proj(x_flat, weight, projected, z_flat, policy,
+                                                        workspace, stream);
+                                     });
+            return;
+        }
         const detail::Nvfp4GdnConvPlan plan =
             detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
         if (geometry.batch > 1) {
@@ -563,6 +605,16 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                                     &value,
                                                     &z};
         require_parent_nonoverlap(weight, tensors, workspace, "fp8 gdn_input_proj_conv_snapshot");
+        if (fp_snapshot_takes_cublas(weight, policy, geometry.aggregate_columns)) {
+            compose_batched_snapshot(x, conv_weight, conv_states, valid_columns,
+                                     initial_state_slots, snapshot_base_slots, query, key, value, z,
+                                     kQueryRows, kKeyRows, kValueRows, geometry, workspace, stream,
+                                     [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
+                                         gdn_input_proj(x_flat, weight, projected, z_flat, policy,
+                                                        workspace, stream);
+                                     });
+            return;
+        }
         detail::fp8_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
                                           initial_state_slots, snapshot_base_slots, query, key,
                                           value, z, policy, workspace, stream);
@@ -956,6 +1008,43 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
 }
 
+namespace {
+// An NVFP4 / FP8 projection's own scratch, or the FP16 cuBLAS route's where it admits the interval.
+std::size_t fp_projection_with_cublas_bytes(std::size_t own, std::int32_t parent_rows,
+                                            std::int32_t input_rows, LinearPolicy policy,
+                                            std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (!allows_cublas_prefill(policy) || !detail::cublas_prefill_admits_fp() ||
+        max_tokens < cublas_prefill_min_tokens(policy)) {
+        return own;
+    }
+    return std::max(own, detail::w4_cublas_projection_workspace_capacity_bytes(
+                             parent_rows, input_rows,
+                             std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
+}
+
+std::size_t gdn_projection_capacity(QType parent_qtype, std::int32_t parent_rows,
+                                    std::int32_t input_rows, LinearPolicy policy,
+                                    std::int32_t min_tokens, std::int32_t max_tokens);
+
+// What a single-parent NVFP4 / FP8 snapshot composed through the cuBLAS projection needs: the
+// projected channels for the widest call plus the projection's scratch. Zero where the route does
+// not admit the interval.
+std::size_t fp_snapshot_cublas_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                     std::int32_t input_rows, LinearPolicy policy,
+                                     std::int32_t batch_size, std::int32_t min_width,
+                                     std::int32_t max_width) {
+    const std::int32_t gate = cublas_prefill_min_tokens(policy);
+    const std::int32_t aggregate = batch_size * max_width;
+    if (!allows_cublas_prefill(policy) || !detail::cublas_prefill_admits_fp() || aggregate < gate) {
+        return 0;
+    }
+    const std::size_t projection =
+        gdn_projection_capacity(parent_qtype, parent_rows, input_rows, policy,
+                                std::max(batch_size * min_width, gate), aggregate);
+    return composed_snapshot_capacity(10240, aggregate, projection);
+}
+} // namespace
+
 std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
                                                     std::int32_t input_rows, LinearPolicy policy,
                                                     std::int32_t min_tokens,
@@ -970,14 +1059,18 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             input_rows != detail::Nvfp4N16384K5120::kInputRows) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return fp_projection_with_cublas_bytes(
+            detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens),
+            parent_rows, input_rows, policy, min_tokens, max_tokens);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16) {
         if (parent_rows != detail::Fp8N16384K5120::kOutputRows ||
             input_rows != detail::Fp8N16384K5120::kInputRows) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported FP8 profile");
         }
-        return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return fp_projection_with_cublas_bytes(
+            detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens),
+            parent_rows, input_rows, policy, min_tokens, max_tokens);
     }
     if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 12288 && input_rows == 2048) {
         (void)detail::q8_gdn_input_resolve_plan(
@@ -995,6 +1088,15 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");
 }
+
+namespace {
+std::size_t gdn_projection_capacity(QType parent_qtype, std::int32_t parent_rows,
+                                    std::int32_t input_rows, LinearPolicy policy,
+                                    std::int32_t min_tokens, std::int32_t max_tokens) {
+    return gdn_input_proj_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows, policy,
+                                                   min_tokens, max_tokens);
+}
+} // namespace
 
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
@@ -1053,16 +1155,22 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
         parent_rows == detail::Fp8N16384K5120::kOutputRows &&
         input_rows == detail::Fp8N16384K5120::kInputRows) {
-        return detail::fp8_gdn_snapshot_workspace_capacity_bytes(policy, batch_size, min_width,
-                                                                 max_width);
+        return std::max(detail::fp8_gdn_snapshot_workspace_capacity_bytes(policy, batch_size,
+                                                                          min_width, max_width),
+                        fp_snapshot_cublas_bytes(parent_qtype, parent_rows, input_rows, policy,
+                                                 batch_size, min_width, max_width));
     }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
         input_rows != detail::Nvfp4N16384K5120::kInputRows) {
         throw std::invalid_argument(
             "gdn_input_proj_conv_snapshot workspace: unsupported single-parent profile");
     }
+    const std::size_t cublas = fp_snapshot_cublas_bytes(parent_qtype, parent_rows, input_rows,
+                                                        policy, batch_size, min_width, max_width);
     if (batch_size == 1) {
-        return detail::nvfp4_gdn_snapshot_workspace_capacity_bytes(policy, min_width, max_width);
+        return std::max(
+            detail::nvfp4_gdn_snapshot_workspace_capacity_bytes(policy, min_width, max_width),
+            cublas);
     }
 
     (void)detail::nvfp4_gdn_conv_resolve_plan(policy, min_width, batch_size);
@@ -1072,7 +1180,8 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     const std::int32_t aggregate_columns   = batch_size * max_width;
     const std::size_t projection_workspace = gdn_input_proj_workspace_capacity_bytes(
         parent_qtype, parent_rows, input_rows, policy, batch_size * min_width, aggregate_columns);
-    return composed_snapshot_capacity(kChannels, aggregate_columns, projection_workspace);
+    return std::max(composed_snapshot_capacity(kChannels, aggregate_columns, projection_workspace),
+                    cublas);
 }
 
 std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(QType qk_qtype,

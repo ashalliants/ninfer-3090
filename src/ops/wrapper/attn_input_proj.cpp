@@ -117,6 +117,45 @@ LinearPolicy without_integer(LinearPolicy policy) {
     return allows_a8_int(policy) ? LinearPolicy::A16Only : policy;
 }
 
+// sm_70's FP16 cuBLAS prefill route for an NVFP4 or FP8 parent (detail::cublas_prefill_admits_fp).
+// Their segmented outputs read the parent's rows as q, k, gate, v, like the Q8 parent's below. False
+// when the route does not take the call, which then runs the format's own plan.
+bool fp_cublas_attention(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                         Tensor& v, LinearPolicy requested, WorkspaceArena* workspace,
+                         cudaStream_t stream) {
+    constexpr std::int32_t kQRows = 6144, kKvRows = 1024;
+    const std::int32_t cols = x.ne[1];
+    if (!allows_cublas_prefill(requested) || cols < cublas_prefill_min_tokens(requested) ||
+        workspace == nullptr || !detail::cublas_prefill_admits_fp()) {
+        return false;
+    }
+    const detail::CublasProjectionDestination dests[] = {
+        {q.data, 0, kQRows, kQRows, 0},
+        {k.data, kQRows, kKvRows, kKvRows, 0},
+        {gate.data, kQRows + kKvRows, kQRows, kQRows, 0},
+        {v.data, 2 * kQRows + kKvRows, kKvRows, kKvRows, 0}};
+    const detail::CublasProjection parent[] = {{&weight, dests, 4}};
+    if (!detail::w4_cublas_projection_supported(parent, 1, cols) ||
+        (cols < kCublasPrefillMinTokens &&
+         !detail::w4_cublas_projection_fits(*workspace, parent, 1, cols))) {
+        return false;
+    }
+    detail::w4_cublas_projection_launch(x, parent, 1, *workspace, stream);
+    return true;
+}
+
+std::size_t fp_attention_with_cublas_bytes(std::size_t own, std::int32_t parent_rows,
+                                           std::int32_t input_rows, LinearPolicy policy,
+                                           std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (!allows_cublas_prefill(policy) || !detail::cublas_prefill_admits_fp() ||
+        max_tokens < cublas_prefill_min_tokens(policy)) {
+        return own;
+    }
+    return std::max(own, detail::w4_cublas_projection_workspace_capacity_bytes(
+                             parent_rows, input_rows,
+                             std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
+}
+
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
@@ -158,6 +197,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
         }
+        if (fp_cublas_attention(x, weight, q, gate, k, v, requested, workspace, stream)) return;
         detail::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
         return;
     }
@@ -178,6 +218,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("fp8 attn_input_proj: unsupported weight shape");
         }
+        if (fp_cublas_attention(x, weight, q, gate, k, v, requested, workspace, stream)) return;
         detail::fp8_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
         return;
     }
@@ -237,13 +278,17 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             input_rows != detail::Nvfp4N14336K5120::kInputRows) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return fp_attention_with_cublas_bytes(
+            detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens),
+            parent_rows, input_rows, policy, min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16:
         if (parent_rows != detail::Fp8N14336K5120::kOutputRows ||
             input_rows != detail::Fp8N14336K5120::kInputRows) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported FP8 profile");
         }
-        return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return fp_attention_with_cublas_bytes(
+            detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens),
+            parent_rows, input_rows, policy, min_tokens, max_tokens);
     case QType::Q8_G32_FP16:
         if (parent_rows != 9216 || input_rows != 2048) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported Q8 profile");
