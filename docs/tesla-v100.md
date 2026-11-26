@@ -457,8 +457,8 @@ greedy, thinking off, 400-token answers, 200 W (2026-11-26):
 
 Single-request decode without speculation is within 4% (40.6 against 42.2, the table above); with
 MTP3 the gap widens to about 20% (the QAD accepted 287 drafts for its 400 code tokens; the Q4/Q5
-mix's acceptance was not recorded in the same run). The Q4/Q5 column is from the router's comments for that build, on the same
-card and settings, not from this session's run.
+mix's acceptance was not recorded in the same run). The Q4/Q5 column is from the router's comments
+for that build, on the same card and settings, not from this session's run.
 
 **Quality.** On the held-out corpus (quick set, 4,096 context, stride 2,048, BF16 KV), the QAD artifact
 scored lower perplexity than the Q4/Q5 mix on all three domains measured: wikipedia_en 5.520
