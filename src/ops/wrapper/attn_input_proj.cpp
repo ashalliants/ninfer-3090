@@ -125,7 +125,7 @@ bool fp_cublas_attention(const Tensor& x, const Weight& weight, Tensor& q, Tenso
                          cudaStream_t stream) {
     constexpr std::int32_t kQRows = 6144, kKvRows = 1024;
     const std::int32_t cols = x.ne[1];
-    if (!allows_cublas_prefill(requested) || cols < cublas_prefill_min_tokens(requested) ||
+    if (!allows_cublas_prefill(requested) || cols < detail::cublas_prefill_fp_min_tokens(requested) ||
         workspace == nullptr || !detail::cublas_prefill_admits_fp()) {
         return false;
     }
@@ -148,12 +148,12 @@ std::size_t fp_attention_with_cublas_bytes(std::size_t own, std::int32_t parent_
                                            std::int32_t input_rows, LinearPolicy policy,
                                            std::int32_t min_tokens, std::int32_t max_tokens) {
     if (!allows_cublas_prefill(policy) || !detail::cublas_prefill_admits_fp() ||
-        max_tokens < cublas_prefill_min_tokens(policy)) {
+        max_tokens < detail::cublas_prefill_fp_min_tokens(policy)) {
         return own;
     }
     return std::max(own, detail::w4_cublas_projection_workspace_capacity_bytes(
                              parent_rows, input_rows,
-                             std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
+                             std::max(min_tokens, detail::cublas_prefill_fp_min_tokens(policy)), max_tokens));
 }
 
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,

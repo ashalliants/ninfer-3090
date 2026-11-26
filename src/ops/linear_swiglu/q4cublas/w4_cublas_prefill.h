@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/linear.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -125,6 +126,10 @@ inline constexpr std::size_t kCublasTileBudgetBytes = 256u << 20;
 // and the tensor or row multiplier is the epilogue's FP32 row scale. There their own prefill
 // kernels run Ampere mma.sync under emulation.
 [[nodiscard]] bool cublas_prefill_admits_fp() noexcept;
+/// The width from which `policy` admits the FP16 route for an NVFP4 / FP8 weight. Their sm_70
+/// alternative below the gate is the emulated A16 MMA kernels, not the streaming tiles Q4 / Q5
+/// have, so the prefill-phase (narrow) gate sits lower than cublas_prefill_min_tokens's.
+[[nodiscard]] std::int32_t cublas_prefill_fp_min_tokens(LinearPolicy policy) noexcept;
 
 [[nodiscard]] std::size_t w4_cublas_prefill_workspace_capacity_bytes(std::int32_t rows,
                                                                     std::int32_t cols,

@@ -89,9 +89,10 @@ std::vector<std::uint16_t> make_activation(std::int32_t rows, std::int32_t token
 // cannot say, since an exact A16 fallback would pass every bound in this file.
 int expect_route(const std::string& label, const WorkspaceArena& workspace,
                  std::size_t weight_bytes, std::int32_t tokens,
-                 ops::LinearPolicy policy = kPolicy) {
+                 ops::LinearPolicy policy = kPolicy, std::int32_t gate = -1) {
     const bool engaged  = workspace.peak_used() >= weight_bytes;
-    const bool expected = tokens >= ops::cublas_prefill_min_tokens(policy);
+    const bool expected =
+        tokens >= (gate < 0 ? ops::cublas_prefill_min_tokens(policy) : gate);
     if (engaged == expected) { return 0; }
     std::cerr << label << ": cuBLAS route " << (engaged ? "ran" : "did not run") << " at T=" << tokens
               << ", expected it to " << (expected ? "run" : "decline") << " (peak workspace "
@@ -601,7 +602,7 @@ int run_fp_swiglu(QType qtype, std::int32_t tokens, ops::LinearPolicy policy) {
                               " cuBLAS T=" + std::to_string(tokens);
     int failures = output.verify_guards(label);
     failures += expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols * 2, tokens,
-                             policy);
+                             policy, ops::detail::cublas_prefill_fp_min_tokens(policy));
     const std::vector<double> got = read_bf16(output, out_elements);
     Samples s;
     for (const std::int32_t token : sample_tokens(tokens, 29U)) {
@@ -639,7 +640,7 @@ int run_fp_add(QType qtype, std::int32_t tokens, std::int32_t kCols, ops::Linear
                               " cuBLAS K=" + std::to_string(kCols) + " T=" + std::to_string(tokens);
     int failures = device_residual.verify_guards(label);
     failures += expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols * 2, tokens,
-                             policy);
+                             policy, ops::detail::cublas_prefill_fp_min_tokens(policy));
     const std::vector<double> got = read_bf16(device_residual, res_elements);
     Samples s;
     for (const std::int32_t token : sample_tokens(tokens, 37U)) {
@@ -680,7 +681,8 @@ int run_fp_gdn_input(QType qtype, std::int32_t tokens, ops::LinearPolicy policy)
         "GdnInputProj " + fp_tag(qtype, policy) + " cuBLAS T=" + std::to_string(tokens);
     int failures = device_qkv.verify_guards(label) + device_z.verify_guards(label);
     failures += expect_route(label, workspace, static_cast<std::size_t>(kParentRows) * kHidden * 2,
-                             tokens, policy);
+                             tokens, policy,
+                             ops::detail::cublas_prefill_fp_min_tokens(policy));
     const std::vector<double> got_qkv =
         read_bf16(device_qkv, static_cast<std::size_t>(kQkvRows) * tokens);
     const std::vector<double> got_z = read_bf16(device_z, static_cast<std::size_t>(kZRows) * tokens);
@@ -731,7 +733,8 @@ int run_fp_attn_input(QType qtype, std::int32_t tokens, ops::LinearPolicy policy
     int failures = device_q.verify_guards(label) + device_gate.verify_guards(label) +
                    device_k.verify_guards(label) + device_v.verify_guards(label);
     failures += expect_route(label, workspace, static_cast<std::size_t>(kParentRows) * kHidden * 2,
-                             tokens, policy);
+                             tokens, policy,
+                             ops::detail::cublas_prefill_fp_min_tokens(policy));
     const std::vector<double> got_q    = read_bf16(device_q, q_elements);
     const std::vector<double> got_gate = read_bf16(device_gate, q_elements);
     const std::vector<double> got_k    = read_bf16(device_k, kv_elements);
@@ -802,7 +805,7 @@ int main() {
         if (ops::detail::cublas_prefill_admits_fp()) {
             constexpr ops::LinearPolicy narrow = ops::prefill_phase_policy(kPolicy);
             for (const ops::LinearPolicy policy : {kPolicy, narrow}) {
-                const std::int32_t g = ops::cublas_prefill_min_tokens(policy);
+                const std::int32_t g = ops::detail::cublas_prefill_fp_min_tokens(policy);
                 for (const std::int32_t tokens : {g - 1, g, 1000}) {
                     if (policy == narrow && tokens == 1000) continue;
                     failures += run_fp_swiglu(QType::NVFP4, tokens, policy);

@@ -146,10 +146,10 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
                 ? detail::nvfp4_linear_swiglu_workspace_capacity_bytes(own, min_tokens, max_tokens)
                 : detail::fp8_linear_swiglu_workspace_capacity_bytes(own, min_tokens, max_tokens);
         if (allows_cublas_prefill(policy) && detail::cublas_prefill_admits_fp() &&
-            max_tokens >= cublas_prefill_min_tokens(policy)) {
+            max_tokens >= detail::cublas_prefill_fp_min_tokens(policy)) {
             return std::max(bytes, detail::w4_cublas_prefill_workspace_capacity_bytes(
                                        gate_up_rows, input_rows,
-                                       std::max(min_tokens, cublas_prefill_min_tokens(policy)),
+                                       std::max(min_tokens, detail::cublas_prefill_fp_min_tokens(policy)),
                                        max_tokens));
         }
         return bytes;
@@ -226,7 +226,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         if (fp8_weight) (void)detail::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
         else (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
         // sm_70: prefill widths on the FP16 cuBLAS route, as for Q4 (w4_cublas_prefill.h).
-        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+        if (allows_cublas_prefill(policy) && t >= detail::cublas_prefill_fp_min_tokens(policy) &&
             detail::cublas_prefill_admits_fp() &&
             detail::w4_cublas_prefill_supported(gate_up_weight, t) &&
             (t >= kCublasPrefillMinTokens ||

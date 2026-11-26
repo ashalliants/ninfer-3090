@@ -161,12 +161,12 @@ std::size_t fp_with_cublas_bytes(std::size_t own, std::int32_t output_rows,
                                  std::int32_t input_rows, LinearPolicy policy,
                                  std::int32_t min_tokens, std::int32_t max_tokens) {
     if (!allows_cublas_prefill(policy) || !detail::cublas_prefill_admits_fp() ||
-        max_tokens < cublas_prefill_min_tokens(policy)) {
+        max_tokens < detail::cublas_prefill_fp_min_tokens(policy)) {
         return own;
     }
     return std::max(own, detail::w4_cublas_prefill_workspace_capacity_bytes(
                              output_rows, input_rows,
-                             std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
+                             std::max(min_tokens, detail::cublas_prefill_fp_min_tokens(policy)), max_tokens));
 }
 } // namespace
 
@@ -410,7 +410,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: NVFP4 requires 16-byte x/residual alignment");
         }
         // sm_70: prefill widths on the FP16 cuBLAS route, as for Q4 (w4_cublas_prefill.h).
-        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+        if (allows_cublas_prefill(policy) && t >= detail::cublas_prefill_fp_min_tokens(policy) &&
             detail::cublas_prefill_admits_fp() && detail::w4_cublas_prefill_supported(w, t) &&
             (t >= kCublasPrefillMinTokens || detail::w4_cublas_prefill_fits(ws, w.n, w.k, t))) {
             detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);
@@ -433,7 +433,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
         // sm_70: prefill widths on the FP16 cuBLAS route, as for Q4 (w4_cublas_prefill.h).
-        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+        if (allows_cublas_prefill(policy) && t >= detail::cublas_prefill_fp_min_tokens(policy) &&
             detail::cublas_prefill_admits_fp() && detail::w4_cublas_prefill_supported(w, t) &&
             (t >= kCublasPrefillMinTokens || detail::w4_cublas_prefill_fits(ws, w.n, w.k, t))) {
             detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);

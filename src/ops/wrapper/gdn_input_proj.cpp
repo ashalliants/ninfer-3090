@@ -327,7 +327,7 @@ LinearPolicy without_integer(LinearPolicy policy) {
 bool fp_cublas_projection(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                           LinearPolicy requested, WorkspaceArena* workspace, cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
-    if (!allows_cublas_prefill(requested) || cols < cublas_prefill_min_tokens(requested) ||
+    if (!allows_cublas_prefill(requested) || cols < detail::cublas_prefill_fp_min_tokens(requested) ||
         workspace == nullptr || !detail::cublas_prefill_admits_fp()) {
         return false;
     }
@@ -346,7 +346,7 @@ bool fp_cublas_projection(const Tensor& x, const Weight& weight, Tensor& qkv, Te
 // Whether a single-parent NVFP4 / FP8 snapshot of `columns` columns projects on the cuBLAS route
 // (composed: projection into scratch, then the conv), as its workspace capacity reserves for.
 bool fp_snapshot_takes_cublas(const Weight& weight, LinearPolicy policy, std::int32_t columns) {
-    return allows_cublas_prefill(policy) && columns >= cublas_prefill_min_tokens(policy) &&
+    return allows_cublas_prefill(policy) && columns >= detail::cublas_prefill_fp_min_tokens(policy) &&
            detail::cublas_prefill_admits_fp() &&
            detail::w4_cublas_prefill_supported(weight, columns);
 }
@@ -1014,12 +1014,12 @@ std::size_t fp_projection_with_cublas_bytes(std::size_t own, std::int32_t parent
                                             std::int32_t input_rows, LinearPolicy policy,
                                             std::int32_t min_tokens, std::int32_t max_tokens) {
     if (!allows_cublas_prefill(policy) || !detail::cublas_prefill_admits_fp() ||
-        max_tokens < cublas_prefill_min_tokens(policy)) {
+        max_tokens < detail::cublas_prefill_fp_min_tokens(policy)) {
         return own;
     }
     return std::max(own, detail::w4_cublas_projection_workspace_capacity_bytes(
                              parent_rows, input_rows,
-                             std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
+                             std::max(min_tokens, detail::cublas_prefill_fp_min_tokens(policy)), max_tokens));
 }
 
 std::size_t gdn_projection_capacity(QType parent_qtype, std::int32_t parent_rows,
@@ -1033,7 +1033,7 @@ std::size_t fp_snapshot_cublas_bytes(QType parent_qtype, std::int32_t parent_row
                                      std::int32_t input_rows, LinearPolicy policy,
                                      std::int32_t batch_size, std::int32_t min_width,
                                      std::int32_t max_width) {
-    const std::int32_t gate = cublas_prefill_min_tokens(policy);
+    const std::int32_t gate = detail::cublas_prefill_fp_min_tokens(policy);
     const std::int32_t aggregate = batch_size * max_width;
     if (!allows_cublas_prefill(policy) || !detail::cublas_prefill_admits_fp() || aggregate < gate) {
         return 0;
