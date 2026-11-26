@@ -65,6 +65,10 @@ struct SwiGluRowMajorMmaEpilogue {
             }
         } else {
             static_assert((Cfg::kBlockRows / Cfg::kWarpRows) == 2);
+            // Only the up half (wm == 1: kWarpRows = kBlockRows / 2 rows) is staged, as FP32:
+            // kWarpRows * BN * 4 bytes, which is the 2 bytes per (row, token) of the whole block
+            // that kSharedBytes reserves.
+            static_assert(MT * 16 * BN * static_cast<int>(sizeof(float)) <= kSharedBytes<Cfg>);
             auto* up_shared = reinterpret_cast<float*>(scratch);
             __syncthreads();
             if (wm == 1) {

@@ -939,6 +939,12 @@ int run_nvfp4() {
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
+    // Above 16 tokens A16 projects through the MMA route and runs the conv post-pass: the only
+    // wide route where NVFP4 has no tensor-core path (sm_70, sm_80-89; TODO.md section 1).
+    for (const auto [tokens, initial_slot] :
+         {std::pair{17, 0}, std::pair{128, 3}, std::pair{1024, 1025}}) {
+        failures += run_nvfp4_case(parent, tokens, ops::LinearPolicy::A16Only, initial_slot);
+    }
     for (const auto [tokens, initial_slot] : {std::pair{3, 4}, std::pair{4, 5},
                                               std::pair{17, 0}, std::pair{1024, 1025}}) {
         failures += run_case_allowing_arch_skip(
@@ -1193,6 +1199,12 @@ int main() {
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 3) != 0 ||
         nvfp4_a4_4 == 0 ||
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 17) == 0 ||
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 17) !=
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 17, 17) ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 4) != nvfp4_a4_4) {
         std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
