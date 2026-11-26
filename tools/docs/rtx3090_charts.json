@@ -1,0 +1,74 @@
+{
+  "meta": {
+    "gpu": "One RTX 3090 24 GB, Windows 11, CUDA 12.8",
+    "power": "315 W limit",
+    "date": "2026-11-26",
+    "sources": "docs/performance.md#qwen38-27b-against-the-best-published-rtx-3090-figures-2026-11-26"
+  },
+  "charts": [
+    {
+      "file": "rtx3090-qwen38-27b.svg",
+      "title": "Qwen3.8-27B on one RTX 3090: against the best published figures",
+      "subtitle": "ashalliants/ninfer-3090 against the fastest figure any other engine publishes for this model on one RTX 3090, per workload. Above 1.0x means ours is faster. Every other figure is the author's own, from a different machine, quant and power limit, so read the ratios as indicative.",
+      "desc": "Qwen3.8-27B on one RTX 3090, ashalliants/ninfer-3090 against the best published figures. Chat, one request, vs syv-ai HyperQwen: 1.02x decode (133.2 vs 131.2), 1.22x prefill. Code vs open-jet: 1.39x (194.6 vs 140). No drafts vs open-jet: 1.11x (47.7 vs 42.9). 98K-token context vs open-jet: 0.98x (93.9 vs 95.9). Eight requests at once vs syv-ai: 1.03x (421.4 vs 407.3).",
+      "build": "master 178d3b5e (Release, launcher settings)",
+      "panels": [
+        {"type": "ratio", "columns": ["Decode", "Prefill"], "max": 1.6,
+         "rows": [
+           {"section": "Reported by their authors (hatched): different machines, quants, prompts and power limits; not re-run here"},
+           {"model": "Chat, one request", "versus": "vs syv-ai HyperQwen (patched vLLM, W4A16 + int8 Marlin, 250 W), greedy, on its own eight prompts",
+            "cells": [
+              {"ours": [133.2], "theirs": [131.2], "reported": true, "detail": "ours: the launcher default (DFlash2 K7 + n-gram copies, rk4v4 KV), 1,024 tokens per prompt"},
+              {"ours": [2367], "theirs": [1940], "reported": true, "detail": "ours at a 1.2K-token prompt, theirs at 1K"}]},
+           {"model": "Code, one request", "versus": "vs the open-jet megakernel (Q4_K_M, 4 drafts)",
+            "cells": [
+              {"ours": [194.6], "theirs": [140], "reported": true, "detail": "ours: six code-writing prompts, 1,024 tokens each, 64.5% of drafts accepted"},
+              {"none": "open-jet publishes no prefill figure for this run"}]},
+           {"model": "No drafts, one request", "versus": "vs the open-jet megakernel (Q4_K_M)",
+            "cells": [
+              {"ours": [47.7], "theirs": [42.9], "reported": true, "detail": "ours: ninfer_bench tg128, INT8 KV (46.7 with rk4v4); llama.cpp reports 41.5"},
+              {"none": "not compared at matching lengths"}]},
+           {"model": "98K-token context", "versus": "vs the open-jet megakernel (7 drafts)",
+            "cells": [
+              {"ours": [93.9], "theirs": [95.9], "reported": true, "detail": "ours: 98,362-token prompt, 512 tokens out (93.1-93.9 over two runs); syv-ai reports 78.5 at 100K"},
+              {"none": "open-jet publishes none; ours reads the 98K prompt at 1,899 tok/s"}]},
+           {"model": "Eight requests at once", "versus": "vs syv-ai HyperQwen's single-user mode (MTP), the same eight prompts",
+            "cells": [
+              {"ours": [421.4], "theirs": [407.3], "reported": true, "detail": "aggregate; ours MTP3, INT8 KV, the launcher's c8 settings"},
+              {"none": "not compared"}]}
+         ]},
+        {"type": "grouped", "title": "Decode, one request (tok/s)",
+         "note": "Greedy, thinking off. \"File rewrite\" asks for a supplied file back with small edits, so most of the answer is copied from the prompt; syv-ai's 381 is its figure for answers that quote the prompt, at 25K context.",
+         "label_w": 150,
+         "groups": ["no drafts", "chat (syv-ai's prompts)", "code", "file rewrite", "98K-token context"],
+         "series": [
+           {"name": "Ours, launcher settings", "kind": "ours", "values": [47.7, 133.2, 194.6, 384.4, 93.9]},
+           {"name": "Best other published figure (reported)", "kind": "reported", "values": [42.9, 131.2, 140, 381, 95.9],
+            "labels": ["open-jet", "syv-ai, greedy", "open-jet", "syv-ai, 25K", "open-jet"]}
+         ]},
+        {"type": "grouped", "title": "Several requests at once, aggregate decode (tok/s)",
+         "note": "syv-ai's eight prompts, 1,024 tokens each, greedy. NInfer serves at most eight requests at once; syv-ai's batch mode reports about 1,035 tok/s at 64.",
+         "label_w": 150,
+         "groups": ["4 requests", "8 requests"],
+         "series": [
+           {"name": "Ours, MTP3, INT8 KV", "kind": "ours", "values": [320.3, 421.4]},
+           {"name": "Ours, DFlash2 K7, rk4v4 KV", "kind": "alt", "values": [263.6, null]},
+           {"name": "syv-ai HyperQwen, MTP (reported)", "kind": "reported", "values": [null, 407.3]}
+         ]},
+        {"type": "rows", "title": "Prefill (tok/s)",
+         "note": "Server-side prefill time of one fresh prompt, no prefix reused. The 10K report does not name its engine (probably syv-ai's).",
+         "rows": [
+           {"label": "Ours", "detail": "1.2K-token prompt", "value": 2367, "kind": "ours"},
+           {"label": "syv-ai HyperQwen", "detail": "1K prompt, int8 activations", "value": 1940, "kind": "reported"},
+           {"label": "Ours", "detail": "9.8K-token prompt", "value": 2908, "kind": "ours"},
+           {"label": "club-3090 #1053", "detail": "10K prompt, engine not named", "value": 2488, "kind": "reported"},
+           {"label": "Ours", "detail": "98K-token prompt", "value": 1899, "kind": "ours"}
+         ]}
+      ],
+      "notes": [
+        "Where we lose: at 98K tokens of context open-jet reports 95.9 tok/s against our 93.9 (0.98x). syv-ai's batch mode reports about 1,035 tok/s at 64 requests; NInfer is built for one to eight.",
+        "Quants differ: ours is this fork's Q4/Q5 group-quant mix (17.0 GiB), syv-ai runs W4A16 AutoRound with int8 Marlin layers, open-jet Unsloth's Q4_K_M. Conditions and sources for every figure: docs/performance.md, \"Qwen3.8-27B against the best published RTX 3090 figures\"."
+      ]
+    }
+  ]
+}

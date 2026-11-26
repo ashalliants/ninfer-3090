@@ -18,6 +18,8 @@ tags:
 
 > **Maintained at [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090)**: the engine, converter and release builds these artifacts are made and tested with. Releases, issues and updates live there, and a star helps others find it.
 
+![Qwen3.8-27B on one RTX 3090: ashalliants/ninfer-3090 against the best published figures, per workload](assets/rtx3090-qwen38-27b.svg)
+
 ![Qwen3.8-27B on one RTX 3090: llama.cpp against NInfer-3090, up to 2.1x the decode speed](assets/llamacpp-vs-ninfer-27b.svg)
 
 ![Qwen3.8-27B on one RTX 3090: this fork's artifact against upstream's, smaller, closer to full precision and faster](assets/qwen38-artifact-gains.svg)
@@ -169,6 +171,22 @@ acceptance does not move (DFlash2 3.558 against 3.560 tokens per round, MTP3 61.
 Before the small-T Q6 kernel, the 6-bit head's 8-token verify took 2.56 ms against 1.58 ms for
 upstream's 8-bit head and cancelled DFlash2's gain (−0.6% on the bench); with it the head reads
 at about 850 GB/s from 3 to 8 tokens.
+
+**Against the best published figures (2026-11-26).** Through `ninfer-serve` with the launcher's
+settings (DFlash2 K7 + draft head + n-gram copies, `rk4v4` KV), greedy, on one RTX 3090 under Windows
+at 315 W, master `178d3b5e`:
+
+| Workload | This artifact | Best other published figure on one RTX 3090 |
+|---|---:|---:|
+| Code, six prompts, 1,024 tokens each | **194.6 tok/s** | 140 (open-jet megakernel, Q4_K_M) |
+| Chat, syv-ai's eight prompts | **133.2 tok/s** | 131.2 (syv-ai HyperQwen, greedy) |
+| No speculation (`ninfer_bench` tg128, INT8 KV) | **47.7 tok/s** | 42.9 (open-jet) |
+| 98K-token context | 93.9 tok/s | **95.9** (open-jet) |
+| Eight requests at once (MTP3, INT8 KV) | **421.4 tok/s** | 407.3 (syv-ai HyperQwen) |
+| Prefill, 1.2K-token prompt | **2,367 tok/s** | 1,940 at 1K (syv-ai HyperQwen) |
+
+The other figures are their authors' own, from different machines, quants and power limits. Method
+and sources: [RTX 3090 comparison](https://github.com/ashalliants/ninfer-3090/blob/master/docs/performance.md#qwen38-27b-against-the-best-published-rtx-3090-figures-2026-11-26).
 
 **Against llama.cpp.** Decode speed on one RTX 3090, one stream, greedy, 8K context. The llama.cpp
 figures are not ours: they are Hsiu-Chi Tsai's
