@@ -1941,6 +1941,18 @@ the prompt, so an agent loop with no new user turn between requests resumes from
 Valid TTL/retention values are accepted, but NInfer does not
 promise their wall-clock residency; physical retention follows the resource scheduler.
 
+When the Host tier is full, a write competes for a place by what it would save:
+- **Proven entries are protected.** A prefix that a second request has used, such as shared
+  instructions, keeps its place against new one-off writes.
+- **A new, unproven write competes with other unproven entries.** It replaces one only when it
+  would save more prompt tokens than that entry would cost to recompute. A stream of one-off prompts
+  (labelling, say) therefore does not pay a Host write per request, whether or not the client sends
+  `mode:"explicit"`.
+- **Unused entries lose their claim with age.** An unproven entry's claim halves each time 32 full
+  turnovers of unproven writes pass without it being used. So a tier filled early by long one-off
+  prompts does not refuse newer ones forever: stale entries are replaced, oldest first. A long
+  prompt that is costly to recompute keeps its place longer than a short one.
+
 ## OpenAI Responses Core
 
 NInfer implements the typed-Item and semantic-event core of the OpenAI

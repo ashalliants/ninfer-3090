@@ -3135,10 +3135,80 @@ void test_direct_victim_release_offers_the_continuation_first() {
             "the directly released continuation was not offered before its release");
 }
 
+// The same workload as a stream: every request shares one hot prefix, adds a unique item, and
+// asks to keep its own end-of-prompt state in a Host tier that holds `residents` images.
+struct OneShotStream {
+    static constexpr std::size_t kImage = 64;
+    Fixture f;
+    Key prefix = tokens(400, 1);
+    Handle shared;
+    std::uint32_t next = 1'000'000;
+    std::vector<Handle> saved; // in save order
+
+    explicit OneShotStream(std::size_t residents) : f((residents + 1) * kImage) {
+        shared = f.program.add(prefix, {f.program.host_block(kImage)});
+        f.publish(shared);
+    }
+
+    Base base_for(std::uint32_t item_tokens) {
+        Base base{.tokens = prefix};
+        const auto item = tokens(item_tokens, next);
+        next += 10'000;
+        base.tokens.insert(base.tokens.end(), item.begin(), item.end());
+        return base;
+    }
+
+    // One request: reuse the shared prefix, then try to keep the end of the prompt. Returns
+    // whether the state was kept.
+    bool request(std::uint32_t item_tokens) {
+        auto& p              = f.program;
+        const auto base      = base_for(item_tokens);
+        const auto frontier  = static_cast<std::uint32_t>(base.tokens.size());
+        const auto owner     = f.begin(base, shared);
+        const auto admission = f.cache.capture_admission(p, owner, base, frontier);
+        auto cursor          = f.cache.begin_reclaim(p, admission);
+        const auto victims =
+            f.cache.host_victims(p, kImage, std::nullopt, {}, {}, admission, &cursor);
+        if (!victims) {
+            f.cache.abandon(p, owner);
+            return false;
+        }
+        f.cache.commit_host_victims(p, *victims, cursor);
+        const auto handle = p.add(base.tokens, {p.host_block(kImage)}, Role::Continuation);
+        f.cache.publish(p, owner, handle);
+        f.cache.finish(p, owner, base, ++f.next_order);
+        saved.push_back(handle);
+        return true;
+    }
+
+    [[nodiscard]] bool cached(Handle handle) const { return f.program.valid_checkpoint(handle); }
+
+    // The Engine's decision for one capture, as prepare_semantic_capture makes it: a victim
+    // query, then a reclaim of the shortage when the query finds nothing. Nothing is kept.
+    bool capture_once(std::uint32_t item_tokens) {
+        auto& p              = f.program;
+        const auto base      = base_for(item_tokens);
+        const auto frontier  = static_cast<std::uint32_t>(base.tokens.size());
+        const auto owner     = f.begin(base, shared);
+        const auto admission = f.cache.capture_admission(p, owner, base, frontier);
+        auto cursor          = f.cache.begin_reclaim(p, admission);
+        const auto victims =
+            f.cache.host_victims(p, kImage, std::nullopt, {}, {}, admission, &cursor);
+        bool saved = victims && !victims->empty();
+        if (!saved) {
+            saved = f.cache.reclaim(p, {.host_bytes = kImage}, {}, cursor) ==
+                    ninfer::runtime::ReclaimProgress::Changed;
+        }
+        f.cache.abandon(p, owner);
+        return saved;
+    }
+};
+
 // The labelling workload measured on the V100 router (2026-11-26): every request shares one hot
 // instruction prefix, adds a short unique item, and asks to keep its own end-of-prompt state.
-// The Host tier is full of earlier requests' one-off states. Each new request's optional capture
-// is refused, and the refusal must stay cheap.
+// The Host tier is full of earlier requests' one-off states (items of 200-259 tokens), so a new
+// request's capture is kept only when its item outweighs one of theirs. Either way the decision
+// must stay cheap.
 struct OneShotOutcome {
     bool saved;
     std::uint64_t recovery_loss_calls, recovery_loss_survivors, recovery_frontier_calls,
@@ -3147,46 +3217,23 @@ struct OneShotOutcome {
 };
 
 OneShotOutcome run_one_shot_capture(std::size_t residents, std::uint32_t item_tokens) {
-    constexpr std::size_t image = 64;
-    Fixture f((residents + 1) * image);
-    const auto prefix_tokens = tokens(400, 1);
-    const auto shared        = f.program.add(prefix_tokens, {f.program.host_block(image)});
-    f.publish(shared);
-    std::uint32_t next = 1'000'000;
+    OneShotStream stream(residents);
     for (std::size_t i = 0; i < residents; ++i) {
-        auto key        = prefix_tokens;
-        const auto item = tokens(200 + static_cast<std::uint32_t>(i % 60), next);
-        next += 1000;
-        key.insert(key.end(), item.begin(), item.end());
-        f.use_shared(shared);
-        f.publish(f.program.add(key, {f.program.host_block(image)}, Role::Continuation));
+        require(stream.request(200 + static_cast<std::uint32_t>(i % 60)), "no room");
     }
-    Base base{.tokens = prefix_tokens};
-    const auto item = tokens(item_tokens, next);
-    base.tokens.insert(base.tokens.end(), item.begin(), item.end());
-    const auto frontier = static_cast<std::uint32_t>(base.tokens.size());
-    auto& p = f.program;
+    auto& p = stream.f.program;
     p.recovery_loss_calls = p.recovery_loss_survivors = p.recovery_frontier_calls = 0;
     p.host_bytes_released_calls = 0;
-    const auto begin     = std::chrono::steady_clock::now();
-    const auto owner     = f.begin(base, shared);
-    const auto admission = f.cache.capture_admission(p, owner, base, frontier);
-    auto cursor          = f.cache.begin_reclaim(p, admission);
-    auto victims = f.cache.host_victims(p, image, std::nullopt, {}, {}, admission, &cursor);
-    bool saved   = victims && !victims->empty();
-    if (!saved) {
-        saved = f.cache.reclaim(p, {.host_bytes = image}, {}, cursor) ==
-                ninfer::runtime::ReclaimProgress::Changed;
-    }
-    const auto end = std::chrono::steady_clock::now();
-    f.cache.abandon(p, owner);
+    const auto begin = std::chrono::steady_clock::now();
+    const auto saved = stream.capture_once(item_tokens);
+    const auto end   = std::chrono::steady_clock::now();
     return {saved, p.recovery_loss_calls, p.recovery_loss_survivors, p.recovery_frontier_calls,
             p.host_bytes_released_calls, std::chrono::duration<double>(end - begin).count()};
 }
 
 void test_one_shot_capture_into_a_full_host_tier() {
     for (const auto residents : {65, 130, 260}) {
-        for (const auto item : {230U, 300U}) {
+        for (const auto item : {150U, 230U, 300U}) {
             const auto out = run_one_shot_capture(residents, item);
             std::cout << "one-shot capture " << residents << " entries, item " << item
                       << ": saved=" << out.saved << " recovery_loss=" << out.recovery_loss_calls
@@ -3194,15 +3241,66 @@ void test_one_shot_capture_into_a_full_host_tier() {
                       << " recovery_frontier=" << out.recovery_frontier_calls
                       << " host_bytes_released=" << out.host_bytes_released_calls
                       << " seconds=" << out.seconds << std::endl;
-            // Measured before the per-evaluation tables: 135,461 recovery-frontier calls and one
-            // survivor sort per candidate at 260 entries. Now each retained checkpoint is asked
-            // once per evaluation (twice here: the cursor's gain limit and the search).
-            require(out.recovery_frontier_calls <= 2 * (residents + 1) + 2,
+            // Before the per-evaluation tables this was about 2N^2 recovery-frontier calls and a
+            // survivor sort per candidate. Now each retained checkpoint is asked once per
+            // evaluation: the cursor's gain limit, the query and, after a refusal, the reclaim.
+            require(out.recovery_frontier_calls <= 3 * (residents + 1) + 2,
                     "a capture's gain is priced per candidate again, not once per evaluation");
             require(out.recovery_loss_calls == 0,
                     "a capture's victim search rebuilt the survivor set for a candidate");
         }
     }
+}
+
+// A tier filled by long one-off prompts used to refuse every shorter one-off forever: none of
+// them could outweigh what an old entry would cost to recompute, so nothing old ever left and
+// nothing new was kept. An unproven entry's claim now fades with the unproven writes it sits
+// through, so the oldest one-off is eventually replaced, and it goes first.
+void test_unproven_one_off_history_ages_out() {
+    constexpr std::size_t residents = 16;
+    OneShotStream stream(residents);
+    for (std::size_t i = 0; i < residents; ++i) {
+        require(stream.request(300), "a one-off was refused while the Host tier had room");
+    }
+    const auto oldest = stream.saved.front();
+    std::size_t attempts = 0;
+    bool kept            = false;
+    while (!kept && attempts < 80 * residents) {
+        kept = stream.request(230);
+        ++attempts;
+    }
+    std::cout << "unproven ageing: first shorter one-off kept after " << attempts << " attempts\n";
+    require(kept, "a tier of old one-off history never let a newer one-off in");
+    require(!stream.cached(oldest), "ageing replaced a newer one-off before the oldest");
+    require(stream.cached(stream.shared), "an unproven write evicted the reused shared prefix");
+}
+
+// Freshly kept one-offs are not churned: a request of the same worth right after the tier
+// fills is refused, so a stream of one-off prompts does not pay a Host write per request.
+void test_fresh_unproven_history_is_not_churned() {
+    constexpr std::size_t residents = 16;
+    OneShotStream stream(residents);
+    for (std::size_t i = 0; i < residents; ++i) { require(stream.request(230), "no room"); }
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < residents; ++i) { kept += stream.request(230); }
+    require(kept == 0, "a full tier of fresh one-offs replaced one with an equal one-off");
+}
+
+// Over a long one-off stream (three halvings of an unproven claim), writes stay a small share of
+// requests and the reused prefix stays.
+void test_unproven_write_rate_is_bounded() {
+    constexpr std::size_t residents = 16;
+    OneShotStream stream(residents);
+    for (std::size_t i = 0; i < residents; ++i) { require(stream.request(230), "no room"); }
+    std::size_t kept = 0;
+    constexpr std::size_t requests = 120 * residents;
+    for (std::size_t i = 0; i < requests; ++i) { kept += stream.request(200 + (i * 37) % 60); }
+    std::cout << "unproven write rate: " << kept << " of " << requests << " one-offs kept\n";
+    // Measured 9.2% with no ageing (the tier keeps the longest one-offs and refuses the rest):
+    // ageing may add a few points of writes, not turn the stream into a write per request.
+    require(kept * 100 <= requests * 15, "over 15% of a one-off stream wrote to the Host tier");
+    require(kept > 0, "a long one-off stream never refreshed the tier");
+    require(stream.cached(stream.shared), "a one-off stream evicted the reused shared prefix");
 }
 
 int main() {
@@ -3215,6 +3313,9 @@ int main() {
         test_candidate_memo_cuts_victim_selection_work();
         test_saturated_host_reclaim_work_stays_bounded();
         test_one_shot_capture_into_a_full_host_tier();
+        test_unproven_one_off_history_ages_out();
+        test_fresh_unproven_history_is_not_churned();
+        test_unproven_write_rate_is_bounded();
         test_reclaim_pricing_cap_stops_a_long_search_once_an_action_is_found();
         test_reclaim_pricing_cap_bounds_the_first_search();
         test_reclaim_pricing_cap_never_costs_progress();
