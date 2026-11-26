@@ -1027,9 +1027,25 @@ parents). The next merge from `neroued/master` will touch the same subsystem.
 
 ---
 
-## 1. Correctness and coverage — closed except the NVFP4 loadability decision
+## 1. Correctness and coverage — closed
 
-- [ ] **The NVFP4 27B artifact cannot start at all on sm_86. It is a shipped, documented
+- [x] **Resolved 2026-11-26: NVFP4 artifacts now plan and serve any prefill width under
+      `A16Only` (sm_70 and sm_80–89).** Option (2) below, the FP32 intermediate, done without a new
+      intermediate buffer: `nvfp4_linear_swiglu_matrix.cu` runs the existing NVFP4 A16 MMA mainloop
+      with the SwiGLU epilogue, so gate and up stay FP32 in registers as in the T ≤ 16 fused
+      kernel, and the BF16 rounding that sank `LinearA16Post` never happens. The GDN snapshot takes
+      the materialized route above T=16 when A4 is not allowed, with a workspace sized for the
+      A16 policy it actually runs. A 248320×5120 A16 shape was added for an NVFP4 output head
+      (NVIDIA's Qwen3.8-27B-NVFP4-QAD quantizes `lm_head`). The extended cases this entry asked for
+      are now in the tree: SwiGLU A16 `{1, 4, 8, 16, 17, 64, 128, 129, 256, 1024}`, GDN A16
+      `{17, 128, 1024}` plus workspace assertions, and the vocabulary shape in
+      `ninfer_linear_nvfp4_a16_test`. All three pass on sm_70 (V100); **sm_86 NOT RUN** (no 3090 on
+      this machine). The QAD artifact loads and serves on the V100 and scored the held-out
+      perplexity corpus end to end. **Speed is the open part, not correctness:** on sm_70 the A16
+      route runs the Ampere MMA under `NINFER_VOLTA_EMULATION` (≈47 tok/s prefill, ≈9 tok/s decode);
+      fast V100 routes are separate work. The history below is kept for the reasoning.
+
+- [x] **(History) The NVFP4 27B artifact cannot start at all on sm_86. It is a shipped, documented
       configuration and it is completely broken on this card.** Found 2026-09-09 while confirming
       an unrelated change against the full suite; not a regression — nothing this cycle touched
       `nvfp4_linear_swiglu`.

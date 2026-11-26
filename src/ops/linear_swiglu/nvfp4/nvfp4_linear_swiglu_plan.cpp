@@ -16,6 +16,7 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    MatrixA16,
     FusedA4,
     TmaFusedA4,
 };
@@ -28,13 +29,10 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!allows_a4(policy)) { // A16Only, AllowA8 and the integer-A8 policies
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        // Deliberately verbose. This throw fires during *runtime planning*, before a token
-        // is processed, so on sm_86 it is the entire user-visible symptom of an artifact
-        // that cannot be loaded at all -- and "registered only through T=16" gives an
-        // operator nothing to act on. It took a full-suite run and a bisect of two
-        // deliberate decisions to work out why; the message now carries that.
-        throw std::invalid_argument(
-            "nvfp4 linear_swiglu: the A16 route is registered only through T=16, and on sm_86 A16 is the only policy available for NVFP4 weights (no NVFP4 tensor-core path), so this artifact cannot serve a prefill chunk wider than 16 columns on this architecture. See TODO.md section 1. Use a groupwise-int artifact here, or build for sm_89+ where AllowA4 handles any width.");
+        // Wider calls run the A16 MMA kernel with the SwiGLU epilogue. On targets without NVFP4
+        // tensor cores (sm_70, sm_80-89) A16 is the only policy NVFP4 admits, so this is what
+        // lets such an artifact serve a prefill chunk at all (TODO.md section 1).
+        return Nvfp4LinearSwiGluRoute::MatrixA16;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -81,6 +79,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
+        return;
+    case Nvfp4LinearSwiGluRoute::MatrixA16:
+        nvfp4_linear_swiglu_matrix_launch(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::FusedA4:
         nvfp4_linear_swiglu_a4_launch(x, weight, out, workspace, stream);

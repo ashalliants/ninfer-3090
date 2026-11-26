@@ -78,7 +78,8 @@ int main() {
     using namespace ninfer::test::linear_swiglu;
 
     try {
-        constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
+        // 17 and up take the A16 MMA route that sm_70 and sm_80-89 serve prefill with (TODO.md section 1).
+        constexpr std::array<std::int32_t, 10> kA16Cases{1, 4, 8, 16, 17, 64, 128, 129, 256, 1024};
         // Exercise both sides of the native MMA/TMA boundary, including the partial TMA tile.
         constexpr std::array<std::int32_t, 17> kA4Cases{2,   4,   5,   16,  56,  64,  65,  96,  97,
                                                         112, 128, 129, 255, 256, 257, 512, 1024};
