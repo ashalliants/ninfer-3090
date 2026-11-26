@@ -145,9 +145,12 @@ The binaries do not embed `VERSION`; build from the release branch commit.
 
 **No `-lineinfo` in release builds.** The library targets build without it by default
 (`NINFER_CUDA_LINEINFO`, OFF): it changes no machine code, but it made every kernel image about 4x larger,
-the binaries about 75% bigger (V100 `ninfer-serve` 1,473 MB with it, 841 MB without), and the CUDA driver keeps
-each loaded image in host RAM for the life of the server. Never pass `-DNINFER_CUDA_LINEINFO=ON` to a release
-tree; both packagers refuse a tree configured with it. The first build of each tree after the switch recompiles
+the binaries about 75% bigger, and the CUDA driver keeps each loaded image in host RAM for the life of the
+server. Never pass `-DNINFER_CUDA_LINEINFO=ON` to a release tree; both packagers refuse a tree configured with
+it on (any value CMake treats as true). **The V100 tree also builds without PTX** (`NINFER_CUDA_PTX`, off by
+default for `CMAKE_CUDA_ARCHITECTURES=70`; a V100 never runs the PTX), and `package-release.sh` refuses a V100
+tree with it on. The sm_86 trees keep PTX so they still run on newer cards. V100 `ninfer-serve`: 1,473 MB with
+both, 448 MB without. The first build of each tree after the switch recompiles
 every CUDA object (the flags changed, so ccache misses): allow about twice the usual build time once. The GPU is usually
 loaded by the user's server, but compiling needs none (the V100 build needs no V100 either).
 
@@ -215,10 +218,9 @@ touches the instance in its own state file).
 - Result: three archives and `SHA256SUMS-vX.Y.Z-{windows,linux,linux-v100}.txt`. Each asset must be under
   2 GiB (GitHub's limit); report the sizes, and compare them with the previous release's. The V100 tarball used
   to be the one at risk (2,125,147,854 bytes in v0.19.0, 22 MB under; 2,246,329,497 with three separate binaries
-  in v0.20.0). Without `-lineinfo` its binaries are about 43% smaller, so it should now sit far under the limit.
-  Archives about as large as the previous release's mean the tree was built with `-lineinfo`: check
-  `NINFER_CUDA_LINEINFO` in its `CMakeCache.txt` before publishing. The next size lever is a build without PTX
-  (`70` builds machine code plus PTX, and a V100 never uses the PTX).
+  in v0.20.0). Without `-lineinfo` and PTX its binaries are about 70% smaller, so it should now sit far under the
+  limit. Archives about as large as the previous release's mean the tree was built with `-lineinfo` (or, for the
+  V100, with PTX): check `NINFER_CUDA_LINEINFO` and `NINFER_CUDA_PTX` in its `CMakeCache.txt` before publishing.
 
 ## 6. Verify before publishing
 

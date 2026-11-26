@@ -57,6 +57,16 @@ option(NINFER_CUDA_RDC "Build ninfer_core and ninfer_ops with relocatable device
 # a router that has served the 35B once holds about 0.9 GiB of it with no model loaded. Off by
 # default; turn it on for profiling builds. The microbenchmarks always keep it.
 option(NINFER_CUDA_LINEINFO "Build ninfer_core and ninfer_ops with -lineinfo (for Nsight Compute source view)" OFF)
+# PTX beside the machine code lets the driver JIT-compile kernels for a newer card than the build
+# targets. A V100 build (70) only ever runs on a V100, which uses the sm_70 machine code, so there
+# the PTX is dead weight (about three quarters of each kernel image without -lineinfo) and the
+# library targets build machine code only. Other architectures keep it.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  set(ninfer_cuda_ptx_default OFF)
+else()
+  set(ninfer_cuda_ptx_default ON)
+endif()
+option(NINFER_CUDA_PTX "Embed PTX beside the machine code in ninfer_core and ninfer_ops" ${ninfer_cuda_ptx_default})
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

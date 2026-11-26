@@ -14,6 +14,14 @@ function(ninfer_cuda_lineinfo target)
   endif()
 endfunction()
 
+# Without NINFER_CUDA_PTX (see CMakeLists.txt) the target builds machine code only ("70-real"):
+# CMAKE_CUDA_ARCHITECTURES itself stays "70", which the per-architecture source lists key on.
+function(ninfer_cuda_ptx target)
+  if(NOT NINFER_CUDA_PTX)
+    set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}-real")
+  endif()
+endfunction()
+
 function(ninfer_cuda_archive target)
   set_target_properties(${target} PROPERTIES
     CUDA_SEPARABLE_COMPILATION ${NINFER_CUDA_RDC}
@@ -22,6 +30,7 @@ function(ninfer_cuda_archive target)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
   ninfer_cuda_lineinfo(${target})
+  ninfer_cuda_ptx(${target})
 endfunction()
 
 function(ninfer_cuda_non_rdc_archive target)
@@ -32,6 +41,7 @@ function(ninfer_cuda_non_rdc_archive target)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
   ninfer_cuda_lineinfo(${target})
+  ninfer_cuda_ptx(${target})
 endfunction()
 
 # NINFER_HOST_ONLY (no CUDA compiler): the target's .cu sources compile as C++ against the CUDA

@@ -228,6 +228,20 @@ Measured on the V100 (router, one Qwen3.6-35B-A3B request then an unload, three 
 
 Neither grows from one cycle to the next; the difference is what each image costs once loaded.
 
+### PTX (`NINFER_CUDA_PTX`)
+
+`CMAKE_CUDA_ARCHITECTURES=70` alone builds each kernel as sm_70 machine code plus compute_70 PTX. The
+PTX only matters on a card newer than the build targets, where the driver JIT-compiles it; a V100
+build runs only on a V100, which uses the machine code. So for 70 the library targets build machine
+code only (`NINFER_CUDA_PTX`, OFF by default for 70, ON for every other architecture, so sm_86
+builds still run on newer cards). `CMAKE_CUDA_ARCHITECTURES` stays `70`, because the source lists
+and tests key on it; `ninfer_cuda_ptx()` in `cmake/NinferTargets.cmake` sets the targets'
+`CUDA_ARCHITECTURES` to `70-real` instead. The driver keeps only the machine code once loaded, so
+dropping PTX saves disk and download, not RAM: the largest object's image went from 33 MiB to 8 MiB
+with identical SASS. The V100 `ninfer-serve` is 1,473 MB with `-lineinfo` and PTX, 841 MB without
+`-lineinfo`, and 448 MB without either; `package-release.sh` refuses a V100 tree configured with
+`NINFER_CUDA_PTX` on.
+
 The library targets therefore build without it by default. Pass `-DNINFER_CUDA_LINEINFO=ON` for a
 profiling build (Nsight Compute source view, compute-sanitizer line numbers). The microbenchmarks
 (`bench/cmake/NinferBenchmarks.cmake`) keep `-lineinfo` for their own sources either way. Nsight

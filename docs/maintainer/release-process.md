@@ -52,9 +52,10 @@ so it is a third build, from the same commit as the other two:
   `apps/serve/main.cpp`), so the archive holds two real binaries (`ninfer-serve`, `ninfer_bench`), about 750 MB
   compressed each. `package-release.sh` probes the build and falls back to a separate `ninfer` for one without the CLI
   mode. Check the size after packaging. Release trees build without `-lineinfo` (`NINFER_CUDA_LINEINFO`, OFF by
-  default; the packagers refuse a tree configured with it on), which took the V100 `ninfer-serve` from 1,473 MB to
-  841 MB. The next levers: each kernel is stored as machine code plus PTX (`70` builds both; a V100 never uses the
-  PTX), and `ninfer_bench` could join the same binary.
+  default; the packagers refuse a tree configured with it on) and, for the V100, without PTX (`NINFER_CUDA_PTX`, off
+  by default for `70`; a V100 never runs the PTX, and `package-release.sh` refuses a V100 tree with it on). Together
+  they took the V100 `ninfer-serve` from 1,473 MB to 448 MB (841 MB with `-lineinfo` dropped alone). The next lever:
+  `ninfer_bench` could join the same binary.
 - `package-release.sh`'s arch check once failed a good tree because `grep -q` closed the pipe early under `pipefail`;
   it now captures `cuobjdump` output first.
 

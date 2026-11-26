@@ -41,9 +41,21 @@ $Products = @(
 # Release binaries carry no -lineinfo: it makes every kernel image about 4x larger, and the CUDA
 # driver keeps each image it loads in host RAM (NINFER_CUDA_LINEINFO in CMakeLists.txt). A profiling
 # tree configured with it on is refused before anything is written.
-$CMakeCache = Join-Path $BuildRoot 'CMakeCache.txt'
-if ((Test-Path -LiteralPath $CMakeCache) -and (Select-String -LiteralPath $CMakeCache -Pattern '^NINFER_CUDA_LINEINFO:BOOL=ON$' -Quiet)) {
-    throw "$BuildRoot was configured with -DNINFER_CUDA_LINEINFO=ON (a profiling build): reconfigure it with =OFF and rebuild before packaging"
+# Test-CacheOptionOn: whether CMakeCache.txt sets the option to a value the CMakeLists' `if(NAME)`
+# treats as true: any value but CMake's false constants (empty, 0, OFF, NO, FALSE, N or IGNORE in
+# any case, or NOTFOUND or *-NOTFOUND in uppercase only), so =TRUE or =1 is caught as well as =ON.
+# No cache, or no such entry, counts as off. Mirrors cache_option_on in package-release.sh.
+function Test-CacheOptionOn([string]$Name) {
+    $cache = Join-Path $BuildRoot 'CMakeCache.txt'
+    if (-not (Test-Path -LiteralPath $cache)) { return $false }
+    $entry = Select-String -LiteralPath $cache -CaseSensitive -Pattern "^$([regex]::Escape($Name)):[A-Za-z]*=(.*)$" | Select-Object -First 1
+    if (-not $entry) { return $false }
+    $value = $entry.Matches[0].Groups[1].Value
+    if ($value -cmatch '^(.*-)?NOTFOUND$') { return $false }
+    return -not ($value -imatch '^(|0|OFF|NO|FALSE|N|IGNORE)$')
+}
+if (Test-CacheOptionOn 'NINFER_CUDA_LINEINFO') {
+    throw "$BuildRoot was configured with NINFER_CUDA_LINEINFO on (a profiling build): reconfigure it with -DNINFER_CUDA_LINEINFO=OFF and rebuild before packaging"
 }
 
 New-Item -ItemType Directory -Force -Path $DistRoot | Out-Null
