@@ -299,12 +299,26 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
 
 namespace {
 
+// The FP16 cuBLAS route's NVFP4 / FP8 forms (sm_70 only, detail::cublas_prefill_admits_fp).
+bool plane_fp_route(QType qtype) {
+    return (qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16) &&
+           detail::cublas_prefill_admits_fp();
+}
+
 // The routes linear_swiglu takes that can hand out the gate/up plane: the cuBLAS prefill route
-// for a Q4 or Q5 row-split weight, admitted exactly as linear_swiglu admits it.
-bool plane_takes_cublas(const Weight& w, LinearPolicy policy, std::int32_t t,
+// for a Q4 or Q5 row-split weight, or for an NVFP4 / FP8 one on sm_70, admitted as linear_swiglu
+// admits it.
+bool plane_takes_cublas(const Weight& w, void* plane, LinearPolicy policy, std::int32_t t,
                         const WorkspaceArena* ws) {
-    return allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
-           w.qtype == QType::Q4_G64_FP16 && detail::w4_cublas_prefill_supported(w, t) &&
+    if (!allows_cublas_prefill(policy) || t < cublas_prefill_min_tokens(policy)) return false;
+    if (plane_fp_route(w.qtype)) {
+        const detail::CublasProjectionDestination destination{plane, 0, w.n, w.n, 0};
+        const detail::CublasProjection parent{&w, &destination, 1};
+        return detail::w4_cublas_projection_supported(&parent, 1, t) &&
+               (t >= kCublasPrefillMinTokens || ws == nullptr ||
+                detail::w4_cublas_projection_fits(*ws, &parent, 1, t));
+    }
+    return w.qtype == QType::Q4_G64_FP16 && detail::w4_cublas_prefill_supported(w, t) &&
            (t >= kCublasPrefillMinTokens || ws == nullptr ||
             detail::w4_cublas_prefill_fits(*ws, w.n, w.k, t));
 }
@@ -329,6 +343,13 @@ std::size_t linear_swiglu_plane_workspace_capacity_bytes(QType qtype, std::int32
                             gate_up_rows, input_rows,
                             std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
     }
+    if (plane_fp_route(qtype) && allows_cublas_prefill(policy) &&
+        max_tokens >= cublas_prefill_min_tokens(policy)) {
+        return std::max(linear_bytes,
+                        detail::w4_cublas_projection_workspace_capacity_bytes(
+                            gate_up_rows, input_rows,
+                            std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
+    }
     return linear_bytes;
 }
 
@@ -340,7 +361,7 @@ void linear_swiglu_plane(const Tensor& x, const Weight& gate_up_weight, Tensor& 
         plane.ne[1] != t || !x.is_contiguous() || !plane.is_contiguous()) {
         throw std::invalid_argument("linear_swiglu_plane: x/plane must be contiguous BF16 [*, T]");
     }
-    if (plane_takes_cublas(gate_up_weight, policy, t, &ws)) {
+    if (plane_takes_cublas(gate_up_weight, plane.data, policy, t, &ws)) {
         const detail::CublasProjectionDestination destination{
             plane.data, 0, gate_up_weight.n, gate_up_weight.n, 0};
         const detail::CublasProjection parent{&gate_up_weight, &destination, 1};

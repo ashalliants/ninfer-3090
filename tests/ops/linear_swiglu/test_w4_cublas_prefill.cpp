@@ -619,6 +619,43 @@ int run_fp_swiglu(QType qtype, std::int32_t tokens, ops::LinearPolicy policy) {
     return failures + finish(label, s);
 }
 
+// linear_swiglu_plane (the LoRA-adapted FFN's projection) on the same route: the gate/up plane.
+int run_fp_plane(QType qtype, std::int32_t tokens, ops::LinearPolicy policy) {
+    constexpr std::int32_t kRows = 34816, kCols = 5120;
+    DeviceWeight w(qtype, kRows, kCols, 8117U);
+    const std::vector<std::uint16_t> activation = make_activation(kCols, tokens, 89U);
+    test::GuardedDeviceBuffer device_x(activation.size() * sizeof(std::uint16_t));
+    device_x.copy_from_host(activation.data(), activation.size() * sizeof(std::uint16_t));
+    const std::size_t out_elements = static_cast<std::size_t>(kRows) * tokens;
+    test::GuardedDeviceBuffer output(out_elements * sizeof(std::uint16_t));
+    output.fill(0xff);
+    WorkspaceArena workspace(std::max<std::size_t>(
+        ops::linear_swiglu_plane_workspace_capacity_bytes(qtype, kRows, kCols, policy, tokens,
+                                                          tokens),
+        256));
+    Tensor x(device_x.data(), DType::BF16, {kCols, tokens});
+    Tensor plane(output.data(), DType::BF16, {kRows, tokens});
+    ops::linear_swiglu_plane(x, w.weight, plane, policy, workspace, nullptr);
+    test::cuda_check(cudaDeviceSynchronize(), "synchronize cublas fp linear_swiglu_plane");
+
+    const std::string label = "LinearSwiGLU plane " + fp_tag(qtype, policy) +
+                              " cuBLAS T=" + std::to_string(tokens);
+    int failures = output.verify_guards(label);
+    failures += expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols * 2, tokens,
+                             policy, ops::cublas_prefill_min_tokens(policy));
+    const std::vector<double> got = read_bf16(output, out_elements);
+    Samples s;
+    for (const std::int32_t token : sample_tokens(tokens, 31U)) {
+        const std::vector<float> input = token_column(activation, kCols, token);
+        for (std::uint32_t r = 0; r < 6; ++r) {
+            const std::int32_t row = pick_row(r, token, kRows);
+            s.reference.push_back(qw::dot_fp64(w.host, row, input.data(), kCols));
+            s.actual.push_back(got[static_cast<std::size_t>(token) * kRows + row]);
+        }
+    }
+    return failures + finish(label, s);
+}
+
 int run_fp_add(QType qtype, std::int32_t tokens, std::int32_t kCols, ops::LinearPolicy policy) {
     constexpr std::int32_t kRows = 5120;
     DeviceWeight w(qtype, kRows, kCols, 9203U);
@@ -814,6 +851,7 @@ int main() {
             for (const auto& [policy, widths] : sweeps) {
                 for (const std::int32_t tokens : widths) {
                     failures += run_fp_swiglu(QType::NVFP4, tokens, policy);
+                    failures += run_fp_plane(QType::NVFP4, tokens, policy);
                     failures += run_fp_add(QType::NVFP4, tokens, 17408, policy);
                     failures += run_fp_add(QType::NVFP4, tokens, 6144, policy);
                     failures += run_fp_add(QType::FP8_E4M3FN_ROW_BF16, tokens, 6144, policy);
