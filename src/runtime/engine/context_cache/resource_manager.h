@@ -664,6 +664,15 @@ public:
         return erase(program, handle, rights);
     }
 
+    // How many unproven write decisions a cached checkpoint has sat through since it entered the
+    // cache unproven (unproven_claim); nullopt when the cache does not hold it. For tests and
+    // diagnostics.
+    [[nodiscard]] std::optional<std::uint64_t> unproven_age(Handle handle) const {
+        const auto since = recorded_since(handle);
+        if (!since) { return std::nullopt; }
+        return unproven_writes_ > *since ? unproven_writes_ - *since : 0;
+    }
+
     // Victim selection reuses each candidate's facts across the plans of one reclaim. The tests turn
     // this off to prove the answers are identical either way; production never does.
     void set_candidate_memo(bool enabled) noexcept { candidate_memo_ = enabled; }
@@ -1343,14 +1352,20 @@ private:
     void replace_points(Program& program, Owner& owner, std::span<const Handle> carried) {
         std::vector<Handle> old;
         for (const auto& point : owner.points) { old.push_back(point.handle); }
+        // Carrying a point is not a use: a point the cache already holds keeps its age.
+        std::vector<std::optional<std::uint64_t>> carried_since;
+        carried_since.reserve(carried.size());
+        for (const auto handle : carried) { carried_since.push_back(recorded_since(handle)); }
         owner.points.clear();
-        for (const auto handle : carried) {
+        for (std::size_t i = 0; i < carried.size(); ++i) {
+            const auto handle = carried[i];
             if (!program.valid_checkpoint(handle)) { continue; }
             const auto summary = program.checkpoint_metadata(handle);
             if (summary.role == CheckpointRole::SharedPrefix) {
                 throw std::logic_error("Native carried a public point as a private continuation");
             }
-            owner.points.push_back({handle, summary.role, unproven_writes_});
+            owner.points.push_back(
+                {handle, summary.role, carried_since[i].value_or(unproven_writes_)});
             index_.insert(program, handle, summary.frontier);
         }
         for (const auto handle : old) { release_unreferenced(program, handle); }
@@ -1899,6 +1914,24 @@ private:
         return recovery_gain(program, *admission, kept, evaluation) > loss;
     }
 
+    // When the cache's newest holder of `handle` took it in unproven (Point::since); nullopt
+    // when no owner or shared entry holds it.
+    [[nodiscard]] std::optional<std::uint64_t> recorded_since(Handle handle) const {
+        std::optional<std::uint64_t> since;
+        const auto include = [&](std::uint64_t value) {
+            since = since ? std::max(*since, value) : value;
+        };
+        for (const auto& owner : owners_) {
+            for (const auto& point : owner.points) {
+                if (point.handle == handle) { include(point.since); }
+            }
+        }
+        for (const auto& shared : shared_) {
+            if (shared.handle == handle) { include(shared.since); }
+        }
+        return since;
+    }
+
     // How many turnovers of the unproven pool (in unproven write decisions per unproven entry)
     // halve an unproven entry's claim to its place (unproven_claim).
     static constexpr std::uint64_t kUnprovenClaimHalvingTurnovers = 32;
@@ -1919,14 +1952,7 @@ private:
                                                std::uint64_t turnover) const {
         std::uint64_t since = 0;
         for (const auto handle : sources) {
-            for (const auto& owner : owners_) {
-                for (const auto& point : owner.points) {
-                    if (point.handle == handle) { since = std::max(since, point.since); }
-                }
-            }
-            for (const auto& shared : shared_) {
-                if (shared.handle == handle) { since = std::max(since, shared.since); }
-            }
+            since = std::max(since, recorded_since(handle).value_or(0));
         }
         const auto age      = unproven_writes_ > since ? unproven_writes_ - since : 0;
         const auto period   = std::max<std::uint64_t>(1, turnover * kUnprovenClaimHalvingTurnovers);
@@ -1962,19 +1988,34 @@ private:
             std::uint64_t value;
             std::size_t order;
         };
-        std::vector<Choice> choices;
+        // The unproven pool this write competes in: actions it may take from unproven history.
+        // Its size (distinct checkpoints, so an alias counts once) is the turnover the ageing
+        // period counts in; proven history and history it may not revoke are not in it.
+        struct Eligible {
+            std::size_t action;
+            ActionFacts facts;
+        };
+        std::vector<Eligible> eligible;
+        std::vector<Handle> pool;
         for (std::size_t i = 0; i < actions.size(); ++i) {
             const auto& sources = actions[i].sources;
-            if (actions[i].released.host_bytes < required || !may_revoke(sources, cursor.rights)) {
-                continue;
-            }
+            if (!may_revoke(sources, cursor.rights)) { continue; }
             auto facts = action_facts(program, sources, cursor, evaluation);
             if (facts.priority.reused) { continue; } // proven history: never for an unproven write
+            for (const auto handle : sources) {
+                if (!contains(pool, handle)) { pool.push_back(handle); }
+            }
+            eligible.push_back({i, std::move(facts)});
+        }
+        std::vector<Choice> choices;
+        for (auto& [i, facts] : eligible) {
+            const auto& sources = actions[i].sources;
+            if (actions[i].released.host_bytes < required) { continue; }
             const auto value =
                 facts.superseded
                     ? 0
                     : unproven_claim(sources, action_loss(program, sources, facts, evaluation),
-                                     actions.size());
+                                     pool.size());
             if (value >= claim) { continue; }
             choices.push_back({i, facts.superseded, waiting_ticket(sources), value, facts.order});
         }

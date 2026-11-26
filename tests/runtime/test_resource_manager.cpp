@@ -3145,7 +3145,8 @@ struct OneShotStream {
     std::uint32_t next = 1'000'000;
     std::vector<Handle> saved; // in save order
 
-    explicit OneShotStream(std::size_t residents) : f((residents + 1) * kImage) {
+    explicit OneShotStream(std::size_t residents, std::size_t extra_bytes = 0)
+        : f((residents + 1) * kImage + extra_bytes) {
         shared = f.program.add(prefix, {f.program.host_block(kImage)});
         f.publish(shared);
     }
@@ -3194,7 +3195,8 @@ struct OneShotStream {
         auto cursor          = f.cache.begin_reclaim(p, admission);
         const auto victims =
             f.cache.host_victims(p, kImage, std::nullopt, {}, {}, admission, &cursor);
-        bool saved = victims && !victims->empty();
+        // An empty answer means the image fits in free space already.
+        bool saved = victims.has_value();
         if (!saved) {
             saved = f.cache.reclaim(p, {.host_bytes = kImage}, {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Changed;
@@ -3303,6 +3305,52 @@ void test_unproven_write_rate_is_bounded() {
     require(stream.cached(stream.shared), "a one-off stream evicted the reused shared prefix");
 }
 
+// The ageing period is a number of turnovers of the unproven pool, so proven entries in the tier
+// must not stretch it: one stale one-off among 30 reused prefixes ages as a pool of one.
+void test_unproven_ageing_ignores_proven_history() {
+    constexpr std::size_t proven = 30;
+    OneShotStream stream(1, proven);
+    for (std::uint32_t i = 0; i < proven; ++i) {
+        const auto handle =
+            stream.f.program.add(tokens(8, 500'000 + 100 * i), {stream.f.program.host_block(1)});
+        stream.f.publish(handle);
+        stream.f.use_shared(handle);
+    }
+    require(stream.request(300), "the one-off was refused while the Host tier had room");
+    const auto stale = stream.saved.front();
+    std::size_t attempts = 0;
+    bool kept            = false;
+    while (!kept && attempts < 200) {
+        kept = stream.request(230);
+        ++attempts;
+    }
+    std::cout << "unproven ageing beside proven history: kept after " << attempts << " attempts\n";
+    require(kept && !stream.cached(stale),
+            "proven history stretched the ageing period of the unproven pool");
+}
+
+// Carrying a point into a new owner (a resumed or taken-over conversation) is not a use: the
+// point keeps its age, so repeated handoffs cannot keep a stale one-off young.
+void test_carried_point_keeps_its_age() {
+    OneShotStream stream(4);
+    auto& f          = stream.f;
+    const auto base  = stream.base_for(230);
+    const auto point = f.program.add(base.tokens, {f.program.host_block(OneShotStream::kImage)},
+                                     Role::Continuation);
+    const auto owner = f.begin(base, stream.shared);
+    f.cache.publish(f.program, owner, point);
+    f.cache.finish(f.program, owner, base, ++f.next_order);
+    for (int i = 0; i < 50; ++i) { (void)stream.capture_once(230); }
+    const auto before = f.cache.unproven_age(point);
+    require(before && *before >= 50, "a cached one-off did not age with unproven writes");
+    auto longer = base;
+    longer.tokens.push_back(7);
+    const auto resumed = f.begin(longer, point, {&point, 1});
+    const auto after   = f.cache.unproven_age(point);
+    require(after && *after == *before, "carrying a point into a new owner reset its age");
+    f.cache.abandon(f.program, resumed);
+}
+
 int main() {
     try {
         test_direct_victim_release_offers_the_continuation_first();
@@ -3316,6 +3364,8 @@ int main() {
         test_unproven_one_off_history_ages_out();
         test_fresh_unproven_history_is_not_churned();
         test_unproven_write_rate_is_bounded();
+        test_unproven_ageing_ignores_proven_history();
+        test_carried_point_keeps_its_age();
         test_reclaim_pricing_cap_stops_a_long_search_once_an_action_is_found();
         test_reclaim_pricing_cap_bounds_the_first_search();
         test_reclaim_pricing_cap_never_costs_progress();
