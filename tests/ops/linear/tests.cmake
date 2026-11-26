@@ -31,7 +31,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   endforeach()
   # The int8-activation streaming GEMV (EngineOptions::verify_a8, ops/linear/common/stream_dp4a.cuh)
   # forced on: the A16 suites at its allowance (tests/ops/op_tester.h, with_stream_a8_allowance).
-  foreach(format q4 q5 q6)
+  foreach(format q4 q5 q6 nvfp4)
     add_test(NAME ninfer_linear_${format}_a16_stream_a8_test
       COMMAND ninfer_tests ninfer_linear_${format}_a16_test)
     set_tests_properties(ninfer_linear_${format}_a16_stream_a8_test PROPERTIES
@@ -95,3 +95,9 @@ ninfer_add_op_test(ninfer_q4_a4_linear_test
 ninfer_add_op_test(ninfer_linear_ggml_device_decode_test NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_device_decode.cu"
   LIBRARIES ninfer_core)
+
+# The bit-level FP8 and NVFP4 decodes used below sm_89 (no FP8/FP4 conversion instructions there):
+# exhaustive, bit-exact against the vendor conversions.
+ninfer_add_op_test(ninfer_fp_codecs_sm70_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp_codecs_sm70.cu"
+  LIBRARIES ninfer_ops)

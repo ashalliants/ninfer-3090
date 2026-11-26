@@ -120,6 +120,11 @@ inline constexpr std::size_t kCublasTileBudgetBytes = 256u << 20;
 // times its group scale is one FP16 rounding; the int8 route has no Q8 form. The Qwen3.6-35B-A3B's
 // Q8 mixer projections take it there (models/qwen3_5/execution/parameters.cpp).
 [[nodiscard]] bool cublas_prefill_admits_q8() noexcept;
+// Whether the route takes NVFP4 and FP8_E4M3FN_ROW_BF16 weights: on the FP16 route (sm_70) only,
+// where both materialise exactly (an E2M1 code times its E4M3 scale, or an E4M3 code, fits FP16)
+// and the tensor or row multiplier is the epilogue's FP32 row scale. There their own prefill
+// kernels run Ampere mma.sync under emulation.
+[[nodiscard]] bool cublas_prefill_admits_fp() noexcept;
 
 [[nodiscard]] std::size_t w4_cublas_prefill_workspace_capacity_bytes(std::int32_t rows,
                                                                     std::int32_t cols,

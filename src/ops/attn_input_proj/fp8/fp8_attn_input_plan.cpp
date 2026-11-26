@@ -17,7 +17,8 @@ enum class Fp8AttnInputRoute : std::uint8_t {
 
 Fp8AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 attn_input_proj: T must be positive"); }
-    if (policy == LinearPolicy::A16Only) { return Fp8AttnInputRoute::A16; }
+    // The integer-A8 and cuBLAS prefill policies have no FP8 form here: A16, as for SwiGLU.
+    if (policy == LinearPolicy::A16Only || allows_a8_int(policy)) { return Fp8AttnInputRoute::A16; }
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 attn_input_proj: unsupported policy");
     }
@@ -52,6 +53,7 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Fp8AttnInputRoute::A16) {
+        if (x.ne[1] >= 2 && fp8_attn_input_stream_launch(x, weight, q, gate, k, v, stream)) return;
         launch_a16(x, weight, q, gate, k, v, stream);
         return;
     }

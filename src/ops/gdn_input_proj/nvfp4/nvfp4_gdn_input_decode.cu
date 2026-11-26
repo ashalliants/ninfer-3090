@@ -21,4 +21,24 @@ void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor
         LinearIdentityEpilogue{}, stream);
 }
 
+bool nvfp4_stream_admits(std::int32_t tokens, cudaStream_t stream) {
+    if constexpr (!kStreamDp4aCompiled) {
+        return false;
+    } else {
+        constexpr std::int32_t kHidden = Nvfp4N16384K5120::kInputRows;
+        return tokens >= 1 && tokens <= kStreamGemvMaxTokens && stream_dp4a_enabled(stream) &&
+               (tokens <= kStreamDp4aMaxCols ||
+                stream_tile_gemm_supported<Nvfp4StreamFormat>(kHidden, kHidden, kHidden));
+    }
+}
+
+bool nvfp4_gdn_input_stream_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                   cudaStream_t stream) {
+    return try_launch_nvfp4_stream<Nvfp4GdnInputOutput, LinearIdentityEpilogue, Nvfp4IdentityRows>(
+        nvfp4_a16_operands(x, weight),
+        Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
+                            static_cast<__nv_bfloat16*>(z.data)},
+        LinearIdentityEpilogue{}, stream);
+}
+
 } // namespace ninfer::ops::detail

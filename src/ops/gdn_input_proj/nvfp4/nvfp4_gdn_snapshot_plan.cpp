@@ -65,7 +65,12 @@ std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
     }
     (void)nvfp4_gdn_conv_resolve_plan(policy, min_tokens, 1);
     const Nvfp4GdnConvPlan maximum_plan = nvfp4_gdn_conv_resolve_plan(policy, max_tokens, 1);
-    if (maximum_plan.schedule != Nvfp4GdnConvScheduleId::Materialized) { return 0; }
+    // sm_70 composes A16 small-T calls too (kNvfp4ComposesSmallT); width 1 is the fused decode
+    // kernel's.
+    const bool composes =
+        maximum_plan.schedule == Nvfp4GdnConvScheduleId::Materialized ||
+        (kNvfp4ComposesSmallT && !allows_a4(policy) && max_tokens >= 2);
+    if (!composes) { return 0; }
 
     WorkspaceLayoutBuilder layout;
     (void)allocate_workspace(layout, policy, max_tokens);
@@ -85,6 +90,11 @@ void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Te
                                          stream);
         return;
     case Nvfp4GdnConvScheduleId::SmallTFusedA16:
+        // sm_70 composes A16 small-T calls below (kNvfp4ComposesSmallT): the projection runs on the
+        // streaming route where it applies (nvfp4_stream_admits; 2-3x the fused kernel's emulated
+        // mma), and composing whether or not it does keeps the workspace query exact, as Q4 / Q5
+        // always compose.
+        if (kNvfp4ComposesSmallT && !allows_a4(policy)) break;
         nvfp4_gdn_snapshot_small_t_launch(x, weight, conv_weight, conv_states, valid_columns,
                                           initial_slot, snapshot_base_slot, query, key, value, z,
                                           stream);

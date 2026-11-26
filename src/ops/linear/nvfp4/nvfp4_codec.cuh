@@ -5,6 +5,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 #include <cstdint>
@@ -41,6 +42,22 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
     asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(multiplier) : "h"(scale_pair));
     asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(multiplier));
     return result;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    // No FP4/FP8 conversion instructions: the vendor types fall back to software, which dominated
+    // the sm_70 kernels. Bit-level instead, exactly: E2M1 s.ee.m placed as FP16 s.00ee.m000000000
+    // is the value times 2^-14 (0.5 lands on the subnormal 2^-15), and E4M3 s.eeee.mmm as FP16
+    // s.0eeee.mmm0000000 is the value times 2^-8. Their product has at most six significant bits
+    // and lies in BF16's normal range, so the FP32 product's top half is the BF16 value exactly.
+    const std::uint32_t c = code;
+    const std::uint32_t pair_bits =
+        ((c & 0x7u) << 9) | ((c & 0x8u) << 12) | ((c & 0x70u) << 21) | ((c & 0x80u) << 24);
+    const float2 values = __half22float2(*reinterpret_cast<const __half2*>(&pair_bits));
+    const std::uint32_t s = scale;
+    const std::uint16_t scale_bits =
+        static_cast<std::uint16_t>(((s & 0x80u) << 8) | ((s & 0x7fu) << 7));
+    const float multiplier = __half2float(__ushort_as_half(scale_bits)) * 4194304.0f; // 2^22
+    return (__float_as_uint(values.x * multiplier) >> 16) |
+           (__float_as_uint(values.y * multiplier) & 0xffff0000u);
 #else
     // CUDA 13.1 retains the exact FP32 expansion.
     const float2 values    = decode_nvfp4_e2m1x2(code);

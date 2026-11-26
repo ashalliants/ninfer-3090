@@ -406,77 +406,81 @@ bool try_launch_stream_gemv_rows(const __nv_bfloat16* x, std::int64_t x_stride,
                                                         row_offset, k, padded_k, stream)) {
         return true;
     }
-    if (k % 256 != 0 && Cols > 1) return false; // chunks are whole multiples of 256
-    if (k % 128 != 0 || x_stride % 8 != 0) return false;
+    if constexpr (StreamDp4aOnlyFormat<Format>) {
+        return false;
+    } else {
+        if (k % 256 != 0 && Cols > 1) return false; // chunks are whole multiples of 256
+        if (k % 128 != 0 || x_stride % 8 != 0) return false;
 
-    const auto launch = [&]<int Warps, int Unroll>() {
-        const auto single  = stream_gemv_kernel<Format, Warps, Unroll, Rows, Cols, false, Sink>;
-        const auto chunked = stream_gemv_kernel<Format, Warps, Unroll, Rows, Cols, true, Sink>;
-        configure_cuda_device_once([&] {
-            const cudaError_t first = cudaFuncSetAttribute(
-                single, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSharedBytes);
-            return first != cudaSuccess
-                       ? first
-                       : cudaFuncSetAttribute(chunked, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                              kMaxDynamicSharedBytes);
-        });
-        int device = 0;
-        int sms    = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
-        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+        const auto launch = [&]<int Warps, int Unroll>() {
+            const auto single  = stream_gemv_kernel<Format, Warps, Unroll, Rows, Cols, false, Sink>;
+            const auto chunked = stream_gemv_kernel<Format, Warps, Unroll, Rows, Cols, true, Sink>;
+            configure_cuda_device_once([&] {
+                const cudaError_t first = cudaFuncSetAttribute(
+                    single, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSharedBytes);
+                return first != cudaSuccess
+                           ? first
+                           : cudaFuncSetAttribute(chunked, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                  kMaxDynamicSharedBytes);
+            });
+            int device = 0;
+            int sms    = 0;
+            CUDA_CHECK(cudaGetDevice(&device));
+            CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
 
-        // One chunk when all of K fits; then about one wave of resident CTAs.
-        std::int32_t chunk_k     = k;
-        std::size_t shared_bytes = stream_gemv_stage_bytes(k, Cols);
-        int blocks               = 0;
-        if (shared_bytes <= static_cast<std::size_t>(kMaxDynamicSharedBytes)) {
-            int per_sm = 0;
-            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, single, Warps * 32,
-                                                                     shared_bytes));
-            blocks = std::max(1, std::min(div_up(items, Warps), sms * std::max(per_sm, 1)));
-        } else {
-            // K-chunked: one CTA per SM; the partials take what the chunk leaves. A matrix with
-            // too many rows for one wave's partials (the 248320-row Q6 head at eight tokens:
-            // ~97 KB a CTA, past the whole budget) runs further waves of CTAs until a CTA's
-            // partials take at most half of shared memory; each CTA restages the chunks of x, a
-            // few hundred KB from L2.
-            const std::size_t budget = static_cast<std::size_t>(kMaxDynamicSharedBytes);
-            const auto partial_for = [&](int b) {
-                return static_cast<std::size_t>(div_up(items, b * Warps)) * Warps * Rows * Cols *
-                       sizeof(float);
-            };
-            const int max_blocks = std::max(1, div_up(items, Warps));
-            blocks               = std::max(1, std::min(max_blocks, sms));
-            if (partial_for(blocks) + stream_gemv_stage_bytes(256, Cols) > budget) {
-                while (partial_for(blocks) > budget / 2 && blocks < max_blocks) {
-                    blocks = std::min(max_blocks, blocks + sms);
+            // One chunk when all of K fits; then about one wave of resident CTAs.
+            std::int32_t chunk_k     = k;
+            std::size_t shared_bytes = stream_gemv_stage_bytes(k, Cols);
+            int blocks               = 0;
+            if (shared_bytes <= static_cast<std::size_t>(kMaxDynamicSharedBytes)) {
+                int per_sm = 0;
+                CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, single, Warps * 32,
+                                                                         shared_bytes));
+                blocks = std::max(1, std::min(div_up(items, Warps), sms * std::max(per_sm, 1)));
+            } else {
+                // K-chunked: one CTA per SM; the partials take what the chunk leaves. A matrix with
+                // too many rows for one wave's partials (the 248320-row Q6 head at eight tokens:
+                // ~97 KB a CTA, past the whole budget) runs further waves of CTAs until a CTA's
+                // partials take at most half of shared memory; each CTA restages the chunks of x, a
+                // few hundred KB from L2.
+                const std::size_t budget = static_cast<std::size_t>(kMaxDynamicSharedBytes);
+                const auto partial_for = [&](int b) {
+                    return static_cast<std::size_t>(div_up(items, b * Warps)) * Warps * Rows * Cols *
+                           sizeof(float);
+                };
+                const int max_blocks = std::max(1, div_up(items, Warps));
+                blocks               = std::max(1, std::min(max_blocks, sms));
+                if (partial_for(blocks) + stream_gemv_stage_bytes(256, Cols) > budget) {
+                    while (partial_for(blocks) > budget / 2 && blocks < max_blocks) {
+                        blocks = std::min(max_blocks, blocks + sms);
+                    }
                 }
+                const std::size_t partial_bytes = partial_for(blocks);
+                if (partial_bytes + stream_gemv_stage_bytes(256, Cols) > budget) return false;
+                chunk_k = static_cast<std::int32_t>(
+                    (budget - partial_bytes) / stream_gemv_stage_bytes(256, Cols) * 256);
+                chunk_k      = std::min(chunk_k, k);
+                shared_bytes = stream_gemv_stage_bytes(chunk_k, Cols) + partial_bytes;
             }
-            const std::size_t partial_bytes = partial_for(blocks);
-            if (partial_bytes + stream_gemv_stage_bytes(256, Cols) > budget) return false;
-            chunk_k = static_cast<std::int32_t>(
-                (budget - partial_bytes) / stream_gemv_stage_bytes(256, Cols) * 256);
-            chunk_k      = std::min(chunk_k, k);
-            shared_bytes = stream_gemv_stage_bytes(chunk_k, Cols) + partial_bytes;
-        }
-        const auto kernel = chunk_k == k ? single : chunked;
-        kernel<<<blocks, Warps * 32, shared_bytes, stream>>>(x, x_stride, planes, sink, items,
-                                                            row_offset, k, padded_k, chunk_k);
-        CUDA_CHECK(cudaGetLastError());
-        return true;
-    };
-    // T = 1: K <= 6144 leaves room for several CTAs per SM, and short rows favour more CTAs with
-    // one slice in flight; the long K = 17408 rows want a full SM's worth of warps and deeper
-    // prefetch. A pair, or several tokens, already keep more work per weight in flight.
-    if constexpr (Cols == 1) {
-        if (k <= 6144) return launch.template operator()<8, 1>();
-        if constexpr (Rows == 1) {
-            return launch.template operator()<16, 2>();
+            const auto kernel = chunk_k == k ? single : chunked;
+            kernel<<<blocks, Warps * 32, shared_bytes, stream>>>(x, x_stride, planes, sink, items,
+                                                                row_offset, k, padded_k, chunk_k);
+            CUDA_CHECK(cudaGetLastError());
+            return true;
+        };
+        // T = 1: K <= 6144 leaves room for several CTAs per SM, and short rows favour more CTAs with
+        // one slice in flight; the long K = 17408 rows want a full SM's worth of warps and deeper
+        // prefetch. A pair, or several tokens, already keep more work per weight in flight.
+        if constexpr (Cols == 1) {
+            if (k <= 6144) return launch.template operator()<8, 1>();
+            if constexpr (Rows == 1) {
+                return launch.template operator()<16, 2>();
+            } else {
+                return launch.template operator()<16, 1>();
+            }
         } else {
             return launch.template operator()<16, 1>();
         }
-    } else {
-        return launch.template operator()<16, 1>();
     }
 }
 

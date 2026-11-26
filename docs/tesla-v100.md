@@ -415,6 +415,39 @@ loss. On this card `int8` stays the right choice (it fits 262K at two lanes with
 prefills fastest); the mixes are for when KV bytes are short. See
 [the README](../README.md#per-layer-mixes---kv-dtype-rk4v4x12int8x4-opt-in).
 
+### Qwen3.8-27B, NVIDIA's NVFP4 QAD checkpoint
+
+[nvidia/Qwen3.8-27B-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD) is NVIDIA's
+quantization-aware-distilled mix: NVFP4 MLP, `lm_head` and most GDN projections, FP8 attention and
+the rest of GDN. Convert it with the `qwen3_8_27b_nvfp4_qad` recipe
+([weight conversion](weight-conversion.md)). The V100 has no FP4 or FP8 hardware, so NInfer runs it
+on routes that widen the weights exactly in software:
+
+- **Decode and short prompts (1-64 tokens):** NVFP4 codes become int8 by a byte permute and run on
+  the same dp4a streaming GEMV as the Q4/Q5 mix up to 8 tokens (`--verify-a8`, on by default), and
+  on its streaming tensor-core tiles from 9 to 64, reading the 4-bit weights directly. FP8 runs
+  2-64 tokens on those tiles too, its codes widened to FP16 bit for bit.
+- **Longer prompts (65+ tokens):** NVFP4 and FP8 weights are expanded to FP16 and multiplied by
+  cuBLAS on the tensor cores, the route the Q8 projections already take.
+  `NINFER_SM70_FP_PREFILL_CUBLAS=0` turns it off.
+
+Same binary, `apps/ninfer` single request (not serve-level), no drafter, BF16 KV, 200 W, two repeats
+per leg agreeing within 0.5% (2026-11-26; no thermal throttle sampled):
+
+| Artifact | Weights | Prefill, 3,754-token prompt | Decode after it | Decode, 22-token prompt | Prefill, 22-token prompt |
+|---|---:|---:|---:|---:|---:|
+| Q4/Q5 mix (`qwen3_8_27b`) | 14.6 GiB | 741.9 tok/s | 40.3 tok/s | 42.2 tok/s | 206.0 tok/s |
+| NVFP4 QAD | 15.9 GiB | 745.8 tok/s | 38.9 tok/s | 40.6 tok/s | 203.6 tok/s |
+
+Before these routes, the QAD artifact decoded at 8.6 tok/s and prefilled the long prompt at about
+25 tok/s. Short prompts now match the Q4/Q5 mix: with a plain template, 11 / 18 / 28 / 47 prompt
+tokens prefill at 184.8 / 235.8 / 324.2 / 305.6 tok/s against its 189.6 / 229.8 / 315.0 / 324.1.
+
+**Quality.** On the held-out corpus (quick set, 4,096 context, stride 2,048, BF16 KV), the QAD artifact
+scored lower perplexity than the Q4/Q5 mix on all three domains measured: wikipedia_en 5.520
+against 5.547, wikipedia_zh 8.961 against 9.287, arxiv 6.401 against 6.425. The other three domains
+were not run.
+
 ### Qwen3.6-35B-A3B
 
 Decode, one stream, through `ninfer-serve` (`--kv-dtype rk4v4 --lm-head-draft --mtp-experts-q4

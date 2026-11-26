@@ -56,6 +56,12 @@ std::size_t scout_a4_swiglu_workspace_bytes(std::int32_t gate_up_rows, std::int3
     return layout.peak_bytes(1);
 }
 
+// NVFP4 and FP8 weights reach their own plans with the cuBLAS policies read as A16Only: those
+// plans know nothing of the cuBLAS route, which the wrapper takes above them.
+LinearPolicy fp_prefill_policy(LinearPolicy policy) {
+    return allows_cublas_prefill(policy) ? LinearPolicy::A16Only : policy;
+}
+
 } // namespace
 
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
@@ -130,11 +136,23 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         }
         return widest;
     }
-    if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
-        return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
-    }
-    if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
-        return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    if ((qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16) && gate_up_rows == 34816 &&
+        input_rows == 5120) {
+        // Below the cuBLAS gate the formats' own plans run, under A16Only when the policy is the
+        // cuBLAS one (fp_prefill_policy); at and above it, the FP16 cuBLAS route's scratch.
+        const LinearPolicy own = fp_prefill_policy(policy);
+        const std::size_t bytes =
+            qtype == QType::NVFP4
+                ? detail::nvfp4_linear_swiglu_workspace_capacity_bytes(own, min_tokens, max_tokens)
+                : detail::fp8_linear_swiglu_workspace_capacity_bytes(own, min_tokens, max_tokens);
+        if (allows_cublas_prefill(policy) && detail::cublas_prefill_admits_fp() &&
+            max_tokens >= cublas_prefill_min_tokens(policy)) {
+            return std::max(bytes, detail::w4_cublas_prefill_workspace_capacity_bytes(
+                                       gate_up_rows, input_rows,
+                                       std::max(min_tokens, cublas_prefill_min_tokens(policy)),
+                                       max_tokens));
+        }
+        return bytes;
     }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
@@ -204,15 +222,24 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         return;
     }
 
-    if (fp8_weight) {
-        (void)detail::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
-        detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
-        return;
-    }
-
-    if (nvfp4_weight) {
-        (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
-        detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+    if (fp8_weight || nvfp4_weight) {
+        if (fp8_weight) (void)detail::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
+        else (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
+        // sm_70: prefill widths on the FP16 cuBLAS route, as for Q4 (w4_cublas_prefill.h).
+        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+            detail::cublas_prefill_admits_fp() &&
+            detail::w4_cublas_prefill_supported(gate_up_weight, t) &&
+            (t >= kCublasPrefillMinTokens ||
+             detail::w4_cublas_prefill_fits(ws, gate_up_weight.n, gate_up_weight.k, t))) {
+            detail::w4_cublas_swiglu_launch(x, gate_up_weight, out, ws, stream);
+            return;
+        }
+        if (fp8_weight)
+            detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, fp_prefill_policy(policy),
+                                               ws, stream);
+        else
+            detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, fp_prefill_policy(policy),
+                                                 ws, stream);
         return;
     }
 
@@ -272,12 +299,26 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
 
 namespace {
 
+// The FP16 cuBLAS route's NVFP4 / FP8 forms (sm_70 only, detail::cublas_prefill_admits_fp).
+bool plane_fp_route(QType qtype) {
+    return (qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16) &&
+           detail::cublas_prefill_admits_fp();
+}
+
 // The routes linear_swiglu takes that can hand out the gate/up plane: the cuBLAS prefill route
-// for a Q4 or Q5 row-split weight, admitted exactly as linear_swiglu admits it.
-bool plane_takes_cublas(const Weight& w, LinearPolicy policy, std::int32_t t,
+// for a Q4 or Q5 row-split weight, or for an NVFP4 / FP8 one on sm_70, admitted as linear_swiglu
+// admits it.
+bool plane_takes_cublas(const Weight& w, void* plane, LinearPolicy policy, std::int32_t t,
                         const WorkspaceArena* ws) {
-    return allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
-           w.qtype == QType::Q4_G64_FP16 && detail::w4_cublas_prefill_supported(w, t) &&
+    if (!allows_cublas_prefill(policy) || t < cublas_prefill_min_tokens(policy)) return false;
+    if (plane_fp_route(w.qtype)) {
+        const detail::CublasProjectionDestination destination{plane, 0, w.n, w.n, 0};
+        const detail::CublasProjection parent{&w, &destination, 1};
+        return detail::w4_cublas_projection_supported(&parent, 1, t) &&
+               (t >= kCublasPrefillMinTokens || ws == nullptr ||
+                detail::w4_cublas_projection_fits(*ws, &parent, 1, t));
+    }
+    return w.qtype == QType::Q4_G64_FP16 && detail::w4_cublas_prefill_supported(w, t) &&
            (t >= kCublasPrefillMinTokens || ws == nullptr ||
             detail::w4_cublas_prefill_fits(*ws, w.n, w.k, t));
 }
@@ -302,6 +343,13 @@ std::size_t linear_swiglu_plane_workspace_capacity_bytes(QType qtype, std::int32
                             gate_up_rows, input_rows,
                             std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
     }
+    if (plane_fp_route(qtype) && allows_cublas_prefill(policy) &&
+        max_tokens >= cublas_prefill_min_tokens(policy)) {
+        return std::max(linear_bytes,
+                        detail::w4_cublas_projection_workspace_capacity_bytes(
+                            gate_up_rows, input_rows,
+                            std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
+    }
     return linear_bytes;
 }
 
@@ -313,7 +361,7 @@ void linear_swiglu_plane(const Tensor& x, const Weight& gate_up_weight, Tensor& 
         plane.ne[1] != t || !x.is_contiguous() || !plane.is_contiguous()) {
         throw std::invalid_argument("linear_swiglu_plane: x/plane must be contiguous BF16 [*, T]");
     }
-    if (plane_takes_cublas(gate_up_weight, policy, t, &ws)) {
+    if (plane_takes_cublas(gate_up_weight, plane.data, policy, t, &ws)) {
         const detail::CublasProjectionDestination destination{
             plane.data, 0, gate_up_weight.n, gate_up_weight.n, 0};
         const detail::CublasProjection parent{&gate_up_weight, &destination, 1};

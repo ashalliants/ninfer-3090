@@ -49,6 +49,7 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
     if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearAddRoute::A16) {
+        if (nvfp4_linear_add_stream_launch(x, weight, residual, stream)) return;
         nvfp4_linear_add_a16_launch(x, weight, residual, stream);
         return;
     }

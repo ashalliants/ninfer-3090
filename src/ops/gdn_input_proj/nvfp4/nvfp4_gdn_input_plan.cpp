@@ -17,7 +17,9 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
 
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
-    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+    // The integer-A8 and cuBLAS prefill policies have no NVFP4 form here: A16, as for linear_add.
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        allows_a8_int(policy)) {
         return Nvfp4GdnInputRoute::A16;
     }
     if (allows_a4(policy)) { return Nvfp4GdnInputRoute::A4; }
@@ -41,6 +43,7 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
+        if (nvfp4_gdn_input_stream_launch(x, weight, qkv, z, stream)) return;
         nvfp4_gdn_input_a16_launch(x, weight, qkv, z, stream);
         return;
     }

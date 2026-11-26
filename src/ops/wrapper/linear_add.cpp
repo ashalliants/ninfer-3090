@@ -150,6 +150,26 @@ void require_policy_format(QType qtype, LinearPolicy policy) {
 
 } // namespace
 
+namespace {
+// NVFP4 and FP8 weights reach their own plans with the cuBLAS policies read as A16Only: those plans
+// know nothing of the cuBLAS route, which linear_add takes above them (sm_70's FP16 route).
+LinearPolicy fp_prefill_policy(LinearPolicy policy) {
+    return allows_cublas_prefill(policy) ? LinearPolicy::A16Only : policy;
+}
+
+std::size_t fp_with_cublas_bytes(std::size_t own, std::int32_t output_rows,
+                                 std::int32_t input_rows, LinearPolicy policy,
+                                 std::int32_t min_tokens, std::int32_t max_tokens) {
+    if (!allows_cublas_prefill(policy) || !detail::cublas_prefill_admits_fp() ||
+        max_tokens < cublas_prefill_min_tokens(policy)) {
+        return own;
+    }
+    return std::max(own, detail::w4_cublas_prefill_workspace_capacity_bytes(
+                             output_rows, input_rows,
+                             std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
+}
+} // namespace
+
 std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
                                                 std::int32_t input_rows, std::int32_t min_tokens,
                                                 std::int32_t max_tokens) {
@@ -224,8 +244,10 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         if (!supported) {
             throw std::invalid_argument("linear_add workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
-                                                                 min_tokens, max_tokens);
+        return fp_with_cublas_bytes(detail::nvfp4_linear_add_workspace_capacity_bytes(
+                                        output_rows, input_rows, fp_prefill_policy(policy),
+                                        min_tokens, max_tokens),
+                                    output_rows, input_rows, policy, min_tokens, max_tokens);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
         const bool supported = (output_rows == detail::Fp8N5120K6144::kOutputRows &&
@@ -235,8 +257,10 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         if (!supported) {
             throw std::invalid_argument("linear_add workspace: unsupported FP8 profile");
         }
-        return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
-                                                               min_tokens, max_tokens);
+        return fp_with_cublas_bytes(detail::fp8_linear_add_workspace_capacity_bytes(
+                                        output_rows, input_rows, fp_prefill_policy(policy),
+                                        min_tokens, max_tokens),
+                                    output_rows, input_rows, policy, min_tokens, max_tokens);
     }
     if (is_ggml_block(qtype)) {
         detail::ggml_require_registered(qtype, output_rows, input_rows, true,
@@ -385,7 +409,14 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: NVFP4 requires 16-byte x/residual alignment");
         }
-        detail::nvfp4_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        // sm_70: prefill widths on the FP16 cuBLAS route, as for Q4 (w4_cublas_prefill.h).
+        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+            detail::cublas_prefill_admits_fp() && detail::w4_cublas_prefill_supported(w, t) &&
+            (t >= kCublasPrefillMinTokens || detail::w4_cublas_prefill_fits(ws, w.n, w.k, t))) {
+            detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);
+            return;
+        }
+        detail::nvfp4_linear_add_dispatch(x, w, residual_out, fp_prefill_policy(policy), ws, stream);
         return;
     }
 
@@ -401,7 +432,14 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
-        detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        // sm_70: prefill widths on the FP16 cuBLAS route, as for Q4 (w4_cublas_prefill.h).
+        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+            detail::cublas_prefill_admits_fp() && detail::w4_cublas_prefill_supported(w, t) &&
+            (t >= kCublasPrefillMinTokens || detail::w4_cublas_prefill_fits(ws, w.n, w.k, t))) {
+            detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);
+            return;
+        }
+        detail::fp8_linear_add_dispatch(x, w, residual_out, fp_prefill_policy(policy), ws, stream);
         return;
     }
 
