@@ -8,7 +8,12 @@
 #include "core/stage_plan.h"
 #include "models/qwen3_5/load/bindings.h"
 
+#include "core/weight_view.h"
+
+#include <cuda_runtime.h>
+
 #include <algorithm>
+#include <cstddef>
 #include <stdexcept>
 #include <utility>
 
@@ -249,6 +254,61 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
     return counts;
 }
 
+namespace {
+
+// The device pointer of mapped page-locked Host memory (the pinned block).
+const void* mapped_device_pointer(const void* host, const std::string& name) {
+    void* mapped = nullptr;
+    if (cudaHostGetDevicePointer(&mapped, const_cast<void*>(host), 0) != cudaSuccess ||
+        mapped == nullptr) {
+        (void)cudaGetLastError();
+        throw std::runtime_error("--hot-embedding-rows: " + name +
+                                 " is not in mapped pinned memory");
+    }
+    return mapped;
+}
+
+// --hot-embedding-rows: copies rows [0, rows) of the pinned Q4_G64_FP16 table's code and scale
+// planes into one device payload of the same RowSplit layout (codes, then the scales at the next
+// 256-byte boundary), and addresses the whole table through its mapped device pointers.
+HotEmbedding make_hot_embedding(const BoundWeight& embedding, std::uint32_t rows) {
+    const Weight table = native_weight(embedding.view);
+    if (table.qtype != QType::Q4_G64_FP16 || table.layout != QuantLayout::RowSplit || rows == 0 ||
+        rows > static_cast<std::uint32_t>(table.shape[0])) {
+        throw std::logic_error("--hot-embedding-rows: the token embedding is not a Q4_G64_FP16 table");
+    }
+    const auto groups                = static_cast<std::uint64_t>(table.padded_shape[1] / 64);
+    const std::uint64_t code_bytes   = rows * groups * 32;
+    const std::uint64_t scale_offset = (code_bytes + 255) / 256 * 256;
+    const std::uint64_t scale_bytes  = rows * groups * 2;
+    HotEmbedding out;
+    out.rows        = static_cast<std::int32_t>(rows);
+    out.table_bytes = table.payload_bytes;
+    out.hot_bytes   = scale_offset + scale_bytes;
+    out.buffer      = DeviceBuffer(static_cast<std::size_t>(out.hot_bytes));
+    out.buffer.copy_from_host(table.qdata, static_cast<std::size_t>(code_bytes));
+    out.buffer.copy_from_host(table.scales, static_cast<std::size_t>(scale_bytes),
+                              static_cast<std::size_t>(scale_offset));
+
+    out.cold         = table;
+    out.cold.payload = mapped_device_pointer(table.payload, embedding.name);
+    out.cold.qdata   = mapped_device_pointer(table.qdata, embedding.name);
+    out.cold.scales  = mapped_device_pointer(table.scales, embedding.name);
+
+    auto* const base        = static_cast<std::byte*>(out.buffer.p);
+    out.hot                 = table;
+    out.hot.payload         = base;
+    out.hot.payload_bytes   = out.hot_bytes;
+    out.hot.qdata           = base;
+    out.hot.scales          = base + scale_offset;
+    out.hot.shape[0]        = out.rows;
+    out.hot.padded_shape[0] = out.rows;
+    out.hot.n               = out.rows;
+    return out;
+}
+
+} // namespace
+
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                          const StartupObserver* observer,
                                          const artifact::MaterializeOptions& materialize) {
@@ -283,10 +343,15 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         vision_overlay =
             loading::vision_overlay_layout(*data->weights.vision, bound, backing.pinned_block());
     }
+    std::optional<HotEmbedding> hot_embedding;
+    if (data->options.hot_embedding_rows != 0) {
+        hot_embedding = make_hot_embedding(bound.at(data->weights.text.token_embedding.index),
+                                           data->options.hot_embedding_rows);
+    }
     return std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(bound),
         std::move(data->resources), std::move(data->info), std::move(backing),
-        std::move(vision_overlay)));
+        std::move(vision_overlay), std::move(hot_embedding)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

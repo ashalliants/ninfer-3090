@@ -422,7 +422,7 @@ private:
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
 
-    const Weight* embed_                        = nullptr;
+    const TokenEmbedding* embed_                = nullptr;
     const Tensor* final_norm_                   = nullptr;
     const LinearParameters* lm_head_            = nullptr;
     const LinearParameters* proposal_head_      = nullptr;

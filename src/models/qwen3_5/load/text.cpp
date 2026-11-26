@@ -1,5 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include "artifact/formats.h"
+
 #include <cstdlib>
 #include <limits>
 #include <set>
@@ -176,12 +178,60 @@ StagePlan plan_stage_plan(std::uint32_t layers, const LoadOptions& options) {
     return StagePlan::even(layers, options.ranks);
 }
 
+namespace {
+
+// --hot-embedding-rows: the Model copies the table's first rows out of its two RowSplit planes
+// (Model::hot_embedding) and the gather is ops::embedding_split, so the table must be one whole
+// Q4_G64_FP16 RowSplit object. A Hadamard-rotated (T2) table is another format and is refused too.
+void require_hot_embedding(const Bindings& b, WeightId embedding, const TextConfig& config,
+                           const LoadOptions& options) {
+    const std::uint32_t rows = options.hot_embedding_rows;
+    if (rows > config.vocab_size) {
+        throw std::invalid_argument("--hot-embedding-rows " + std::to_string(rows) +
+                                    " exceeds the model's " + std::to_string(config.vocab_size) +
+                                    " embedding rows: use at most " +
+                                    std::to_string(config.vocab_size));
+    }
+    if (options.ranks > 1) {
+        throw std::invalid_argument(
+            "--hot-embedding-rows runs on one GPU: start without it, or with one device in --devices");
+    }
+    if (options.embedding_q4 || options.embedding_q6) {
+        throw std::invalid_argument(
+            "--hot-embedding-rows keeps the stored token embedding and cannot be combined with "
+            "--embedding-q4 or --embedding-q6: drop one of them");
+    }
+    const auto& binding = b.at(embedding).reference.binding;
+    const auto& reader  = b.binder.reader();
+    bool q4             = binding.whole_object && binding.parts.size() == 1;
+    for (const auto& part : binding.parts) {
+        const auto& geometry = reader.geometry(part.object);
+        q4 = q4 && geometry.format == QType::Q4_G64_FP16 && geometry.layout == QuantLayout::RowSplit;
+    }
+    if (!q4) {
+        const std::string stored =
+            binding.parts.empty()
+                ? std::string("empty")
+                : std::string(artifact::format_name(reader.geometry(binding.parts[0].object).format));
+        throw std::invalid_argument(
+            "--hot-embedding-rows needs a token embedding stored as one Q4_G64_FP16 table; this "
+            "model's is " + stored + " (start without --hot-embedding-rows)");
+    }
+}
+
+} // namespace
+
 TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& options,
                       StagePlan stages) {
     TextWeights out;
     out.stages = std::move(stages);
+    // --hot-embedding-rows: the whole table in the pinned Host block (mapped, so the gather reads it
+    // through its device pointer); only its first rows get a device copy, made by the Model.
     out.token_embedding =
-        b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
+        b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size}, {}, {},
+                    options.hot_embedding_rows != 0 ? artifact::Residency::Pinned
+                                                    : artifact::Residency::Device);
+    if (options.hot_embedding_rows != 0) { require_hot_embedding(b, out.token_embedding, config, options); }
     std::vector<std::string> head_inputs{"text/final_hidden"};
     if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");

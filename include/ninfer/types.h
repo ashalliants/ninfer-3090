@@ -638,7 +638,7 @@ struct LoraSource {
 };
 
 // Qwen3.8-Flash-Next (Qwen4ExpForCausalLM) only; a dense model refuses any of these that is set
-// (runtime::validate_flash_next_options_unused) rather than ignoring it.
+// (runtime::validate_flash_next_options_unused) rather than ignoring it, except hot_embedding_rows.
 struct FlashNextOptions {
     // DeepSeek-V4.1-Flash only (--engram-dir): the folder `python3 -m tools.convert.dsv4_engram_volume` wrote (the
     // Engram volume, the token map and engram.json). Empty falls back to NINFER_DSV4_ENGRAM_DIR, then to no Engram
@@ -753,9 +753,9 @@ struct FlashNextOptions {
     bool shared_expert_stream = false;
     // Keep only the token embedding's first N rows (the lowest ids, the most frequent tokens) in VRAM
     // (--hot-embedding-rows N; Basalt keeps 8192): the whole table moves to the pinned host block,
-    // the GPU reads the other rows from it over PCIe, and the device memory saved (about 311 MiB at
-    // 8192) goes to the expert cache. The same embedding values, bit for bit. 0: the table stays in
-    // VRAM. At most the vocabulary.
+    // the GPU reads the other rows over PCIe; the VRAM saved (Flash-Next ~311 MiB at 8192) goes to
+    // the expert cache, on Qwen3.8-27B (Q4 table, one GPU; ~600 MiB) to the KV cache. The same
+    // embedding values, bit for bit. 0: the table stays in VRAM. At most the vocabulary.
     std::uint32_t hot_embedding_rows = 0;
     // Read the GatedDeltaNet's 16 key heads for its 48 value heads in place, through the GGUF's tiled
     // head map (value head h reads key head h % 16), instead of copying them to one key head per value

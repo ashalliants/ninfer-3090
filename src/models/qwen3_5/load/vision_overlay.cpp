@@ -77,7 +77,10 @@ void apply_vision_overlay_placement(Bindings& bindings, const ModelWeights& weig
         bindings.evict(WeightId{index}, kEvictRankMtp);
     }
     if (weights.proposal) { bindings.evict(weights.proposal->head, kEvictRankProposalHead); }
-    bindings.evict(weights.text.token_embedding, kEvictRankEmbedding);
+    // With --hot-embedding-rows the table is in the pinned Host block and lends no device bytes.
+    if (bindings.at(weights.text.token_embedding).reference.residency == artifact::Residency::Device) {
+        bindings.evict(weights.text.token_embedding, kEvictRankEmbedding);
+    }
     bindings.evict(weights.text.output_head, kEvictRankOutputHead);
 }
 

@@ -2,6 +2,8 @@
 
 #include "artifact/framing.h"
 #include "artifact/materializer.h"
+#include "core/arena.h"
+#include "core/weight.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
@@ -22,6 +24,21 @@ struct InstanceInfo {
 };
 
 class LoadPlan;
+
+// --hot-embedding-rows N (LoadOptions::hot_embedding_rows): the token embedding (Q4_G64_FP16
+// RowSplit) is bound in the mapped pinned Host block, and the Model keeps a device copy of its first
+// N rows. ops::embedding_split reads ids below N from `hot` and the rest from `cold` over PCIe.
+struct HotEmbedding {
+    std::int32_t rows = 0;
+    // Rows [0, rows) of both planes, laid out as a RowSplit payload of `rows` rows.
+    DeviceBuffer buffer;
+    Weight hot;
+    // The whole table, its planes addressed through their mapped device pointers.
+    Weight cold;
+    // Bytes of the whole table (pinned) and of the device copy.
+    std::uint64_t table_bytes = 0;
+    std::uint64_t hot_bytes   = 0;
+};
 
 class Model {
 public:
@@ -63,6 +80,12 @@ public:
         return vision_overlay_;
     }
 
+    // Set with --hot-embedding-rows only. The device copy is not part of the weight arenas, so it
+    // stays resident while the Model is suspended (release_device_weights).
+    [[nodiscard]] const HotEmbedding* hot_embedding() const noexcept {
+        return hot_embedding_ ? &*hot_embedding_ : nullptr;
+    }
+
     [[nodiscard]] std::span<const std::byte> pinned_weights() const noexcept {
         return backing_.pinned_block();
     }
@@ -97,7 +120,8 @@ private:
                                                     const artifact::MaterializeOptions&);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
           FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing,
-          std::optional<VisionOverlayLayout> vision_overlay);
+          std::optional<VisionOverlayLayout> vision_overlay,
+          std::optional<HotEmbedding> hot_embedding);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     artifact::MaterializedArtifact backing_;
@@ -108,6 +132,7 @@ private:
     FrontendResources resources_;
     InstanceInfo info_;
     std::optional<VisionOverlayLayout> vision_overlay_;
+    std::optional<HotEmbedding> hot_embedding_;
 };
 
 } // namespace ninfer::models::qwen3_5

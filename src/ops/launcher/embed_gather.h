@@ -21,6 +21,9 @@ void embed_gather_dense_launch(const Tensor& ids, const Tensor& table, Tensor& o
                                cudaStream_t stream);
 void embed_gather_q4_launch(const Tensor& ids, const Weight& table, Tensor& out,
                             cudaStream_t stream);
+// The Q4_G64_FP16 decode with rows [0,hot_rows) read from `hot` and the rest from `cold`.
+void embed_gather_q4_split_launch(const Tensor& ids, const Weight& hot, const Weight& cold,
+                                  std::int32_t hot_rows, Tensor& out, cudaStream_t stream);
 void embed_gather_q6_launch(const Tensor& ids, const Weight& table, Tensor& out,
                             cudaStream_t stream);
 void embed_gather_q8_launch(const Tensor& ids, const Weight& table, Tensor& out,

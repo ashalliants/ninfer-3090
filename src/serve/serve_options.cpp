@@ -433,6 +433,7 @@ std::string serve_usage_text(const char* argv0) {
            "(--spec mtp) reads the anchor column's n-gram rows while the drafter runs, so verification "
            "finds them cached (off by default); --hot-embedding-rows N keeps only the token embedding's "
            "first N rows in VRAM and reads the rest from pinned RAM, freeing VRAM for the expert cache "
+           "(Flash-Next) or the KV cache (Qwen3.8-27B, Q4 embedding; 8192 frees about 600 MiB) "
            "(the same output; 0, the default, keeps the whole table in VRAM; at most the vocabulary); "
            "--gdn-head-map reads the GDN's key heads through the tiled head map instead of copying "
            "them per value head (the same output, bit for bit; off by default); --moe-precast-input "

@@ -41,13 +41,28 @@ enum class InputBasis : std::uint8_t { Primal, Rotated };
     return out;
 }
 
+// The token embedding as every gather of the target, the MTP drafter and the DFlash drafters reads
+// it.
+struct TokenEmbedding {
+    Weight table;
+    // A token table stored in the rotated basis (T2) is restored after the gather with the
+    // hidden-width sign vector; empty for an ordinary table.
+    Tensor signs;
+    // --hot-embedding-rows: ids below hot_rows read `hot` (device rows [0, hot_rows)), the rest
+    // `table`, which then addresses the pinned Host table (Model::hot_embedding). 0: `table` only.
+    Weight hot;
+    std::int32_t hot_rows = 0;
+};
+
 // The token rows of `ids`, restored to the primal basis when the table is stored rotated.
-inline void embed_tokens(const Tensor& ids, const Weight& table, const Tensor& signs, Tensor& out,
+inline void embed_tokens(const Tensor& ids, const TokenEmbedding& embedding, Tensor& out,
                          cudaStream_t stream) {
-    if (rotated(signs)) {
-        ops::embedding_rotated(ids, table, signs, out, stream);
+    if (embedding.hot_rows != 0) {
+        ops::embedding_split(ids, embedding.hot, embedding.table, embedding.hot_rows, out, stream);
+    } else if (rotated(embedding.signs)) {
+        ops::embedding_rotated(ids, embedding.table, embedding.signs, out, stream);
     } else {
-        ops::embedding(ids, table, out, stream);
+        ops::embedding(ids, embedding.table, out, stream);
     }
 }
 

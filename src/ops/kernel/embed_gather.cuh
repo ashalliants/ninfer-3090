@@ -73,9 +73,14 @@ __device__ __forceinline__ int unpack_q4_code(const std::uint8_t* nibble, int in
     return (value ^ 0x08) - 0x08;
 }
 
+// Split (embedding_split): rows below hot_rows are read from the hot planes (rows [0,hot_rows) of
+// the same RowSplit layout), the rest from `codes`/`scales`; otherwise every row comes from the latter.
+template <bool Split>
 __global__ void embed_gather_q4_kernel(const std::int32_t* ids, const std::uint8_t* codes,
-                                       const std::uint8_t* scales, __nv_bfloat16* out,
-                                       std::int32_t d, std::int32_t T, std::int32_t padded_d) {
+                                       const std::uint8_t* scales, const std::uint8_t* hot_codes,
+                                       const std::uint8_t* hot_scales, std::int32_t hot_rows,
+                                       __nv_bfloat16* out, std::int32_t d, std::int32_t T,
+                                       std::int32_t padded_d) {
     const std::int32_t kg     = padded_d / kEmbedGatherQ4Group;
     const std::int64_t n      = static_cast<std::int64_t>(d) * T;
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -88,20 +93,31 @@ __global__ void embed_gather_q4_kernel(const std::int32_t* ids, const std::uint8
         const std::int32_t g    = k / kEmbedGatherQ4Group;
         const std::int32_t lane = k - g * kEmbedGatherQ4Group;
         const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + g;
+        const std::uint8_t* row_codes  = codes;
+        const std::uint8_t* row_scales = scales;
+        if constexpr (Split) {
+            if (row < hot_rows) {
+                row_codes  = hot_codes;
+                row_scales = hot_scales;
+            }
+        }
         const std::uint16_t scale_bits =
-            static_cast<std::uint16_t>(scales[group_index * 2]) |
-            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1])
+            static_cast<std::uint16_t>(row_scales[group_index * 2]) |
+            static_cast<std::uint16_t>(static_cast<std::uint16_t>(row_scales[group_index * 2 + 1])
                                        << 8);
         const float scale = __half2float(__ushort_as_half(scale_bits));
-        const int code    = unpack_q4_code(codes + group_index * kEmbedGatherQ4NibbleBpr, lane);
+        const int code    = unpack_q4_code(row_codes + group_index * kEmbedGatherQ4NibbleBpr, lane);
         out[i]            = __float2bfloat16(static_cast<float>(code) * scale);
     }
 }
 
+// Split: as embed_gather_q4_kernel.
+template <bool Split>
 __launch_bounds__(kEmbedGatherQ4Group* kEmbedGatherQ4GroupsPerBlock) __global__
     void embed_gather_q4_grouped_kernel(const std::int32_t* ids, const std::uint8_t* codes,
-                                        const std::uint8_t* scales, __nv_bfloat16* out,
-                                        std::int32_t d, std::int32_t T) {
+                                        const std::uint8_t* scales, const std::uint8_t* hot_codes,
+                                        const std::uint8_t* hot_scales, std::int32_t hot_rows,
+                                        __nv_bfloat16* out, std::int32_t d, std::int32_t T) {
     const std::int32_t kg           = d / kEmbedGatherQ4Group;
     const std::int32_t group_blocks = div_up(kg, kEmbedGatherQ4GroupsPerBlock);
     const std::int32_t t            = static_cast<std::int32_t>(blockIdx.x) / group_blocks;
@@ -113,6 +129,12 @@ __launch_bounds__(kEmbedGatherQ4Group* kEmbedGatherQ4GroupsPerBlock) __global__
 
     const std::int32_t row         = ids[t];
     const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + g;
+    if constexpr (Split) {
+        if (row < hot_rows) {
+            codes  = hot_codes;
+            scales = hot_scales;
+        }
+    }
 
     int scale_bits = 0;
     if ((lane & 31) == 0) {

@@ -476,7 +476,8 @@ std::size_t prepare_vision_overlay(const execution::Parameters& parameters, Devi
             "embedding, proposal head and MTP or drafter weights provide " +
             mib(pool->evictable_tail_bytes()) +
             "; lower --vision-max-merged, use --vision-residency resident, or drop a flag that "
-            "shrinks those weights (--embedding-q4/q6, --lm-head-q4/q6)");
+            "shrinks or moves those weights (--embedding-q4/q6, --lm-head-q4/q6, "
+            "--hot-embedding-rows)");
     }
     if (!pool->mirror_captured()) { pool->capture_window_mirror(window, device.transfer_stream); }
     return pool->window_capacity_bytes();
