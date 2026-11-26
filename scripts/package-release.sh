@@ -68,9 +68,9 @@ if cache_option_on NINFER_CUDA_LINEINFO; then
   printf '%s was configured with NINFER_CUDA_LINEINFO on (a profiling build): reconfigure it with -DNINFER_CUDA_LINEINFO=OFF and rebuild before packaging\n' "$build_root" >&2
   exit 1
 fi
-# The V100 archive carries machine code only: a V100 never runs the PTX (NINFER_CUDA_PTX, off by
-# default for CMAKE_CUDA_ARCHITECTURES=70).
-if [[ "$target" == v100 ]] && cache_option_on NINFER_CUDA_PTX; then
+# The V100 archive carries machine code only: a V100 never runs the PTX. NINFER_CUDA_PTX is AUTO, ON
+# or OFF; the configure records what it resolved to as NINFER_CUDA_PTX_EFFECTIVE.
+if [[ "$target" == v100 ]] && cache_option_on NINFER_CUDA_PTX_EFFECTIVE; then
   printf '%s was configured with NINFER_CUDA_PTX on: the V100 archive ships machine code only; reconfigure it with -DNINFER_CUDA_PTX=OFF and rebuild before packaging\n' "$build_root" >&2
   exit 1
 fi

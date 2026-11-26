@@ -147,9 +147,9 @@ The binaries do not embed `VERSION`; build from the release branch commit.
 (`NINFER_CUDA_LINEINFO`, OFF): it changes no machine code, but it made every kernel image about 4x larger,
 the binaries about 75% bigger, and the CUDA driver keeps each loaded image in host RAM for the life of the
 server. Never pass `-DNINFER_CUDA_LINEINFO=ON` to a release tree; both packagers refuse a tree configured with
-it on (any value CMake treats as true). **The V100 tree also builds without PTX** (`NINFER_CUDA_PTX`, off by
-default for `CMAKE_CUDA_ARCHITECTURES=70`; a V100 never runs the PTX), and `package-release.sh` refuses a V100
-tree with it on. The sm_86 trees keep PTX so they still run on newer cards. V100 `ninfer-serve`: 1,473 MB with
+it on (any value CMake treats as true). **The V100 tree also builds without PTX** (`NINFER_CUDA_PTX`, `AUTO` by
+default, which is off for `CMAKE_CUDA_ARCHITECTURES=70` even in a tree first configured for 86; a V100 never runs
+the PTX), and `package-release.sh` refuses a V100 tree that embeds it. Leave `NINFER_CUDA_PTX` at `AUTO`. The sm_86 trees keep PTX so they still run on newer cards. V100 `ninfer-serve`: 1,473 MB with
 both, 448 MB without. The first build of each tree after the switch recompiles
 every CUDA object (the flags changed, so ccache misses): allow about twice the usual build time once. The GPU is usually
 loaded by the user's server, but compiling needs none (the V100 build needs no V100 either).
@@ -220,7 +220,7 @@ touches the instance in its own state file).
   to be the one at risk (2,125,147,854 bytes in v0.19.0, 22 MB under; 2,246,329,497 with three separate binaries
   in v0.20.0). Without `-lineinfo` and PTX its binaries are about 70% smaller, so it should now sit far under the
   limit. Archives about as large as the previous release's mean the tree was built with `-lineinfo` (or, for the
-  V100, with PTX): check `NINFER_CUDA_LINEINFO` and `NINFER_CUDA_PTX` in its `CMakeCache.txt` before publishing.
+  V100, with PTX): check `NINFER_CUDA_LINEINFO` and `NINFER_CUDA_PTX_EFFECTIVE` in its `CMakeCache.txt` before publishing.
 
 ## 6. Verify before publishing
 

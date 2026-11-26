@@ -81,6 +81,10 @@ jobs:
       - name: Run tests/release/test-package-release-imports.ps1
         shell: pwsh
         run: ./tests/release/test-package-release-imports.ps1
+      # The refusal of a tree built with -lineinfo reads CMakeCache.txt the way CMake's if() does.
+      - name: Run tests/release/test-package-release-cache.ps1
+        shell: pwsh
+        run: ./tests/release/test-package-release-cache.ps1
 
   # The Tesla V100 (sm_70) port emulates the Ampere instructions in a few shared helpers. A kernel
   # that writes cp.async / mma.sync / ldmatrix as raw asm skips the emulation and only fails in a

@@ -14,10 +14,10 @@ function(ninfer_cuda_lineinfo target)
   endif()
 endfunction()
 
-# Without NINFER_CUDA_PTX (see CMakeLists.txt) the target builds machine code only ("70-real"):
+# Without PTX (NINFER_CUDA_PTX_EFFECTIVE, see CMakeLists.txt) the target builds machine code only ("70-real"):
 # CMAKE_CUDA_ARCHITECTURES itself stays "70", which the per-architecture source lists key on.
 function(ninfer_cuda_ptx target)
-  if(NOT NINFER_CUDA_PTX)
+  if(NOT NINFER_CUDA_PTX_EFFECTIVE)
     set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}-real")
   endif()
 endfunction()

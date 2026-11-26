@@ -41,20 +41,9 @@ $Products = @(
 # Release binaries carry no -lineinfo: it makes every kernel image about 4x larger, and the CUDA
 # driver keeps each image it loads in host RAM (NINFER_CUDA_LINEINFO in CMakeLists.txt). A profiling
 # tree configured with it on is refused before anything is written.
-# Test-CacheOptionOn: whether CMakeCache.txt sets the option to a value the CMakeLists' `if(NAME)`
-# treats as true: any value but CMake's false constants (empty, 0, OFF, NO, FALSE, N or IGNORE in
-# any case, or NOTFOUND or *-NOTFOUND in uppercase only), so =TRUE or =1 is caught as well as =ON.
-# No cache, or no such entry, counts as off. Mirrors cache_option_on in package-release.sh.
-function Test-CacheOptionOn([string]$Name) {
-    $cache = Join-Path $BuildRoot 'CMakeCache.txt'
-    if (-not (Test-Path -LiteralPath $cache)) { return $false }
-    $entry = Select-String -LiteralPath $cache -CaseSensitive -Pattern "^$([regex]::Escape($Name)):[A-Za-z]*=(.*)$" | Select-Object -First 1
-    if (-not $entry) { return $false }
-    $value = $entry.Matches[0].Groups[1].Value
-    if ($value -cmatch '^(.*-)?NOTFOUND$') { return $false }
-    return -not ($value -imatch '^(|0|OFF|NO|FALSE|N|IGNORE)$')
-}
-if (Test-CacheOptionOn 'NINFER_CUDA_LINEINFO') {
+# Test-CacheOptionOn is in lib/package-release-cache.ps1, where tests\release can drive it.
+. (Join-Path $PSScriptRoot 'lib/package-release-cache.ps1')
+if (Test-CacheOptionOn $BuildRoot 'NINFER_CUDA_LINEINFO') {
     throw "$BuildRoot was configured with NINFER_CUDA_LINEINFO on (a profiling build): reconfigure it with -DNINFER_CUDA_LINEINFO=OFF and rebuild before packaging"
 }
 

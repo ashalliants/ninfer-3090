@@ -1,0 +1,44 @@
+# Values and what CMake's if(<variable>) makes of each, generated with `cmake -P` (CMake 3.28.3).
+# Format: on|off, a tab, then the value (empty after the tab is the empty string). Used by
+# tests/release/test-package-release-cache.ps1 and scripts/check-linux-scripts.sh to check the
+# packagers' CMakeCache.txt readers against CMake itself.
+on	ON
+on	on
+on	On
+on	YES
+on	yes
+on	TRUE
+on	true
+on	Y
+on	y
+on	1
+on	2
+on	-1
+on	-0
+on	0.5
+on	1e3
+on	0.0
+on	00
+on	garbage
+on	AUTO
+off	OFF
+off	off
+off	Off
+off	NO
+off	no
+off	No
+off	FALSE
+off	false
+off	fAlSe
+off	N
+off	n
+off	0
+off	
+off	IGNORE
+off	ignore
+off	NOTFOUND
+on	notfound
+on	NotFound
+off	X-NOTFOUND
+off	x-NOTFOUND
+on	x-notfound

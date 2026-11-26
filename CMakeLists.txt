@@ -60,13 +60,24 @@ option(NINFER_CUDA_LINEINFO "Build ninfer_core and ninfer_ops with -lineinfo (fo
 # PTX beside the machine code lets the driver JIT-compile kernels for a newer card than the build
 # targets. A V100 build (70) only ever runs on a V100, which uses the sm_70 machine code, so there
 # the PTX is dead weight (about three quarters of each kernel image without -lineinfo) and the
-# library targets build machine code only. Other architectures keep it.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
-  set(ninfer_cuda_ptx_default OFF)
+# library targets build machine code only. Other architectures keep it. AUTO is resolved on every
+# configure, so a tree reconfigured from 86 to 70 drops the PTX; ON or OFF overrides it.
+set(NINFER_CUDA_PTX AUTO CACHE STRING
+    "Embed PTX beside the machine code in ninfer_core and ninfer_ops: AUTO (off for 70, on otherwise), ON or OFF")
+set_property(CACHE NINFER_CUDA_PTX PROPERTY STRINGS AUTO ON OFF)
+if(NINFER_CUDA_PTX STREQUAL "AUTO")
+  if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+    set(ninfer_cuda_ptx_effective OFF)
+  else()
+    set(ninfer_cuda_ptx_effective ON)
+  endif()
+elseif(NINFER_CUDA_PTX)
+  set(ninfer_cuda_ptx_effective ON)
 else()
-  set(ninfer_cuda_ptx_default ON)
+  set(ninfer_cuda_ptx_effective OFF)
 endif()
-option(NINFER_CUDA_PTX "Embed PTX beside the machine code in ninfer_core and ninfer_ops" ${ninfer_cuda_ptx_default})
+# Recorded in the cache for scripts/package-release.sh, which refuses a V100 tree that embeds PTX.
+set(NINFER_CUDA_PTX_EFFECTIVE ${ninfer_cuda_ptx_effective} CACHE INTERNAL "NINFER_CUDA_PTX as resolved for this configure")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
