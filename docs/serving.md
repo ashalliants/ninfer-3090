@@ -661,9 +661,9 @@ can read high or low next to its neighbours.
 **The key.** The page itself is served without `--api-key`, since it holds no data, but everything
 it polls needs the key. If the server has one, the page says so: type the key into the field at the
 top and press Enter or **Use key**. The page sends it as `Authorization: Bearer` on its own
-requests and keeps it in the tab's session storage, so it survives a reload of that tab but not
-closing it; **Forget** clears it. `scripts/run.sh` and `scripts/run.bat` print a ready-to-open link ending in `#key=...`;
-the part after `#` is never sent to the server, and the page keeps the key for the tab and removes it from the address bar
+requests and saves it in the browser's local storage for that address (host and port), so it is still there after
+a reload, closing the tab or coming back weeks later; **Forget** clears it. Anyone using the same browser profile can read it from there. `scripts/run.sh` and `scripts/run.bat` print a ready-to-open link ending in `#key=...`;
+the part after `#` is never sent to the server, and the page saves the key and removes it from the address bar
 right away. The status endpoints still need the key. On a server without a key the
 [Host check](#host-and-origin-checks) applies to the page like every route, so open it by a name
 the server answers to (or an address); its requests go to its own origin, so they pass the Origin

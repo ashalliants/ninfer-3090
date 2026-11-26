@@ -224,7 +224,7 @@ const nf0 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
 const nf2 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
 
 let apiKey = '';
-try { apiKey = sessionStorage.getItem(KEY_STORE) || ''; } catch (e) { /* storage disabled */ }
+try { apiKey = localStorage.getItem(KEY_STORE) || ''; } catch (e) { /* storage disabled */ }
 let samples = [];        // {t (ms), decode, prefill, accept, power}; null where unknown
 let previous = null;     // the last /metrics counters and when they were read
 let timer = null, busy = false;
@@ -824,14 +824,14 @@ for (const chart of charts) {
 function useKey() {
   apiKey = $('key').value.trim();
   $('key').value = '';
-  try { if (apiKey) sessionStorage.setItem(KEY_STORE, apiKey); else sessionStorage.removeItem(KEY_STORE); } catch (e) { /* storage disabled */ }
-  $('key').placeholder = apiKey ? 'Key set for this tab' : 'API key (if the server has one)';
+  try { if (apiKey) localStorage.setItem(KEY_STORE, apiKey); else localStorage.removeItem(KEY_STORE); } catch (e) { /* storage disabled */ }
+  $('key').placeholder = apiKey ? 'Key saved in this browser' : 'API key (if the server has one)';
   tick();
 }
 $('use-key').addEventListener('click', useKey);
 $('key').addEventListener('keydown', (e) => { if (e.key === 'Enter') useKey(); });
 $('forget-key').addEventListener('click', () => { $('key').value = ''; useKey(); });
-if (apiKey) $('key').placeholder = 'Key set for this tab';
+if (apiKey) $('key').placeholder = 'Key saved in this browser';
 
 function setRange(seconds) {
   windowS = seconds;
@@ -857,12 +857,12 @@ document.addEventListener('keydown', (e) => {
 {
   const q = new URLSearchParams(location.hash.slice(1));
   // The launch scripts print a link ending in #key=...: the part after # stays in the browser and
-  // is never sent to the server. Keep the key for this tab, then drop it from the address bar
+  // is never sent to the server. Save the key in this browser, then drop it from the address bar
   // (writeHash below rebuilds the address without it).
   if (q.get('key')) {
     apiKey = q.get('key');
-    try { sessionStorage.setItem(KEY_STORE, apiKey); } catch (e) { /* storage disabled */ }
-    $('key').placeholder = 'Key set for this tab';
+    try { localStorage.setItem(KEY_STORE, apiKey); } catch (e) { /* storage disabled */ }
+    $('key').placeholder = 'Key saved in this browser';
   }
   // Read both values before setRange, whose writeHash would otherwise drop the lane.
   const lane = Number(q.get('lane'));
