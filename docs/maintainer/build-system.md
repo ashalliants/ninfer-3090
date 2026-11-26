@@ -204,8 +204,25 @@ numbers carry the calling-convention ABI and no static shared memory yet.
 `ninfer_nvfp4_non_rdc` disables separable compilation and device-symbol resolution. It contains
 the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend on
 `setmaxnreg` register transfer. Their owning family manifests register these sources into the
-non-RDC target; host launchers connect them to the normal Ops. All three CUDA archive targets
-retain `-lineinfo`.
+non-RDC target; host launchers connect them to the normal Ops. All three CUDA archive targets take
+`-lineinfo` only with `-DNINFER_CUDA_LINEINFO=ON`.
+
+### Line info (`NINFER_CUDA_LINEINFO`)
+
+`-lineinfo` adds source-line tables and the PTX text to every kernel image, so Nsight Compute can
+show source and compute-sanitizer can name lines. It does not change the generated code: compiled
+both ways, the largest object (`q8_attn_input_gemm_splitk.cu`, 308 kernels) has identical SASS and
+identical register, stack and shared-memory use. It does change size. Debug sections are 73% of the
+sm_70 cubins (1,625 of 2,227 MiB), and the CUDA driver keeps a loaded image in host RAM until the
+process exits, debug sections included: loading that one object costs about 300 MiB of RSS with
+`-lineinfo` and 66 MiB without. With lazy module loading, an object is loaded the first time any of
+its kernels runs, so a long-running router pays this once per object it has used: after one
+Qwen3.6-35B-A3B request and an unload, about 0.9 GiB of heap was the driver's copies of these images.
+
+The library targets therefore build without it by default. Pass `-DNINFER_CUDA_LINEINFO=ON` for a
+profiling build (Nsight Compute source view, compute-sanitizer line numbers). The microbenchmarks
+(`bench/cmake/NinferBenchmarks.cmake`) keep `-lineinfo` for their own sources either way. Nsight
+Systems traces need only kernel names and work on the default build.
 
 Source-list maintenance must preserve language, architecture, RDC mode, device-link ownership
 and numerical compiler options. Splitting a manifest does not reduce kernel instantiation work

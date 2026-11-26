@@ -51,6 +51,12 @@ option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 # build. Nothing in src/ needs RDC, so the default is whole-program compilation. Turn it back on
 # with -DNINFER_CUDA_RDC=ON; see "CUDA compilation boundaries" in docs/maintainer/build-system.md.
 option(NINFER_CUDA_RDC "Build ninfer_core and ninfer_ops with relocatable device code" OFF)
+# -lineinfo maps each kernel's SASS back to source lines for Nsight Compute's source view and
+# compute-sanitizer reports. It does not change the generated code, but it makes every kernel image
+# about 4x larger, and the CUDA driver keeps a loaded image in host RAM for the life of the process:
+# a router that has served the 35B once holds about 0.9 GiB of it with no model loaded. Off by
+# default; turn it on for profiling builds. The microbenchmarks always keep it.
+option(NINFER_CUDA_LINEINFO "Build ninfer_core and ninfer_ops with -lineinfo (for Nsight Compute source view)" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

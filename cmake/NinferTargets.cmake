@@ -6,6 +6,14 @@ function(ninfer_internal_includes target)
     ${PROJECT_SOURCE_DIR}/src)
 endfunction()
 
+# -lineinfo only with NINFER_CUDA_LINEINFO (see CMakeLists.txt): kernel images otherwise carry no
+# source-line tables or PTX text, which the driver would keep in host RAM once a kernel has run.
+function(ninfer_cuda_lineinfo target)
+  if(NINFER_CUDA_LINEINFO)
+    target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  endif()
+endfunction()
+
 function(ninfer_cuda_archive target)
   set_target_properties(${target} PROPERTIES
     CUDA_SEPARABLE_COMPILATION ${NINFER_CUDA_RDC}
@@ -13,7 +21,7 @@ function(ninfer_cuda_archive target)
   if(WIN32)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
-  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  ninfer_cuda_lineinfo(${target})
 endfunction()
 
 function(ninfer_cuda_non_rdc_archive target)
@@ -23,7 +31,7 @@ function(ninfer_cuda_non_rdc_archive target)
   if(WIN32)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
-  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  ninfer_cuda_lineinfo(${target})
 endfunction()
 
 # NINFER_HOST_ONLY (no CUDA compiler): the target's .cu sources compile as C++ against the CUDA
