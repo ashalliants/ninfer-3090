@@ -10,5 +10,6 @@
   "draft-tokens": 3,
   "lm-head-draft": true,
   "device-state-slots": 8,
-  "host-context-mib": 8192
+  "host-context-mib": 8192,
+  "hot-embedding-rows": 8192
 }

@@ -242,12 +242,12 @@ common_tuned=(--host 127.0.0.1 --port 8080 --kv-dtype rk4v4 --gdn-state-fp16 --p
   --host-context-mib 8192 --min-p 0.03 --presence-penalty 0.5)
 recorded="$(record whole_dflash2 -- qwen38-27b)"
 expect_config '27B default' "$recorded" qwen38-27b-tuned-dflash2
-expect_options '27B default' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
+expect_options '27B default' "$recorded" "${common_tuned[@]}" --fit-context 32768 --hot-embedding-rows 8192 \
   --max-concurrency 1 --max-context 262144 --kv-capacity 262144 \
   --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 --prefill-chunk 4096
 recorded="$(record whole_mtp NINFER_SPEC=mtp -- qwen38-27b)"
 expect_config '27B NINFER_SPEC=mtp' "$recorded" qwen38-27b-tuned-mtp
-expect_options '27B NINFER_SPEC=mtp' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
+expect_options '27B NINFER_SPEC=mtp' "$recorded" "${common_tuned[@]}" --fit-context 32768 --hot-embedding-rows 8192 \
   --max-concurrency 2 --max-context 262144 --kv-capacity 262144 \
   --spec mtp --draft-tokens 3 --lm-head-draft --prefill-chunk 2048
 recorded="$(record whole_none NINFER_SPEC=none -- qwen38-27b)"
@@ -272,13 +272,14 @@ recorded="$(record whole_int8 -- qwen38-27b int8)"
 expect_config '27B int8' "$recorded" qwen38-27b-int8
 expect_options '27B int8' "$recorded" --host 127.0.0.1 --port 8080 \
   --max-context 65536 --kv-capacity 65536 --max-concurrency 1 --max-pending-requests 16 \
-  --pending-timeout-ms 600000 --prefill-chunk 1024 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft
+  --pending-timeout-ms 600000 --prefill-chunk 1024 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft \
+  --hot-embedding-rows 8192
 recorded="$(record whole_c8 -- qwen38-27b c8)"
 expect_config '27B c8' "$recorded" qwen38-27b-c8
 expect_options '27B c8' "$recorded" --host 127.0.0.1 --port 8080 \
   --max-context 8192 --kv-capacity 16384 --max-concurrency 8 --max-pending-requests 32 \
   --pending-timeout-ms 600000 --prefill-chunk 512 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft \
-  --device-state-slots 8 --host-context-mib 8192
+  --device-state-slots 8 --host-context-mib 8192 --hot-embedding-rows 8192
 # The environment's overrides go after --config and win over the file's values; the banner reports
 # the values in force, the file's where nothing overrides them.
 recorded="$(record whole_overrides NINFER_SPEC=mtp NINFER_DRAFT_TOKENS=11 NINFER_CONTEXT=131072 \
@@ -287,9 +288,34 @@ expect_options '27B overrides over the file' "$recorded" --host 127.0.0.1 --port
   --prefill-cublas --max-pending-requests 16 --pending-timeout-ms 600000 --vision --vision-residency overlay \
   --host-context-mib 8192 --min-p 0.03 --presence-penalty 0.5 \
   --max-concurrency 2 --max-context 131072 --kv-capacity 131072 \
-  --kv-dtype rk8v4 --spec mtp --draft-tokens 11 --lm-head-draft --prefill-chunk 1024
+  --kv-dtype rk8v4 --spec mtp --draft-tokens 11 --lm-head-draft --prefill-chunk 1024 --hot-embedding-rows 8192
 refuse_flag '27B NINFER_SPEC=none NINFER_DRAFT_TOKENS=11' \
   "$(record none_draft NINFER_SPEC=none NINFER_DRAFT_TOKENS=11 -- qwen38-27b)" '--draft-tokens'
+# MTP at three or more lanes shares a pool sized to the card: each request capped at 131,072, the
+# pool automatic, no extra device state slots, and no context fit (the server refuses it with auto).
+recorded="$(record whole_mtp_c4 NINFER_SPEC=mtp NINFER_CONCURRENCY=4 -- qwen38-27b)"
+expect_options '27B NINFER_SPEC=mtp at four lanes' "$recorded" "${common_tuned[@]}" --hot-embedding-rows 8192 \
+  --max-concurrency 4 --max-context 131072 --kv-capacity auto --device-state-slots 0 \
+  --spec mtp --draft-tokens 3 --lm-head-draft --prefill-chunk 2048
+expect_flags '27B mtp three lanes' "$(record mtp_c3 NINFER_SPEC=mtp NINFER_CONCURRENCY=3 -- qwen38-27b)" \
+  '--max-context 131072' '--kv-capacity auto' '--device-state-slots 0'
+expect_flags '27B mtp four lanes, own cap and slots' \
+  "$(record mtp_c4_own NINFER_SPEC=mtp NINFER_CONCURRENCY=4 NINFER_CONTEXT=65536 NINFER_DEVICE_STATE_SLOTS=2 -- qwen38-27b)" \
+  '--max-context 65536' '--kv-capacity auto' '--device-state-slots 2'
+refuse_flag '27B DFlash2 four lanes keeps one pool' \
+  "$(record dflash2_c4 NINFER_CONCURRENCY=4 -- qwen38-27b)" '--device-state-slots'
+expect_flags '27B DFlash2 four lanes keeps one pool' \
+  "$(record dflash2_c4_pool NINFER_CONCURRENCY=4 -- qwen38-27b)" '--kv-capacity 262144' '--fit-context 32768'
+# The hot embedding rows are on for every 27B profile, NINFER_HOT_EMBEDDING_ROWS=0 turns them off, and
+# a load-time embedding transcode or several devices turn them off (the server refuses the pair).
+expect_flags '27B NINFER_HOT_EMBEDDING_ROWS=0' \
+  "$(record hot_off NINFER_HOT_EMBEDDING_ROWS=0 -- qwen38-27b)" '--hot-embedding-rows 0'
+expect_flags '27B NINFER_EMBEDDING_Q4=on' \
+  "$(record hot_q4 NINFER_EMBEDDING_Q4=on -- qwen38-27b)" '--embedding-q4' '--hot-embedding-rows 0'
+expect_flags '27B c8 NINFER_EMBEDDING_Q6=on' \
+  "$(record hot_q6 NINFER_EMBEDDING_Q6=on -- qwen38-27b c8)" '--embedding-q6' '--hot-embedding-rows 0'
+expect_flags '27B several NINFER_DEVICES' \
+  "$(record hot_devices NINFER_DEVICES=0,1 -- qwen38-27b)" '--hot-embedding-rows 0'
 banner_of() { # banner_of [NAME=value ...] -- <run.sh arguments>
   local assignments=()
   while [[ "$1" != '--' ]]; do assignments+=("$1"); shift; done
@@ -348,6 +374,9 @@ recorded="$(record none NINFER_SPEC=none -- qwen38-27b)"
 expect_flags '27B NINFER_SPEC=none' "$recorded" '--prefill-cublas --prefill-chunk 2048'
 refuse_flag '27B NINFER_SPEC=none' "$recorded" '--embedding-q4'
 refuse_flag '27B NINFER_SPEC=none' "$recorded" '--spec'
+# Without speculation the overlay Vision window borrows from the output head and the embedding alone,
+# so the none profile keeps the whole embedding in VRAM (with hot rows the window does not fit).
+refuse_flag '27B NINFER_SPEC=none' "$recorded" '--hot-embedding-rows'
 refuse_flag '27B NINFER_SPEC=none' "$recorded" '--lm-head-q6'
 
 # NINFER_ALLOWED_HOST: each comma- or space-separated name becomes one --allowed-host, in every
@@ -546,6 +575,8 @@ expect_exit 2 'profile the model lacks' clear_env "${serve_env[@]}" "$root/run.s
 expect_exit 2 'unknown profile' clear_env "${serve_env[@]}" "$root/run.sh" qwen38-27b fastest
 expect_exit 2 'unknown NINFER_SPEC' clear_env "${serve_env[@]}" NINFER_SPEC=bogus "$root/run.sh" qwen38-27b
 expect_exit 2 'unknown NINFER_NGRAM' clear_env "${serve_env[@]}" NINFER_NGRAM=yes "$root/run.sh" qwen38-27b
+expect_exit 2 'NINFER_HOT_EMBEDDING_ROWS with NINFER_EMBEDDING_Q4' clear_env "${serve_env[@]}" \
+  NINFER_HOT_EMBEDDING_ROWS=8192 NINFER_EMBEDDING_Q4=on "$root/run.sh" qwen38-27b
 expect_exit 2 'NINFER_NGRAM=on without DFlash2' clear_env "${serve_env[@]}" NINFER_SPEC=mtp NINFER_NGRAM=on \
   "$root/run.sh" qwen38-27b
 expect_exit 2 'NINFER_NGRAM=on on the 35B' clear_env "${serve_env[@]}" NINFER_NGRAM=on "$root/run.sh" qwen36-35b-a3b

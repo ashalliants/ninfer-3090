@@ -219,6 +219,15 @@ and is refused at 196,608, so `run.bat` now defaults to 188,416. `run.bat` no lo
 `--embedding-q4` or `--lm-head-q6`, which this artifact does not need; the upstream file therefore
 no longer fits the default profiles.
 
+Since 2026-11-26 the launcher profiles (all but `none`) keep only the token embedding's first 8,192
+rows in VRAM and read the rest from pinned RAM (`--hot-embedding-rows 8192`): the same output bit for
+bit, no measured speed change, 622 MiB more for the KV cache. That day, on a desktop holding about
+1.5 GiB, the DFlash2 profile started at 188,416 with 1.48-1.61 GiB free with them and fitted to
+182,272 without them; the MTP profile's two lanes at 262,144 started with 1.90 GiB free (1.17 GiB
+without). With `NINFER_SPEC=mtp` and three or more lanes, each request is capped at 131,072 tokens
+and the shared pool is sized to the card: 328,256 tokens at four lanes, enough for four 75-84K-token
+agent sessions at once (+9% aggregate decode against the earlier one-context pool).
+
 **Smoke tests.** These all completed coherently:
 
 - both `run.bat` profiles served a chat request;

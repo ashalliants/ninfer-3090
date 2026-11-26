@@ -7,5 +7,6 @@
   "prefill-cublas": true,
   "prefill-chunk": 4096,
   "max-pending-requests": 16,
-  "pending-timeout-ms": 600000
+  "pending-timeout-ms": 600000,
+  "hot-embedding-rows": 8192
 }

@@ -8,5 +8,6 @@
   "kv-dtype": "int8",
   "spec": "mtp",
   "draft-tokens": 3,
-  "lm-head-draft": true
+  "lm-head-draft": true,
+  "hot-embedding-rows": 8192
 }

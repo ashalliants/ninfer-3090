@@ -75,6 +75,16 @@
 # that falls short (IF THE CARD IS BUSY). The mtp set starts at 262,144 with two lanes even beside a
 # desktop.
 # `none` is the mtp set without speculation.
+#
+# Every 27B profile but `none` keeps only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in
+# the profile file): the rest of the table is read from pinned RAM, with the same output bit for bit
+# and no measured speed change, and the 622 MiB freed goes to the KV cache. NINFER_HOT_EMBEDDING_ROWS=0
+# keeps the whole table in VRAM; NINFER_EMBEDDING_Q4/Q6 turn it off (the server refuses the pair).
+#
+# SHARED POOL. NINFER_SPEC=mtp with NINFER_CONCURRENCY=3 or more caps each request at 131,072 tokens
+# and sizes the lanes' shared KV pool to the card (--kv-capacity auto --device-state-slots 0), so
+# several long agent sessions run at once instead of queueing behind a pool of one context. One and
+# two lanes keep the pool of one context.
 # The qwen3_8_27b.ninfer that download-model.sh fetches is the DFlash2 bundle and carries the MTP
 # weights too, so one file serves both.
 #
@@ -290,9 +300,24 @@ case "$model_key/$profile" in
       none) spec_label='no speculation' ;;
     esac
     spec_args=()
-    CONTEXT="${NINFER_CONTEXT:-$default_context}"
     CONCURRENCY="${NINFER_CONCURRENCY:-$default_concurrency}"
-    KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
+    # SHARED POOL: MTP at three or more lanes serves several long sessions at once. A pool of one
+    # context (the default below) runs only as many of them as fit it, so here each request is
+    # capped at 131,072 tokens and the pool is sized to the card (--kv-capacity auto, with no device
+    # state slots beyond the active ones): four agent sessions of 75-84K tokens all ran at once
+    # (docs/performance.md, "Shared KV pool"). NINFER_CONTEXT sets the per-request cap,
+    # NINFER_KV_CAPACITY a fixed pool, NINFER_DEVICE_STATE_SLOTS the slots.
+    shared_pool=0
+    if [[ "$SPEC" == 'mtp' && "$CONCURRENCY" =~ ^[0-9]+$ ]] && (( CONCURRENCY >= 3 )); then
+      shared_pool=1
+      default_context=131072
+    fi
+    CONTEXT="${NINFER_CONTEXT:-$default_context}"
+    if (( shared_pool )); then
+      KV_CAPACITY="${NINFER_KV_CAPACITY:-auto}"
+    else
+      KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
+    fi
     KV_DTYPE="${NINFER_KV_DTYPE:-$(profile_value kv-dtype)}"
     PREFILL_CHUNK="${NINFER_PREFILL_CHUNK:-$(profile_value prefill-chunk)}"
     # N-gram copy drafting rides on DFlash2 and is on at one and two lanes: +42% decode at one lane on
@@ -316,8 +341,15 @@ case "$model_key/$profile" in
       --max-concurrency "$CONCURRENCY" --max-context "$CONTEXT" --kv-capacity "$KV_CAPACITY"
       ${spec_args[@]+"${spec_args[@]}"}
     )
+    if (( shared_pool )); then
+      profile_args+=(--device-state-slots 0)
+      spec_label="MTP$DRAFT_TOKENS + draft head"
+    fi
     tuned_overrides
     label="C$CONCURRENCY  |  context $CONTEXT  |  KV pool $KV_CAPACITY  |  $KV_DTYPE  |  $spec_label"
+    if (( shared_pool )) && [[ "$KV_CAPACITY" == 'auto' ]]; then
+      label="C$CONCURRENCY  |  context $CONTEXT per request  |  KV pool sized to the card  |  $KV_DTYPE  |  $spec_label"
+    fi
     prefill_note="Prefill: cuBLAS route, chunk $PREFILL_CHUNK"
     if [[ "$SPEC" == 'dflash2' ]]; then
       hint="Need a second lane?  NINFER_SPEC=mtp ${0##*/} $model_key  (slower decode)"
@@ -681,7 +713,10 @@ if [[ "$profile" == 'tuned' ]]; then
   # and say so. 32,768 tokens is the smallest context still worth serving; below it the server
   # stops and says how much memory is missing.
   FIT_FLOOR=32768
-  if [[ "${NINFER_FALLBACK:-on}" != 'off' && -z "${NINFER_CONTEXT:-}${NINFER_KV_CAPACITY:-}" ]]; then
+  # A pool sized to the card (SHARED POOL above) needs no fit: --kv-capacity auto already takes what
+  # is free, and the server refuses the two together.
+  if [[ "${NINFER_FALLBACK:-on}" != 'off' && -z "${NINFER_CONTEXT:-}${NINFER_KV_CAPACITY:-}" &&
+        "${KV_CAPACITY:-}" != 'auto' ]]; then
     profile_args+=(--fit-context "$FIT_FLOOR")
     label="${label/context $CONTEXT/context up to $CONTEXT}"
   fi
@@ -728,6 +763,19 @@ for flag in "${passthrough_switch_flags[@]}"; do
     *) printf '%s must be on or off, got %s\n' "$var" "${!var}" >&2; exit 2 ;;
   esac
 done
+# The 27B profiles keep only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in
+# the profile file; NINFER_HOT_EMBEDDING_ROWS=0 keeps the whole table there). The server refuses it
+# with a load-time embedding transcode or more than one device, so those turn it off unless the
+# caller asked for both, which is refused here.
+if [[ "${NINFER_EMBEDDING_Q4:-off}" == 'on' || "${NINFER_EMBEDDING_Q6:-off}" == 'on' ||
+      "${NINFER_DEVICES:-}" == *,* ]]; then
+  case "${NINFER_HOT_EMBEDDING_ROWS:-}" in
+    '') profile_args+=(--hot-embedding-rows 0) ;;
+    0) ;;
+    *) printf 'NINFER_HOT_EMBEDDING_ROWS cannot be combined with NINFER_EMBEDDING_Q4/Q6 or several NINFER_DEVICES; set it to 0\n' >&2
+       exit 2 ;;
+  esac
+fi
 
 if [[ -n "${NINFER_CHAT_TEMPLATE:-}" ]]; then
   profile_args+=(--chat-template "$NINFER_CHAT_TEMPLATE")
@@ -850,6 +898,9 @@ set +e
 status="${PIPESTATUS[0]}"
 set -e
 if (( status != 0 )) && grep -q 'not enough free GPU memory' "$server_log"; then
+  memory_advice
+elif (( status != 0 )) && grep -q 'minimum Engine runtime reservation requires' "$server_log"; then
+  # Automatic sizing (the shared pool) could not fit even one request's context beside the weights.
   memory_advice
 elif (( status != 0 )) && grep -q 'requested Engine runtime reservation requires' "$server_log"; then
   # A fixed context or KV pool was demanded and the card could not hold it beside the weights.

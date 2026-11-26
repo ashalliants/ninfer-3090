@@ -186,6 +186,80 @@ before), 100.3 thinking (97.1), 80.5 story (80.1) and 78.8 Chinese (78.6). **Fre
 
 ## RTX 3090 (`sm_86`) findings — this fork
 
+### Qwen3.8-27B: hot embedding rows and a shared KV pool for long agent sessions (2026-11-26)
+
+Two launcher changes, measured on the desktop RTX 3090 (Windows 11, the desktop holding 1.4-1.9 GiB)
+with `rk4v4` KV, vision in overlay residency and the 8 GiB Host context budget:
+
+- **`--hot-embedding-rows 8192`** in every 27B profile except `none` (below). The Q4 token embedding
+  (644 MiB) moves to pinned RAM and only its first 8,192 rows (21 MiB) stay in VRAM, so 622 MiB more
+  goes to the KV cache. The output is the same bit for bit (a greedy chat answer byte-identical with
+  and without it, MTP and DFlash2). `NINFER_HOT_EMBEDDING_ROWS=0` turns it off.
+- **Shared pool at three or more MTP lanes** (`NINFER_SPEC=mtp NINFER_CONCURRENCY=3` or more): each
+  request is capped at 131,072 tokens and the lanes' pool is sized to the card (`--kv-capacity auto
+  --device-state-slots 0`) instead of being one context.
+
+**Speed: neutral.** Same binary, flag off against on, interleaved, two runs each (WSL build):
+
+| Workload | off (tok/s) | on (tok/s) |
+|---|---|---|
+| DFlash2 launcher settings, 8 chat prompts, C1 | 129.38 / 129.77 | 129.84 / 129.89 |
+| DFlash2, 98,362-token prompt, 512 out | 91.68 / 91.54 | 91.77 / 91.68 |
+
+Acceptance was identical (39.37%, 3.757 tokens a round) and the long prompt's output identical.
+
+**Four concurrent agent sessions** (the target workload): 75-84K-token contexts, follow-ups ~95%
+prefix-cached with 2.5-5.8K new tokens, 1,700 tokens out each, MTP3, `rk4v4`, prefill chunk 2048,
+`--max-concurrency 4`, WSL build beside the Windows desktop:
+
+| Configuration | KV pool | running at once | worst wait for a first token | batch | aggregate |
+|---|---:|---|---|---:|---:|
+| launcher before (`--max-context 212992 --kv-capacity 212992 --fit-context 32768`) | 212,992 | 2 of 4 | 34-41 s (two waiting) | 68.9 s | 98.7 tok/s |
+| `--max-context 131072 --kv-capacity auto` | 279,488 | 3 of 4 | 47 s (one waiting) | 70.3 s | 96.8 tok/s |
+| same + `--device-state-slots 0` | 296,000 | 3 of 4 | | | |
+| same + `--hot-embedding-rows 8192` (the new launcher) | 328,512 | **4 of 4** | 13.7 s | **63.2 s** | **107.7 tok/s** (+9%) |
+
+The automatic pool started with 932 MiB free. An explicit `--kv-capacity 335,872` (200 MiB free at
+startup) or 344,064 made Windows page VRAM to system RAM and decode collapsed to 1-5 tok/s aggregate,
+so the launcher keeps the automatic sizing's margin rather than a larger fixed pool.
+
+**Startup contexts with the new profiles** (Windows build of this branch, `ninfer-serve` started
+with each profile's exact flags; each line is one start):
+
+| Profile | hot rows off | hot rows on |
+|---|---|---|
+| `mtp`, two lanes, 262,144 | starts, 1.17 GiB free | starts, 1.90 GiB free |
+| `mtp`, three lanes, shared pool | | pool 337,728 tokens, 718 MiB free |
+| `mtp`, four lanes, shared pool | | pool 328,256 tokens, 592 MiB free (WSL build: 326,528, 800 MiB) |
+| `dflash2` as the launcher starts it (188,416, `--fit-context 32768`) | fitted to 182,272, 1.10 GiB free | starts at 188,416, 1.61 GiB free |
+| `dflash2`, one lane, explicit 188,416 | refused (5.30 GB available, 5.62 needed) | starts, 1.48 GiB free |
+| `dflash2`, explicit 196,608 | refused | refused once (5.45 GB available, 5.76 needed), started once (1.48 GiB free) |
+| `dflash2`, explicit 204,800 | | started once, 1.24 GiB free |
+| `dflash2`, explicit 212,992 to 237,568 | | refused |
+
+The DFlash2 edge moves with the desktop: the memory available at startup varied by about 250 MB
+between starts, which is why 196,608 and 204,800 each started once after a refusal. The launcher
+keeps its 188,416 ceiling: with the hot rows it started there every time (three starts, 1.48-1.61
+GiB free), while without them it was refused at 188,416 explicitly and fitted down to 182,272 (it
+started with 721 MiB free on 2026-10-02, before the desktop held as much). 196,608 is not yet a
+dependable default on this desktop.
+
+Two findings left open:
+
+- **`--fit-context` undersizes on this Windows desktop.** Asked for 262,144, the DFlash2 profile
+  fitted 99,328 tokens without the hot rows and 137,216 with them, and then reported 1.86 and 1.80 GiB
+  still free; under WSL on the same card it fitted 157,696 and 241,664 (1.35 GiB and 358 MiB free).
+  The free memory it measures before sizing is lower, and noisier, than what is free once the
+  server runs. Not caused by this change; not yet investigated.
+- **`none` keeps the whole embedding in VRAM.** Without speculation, the overlay Vision window
+  borrows from the output head and the embedding alone: with the hot rows that tail is 960 MiB, less
+  than the 1,056 MiB one encode window needs, and startup refuses. The `none` profile therefore
+  leaves the flag off; with `NINFER_VISION=off` it can be set by hand.
+
+The 27B output is unchanged by either change; one 64-token greedy request per start decoded at the
+same speed with and without the hot rows (DFlash2 199-201 tok/s, MTP 147-148 tok/s; single requests,
+not a speed measurement).
+
 ### Qwen3.8-27B against the best published RTX 3090 figures (2026-11-26)
 
 ![Qwen3.8-27B on one RTX 3090: ashalliants/ninfer-3090 against the best published figures](assets/rtx3090-qwen38-27b.svg)
