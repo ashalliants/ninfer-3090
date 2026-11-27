@@ -80,11 +80,20 @@ void check_key(const std::string& section, const std::string& key) {
     }
 }
 
+// Options whose value is itself a word like on or off (ninfer-serve parses it), so a preset's value is
+// passed as given rather than read as a boolean flag.
+bool takes_on_off_value(const std::string& key) {
+    return key == "mxfp8-experts" || key == "dspark-adaptive";
+}
+
 void append_option(std::vector<std::string>& arguments, const std::string& key,
                    const std::string& value) {
     const std::string flag = "--" + key;
     const std::string word = lower(value);
-    if (word == "true" || word == "on" || word == "yes") {
+    if (takes_on_off_value(key)) {
+        arguments.push_back(flag);
+        arguments.push_back(word);
+    } else if (word == "true" || word == "on" || word == "yes") {
         arguments.push_back(flag);
     } else if (word == "false" || word == "off" || word == "no") {
         // A false flag leaves the option out; an explicit negation is its own key (no-...).

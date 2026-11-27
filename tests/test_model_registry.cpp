@@ -696,6 +696,16 @@ model-suspend = false
     const std::vector<std::string> big_arguments{"--max-context", "8192", "--kv-capacity",
                                                  "16384"};
     expect(big.arguments == big_arguments, "a model's false boolean undoes the global true");
+    {
+        const auto valued = build_catalog(
+            std::nullopt,
+            parse_preset_file("[*]\nmxfp8-experts = on\ndspark-adaptive = off\n[a]\nmodel=/x.ninfer\n"
+                              "mxfp8-experts = Off\n"),
+            {});
+        const std::vector<std::string> valued_arguments{"--dspark-adaptive", "off", "--mxfp8-experts", "off"};
+        expect(valued.size() == 1 && valued[0].arguments == valued_arguments,
+               "on/off values of value-taking options are passed through, not read as booleans");
+    }
     bool router_key = false;
     try {
         (void)build_catalog(std::nullopt,

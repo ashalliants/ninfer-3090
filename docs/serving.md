@@ -1090,6 +1090,7 @@ max-context = 65536
 kv-dtype = rk8v4
 ; a boolean key is a flag; a model's section can drop it with false. A flag that is on by
 ; default (prefill-a8, cuda-graph, prefix-reuse) is turned off with its no- key, e.g. no-cuda-graph = true
+; an option whose value is a word like on or off is passed as written: mxfp8-experts = on, dspark-adaptive = off
 model-suspend = true
 
 [coder]
