@@ -3161,7 +3161,7 @@ struct OneShotStream {
 
     // One request: reuse the shared prefix, then try to keep the end of the prompt. Returns
     // whether the state was kept.
-    bool request(std::uint32_t item_tokens) {
+    bool request(std::uint32_t item_tokens, std::size_t bytes = kImage) {
         auto& p              = f.program;
         const auto base      = base_for(item_tokens);
         const auto frontier  = static_cast<std::uint32_t>(base.tokens.size());
@@ -3169,13 +3169,13 @@ struct OneShotStream {
         const auto admission = f.cache.capture_admission(p, owner, base, frontier);
         auto cursor          = f.cache.begin_reclaim(p, admission);
         const auto victims =
-            f.cache.host_victims(p, kImage, std::nullopt, {}, {}, admission, &cursor);
+            f.cache.host_victims(p, bytes, std::nullopt, {}, {}, admission, &cursor);
         if (!victims) {
             f.cache.abandon(p, owner);
             return false;
         }
         f.cache.commit_host_victims(p, *victims, cursor);
-        const auto handle = p.add(base.tokens, {p.host_block(kImage)}, Role::Continuation);
+        const auto handle = p.add(base.tokens, {p.host_block(bytes)}, Role::Continuation);
         f.cache.publish(p, owner, handle);
         f.cache.finish(p, owner, base, ++f.next_order);
         saved.push_back(handle);
@@ -3342,13 +3342,58 @@ void test_carried_point_keeps_its_age() {
     f.cache.finish(f.program, owner, base, ++f.next_order);
     for (int i = 0; i < 50; ++i) { (void)stream.capture_once(230); }
     const auto before = f.cache.unproven_age(point);
-    require(before && *before >= 50, "a cached one-off did not age with unproven writes");
+    require(before && *before > 0, "a cached one-off did not age with unproven writes");
     auto longer = base;
     longer.tokens.push_back(7);
     const auto resumed = f.begin(longer, point, {&point, 1});
     const auto after   = f.cache.unproven_age(point);
     require(after && *after == *before, "carrying a point into a new owner reset its age");
     f.cache.abandon(f.program, resumed);
+}
+
+// The ageing clock counts turnovers of the unproven pool as it was at each write: two writes
+// into a pool of two are one turnover, eight into a pool of eight another. Dividing lifetime
+// writes by today's pool size would misread both a growing and a shrinking pool.
+void test_unproven_age_follows_the_pool_size() {
+    OneShotStream stream(16);
+    using Cache       = decltype(stream.f.cache);
+    const auto unit   = static_cast<double>(Cache::kTurnoverUnit);
+    require(stream.request(200) && stream.request(200), "one-offs were refused with free room");
+    const auto first = stream.saved.front();
+    for (int i = 0; i < 4; ++i) { (void)stream.capture_once(200); } // 4 writes, pool 2
+    for (int i = 0; i < 6; ++i) {                                     // pool 2 -> 8
+        require(stream.request(200), "a one-off was refused with free room");
+    }
+    for (int i = 0; i < 8; ++i) { (void)stream.capture_once(200); } // 8 writes, pool 8
+    // The second save was one write at pool 1; the six saves were writes at pools 2..7.
+    const double expected = 2.0 + (1.0 / 2 + 1.0 / 3 + 1.0 / 4 + 1.0 / 5 + 1.0 / 6 + 1.0 / 7) +
+                            1.0 + 1.0;
+    const auto age = stream.f.cache.unproven_age(first);
+    require(age.has_value(), "the first one-off left the cache");
+    const double turnovers = static_cast<double>(*age) / unit;
+    std::cout << "unproven age across pool growth: " << turnovers << " turnovers (expected "
+              << expected << ")\n";
+    require(turnovers > expected - 0.01 && turnovers < expected + 0.01,
+            "the ageing clock did not follow the pool size at each write");
+}
+
+// When only proven history frees enough on its own, the one-action rule has no answer, and
+// the combination search must still decide: two short stale one-offs can make room together
+// for a long write that outweighs both.
+void test_unproven_write_falls_back_when_only_proven_history_suffices() {
+    using S = OneShotStream;
+    S stream(2, 2 * S::kImage);
+    auto& f            = stream.f;
+    const auto proven  = f.program.add(tokens(8, 700'000), {f.program.host_block(2 * S::kImage)});
+    f.publish(proven);
+    f.use_shared(proven);
+    require(stream.request(20) && stream.request(20), "short one-offs were refused with room");
+    const auto small = stream.saved;
+    require(stream.request(400, 2 * S::kImage),
+            "a long write was refused although two short one-offs could make room together");
+    require(stream.cached(proven), "the long write took proven history");
+    require(!stream.cached(small[0]) && !stream.cached(small[1]),
+            "the long write did not take the two short one-offs");
 }
 
 int main() {
@@ -3366,6 +3411,8 @@ int main() {
         test_unproven_write_rate_is_bounded();
         test_unproven_ageing_ignores_proven_history();
         test_carried_point_keeps_its_age();
+        test_unproven_age_follows_the_pool_size();
+        test_unproven_write_falls_back_when_only_proven_history_suffices();
         test_reclaim_pricing_cap_stops_a_long_search_once_an_action_is_found();
         test_reclaim_pricing_cap_bounds_the_first_search();
         test_reclaim_pricing_cap_never_costs_progress();
