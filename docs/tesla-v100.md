@@ -44,6 +44,7 @@ rows marked 200 W, re-measured 2026-11-23 (prefill 2026-11-24); the
 | **Decode**, `--max-concurrency 8` | **198.2 tok/s** aggregate (plain) |
 | **Prefill** (200 W) | **2,727 tok/s** at 8K (131,072 context, `--prefill-chunk 8192`); 2,227 at 34K, 1,577 at 100K. At the default chunk 2048: 2,170 at 8K, 1,962 at 1K, 1,339 at 100K. At 262,144 with DSpark and vision (chunk 2048): 2,125 at 8K, 1,930 at 1K, 1,324 at 100K |
 | **Low-bit KV** (`--kv-dtype rk4v4`, opt-in, lossy) | plain decode **41.1 tok/s at 200K** (FP16 34.8), 53.2 at 100K (47.8); frees 5,952 MiB at 262,144; KLD 2.8x the FP32 floor (`int8`: 1.06x, 40.7 tok/s) |
+| **`--speed fast`** (opt-in, lossy) | **163.5 tok/s** on structured output (133.1 exact), **109.3-110.3** over 12 chats (101.1-101.3 exact); 2026-11-27, 200 W ([spec](maintainer/inkling2-model.md#speed-fast)) |
 | **Load** | 9.2-14.2 s |
 
 ## Comparison charts

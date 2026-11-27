@@ -82,6 +82,9 @@ Inkling-2-Mini runs on the RTX 3090 as well, on Windows and Linux, with 137,216 
 >   official NVFP4 experts), reports 69 tok/s writing without a drafter (its DSpark kernels need sm_120a) and 850
 >   tok/s reading a short prompt. Those figures are theirs, from a different machine and prompts, so read the
 >   ratios as indicative.
+> - **Opt in to more speed.** `--speed fast` trades a little accuracy for speed (structured output 163.5 tok/s
+>   against 133.1 exact, 12 chats +8.5% on a V100); the default stays exact. See the
+>   [spec](docs/maintainer/inkling2-model.md#speed-fast).
 
 ### Performance by model and card
 

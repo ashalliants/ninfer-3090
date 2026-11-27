@@ -158,6 +158,35 @@ int main() {
             } catch (const std::invalid_argument&) { refused = true; }
             check(refused, "DSpark with " + std::to_string(bad) + " drafts is refused");
         }
+        {
+            // --speed fast's settings need the drafter: refused on a plain Engine.
+            for (const bool keep : {true, false}) {
+                auto plain_fast        = options;
+                plain_fast.speculative = ninfer::SpeculativeOptions{};
+                if (keep) { plain_fast.speculative.dspark_greedy_keep = 0.1F; } else { plain_fast.speculative.dspark_lookup_match = 3; }
+                bool refused = false;
+                try {
+                    ninfer::Engine refused_engine(plain_fast);
+                } catch (const std::invalid_argument&) { refused = true; }
+                check(refused, keep ? "a greedy keep fraction without DSpark is refused" : "prompt lookup without DSpark is refused");
+            }
+            // Prompt lookup alone (as --speed fast runs it: up to 7 drafts) only changes which rounds run: greedy output is
+            // plain greedy's.
+            auto lookup                            = options;
+            lookup.speculative.draft_tokens        = 7;
+            lookup.speculative.dspark_lookup_match = 3;
+            lookup.speculative.dspark_adaptive     = true; // as --speed fast runs: rounds draft 1 .. 7, so a copy can be longer
+            lookup.speculative.draft_min_p         = 0.5F;
+            ninfer::Engine lookup_engine(lookup);
+            std::printf("dspark, 7 drafts per round, prompt lookup on 3 tokens:\n");
+            const Run with_lookup = run_all(lookup_engine, tokens);
+            for (std::size_t i = 0; i < kPrompts.size(); ++i) {
+                check(with_lookup.tokens[i] == plain.tokens[i], "prompt " + std::to_string(i) + ": prompt lookup changed greedy output");
+            }
+            const std::uint64_t lookup_rounds = lookup_engine.runtime_stats().speculative_ngram_rounds;
+            std::printf("  lookup rounds %llu\n", static_cast<unsigned long long>(lookup_rounds));
+            check(lookup_rounds > 0, "no round verified a prompt lookup copy");
+        }
         ninfer::Engine engine(options);
         std::printf("dspark, %u drafts per round:\n", drafts);
         const Run spec = run_all(engine, tokens);

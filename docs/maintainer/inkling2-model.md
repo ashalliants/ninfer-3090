@@ -785,6 +785,51 @@ in the FP32 program (`ninfer_inkling2_adapters_test` with `NINFER_INKLING2_KLD_T
 | Output tok/s, plain (`--spec dspark`), 2026-11-21 | 71.7 (77.1) | 68.9 (68.1) | 68.9 (67.8) |
 | Output tok/s, plain (`--spec dspark`), master `dad1623b` | 78.83 / 78.78 (94.13 / 94.35) | 75.43 / 75.39 (91.65 / 90.84) | 75.15 / 75.15 (92.71 / 91.56) |
 
+## Speed fast
+
+**Lossy, opt-in.** `--speed exact|fast` (exact by default). `fast` trades a little accuracy for speed and sets what the
+command line left unset (`ServeOptions::speed_fast`, applied in `parse_serve_options`):
+
+- DSpark drafting (`--spec dspark`) with up to 7 drafts a round (`kSpeedFastDraftTokens`), still with the adaptive
+  width and the 0.5 draft floor ("Draft floor and adaptive width").
+- **Greedy keep** (`SpeculativeOptions::dspark_greedy_keep` = 0.1): in a greedy round, a draft the target gives at least
+  a tenth of its top token's probability is taken in place of the top token, so the round goes on. It reads the two
+  logits of that column (one 8-byte copy). Never into or out of a stop token, and never for sampled or constrained
+  requests (those read the full logits on the host and stay exact). Kept drafts count as `relaxed_kept`.
+- **Prompt lookup** (`dspark_lookup_match` = 3): when a round's drafts are the start of what followed the latest earlier
+  occurrence of the sequence's last 3 tokens (prompt or output), the round verifies the rest of that copy too, up to 7
+  drafts. The verifier decides every token, so this part is lossless (`ninfer_inkling2_engine_dspark_test` checks its
+  greedy output equals plain). Such rounds count as `ngram_rounds` and stay out of the drafter's width and cost
+  statistics.
+- The 8-bit dense head (`--dense-q8 head`, "Dense 8-bit re-encoding": KLD mean 8.8e-6, argmax agrees at 99.77%).
+
+An explicit `--draft-tokens` or `--dense-q8` keeps its value. `--speed fast` with another `--spec` backend, or on a model
+without DSpark, is refused.
+
+**Output.** Greedy text differs from the default's on some requests (on the 12 chats below, all 4 whose 300
+tokens reached the answer worded it differently; the arithmetic answer held). Because the greedy keep acts on the drafts, and the adaptive width picks drafts from
+measured round times, the same request can give slightly different text from one run to the next. The default and
+`--speed exact` are unchanged.
+
+Measured on the V100 (2026-11-27, 200 W limit, branch `perf/inkling-speed-fast` at `42b5ec8e7`, `--max-context 8192
+--mxfp8-experts on`, against `--spec dspark` at its defaults on the same build, two ABAB legs). The 12 chats are the
+greedy 300-token set ("Draft floor and adaptive width"); conv, prose and struct are Lapilli's `basalt-bench` prompts
+(conv and prose sampled at temperature 0.6, struct greedy, 1,200 / 1,200 / 8,069 tokens). Quality: 40 generated maths
+word problems with known answers and 10 JSON-only prompts, greedy, thinking off.
+
+| | exact (`--spec dspark`) | `--speed fast` | |
+|---|---:|---:|---:|
+| 12 chats, mean tok/s | 101.1-101.3 | **109.3-110.3** | +8.5% |
+| struct (greedy) | 133.1 | **163.5** | +23% |
+| prose (sampled) | 71.7-74.5 | 76.0-76.2 | +2-6% |
+| conv (sampled) | 83.5-87.1 | 84.3-85.5 | about the same |
+| maths answers correct | 40/40 | 40/40 | |
+| JSON outputs that parse | 9/10 | 10/10 | |
+
+Sampled requests gain only from the 7-draft width, the lookup and the 8-bit head: the greedy keep never applies to
+them. A sampled form of the keep (taking a missed draft with probability p/q) kept 97 of 771 misses and gained
+nothing, so it is not included.
+
 ## Dense 8-bit re-encoding
 
 **Lossy.** `--dense-q8 head|all` (`EngineOptions::dense_q8`, `ProgramLimits::dense`; opt-in, off by default: the
