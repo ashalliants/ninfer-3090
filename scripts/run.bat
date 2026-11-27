@@ -392,36 +392,44 @@ if /i "%SPEC%"=="dflash2" set "HINT=Need the full 262K context or a second lane?
 goto :profile_tuned_common
 
 :profile_27b_qad_tuned
-rem NVIDIA's quantization-aware-distilled NVFP4/FP8 weights: closer to BF16, slower to decode. No
-rem DFlash2 bundle, so MTP is the only speculation, and overlay vision borrows its window from the MTP
-rem weights. Measured on the Tesla V100 only; not yet on the RTX 3090.
+rem NVIDIA's quantization-aware-distilled NVFP4/FP8 weights: closer to BF16, slower to decode. MTP3 is
+rem the default; since revision 2026-11-27 the artifact also carries the Q4/Q5 build's DFlash2 drafter
+rem (NINFER_SPEC=dflash2: faster on code and JSON, slower on prose). Overlay vision borrows its window
+rem from the speculative weights. Measured on the Tesla V100 only; not yet on the RTX 3090.
 set "SPEC=mtp"
 if not "%NINFER_SPEC%"=="" set "SPEC=%NINFER_SPEC%"
-if /i not "%SPEC%"=="mtp" (
-  echo NINFER_SPEC must be mtp for qwen38-27b-qad, got %SPEC% 1>&2
-  exit /b 2
-)
-rem As run.sh: off (or unset) is the only value; on needs DFlash2, anything else is a typo.
-if /i "%NINFER_NGRAM%"=="on" (
-  echo NINFER_NGRAM=on needs NINFER_SPEC=dflash2, which only qwen38-27b has 1>&2
-  exit /b 2
-)
-if not "%NINFER_NGRAM%"=="" if /i not "%NINFER_NGRAM%"=="off" (
-  echo NINFER_NGRAM must be on or off, got %NINFER_NGRAM% 1>&2
+if /i not "%SPEC%"=="mtp" if /i not "%SPEC%"=="dflash2" (
+  echo NINFER_SPEC must be mtp or dflash2 for qwen38-27b-qad, got %SPEC% 1>&2
   exit /b 2
 )
 set "CONTEXT=262144"
 set "CONCURRENCY=2"
-set "PROFILE_FILE=%PROFILES_DIR%\qwen38-27b-qad-tuned-mtp.json"
+set "PROFILE_FILE=%PROFILES_DIR%\qwen38-27b-qad-tuned-%SPEC%.json"
 call :read_profile || exit /b 1
 if not "%NINFER_DRAFT_TOKENS%"=="" set "DRAFT_TOKENS=%NINFER_DRAFT_TOKENS%"
 if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
 if not "%NINFER_CONCURRENCY%"=="" set "CONCURRENCY=%NINFER_CONCURRENCY%"
 if not "%NINFER_KV_DTYPE%"=="" set "KV_DTYPE=%NINFER_KV_DTYPE%"
 if not "%NINFER_PREFILL_CHUNK%"=="" set "PREFILL_CHUNK=%NINFER_PREFILL_CHUNK%"
+rem As run.sh: n-gram copies ride on DFlash2, on at one and two lanes.
+set "NGRAM=off"
+if /i "%SPEC%"=="dflash2" if "%CONCURRENCY%"=="1" set "NGRAM=on"
+if /i "%SPEC%"=="dflash2" if "%CONCURRENCY%"=="2" set "NGRAM=on"
+if not "%NINFER_NGRAM%"=="" set "NGRAM=%NINFER_NGRAM%"
+if /i not "%NGRAM%"=="on" if /i not "%NGRAM%"=="off" (
+  echo NINFER_NGRAM must be on or off, got %NGRAM% 1>&2
+  exit /b 2
+)
+if /i "%NGRAM%"=="on" if /i not "%SPEC%"=="dflash2" (
+  echo NINFER_NGRAM=on needs NINFER_SPEC=dflash2 1>&2
+  exit /b 2
+)
 set "SPEC_ARGS="
+if /i "%NGRAM%"=="on" set "SPEC_ARGS= --ngram-draft-tokens 15"
 call :tuned_overrides
-set "SPEC_LABEL=MTP%DRAFT_TOKENS% + draft head, full context"
+if /i "%SPEC%"=="mtp" set "SPEC_LABEL=MTP%DRAFT_TOKENS% + draft head, full context"
+if /i "%SPEC%"=="dflash2" set "SPEC_LABEL=DFlash2 K=%DRAFT_TOKENS% + draft head"
+if /i "%NGRAM%"=="on" set "SPEC_LABEL=%SPEC_LABEL% + n-gram copies"
 set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %CONTEXT%%OVERRIDE_ARGS%%SPEC_ARGS%"
 set "LABEL=C%CONCURRENCY%  ^|  %CONTEXT_WORD% %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
 set "PREFILL_NOTE=Prefill: cuBLAS route, chunk %PREFILL_CHUNK%"

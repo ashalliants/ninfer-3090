@@ -20,10 +20,11 @@ rem                    vision, MTP and DFlash2 weights, so one file serves --vis
 rem                    --spec dflash2. Executables older than the 5120x17408 Q4 linear_add route refuse
 rem                    it at startup. Figures published before 2026-10 were measured against the
 rem                    upstream neroued pin 1cbd84e7 (v2 18dfc887), 19.0 GiB.
-rem   qwen38-27b-qad   Qwen3.8-27B from NVIDIA's NVFP4 QAD checkpoint, 16.9 GiB
+rem   qwen38-27b-qad   Qwen3.8-27B from NVIDIA's NVFP4 QAD checkpoint, 19.0 GiB
 rem                    (WarlaxZ/Qwen3.8-27B-NVFP4-QAD-NInfer-V100): the same model, quantization-aware
 rem                    distilled so its weights track BF16 more closely, but slower to decode. Vision and
-rem                    MTP, no DFlash2. Measured on the Tesla V100; not yet on the RTX 3090.
+rem                    MTP, and (revision 2026-11-27) the Q4/Q5 build's DFlash2 drafter. Measured on the
+rem                    Tesla V100; not yet on the RTX 3090.
 rem   qwen36-27b       Qwen3.6-27B groupwise-int, 16.3 GiB, target_key qwen3_6_27b. A different model
 rem                    family from qwen3_8_27b, which is why having the latter does not satisfy the
 rem                    former: four real-model tests -- ninfer_qwen3_6_27b_prefix_real_test,
@@ -141,10 +142,10 @@ goto :model_selected
 set "ARTIFACT=qwen3_8_27b_nvfp4_qad.ninfer"
 set "OWNER=WarlaxZ"
 set "REPO=Qwen3.8-27B-NVFP4-QAD-NInfer-V100"
-set "REVISION=2cd93ef54b0a68b33f5d1a10abad68fef2cbbd2f"
-set "EXPECTED_SIZE=18159548164"
-set "EXPECTED_SHA256=c79ff2d1f9b3c0f729327d073bfd0b9dbf085c5c300a53d51f260a0fd634de0d"
-set "LABEL=the Qwen3.8-27B NVIDIA NVFP4 QAD model (16.9 GiB)"
+set "REVISION=ca21fddeb4077f717f23505144005901f7339a5f"
+set "EXPECTED_SIZE=20386365952"
+set "EXPECTED_SHA256=7c62491a31ce950f8ad2053861f03843dd1c75064028ab2e072607b6a8dadcb1"
+set "LABEL=the Qwen3.8-27B NVIDIA NVFP4 QAD model (19.0 GiB)"
 set "TESTS_VARIABLE="
 goto :model_selected
 

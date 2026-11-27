@@ -31,7 +31,8 @@
 #     KV is the cache validated on the card;
 #   - Qwen3.8-27B, NVIDIA's NVFP4 QAD (qwen38-27b-qad): run.sh's MTP3 profile with INT8 KV, as for the
 #     27B above. Served with the router's flags it decodes code at 90 tok/s and prose at 59 (the Q4/Q5
-#     27B: 110 / 77), for perplexity closer to full precision (docs/tesla-v100.md);
+#     27B: 110 / 77), for perplexity closer to full precision (docs/tesla-v100.md). NINFER_SPEC=dflash2
+#     (artifact revision 2026-11-27) runs the borrowed DFlash2 drafter: code 116, prose 47-64;
 #   - Qwen3.6-35B-A3B: run.sh's `tuned` profile (profiles/qwen36-35b-a3b-tuned-mtp.json: rk4v4 KV,
 #     MTP3 with the draft head and Q4 MTP experts, FP16 GDN state, cuBLAS prefill at chunk 4096) at
 #     two lanes instead of three (NINFER_CONCURRENCY overrides), with the Vision tower resident in
