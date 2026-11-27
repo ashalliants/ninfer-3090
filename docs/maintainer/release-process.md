@@ -55,7 +55,9 @@ so it is a third build, from the same commit as the other two:
   default; the packagers refuse a tree configured with it on) and, for the V100, without PTX (`NINFER_CUDA_PTX`,
   `AUTO` by default, which is off for `70`; a V100 never runs the PTX, and `package-release.sh` refuses a V100 tree
   that embeds it). Together
-  they took the V100 `ninfer-serve` from 1,473 MB to 448 MB (841 MB with `-lineinfo` dropped alone). The next lever:
+  they took the V100 `ninfer-serve` from 1,473 MB to 448 MB (841 MB with `-lineinfo` dropped alone) when measured
+  on the PR branch; the v0.21.0 release tree measured 524 MB (524,116,824 bytes), so quote the figure from the
+  tree you ship. v0.21.0's V100 tarball was 343 MB (v0.20.0: 1,498 MB). The next lever:
   `ninfer_bench` could join the same binary.
 - `package-release.sh`'s arch check once failed a good tree because `grep -q` closed the pipe early under `pipefail`;
   it now captures `cuobjdump` output first.
@@ -339,3 +341,39 @@ said nothing had run on a GPU after #394 had run it), trust the PR body's dated 
 - Windows: all three executables start with only Windows on `PATH`.
 - Linux: a fresh unpack runs `./ninfer-serve --help` and `./run.sh --help`.
 - The default launcher profile starts and serves a chat completion on the real 3090.
+
+## Traps hit in v0.21.0 (all cost a retry)
+
+v0.21.0 was built entirely on the 3090 PC: Windows in `build-ninja`, Linux sm_86 and V100 sm_70 under WSL
+(which has CUDA 12.8 and ccache). No Vast box and no second machine were needed. Cold timings: Windows about
+25 minutes, WSL sm_86 about 9, WSL sm_70 about 13 (a 29% ccache hit rate, because the `-lineinfo` / PTX flags
+had changed the objects); packaging a few minutes each.
+
+- **A `run_in_background` command that ends in `&` completes at once and orphans the job.** The first WSL
+  build never started: the log redirect went through a `$(... | sed ...)` that produced a bad path, and the
+  `&` made the task "complete" with exit 0. Redirect to a literal absolute path inside the command and let the
+  harness background it. After starting, confirm the log exists and is growing before moving on.
+- **Run `package-release.ps1` with `pwsh`, not `powershell.exe`.** Under Windows PowerShell 5.1 started from a
+  session whose `PSModulePath` is pwsh's, the packager died after the compile with `Get-FileHash is not
+  recognized` (at the inner-checksum step), having already deleted nothing but wasted a repackage. `pwsh -File`
+  works. `powershell.exe` is still the right way to reach the Windows side from WSL scripts; it is only the
+  packager that needs `pwsh`.
+- **Put no exact archive byte sizes in the release notes.** The archives embed the notes, so every notes edit
+  changes every archive's size and hash. v0.21.0 was packaged three times because the first draft quoted
+  exact sizes taken from the previous package. Use rounded sizes ("about 343 MB") in the notes; put the exact
+  figures in the PR/release description and the `SHA256SUMS` files. Fill in Verification text and sizes, commit
+  once, then package once.
+- **Quote binary sizes from the tree you ship.** The doc and skill said the V100 `ninfer-serve` was 448 MB;
+  the release tree measured 524 MB (the 448 figure was the PR branch). Check `ls -l` on the unpacked archive
+  before writing a size into the notes.
+- **The Linux copy-back line copies directories.** `cp dist/*linux* dist/*v100*` also matches the unpacked
+  product folders and prints `cp: -r not specified`. Harmless, but copy `*.tar.gz` and `SHA256SUMS-*` only.
+- **Hold the Windows GPU lock around the WSL smoke test too.** The lock is a Windows file handle, so run
+  `wsl.exe -e bash <script>` inside `Invoke-WithGpuLock { ... }` in one `pwsh -File`. Give the WSL launcher
+  `NINFER_MODEL_DIR=/mnt/c/ninfer-fork/ninfer-3090/models`; the 15.6 GiB load from `/mnt/c` took about 170 s, so
+  poll up to 10 minutes. Start `run.sh` under `setsid`, stop its process group, and then kill any
+  `ninfer-serve` whose `/proc/<pid>/cwd` is the unpacked folder (never `pkill` by name).
+- **Merge before the PR's checks finish is allowed** (none are required, and the release PR changes no code), but
+  look at `gh pr checks <n>` afterwards and say in the report if any failed.
+- **Skill fixes belong in the same PR as the doc.** When the doc and `.claude/skills/release/SKILL.md` disagree,
+  fix both; v0.21.0 found stale V100 size figures in each.
