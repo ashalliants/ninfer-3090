@@ -400,7 +400,17 @@ struct AttentionArgs {
     std::int64_t slot_stride;
     // Lowbit rings (rk4v4 coding): bytes per position of each, and the KV heads (where the scales start).
     int k_row, v_row, kv_heads;
+    // Lowbit, beside the group kernel: the single-block kernel takes only the columns that do not split (the group
+    // kernel the rest), so every column has the bits of its one-column call.
+    bool short_only;
 };
+
+// Whether column `pos` splits its keys: exactly when its one-column call would (it sees more than kSplitMinKeys).
+__device__ __forceinline__ bool column_splits(const AttentionArgs& a, std::int64_t pos) {
+    std::int64_t seen = pos + 1 < a.capacity ? pos + 1 : a.capacity;
+    if (a.window > 0 && a.window < seen) { seen = a.window; }
+    return seen > kSplitMinKeys;
+}
 
 // Column t's position (Columns: batched decode, from the ColumnSequences table).
 template <bool Columns>
@@ -497,8 +507,9 @@ __global__ void __launch_bounds__(kThreads, 2) attention_kernel(AttentionArgs a)
     __syncthreads();
     const std::int64_t pos = column_position<Columns>(a, t);
     const std::int64_t lo  = a.window > 0 ? (pos - a.window + 1 > 0 ? pos - a.window + 1 : 0) : 0;
-    // Batched decode: the column's own rings, and it splits only where its one-column call would (more than
-    // kSplitMinKeys visible keys); otherwise block z = 0 runs the single block's loop and store.
+    // Batched decode: the column's own rings. Every column (batched or not) splits only where its one-column call
+    // would (more than kSplitMinKeys visible keys); otherwise block z = 0 runs the single block's loop and store, so a
+    // verification's column has the bits of the plain step at its position.
     const void* k_ring = a.k;
     const void* v_ring = a.v;
     bool split = Split;
@@ -506,11 +517,7 @@ __global__ void __launch_bounds__(kThreads, 2) attention_kernel(AttentionArgs a)
         k_ring = static_cast<const char*>(a.k) + a.col_slot[t] * a.slot_stride;
         v_ring = static_cast<const char*>(a.v) + a.col_slot[t] * a.slot_stride;
     }
-    if (Split && Columns) {
-        std::int64_t seen = pos + 1 < a.capacity ? pos + 1 : a.capacity;
-        if (a.window > 0 && a.window < seen) { seen = a.window; }
-        split = seen > kSplitMinKeys;
-    }
+    if (Split) { split = column_splits(a, pos); }
     const float inv_sqrt_d = rsqrtf(static_cast<float>(kHeadDim));
     const int z = Split ? static_cast<int>(blockIdx.z) : 0;
     if (Split && !split && z > 0) { return; }
@@ -719,11 +726,15 @@ __global__ void __launch_bounds__(kThreads, 2) attention_lowbit_kernel(Attention
     const std::int64_t pos = column_position<false>(a, t);
     const std::int64_t lo  = a.window > 0 ? (pos - a.window + 1 > 0 ? pos - a.window + 1 : 0) : 0;
     const float inv_sqrt_d = rsqrtf(static_cast<float>(kHeadDim));
+    // A column splits only where its one-column call would; beside the group kernel this one takes only the others.
+    const bool split = Split && column_splits(a, pos);
+    if (!Split && a.short_only && column_splits(a, pos)) { return; }
     const int z = Split ? static_cast<int>(blockIdx.z) : 0;
+    if (Split && !split && z > 0) { return; }
     const std::int64_t first = lo + static_cast<std::int64_t>(z) * kSplitKeys;
-    const std::int64_t last  = Split ? (first + kSplitKeys - 1 < pos ? first + kSplitKeys - 1 : pos) : pos;
-    float* part_out = Split ? a.split + ((static_cast<std::int64_t>(t) * a.heads + h) * gridDim.z + z) * (kHeadDim + 2) : nullptr;
-    if (Split && first > pos) { return; }
+    const std::int64_t last  = split ? (first + kSplitKeys - 1 < pos ? first + kSplitKeys - 1 : pos) : pos;
+    float* part_out = split ? a.split + ((static_cast<std::int64_t>(t) * a.heads + h) * gridDim.z + z) * (kHeadDim + 2) : nullptr;
+    if (split && first > pos) { return; }
     float m     = z == 0 ? a.sink[t * a.ss + h] : -INFINITY;
     float denom = z == 0 ? 1.0F : 0.0F;
     float acc   = 0.0F;
@@ -852,7 +863,7 @@ __global__ void __launch_bounds__(kThreads, 2) attention_lowbit_kernel(Attention
         m = top;
         __syncthreads();
     }
-    if constexpr (Split) {
+    if (split) {
         if (threadIdx.x < kHeadDim) { part_out[2 + threadIdx.x] = acc; }
         if (threadIdx.x == 0) { part_out[0] = m, part_out[1] = denom; }
         finish_split<Out, false>(a, t, h, static_cast<int>((pos - lo) / kSplitKeys) + 1);
@@ -891,6 +902,7 @@ __global__ void __launch_bounds__(kThreads, 2) attention_lowbit_group_kernel(Att
     }
     __syncthreads();
     const std::int64_t pos = column_position<false>(a, t);
+    if (!column_splits(a, pos)) { return; } // the single-block kernel's column (launched beside this one)
     const std::int64_t lo  = a.window > 0 ? (pos - a.window + 1 > 0 ? pos - a.window + 1 : 0) : 0;
     const std::int64_t first = lo + static_cast<std::int64_t>(z) * kSplitKeys;
     if (first > pos) { return; }
@@ -1627,6 +1639,14 @@ void relative_bias_sink_attention(const RelativeBiasAttentionShape& s, const Ten
                 };
                 if (kb == 4 && vb == 4) { go.template operator()<4, 4>(); } else if (kb == 8 && vb == 8) { go.template operator()<8, 8>(); }
                 else if (kb == 8) { go.template operator()<8, 4>(); } else { go.template operator()<4, 8>(); }
+                // The columns that see at most kSplitMinKeys keys (any, when the start is on the device) run the
+                // single block, as their one-column calls do.
+                if (start_offset != nullptr || start < kSplitMinKeys) {
+                    check_launch(op);
+                    AttentionArgs single = a;
+                    single.short_only = true;
+                    launch_lowbit<false>(single, dim3(cols, s.heads), bf16, kb, vb, stream);
+                }
             } else {
                 const dim3 parts(cols, s.heads, splits);
                 launch_lowbit<true>(a, parts, bf16, kb, vb, stream);

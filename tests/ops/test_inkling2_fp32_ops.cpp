@@ -565,6 +565,78 @@ void test_attention(int window, int extent, int n, int chunk, const std::string&
     compare(label, std::vector<float>(got.begin() + static_cast<std::ptrdiff_t>(check_from) * qw, got.end()), want, 2e-6);
 }
 
+// A verification's columns straddling the split threshold (kSplitMinKeys): one call of 8 columns at positions
+// 506..513 over a ring already holding their keys gives each column the bits of its own one-column call, though
+// some columns split their keys and some do not. FP16 rings (global and windowed) and lowbit global rings, with the
+// start on the host and on the device.
+void test_split_threshold_columns() {
+    namespace ops = ninfer::ops;
+    struct KeepSeed {
+        std::uint32_t saved = seed_state;
+        ~KeepSeed() { seed_state = saved; }
+    } keep_seed;
+    seed_state = 0x51117e5U;
+    const int heads = 24, kvh = 8, d = 128, rel = 16, qw = heads * d, kvw = kvh * d, extent = 1024;
+    constexpr int kCols = 8, kStart = 506, kN = kStart + kCols;
+    static_assert(kStart + 1 <= ops::kSplitMinKeys && kN > ops::kSplitMinKeys, "the call must straddle the threshold");
+    for (const int kind : {0, 1, 2}) { // FP16 global, FP16 window 1024, lowbit k8v8 global
+        const bool lowbit = kind == 2;
+        const int window = kind == 1 ? 1024 : 0, capacity = kind == 1 ? window - 1 + kCols : kN;
+        auto q = randoms(qw * kN, -0.3F, 0.3F), r = randoms(heads * rel * kN), sink = randoms(heads * kN, -2, 2);
+        auto k = randoms(kvw * kN, -2.5F, 2.5F), v = randoms(kvw * kN), table = randoms(extent * rel, -0.5, 0.5);
+        Buf dq(q), dr(r), ds(sink), dk(k), dv(v), dt(table);
+        const std::int64_t krow = lowbit ? kvh * ops::lowbit_key_bytes(8) : 2 * kvw, vrow = lowbit ? kvh * ops::lowbit_value_bytes(8) : 2 * kvw;
+        ninfer::DeviceBuffer kring(static_cast<std::size_t>(krow) * capacity), vring(static_cast<std::size_t>(vrow) * capacity), doff(8);
+        Tensor tk = lowbit ? Tensor(kring.p, DType::U8, {static_cast<std::int32_t>(krow), capacity}) : Tensor(kring.p, DType::FP16, {kvw, capacity});
+        Tensor tv = lowbit ? Tensor(vring.p, DType::U8, {static_cast<std::int32_t>(vrow), capacity}) : Tensor(vring.p, DType::FP16, {kvw, capacity});
+        // Every position's keys and values into the rings (a windowed ring keeps the last capacity of them), the
+        // queries normalized (rotated for lowbit) in place.
+        for (int s = 0; s < kN; s += kCols) {
+            const int len = std::min(kCols, kN - s);
+            Tensor qt = dq.tensor({qw, kN}).slice(1, s, len), kt = dk.tensor({kvw, kN}).slice(1, s, len), vt = dv.tensor({kvw, kN}).slice(1, s, len);
+            ops::KvAppend ka{&tk, s, nullptr}, va{&tv, s, nullptr};
+            if (lowbit) { ka.quant = ops::kLowbitKeys8, va.quant = ops::kLowbitValues8; }
+            ops::HeadNormJob jobs[3];
+            jobs[0].x = &qt, jobs[0].head_dim = d, jobs[0].threshold = 1e30F, jobs[0].rotate = lowbit;
+            jobs[1].x = &kt, jobs[1].head_dim = d, jobs[1].threshold = 16.0F * std::sqrt(2.0F), jobs[1].append = &ka;
+            jobs[2].x = &vt, jobs[2].head_dim = d, jobs[2].unit_rms = true, jobs[2].eps = 1e-6F, jobs[2].append = &va;
+            ops::head_norms_fp32(jobs, nullptr);
+        }
+        const ops::RelativeBiasAttentionShape shape{heads, kvh, d, rel, window};
+        const std::size_t split_bytes = ops::relative_bias_attention_split_bytes(shape, kCols, capacity);
+        check(split_bytes > 0, "the threshold case has a split workspace");
+        Buf ws(split_bytes / 4), wide(static_cast<std::size_t>(qw * kCols)), single(static_cast<std::size_t>(qw * kCols));
+        const Tensor tws = ws.tensor({static_cast<std::int32_t>(split_bytes / 4)});
+        ninfer::DeviceBuffer counters(std::size_t(ops::kSplitMaxColumns) * heads * 4);
+        counters.fill(0);
+        auto* ctr = static_cast<std::int32_t*>(counters.p);
+        for (const bool device_start : {false, true}) {
+            const auto call = [&](int s, int len, Buf& out) {
+                if (device_start) {
+                    const std::int64_t position = s;
+                    check(cudaMemcpy(doff.p, &position, 8, cudaMemcpyHostToDevice) == cudaSuccess, "offset upload");
+                }
+                const std::int64_t* off = device_start ? static_cast<const std::int64_t*>(doff.p) : nullptr;
+                Tensor to = out.tensor({qw, kCols}).slice(1, s - kStart, len);
+                ops::relative_bias_sink_attention(shape, dq.tensor({qw, kN}).slice(1, s, len), dr.tensor({heads * rel, kN}).slice(1, s, len),
+                                                  ds.tensor({heads, kN}).slice(1, s, len), nullptr, nullptr, dt.tensor({rel, extent}), tk, tv,
+                                                  device_start ? 0 : s, off, nullptr, to, nullptr, &tws, ctr);
+                check(cudaDeviceSynchronize() == cudaSuccess, "threshold attention launch");
+            };
+            call(kStart, kCols, wide);
+            for (int i = 0; i < kCols; ++i) { call(kStart + i, 1, single); }
+            const std::string label = std::string(kind == 0 ? "FP16 global" : kind == 1 ? "FP16 window 1024" : "lowbit k8v8 global") +
+                                      (device_start ? ", device start" : "");
+            check(same_bits(wide.get(static_cast<std::size_t>(qw * kCols)), single.get(static_cast<std::size_t>(qw * kCols))),
+                  "attention over the split threshold (" + label + "): a column's bits differ from its one-column call");
+        }
+        std::vector<std::int32_t> left(std::size_t(ops::kSplitMaxColumns) * heads);
+        counters.copy_to_host(left.data(), left.size() * 4);
+        check(std::all_of(left.begin(), left.end(), [](std::int32_t c) { return c == 0; }), "threshold attention: the split counters are not left zero");
+    }
+    std::printf("attention over the split threshold (positions 506..513): each column the bits of its one-column call\n");
+}
+
 // Opt-in low-bit global rings (ops::kLowbitKeys4 ...; kb, vb the key and value bits): head_norms_fp32 appends the clipped
 // keys and unit-rms values coded into U8 rings and rotates the queries; the host decodes the rings (FP64 Hadamard),
 // checks the codes against an FP64 encoder and the round-trip error, then relative_bias_sink_attention over the rings
@@ -2181,6 +2253,7 @@ int main() {
             test_lowbit_rings(1100, 100, "lowbit rings" + form + ": tensor cores (last 40)", false, false, true, 1060, 4e-3, kb, vb);
         }
         test_kv_fp16();
+        test_split_threshold_columns();
         test_column_sequences();
         test_projection_inputs();
         test_route();
