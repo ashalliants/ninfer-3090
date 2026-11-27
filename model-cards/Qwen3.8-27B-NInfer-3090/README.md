@@ -174,7 +174,7 @@ at about 850 GB/s from 3 to 8 tokens.
 
 **Against the best published figures (2026-11-26).** Through `ninfer-serve` with the launcher's
 settings (DFlash2 K7 + draft head + n-gram copies, `rk4v4` KV), greedy, on one RTX 3090 under Windows
-at 315 W, master `178d3b5e`:
+at 315 W, master `178d3b5e` (the 98K-token row with the small-T P-tile fix that followed it):
 
 | Workload | This artifact | Best other published figure on one RTX 3090 |
 |---|---:|---:|

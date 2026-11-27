@@ -103,7 +103,7 @@ Decode is one stream unless the column says otherwise.
 
 RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The 27B's code,
 chat, 98K-context and 315 W C8 figures were measured on 2026-11-26 under Windows at a 315 W limit
-(master `178d3b5e`, [conditions](docs/performance.md#qwen38-27b-against-the-best-published-rtx-3090-figures-2026-11-26));
+(master `178d3b5e`; the 98K figure with the small-T P-tile fix, [conditions](docs/performance.md#qwen38-27b-against-the-best-published-rtx-3090-figures-2026-11-26));
 its 477 at C8 on 2026-10-02 at the stock 350 W. The V100 was
 measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host: Qwen rows on 2026-11-18 (the
 two-lane figure 2026-11-20; the 27B's single-stream decode re-measured 2026-11-25 at 200 W on master `d309f3d8` (the comparison-chart run) and its plain and two-lane figures 2026-11-24, with `--verify-a8` and the int8-activation DFlash2 drafter, both the default in a V100 build, [conditions](docs/tesla-v100.md#qwen38-27b); Flash-Next decode re-measured 2026-11-25 at 200 W with the router's flags, with the MTP draft vocabulary now derived from the tokenizer; [conditions](docs/tesla-v100.md#qwen38-flash-next); Qwen3.6-35B-A3B on 2026-11-25 at 200 W, [conditions](docs/tesla-v100.md#qwen36-35b-a3b)), Inkling-2-Mini on 2026-11-22 (master `dad1623b`, 250 W limit; the 12-chat decode figures re-measured 2026-11-23 at 200 W; prefill re-measured 2026-11-24 at 200 W with `--prefill-cublas`, the layers 20-23 experts on the tensor-core kernels). Inkling-2-Mini on the RTX 3090:
