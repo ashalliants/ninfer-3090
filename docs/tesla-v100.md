@@ -587,6 +587,23 @@ emulation. With those two the gap to llama.cpp's 2,745 at 4.2K was 12%. Prefill-
 
 ### Qwen3.8-Flash-Next
 
+**2026-11-27: requests that offer tools, or ask for JSON, now use MTP** (#501). Such a request's whole
+output follows a grammar (the tool-call grammar when tools are offered), and Flash-Next decoded every
+constrained request without MTP unless `--mtp-constrained` was set. Constrained requests now speculate
+by default, accepting each draft under its own grammar mask; `--no-mtp-constrained` restores the old
+behaviour. Through `ninfer-serve` with the router's flags (7 drafts, joint acceptance, 32,768
+context), greedy, thinking off, 2026-11-27, 200 W, no thermal throttling, ABBA, with every output and
+tool call byte-identical between the arms:
+
+| Request | before | now |
+|---|---:|---:|
+| 7 tools offered, an explanation (467 tokens) | 43.0-44.7 | **70.3-70.6** |
+| 7 tools offered, code (500 tokens) | 45.4-46.8 | **114.3-115.5** |
+| 7 tools offered, a story (410 tokens) | 45.5-46.0 | **72.2-72.4** |
+| JSON schema, a list of cities (495 tokens) | 21.4-21.8 | **112.8-114.3** |
+
+RTX 3090 NOT RUN.
+
 **2026-11-25: the MTP draft vocabulary comes from the model's tokenizer**, with the same output.
 On a V100 `--mtp-draft-vocab auto` (the default) no longer reads the Basalt list beside the model: the
 server derives its list from the tokenizer at load. It holds every token id below 65,536 (the

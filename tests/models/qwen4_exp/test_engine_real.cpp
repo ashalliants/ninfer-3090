@@ -1080,9 +1080,10 @@ int partial_ram_residency_matches_full(const std::string& artifact, std::vector<
 
 // mtp_constrained_matches_plain (--mtp-constrained, FlashNextOptions::mtp_constrained): a greedy
 // JSON-schema request on an MTP Engine with the option gives the ids of plain constrained decoding.
-// The reference is an MTP Engine without the option, where the constrained row runs plain rounds
-// (checked: no verification round); with the option the row must have verified drafts, each column
-// accepted under its own grammar mask (the Engine's mask provider), so both paths ran.
+// The reference is an MTP Engine with --no-mtp-constrained, where the constrained row runs plain
+// rounds (checked: no verification round). The other Engine leaves the option unset, the default
+// with --spec mtp: the row must have verified drafts, each column accepted under its own grammar
+// mask (the Engine's mask provider), so both paths ran and the default is MTP.
 int mtp_constrained_matches_plain(const std::string& artifact, const std::vector<std::string>& args) {
     std::uint32_t max_context = 8192, tokens = 160, depth = 3;
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -1124,7 +1125,7 @@ int mtp_constrained_matches_plain(const std::string& artifact, const std::vector
         options.flash_next.save_expert_state = false;
         options.speculative.backend          = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens     = depth;
-        options.flash_next.mtp_constrained   = constrained_mtp;
+        if (!constrained_mtp) { options.flash_next.mtp_constrained = false; }
         Engine engine(options);
         return engine.generate(engine.prepare(prompt), request);
     };
@@ -1148,15 +1149,15 @@ int mtp_constrained_matches_plain(const std::string& artifact, const std::vector
         print_speculation(label, r.speculative);
         return closed;
     };
-    ok = valid("plain constrained (MTP Engine without --mtp-constrained)", off) && ok;
-    ok = valid("--mtp-constrained", on) && ok;
+    ok = valid("plain constrained (MTP Engine with --no-mtp-constrained)", off) && ok;
+    ok = valid("MTP default (constrained rows speculate)", on) && ok;
     if (off.speculative.rounds != 0) {
-        std::printf("FAIL: without --mtp-constrained the constrained request ran %llu verification rounds\n",
+        std::printf("FAIL: with --no-mtp-constrained the constrained request ran %llu verification rounds\n",
                     static_cast<unsigned long long>(off.speculative.rounds));
         ok = false;
     }
     if (on.speculative.rounds == 0 || on.speculative.drafted_tokens == 0) {
-        std::printf("FAIL: with --mtp-constrained the constrained request verified no drafts\n");
+        std::printf("FAIL: by default (--spec mtp) the constrained request verified no drafts\n");
         ok = false;
     }
     ok = same("mtp_constrained_matches_plain", off.generated_token_ids, on.generated_token_ids) && ok;

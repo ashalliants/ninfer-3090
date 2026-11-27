@@ -267,7 +267,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] "
            "[--no-cuda-graph] [--no-prefix-reuse] [--devices N,M,...] [--stage-layers A,B,...] "
            "[--ngram-volume FILE] [--ngram-keepalive-ms N] [--ngram-ram-mib N|auto] [--expert-state FILE|--no-expert-state] [--default-expert-state FILE] "
-           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained] [--mtp-joint-acceptance] [--mtp-staged-drafts] [--mtp-draft-vocab PATH|auto|tokenizer|off] [--mtp-rows-verify] [--ngram-prefetch] "
+           "[--vram-headroom-mib N] [--shared-expert-stream] [--mtp-constrained|--no-mtp-constrained] [--mtp-joint-acceptance] [--mtp-staged-drafts] [--mtp-draft-vocab PATH|auto|tokenizer|off] [--mtp-rows-verify] [--ngram-prefetch] "
            "[--hot-embedding-rows N] [--gdn-head-map] [--moe-precast-input [--moe-gate-up-registers]] "
            "[--moe-fused-route] [--cpu-verify-misses] [--prefill-cpu-share F [--prefill-cpu-all-columns N] [--prefill-cpu-max-columns N]] [--cpu-verify-workers N] [--gdn-async-commit] [--hc-int8 [--hc-fused-read]] "
            "[--ngram-flag-wait] [--partial-ram-residency] [--ggml-decode-mma] "
@@ -412,9 +412,10 @@ std::string serve_usage_text(const char* argv0) {
            "--expert-cache-mib N caps the "
            "expert cache (for measurement); --shared-expert-stream runs each MoE block's shared "
            "expert on a second CUDA stream beside the routed experts (high priority in eager calls "
-           "only; CUDA graphs ignore stream priority; the same output, bit for bit; off by default); --mtp-constrained keeps MTP speculation (--spec mtp) on for "
-           "constrained requests (JSON schema, grammar, tool calls), accepting each draft under its "
-           "own grammar mask (off by default: they decode without MTP); --mtp-joint-acceptance "
+           "only; CUDA graphs ignore stream priority; the same output, bit for bit; off by default); with --spec mtp, "
+           "constrained requests (JSON schema, grammar, and any request that offers tools) speculate "
+           "too, accepting each draft under its own grammar mask; --no-mtp-constrained decodes them "
+           "without MTP (--mtp-constrained, the default, needs --spec mtp); --mtp-joint-acceptance "
            "(--spec mtp) drafts --draft-tokens each round and verifies the drafts whose joint chance "
            "of acceptance, estimated from each draft's probability, stays above an adaptive threshold "
            "(off by default: an acceptance estimate picks the count before drafting); --mtp-staged-drafts "
@@ -1187,6 +1188,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             options.flash_next.shared_expert_stream = true;
         } else if (arg == "--mtp-constrained") {
             options.flash_next.mtp_constrained = true;
+        } else if (arg == "--no-mtp-constrained") {
+            options.flash_next.mtp_constrained = false;
         } else if (arg == "--mtp-joint-acceptance") {
             options.flash_next.mtp_joint_acceptance = true;
         } else if (arg == "--mtp-staged-drafts") {
@@ -1513,7 +1516,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         throw std::invalid_argument("--draft-context-rows adds rows to the draft head's proposals and needs "
                                     "--spec mtp, dflash or dflash2");
     }
-    if (options.flash_next.mtp_constrained && options.speculative.backend != SpeculativeBackend::Mtp) {
+    if (options.flash_next.mtp_constrained.value_or(false) &&
+        options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("--mtp-constrained keeps MTP speculation on for constrained requests and "
                                     "needs --spec mtp");
     }

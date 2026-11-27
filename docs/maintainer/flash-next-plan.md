@@ -627,8 +627,9 @@ None has been measured on the RTX 3090 yet.
     `--shared-expert-stream` if a format needs more (only the GGML formats are planned for).
   - Designed to work with two lanes, MTP and vision. Basalt estimates 0.25-0.5 ms per token. Not
     measured.
-- **MTP for constrained requests** (`--mtp-constrained`, needs `--spec mtp`). Without it a
-  constrained row (JSON schema, grammar, tool calls) decodes plain rounds. With it the row drafts as
+- **MTP for constrained requests** (on by default with `--spec mtp` since #501; `--no-mtp-constrained`
+  turns it off). Off, a constrained row (JSON schema, grammar, and any request that offers tools:
+  its whole output follows the tool-call grammar) decodes plain rounds. On, the row drafts as
   any other; once the drafts are on the host the Program asks the Engine's mask provider for one
   grammar mask per position 0..K (position j follows the committed output and drafts[0:j]) while
   the verification forward runs, uploads them, and installs them in the round's sampling config.
@@ -1362,7 +1363,7 @@ Flash-Next options (Qwen3.8-Flash-Next):
 |---|---|---|---|---|
 | `--ngram-keepalive-ms N` (default 40, was a fixed 100) | F7a | speed | not scripted; TTFT after an idle pause was not measured | default changed, unmeasured |
 | `--shared-expert-stream` | F4a | identity | identity passes, eager and in graphs; wash | neutral |
-| `--mtp-constrained` | F2 | identity | `ninfer_qwen4_exp_mtp_constrained_test` passes; no speed workload | unmeasured |
+| `--mtp-constrained` | F2 | identity | `ninfer_qwen4_exp_mtp_constrained_test` passes (V100, 2026-11-27); with tools offered 1.6-2.5x, JSON schema 5.3x, byte-identical (V100, ABBA) | default on (#501) |
 | `--mtp-joint-acceptance` | F3 | identity | identity gate passes; in the 12-rep A/B the MTP rounds line varied between runs while greedy ids stayed identical (judged noise: it changes which candidates are offered, not which wins); wash | neutral |
 | `--ngram-prefetch` | F7b | identity | identity passes; **-16.57%, 0/12** | regression, keep off |
 | `--default-expert-state FILE` | F10a | speed | export, then a fresh start reads it back and uses it | works |
