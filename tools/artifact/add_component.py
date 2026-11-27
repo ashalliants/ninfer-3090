@@ -64,13 +64,18 @@ def add_component(base_path: Path, donor_path: Path, output: Path, component: st
             raise ArtifactError(f"the base has no {target!r} component for {component!r}")
 
         bindings = {k: v for k, v in d.bindings.items() if k.startswith(prefix)}
-        owned: set[str] = set()
+        config = d.components[component]
+        resources = dict(config.get("resources", {}))
+        owned: set[str] = set(resources.values())
         for value in bindings.values():
             owned |= _objects_of(value)
         others: set[str] = set()
         for name, value in d.bindings.items():
             if not name.startswith(prefix):
                 others |= _objects_of(value)
+        for name, value in d.components.items():
+            if name != component:
+                others |= set(value.get("resources", {}).values())
         if owned & others:
             raise ArtifactError(f"{component} shares objects with other donor components")
 
@@ -80,14 +85,14 @@ def add_component(base_path: Path, donor_path: Path, output: Path, component: st
         ]
         for use in uses:
             parameter = use["parameter"]
+            if "auxiliaries" in use:
+                raise ArtifactError(f"{parameter}: a use with auxiliaries cannot be carried over")
             if parameter.startswith(prefix):
                 continue
             if parameter not in b.bindings:
                 raise ArtifactError(f"{component} uses {parameter}, which the base does not bind")
             if _shape(base, b.bindings[parameter]) != _shape(donor, d.bindings[parameter]):
                 raise ArtifactError(f"{parameter}: shapes differ between base and donor")
-            if "auxiliaries" in use:
-                raise ArtifactError(f"{parameter}: a use with auxiliaries cannot be carried over")
 
         taken = {obj.id for obj in b.objects}
         renamed: dict[str, str] = {}
@@ -108,7 +113,14 @@ def add_component(base_path: Path, donor_path: Path, output: Path, component: st
         writer = ArtifactWriter(
             output,
             specs,
-            components={**b.components, component: d.components[component]},
+            components={
+                **b.components,
+                component: {
+                    **config,
+                    **({"resources": {k: renamed[v] for k, v in resources.items()}}
+                       if resources else {}),
+                },
+            },
             bindings={**b.bindings, **{k: _rename(v, renamed) for k, v in bindings.items()}},
             uses=[*b.uses, *uses],
             metadata=b.metadata,

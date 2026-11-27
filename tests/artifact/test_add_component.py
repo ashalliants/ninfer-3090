@@ -6,7 +6,7 @@ import pytest
 
 from tools.artifact.add_component import add_component
 from tools.artifact.reader import Artifact
-from tools.artifact.schema import ArtifactError, TensorSpec
+from tools.artifact.schema import ArtifactError, ResourceSpec, TensorSpec
 from tools.artifact.writer import ArtifactWriter
 
 
@@ -96,3 +96,33 @@ def test_refuses_a_base_that_has_the_component(tmp_path: Path) -> None:
     _donor(tmp_path / "donor.ninfer")
     with pytest.raises(ArtifactError, match="already has"):
         add_component(tmp_path / "donor.ninfer", tmp_path / "donor.ninfer", tmp_path / "out.ninfer", "dflash2")
+
+
+def test_copies_the_component_resources(tmp_path: Path) -> None:
+    _base(tmp_path / "base.ninfer")
+    specs = [TensorSpec("weight/0", (4, 4), "bf16", "contiguous_le_v1"), ResourceSpec("resource/0", 5)]
+    components = {**TEXT, "dflash2": {**DRAFT["dflash2"], "resources": {"config.json": "resource/0"}}}
+    with ArtifactWriter(tmp_path / "donor.ninfer", specs, components=components,
+                        bindings={"dflash2/proj": {"object": "weight/0"}}) as writer:
+        writer.write_object("weight/0", _pattern(32, 1))
+        writer.write_object("resource/0", b"hello")
+    add_component(tmp_path / "base.ninfer", tmp_path / "donor.ninfer", tmp_path / "out.ninfer", "dflash2")
+    with Artifact(tmp_path / "out.ninfer") as out:
+        name = out.directory.components["dflash2"]["resources"]["config.json"]
+        assert name == "dflash2/resource/0"
+        assert out.read_object(name) == b"hello"
+
+
+def test_refuses_a_component_use_with_auxiliaries(tmp_path: Path) -> None:
+    _base(tmp_path / "base.ninfer")
+    _write(
+        tmp_path / "donor.ninfer",
+        {"weight/0": (4, 4), "weight/1": (1, 4)},
+        DRAFT | TEXT,
+        {"dflash2/proj": {"object": "weight/0"}},
+        [{"parameter": "dflash2/proj", "input": "dflash2/x", "activation_policy": "AllowA4",
+          "auxiliaries": {"activation_input_divisor": {"object": "weight/1"}}}],
+    )
+    with pytest.raises(ArtifactError, match="auxiliaries"):
+        add_component(tmp_path / "base.ninfer", tmp_path / "donor.ninfer", tmp_path / "out.ninfer", "dflash2")
+    assert not (tmp_path / "out.ninfer").exists()
