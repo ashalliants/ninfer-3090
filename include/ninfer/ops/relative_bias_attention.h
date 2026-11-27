@@ -134,7 +134,9 @@ struct RelativeBiasAttentionShape {
  *   (inkling2_reference.h attention, relative_bias). With a gate, the same bits as sigmoid_gate_fp32 of the
  *   ungated FP32 output (a BF16 out rounds that to nearest even).
  *   Split keys: given a `split_workspace`, a call of at most kSplitMaxColumns columns over a ring that can show a
- *   column more than kSplitMinKeys keys splits each column's keys into blocks of 256 (one CUDA block each, the sink in the
+ *   column more than kSplitMinKeys keys splits the keys of each column that sees more than kSplitMinKeys (exactly the
+ *   columns whose one-column call would split, so a column has the bits of its one-column call whatever the call's
+ *   width) into blocks of 256 (one CUDA block each, the sink in the
  *   first); the last of a column's blocks to finish combines their maxima, denominators and sums in order, weighted
  *   by e^{m_z - max m}. FP32 all the
  *   way, but the sums run in another order: a column that sees more than 256 keys gets other bits than the

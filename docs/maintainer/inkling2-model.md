@@ -905,7 +905,11 @@ to finish (an atomic counter per column and head) merges the blocks' maxima, den
 weighted by e^{m_z - max m}. It applies only once a column can see more than `ops::kSplitMinKeys` (512) keys: below
 that the extra blocks cost more than they save. Decode replays one CUDA graph for positions up to 512 (the single
 block) and another past them (split; its grid is sized for the whole ring, and the blocks past a column's keys return
-at once). The single-block kernel walks
+at once). The choice is made per column, in the kernel: in a call that may split, a column splits only if its own
+one-column call would (it sees more than 512 keys), so a verification that straddles position 512 gives every column
+the bits of the plain step at its position. Before 2026-11-27 such a call split every column, and greedy DSpark output
+could differ from plain decode after position 510 (a 4-column round at 510..513). Low-bit global rings run the
+group kernel for the columns that split and the single-block kernel, in a second launch, for the rest. The single-block kernel walks
 every key of a column in one block (then of 128 threads), so a decode step ran 24 blocks per visit on 80 SMs and
 was latency-bound. At 16K context, 70% of the step was attention.
 
