@@ -585,7 +585,8 @@ public:
             cursor.gain_limit = recovery_gain(program, *admission, surviving(program, {}));
             // One unproven write is one turn of a pool of this size, so the clock counts pool
             // turnovers however the pool grows or shrinks between decisions.
-            unproven_turnovers_ += kTurnoverUnit / std::max<std::size_t>(1, unproven_pool_size());
+            unproven_turnovers_ +=
+                kTurnoverUnit / std::max<std::size_t>(1, unproven_pool_size(program));
         }
         return cursor;
     }
@@ -1937,16 +1938,24 @@ private:
         return since;
     }
 
-    // The unproven pool: distinct checkpoints the cache holds only for owners and shared entries
-    // without repeat demand (proven history is not in it).
-    [[nodiscard]] std::size_t unproven_pool_size() const {
+    // The unproven pool: distinct checkpoints no repeat demand protects. A reused owner's
+    // protection covers its points up to the position it was actually adopted at
+    // (proven_frontier); a newer point past it is as unproven as a one-off (action_priority
+    // treats it the same way when an earlier point survives to cover the proof; when none
+    // does, counting it here only makes the pool larger and the ageing slower).
+    [[nodiscard]] std::size_t unproven_pool_size(const Program& program) const {
         std::vector<Handle> unproven, proven;
         const auto add = [&](Handle handle, bool reused) {
             auto& into = reused ? proven : unproven;
             if (!contains(into, handle)) { into.push_back(handle); }
         };
         for (const auto& owner : owners_) {
-            for (const auto& point : owner.points) { add(point.handle, owner.priority.reused); }
+            for (const auto& point : owner.points) {
+                const bool covered =
+                    owner.priority.reused && program.valid_checkpoint(point.handle) &&
+                    program.checkpoint_metadata(point.handle).frontier <= owner.proven_frontier;
+                add(point.handle, covered);
+            }
         }
         for (const auto& shared : shared_) { add(shared.handle, shared.priority.reused); }
         return static_cast<std::size_t>(std::count_if(

@@ -3396,6 +3396,38 @@ void test_unproven_write_falls_back_when_only_proven_history_suffices() {
             "the long write did not take the two short one-offs");
 }
 
+// A continuation that was reused is protected up to where it was adopted; a newer point past
+// that is unproven and in the pool like any one-off, so it ages at the pool's pace: with two
+// unproven checkpoints, four writes are two turnovers, not four.
+void test_fresh_point_on_a_reused_owner_ages_with_the_pool() {
+    OneShotStream stream(8);
+    auto& f            = stream.f;
+    using Cache        = decltype(f.cache);
+    const auto unit    = static_cast<double>(Cache::kTurnoverUnit);
+    const Base first{.tokens = tokens(300, 5'000'000)};
+    const auto predecessor =
+        f.program.add(first.tokens, {f.program.host_block(OneShotStream::kImage)},
+                      Role::Continuation);
+    const auto owner = f.publish(predecessor);
+    const Base next{.tokens = tokens(340, 5'000'000)};
+    require(f.begin(next, predecessor) == owner, "fixture did not continue its owner");
+    require(f.cache.retention(owner).reused, "a continued owner was not reused");
+    const auto endpoint =
+        f.program.add(next.tokens, {f.program.host_block(OneShotStream::kImage)},
+                      Role::Continuation);
+    f.cache.publish(f.program, owner, endpoint);
+    f.cache.finish(f.program, owner, next, ++f.next_order);
+    require(stream.request(200), "a one-off was refused with free room");
+    const auto before = f.cache.unproven_age(endpoint);
+    for (int i = 0; i < 4; ++i) { (void)stream.capture_once(200); }
+    const auto after = f.cache.unproven_age(endpoint);
+    require(before && after, "the fresh point left the cache");
+    const double turnovers = static_cast<double>(*after - *before) / unit;
+    std::cout << "fresh point on a reused owner: " << turnovers << " turnovers in 4 writes\n";
+    require(turnovers > 1.99 && turnovers < 2.01,
+            "a fresh point on a reused owner was left out of the unproven pool");
+}
+
 int main() {
     try {
         test_direct_victim_release_offers_the_continuation_first();
@@ -3413,6 +3445,7 @@ int main() {
         test_carried_point_keeps_its_age();
         test_unproven_age_follows_the_pool_size();
         test_unproven_write_falls_back_when_only_proven_history_suffices();
+        test_fresh_point_on_a_reused_owner_ages_with_the_pool();
         test_reclaim_pricing_cap_stops_a_long_search_once_an_action_is_found();
         test_reclaim_pricing_cap_bounds_the_first_search();
         test_reclaim_pricing_cap_never_costs_progress();
