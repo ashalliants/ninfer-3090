@@ -885,11 +885,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                                       : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
-                p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col0)] = __float2half_rn(p00);
-                p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col1)] = __float2half_rn(p01);
-                p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col0)] =
+                p_sw[gid * Bc + causal_small_t_p_swz<Bc>(gid, col0)] = __float2half_rn(p00);
+                p_sw[gid * Bc + causal_small_t_p_swz<Bc>(gid, col1)] = __float2half_rn(p01);
+                p_sw[(gid + 8) * Bc + causal_small_t_p_swz<Bc>(gid + 8, col0)] =
                     __float2half_rn(p10);
-                p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col1)] =
+                p_sw[(gid + 8) * Bc + causal_small_t_p_swz<Bc>(gid + 8, col1)] =
                     __float2half_rn(p11);
             }
             bl0 = warp_sum<4>(bl0, FullMask);
@@ -978,13 +978,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 #pragma unroll 4
             for (int key = 0; key < Bc; ++key) {
                 const float p0 = row0 < RowCount
-                                     ? __half2float(p_consumer[gid * Bc + causal_small_t_tc_swz32(gid, key)])
+                                     ? __half2float(p_consumer[gid * Bc + causal_small_t_p_swz<Bc>(gid, key)])
                                      : 0.0f;
                 float p1 = 0.0f;
                 if constexpr (RowCount > 8) {
                     if (row1 < RowCount) {
                         p1 = __half2float(
-                            p_consumer[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, key)]);
+                            p_consumer[(gid + 8) * Bc + causal_small_t_p_swz<Bc>(gid + 8, key)]);
                     }
                 }
                 const __half* v_row = &v_f16[key * D];
@@ -1012,7 +1012,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     ldmatrix_x4(
                         pf[0], pf[1], pf[2], pf[3],
                         smem_addr(
-                            &p_consumer[a_rowoff * Bc + causal_small_t_tc_swz32(a_rowoff, pcol)]));
+                            &p_consumer[a_rowoff * Bc + causal_small_t_p_swz<Bc>(a_rowoff, pcol)]));
                     unsigned vf[2];
                     const int vrow = k * 16 + b_koff + b_rin;
                     const int vcol = global_n * 8;

@@ -10,8 +10,8 @@
       "file": "rtx3090-qwen38-27b.svg",
       "title": "Qwen3.8-27B on one RTX 3090: against the best published figures",
       "subtitle": "ashalliants/ninfer-3090 against the fastest figure any other engine publishes for this model on one RTX 3090, per workload. Above 1.0x means ours is faster. Every other figure is the author's own, from a different machine, quant and power limit, so read the ratios as indicative.",
-      "desc": "Qwen3.8-27B on one RTX 3090, ashalliants/ninfer-3090 against the best published figures. Chat, one request, vs syv-ai HyperQwen: 1.02x decode (133.2 vs 131.2), 1.22x prefill. Code vs open-jet: 1.39x (194.6 vs 140). No drafts vs open-jet: 1.11x (47.7 vs 42.9). 98K-token context vs open-jet: 0.98x (93.9 vs 95.9). Eight requests at once vs syv-ai: 1.03x (421.4 vs 407.3).",
-      "build": "master 178d3b5e (Release, launcher settings)",
+      "desc": "Qwen3.8-27B on one RTX 3090, ashalliants/ninfer-3090 against the best published figures. Chat, one request, vs syv-ai HyperQwen: 1.02x decode (133.2 vs 131.2), 1.22x prefill. Code vs open-jet: 1.39x (194.6 vs 140). No drafts vs open-jet: 1.11x (47.7 vs 42.9). 98K-token context vs open-jet: 0.98x (94.0 vs 95.9). Eight requests at once vs syv-ai: 1.03x (421.4 vs 407.3).",
+      "build": "master 178d3b5e (Release, launcher settings); 98K with the small-T P-tile fix",
       "panels": [
         {"type": "ratio", "columns": ["Decode", "Prefill"], "max": 1.6,
          "rows": [
@@ -30,7 +30,7 @@
               {"none": "not compared at matching lengths"}]},
            {"model": "98K-token context", "versus": "vs the open-jet megakernel (7 drafts)",
             "cells": [
-              {"ours": [93.9], "theirs": [95.9], "reported": true, "detail": "ours: 98,362-token prompt, 512 tokens out (93.1-93.9 over two runs); syv-ai reports 78.5 at 100K"},
+              {"ours": [94.0], "theirs": [95.9], "reported": true, "detail": "ours: 98,362-token prompt, 512 tokens out (93.8-94.0 over two runs); syv-ai reports 78.5 at 100K"},
               {"none": "open-jet publishes none; ours reads the 98K prompt at 1,899 tok/s"}]},
            {"model": "Eight requests at once", "versus": "vs syv-ai HyperQwen's single-user mode (MTP), the same eight prompts",
             "cells": [
@@ -42,7 +42,7 @@
          "label_w": 150,
          "groups": ["no drafts", "chat (syv-ai's prompts)", "code", "file rewrite", "98K-token context"],
          "series": [
-           {"name": "Ours, launcher settings", "kind": "ours", "values": [47.7, 133.2, 194.6, 384.4, 93.9]},
+           {"name": "Ours, launcher settings", "kind": "ours", "values": [47.7, 133.2, 194.6, 384.4, 94.0]},
            {"name": "Best other published figure (reported)", "kind": "reported", "values": [42.9, 131.2, 140, 381, 95.9],
             "labels": ["open-jet", "syv-ai, greedy", "open-jet", "syv-ai, 25K", "open-jet"]}
          ]},
@@ -66,7 +66,7 @@
          ]}
       ],
       "notes": [
-        "Where we lose: at 98K tokens of context open-jet reports 95.9 tok/s against our 93.9 (0.98x). syv-ai's batch mode reports about 1,035 tok/s at 64 requests; NInfer is built for one to eight.",
+        "Where we lose: at 98K tokens of context open-jet reports 95.9 tok/s against our 94.0 (0.98x). syv-ai's batch mode reports about 1,035 tok/s at 64 requests; NInfer is built for one to eight.",
         "Quants differ: ours is this fork's Q4/Q5 group-quant mix (17.0 GiB), syv-ai runs W4A16 AutoRound with int8 Marlin layers, open-jet Unsloth's Q4_K_M. Conditions and sources for every figure: docs/performance.md, \"Qwen3.8-27B against the best published RTX 3090 figures\"."
       ]
     }

@@ -22,7 +22,7 @@ different machine and prompt set, so read the ratio as indicative. The measureme
 **On one RTX 3090, ahead of every other engine's published Qwen3.8-27B figure but one:**
 194.6 tok/s on code against open-jet's 140 (1.39x), 133.2 on chat against syv-ai HyperQwen's 131.2,
 47.7 without speculation against 42.9, 421 tok/s at eight requests against 407, and 1.2x the prefill
-speed. The loss: at 98K tokens of context we decode 93.9 tok/s against open-jet's 95.9. Their figures
+speed. The loss: at 98K tokens of context we decode 94.0 tok/s against open-jet's 95.9. Their figures
 are their own, from other machines; sources and conditions:
 [RTX 3090 comparison](docs/performance.md#qwen38-27b-against-the-best-published-rtx-3090-figures-2026-11-26).
 
@@ -90,7 +90,7 @@ Decode is one stream unless the column says otherwise.
 
 | Model | Card | Max context | Prefill | Decode, one stream | Decode, all lanes |
 |---|---|---:|---:|---:|---:|
-| **Qwen3.8-27B** (dense) | RTX 3090 | **262,144** | **3,222 tok/s** at 4K | **194.6 tok/s** on code, 133 on chat, 93.9 at 98K context (DFlash2 + n-gram copies, 315 W); 140 on chat in an earlier session | **477 tok/s** at C8 (MTP3; 421 at 315 W) |
+| **Qwen3.8-27B** (dense) | RTX 3090 | **262,144** | **3,222 tok/s** at 4K | **194.6 tok/s** on code, 133 on chat, 94.0 at 98K context (DFlash2 + n-gram copies, 315 W); 140 on chat in an earlier session | **477 tok/s** at C8 (MTP3; 421 at 315 W) |
 | Qwen3.6-35B-A3B (MoE) | RTX 3090 | 262,144, shared by 3 lanes | 8,848 tok/s at 4K | 313 tok/s (MTP3 + draft head) | 453 tok/s at C6 (MTP3) |
 | Ternary Bonsai 2 27B | RTX 3090 | **262,144** (with DFlash2, 9.6 GiB free) | 2.8-2.9K tok/s | 88-90 plain; **238** mean over 12 chats, 372 maths (DFlash2, 7 drafts, Windows; 235 and 364 under WSL); 74 after a 245K-token document | **573 tok/s** at C8 (MTP3; 572.5 under WSL) |
 | Qwen3.8-Flash-Next (preview, Windows) | RTX 3090 | 32K default | 2,345-2,422 tok/s at 4K-128K | 108-113 tok/s (MTP), 78-81 plain | ~115 tok/s at C2 (MTP; 103-125, Linux) |
@@ -103,7 +103,7 @@ Decode is one stream unless the column says otherwise.
 
 RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The 27B's code,
 chat, 98K-context and 315 W C8 figures were measured on 2026-11-26 under Windows at a 315 W limit
-(master `178d3b5e`, [conditions](docs/performance.md#qwen38-27b-against-the-best-published-rtx-3090-figures-2026-11-26));
+(master `178d3b5e`; the 98K figure with the small-T P-tile fix, [conditions](docs/performance.md#qwen38-27b-against-the-best-published-rtx-3090-figures-2026-11-26));
 its 477 at C8 on 2026-10-02 at the stock 350 W. The V100 was
 measured over a 3.3 GB/s eGPU link (PCIe Gen3 x4) on a 59 GiB host: Qwen rows on 2026-11-18 (the
 two-lane figure 2026-11-20; the 27B's single-stream decode re-measured 2026-11-25 at 200 W on master `d309f3d8` (the comparison-chart run) and its plain and two-lane figures 2026-11-24, with `--verify-a8` and the int8-activation DFlash2 drafter, both the default in a V100 build, [conditions](docs/tesla-v100.md#qwen38-27b); Flash-Next decode re-measured 2026-11-25 at 200 W with the router's flags, with the MTP draft vocabulary now derived from the tokenizer; [conditions](docs/tesla-v100.md#qwen38-flash-next); Qwen3.6-35B-A3B on 2026-11-25 at 200 W, [conditions](docs/tesla-v100.md#qwen36-35b-a3b)), Inkling-2-Mini on 2026-11-22 (master `dad1623b`, 250 W limit; the 12-chat decode figures re-measured 2026-11-23 at 200 W; prefill re-measured 2026-11-24 at 200 W with `--prefill-cublas`, the layers 20-23 experts on the tensor-core kernels). Inkling-2-Mini on the RTX 3090:
@@ -880,7 +880,7 @@ Method, the KV-format comparison and the tests run:
 launcher's settings, NInfer decodes 194.6 tok/s on code (open-jet reports 140), 133.2 on syv-ai's
 eight chat prompts (HyperQwen reports 131.2 greedy), 47.7 without speculation (open-jet 42.9,
 llama.cpp 41.5) and 421 tok/s at eight requests (HyperQwen 407), and prefills 2,367 tok/s at 1.2K
-tokens (HyperQwen 1,940 at 1K). At 98K tokens of context it decodes 93.9 tok/s against open-jet's
+tokens (HyperQwen 1,940 at 1K). At 98K tokens of context it decodes 94.0 tok/s against open-jet's
 95.9, the one workload where another engine reports more. The other figures are their authors' own;
 chart, method and sources: [RTX 3090 comparison](docs/performance.md#qwen38-27b-against-the-best-published-rtx-3090-figures-2026-11-26).
 
