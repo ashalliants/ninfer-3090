@@ -76,6 +76,15 @@ void validate_engine_options(const EngineOptions& options) {
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    // --speed fast's DSpark settings (Inkling-2's drafter only).
+    const auto& spec = options.speculative;
+    if (!(spec.dspark_greedy_keep >= 0.0F && spec.dspark_greedy_keep < 1.0F)) {
+        throw std::invalid_argument("the DSpark greedy keep fraction must be in [0,1)");
+    }
+    if (spec.dspark_lookup_match > 64) { throw std::invalid_argument("the DSpark lookup match must be 0 to 64 tokens"); }
+    if ((spec.dspark_greedy_keep != 0.0F || spec.dspark_lookup_match != 0) && spec.backend != SpeculativeBackend::DSpark) {
+        throw std::invalid_argument("--speed fast needs Inkling-2's drafter (--spec dspark)");
+    }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit:
         if (options.kv_capacity.explicit_tokens == 0) {

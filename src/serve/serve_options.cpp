@@ -258,7 +258,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-store-s3-upload-delay-seconds N]]] "
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|<per-layer INT8-family runs, e.g. rk4v4x12,int8x4>|fp16|fp32 (Inkling-2: fp16|fp32, or lossy opt-in global rings int8|rk8v4|rk4v4)] [--dense-q8 head|all (lossy)] [--mxfp8-experts auto|on|off] [--no-split-attention] [--prefill-math tc|fp32] "
+           "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|<per-layer INT8-family runs, e.g. rk4v4x12,int8x4>|fp16|fp32 (Inkling-2: fp16|fp32, or lossy opt-in global rings int8|rk8v4|rk4v4)] [--speed exact|fast (Inkling-2; fast is lossy)] [--dense-q8 head|all (lossy)] [--mxfp8-experts auto|on|off] [--no-split-attention] [--prefill-math tc|fp32] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N] [--draft-min-p P] [--dspark-adaptive on|off]] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
@@ -489,6 +489,11 @@ std::string serve_usage_text(const char* argv0) {
            "where the wide window wastes time on rejected drafts. It costs one more set of CUDA "
            "Graphs (startup refuses when they do not fit); output is still verified by the "
            "target. 0 (the default) disables it\n"
+           "       --speed exact|fast (Inkling-2; exact by default). fast trades a little accuracy for speed "
+           "(CHANGES THE OUTPUT): it drafts with DSpark up to 7 tokens a round, lets a greedy round keep a draft "
+           "the model gives at least a tenth of its top token's probability, verifies prompt lookup copies "
+           "that extend the drafts, and reads an 8-bit copy of the output head (--dense-q8 head). "
+           "Explicit --draft-tokens and --dense-q8 still apply\n"
            "       --relaxed-drafting [P] (off by default; CHANGES THE OUTPUT DISTRIBUTION) keeps a "
            "sampled draft whenever the model gives it probability P or more (0..1, 0.5 without a "
            "value), even where exact speculative sampling would have drawn another token: faster, "
@@ -1071,6 +1076,10 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             const std::string_view form = require_value("--prefill-math");
             if (form != "tc" && form != "fp32") { throw std::invalid_argument("invalid --prefill-math (tc or fp32): " + std::string(form)); }
             options.prefill_math = form == "tc" ? PrefillMath::TensorCores : PrefillMath::FP32;
+        } else if (arg == "--speed") {
+            const std::string_view v = require_value("--speed");
+            if (v != "exact" && v != "fast") { throw std::invalid_argument("invalid --speed (exact or fast): " + std::string(v)); }
+            options.speed_fast = v == "fast";
         } else if (arg == "--dense-q8") {
             options.dense_q8 = parse_dense_q8(require_value("--dense-q8"));
         } else if (arg == "--mxfp8-experts") {
@@ -1659,6 +1668,22 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         throw std::invalid_argument("--prefill-layer-slices must be at most 16");
     }
     models::qwen3_5::validate_lossy_prefill_options(options.lossy_prefill);
+    if (options.speed_fast) {
+        // --speed fast (Inkling-2, lossy; docs/maintainer/inkling2-model.md, "Speed fast"): what the command line did
+        // not set explicitly takes the preset's value.
+        auto& spec = options.speculative;
+        if (spec.backend == SpeculativeBackend::None) { spec.backend = SpeculativeBackend::DSpark; }
+        if (spec.backend != SpeculativeBackend::DSpark) {
+            throw std::invalid_argument("--speed fast is for Inkling-2 and drafts with its DSpark drafter (--spec dspark)");
+        }
+        if (!given.draft_tokens) {
+            spec.draft_tokens  = product::kSpeedFastDraftTokens;
+            given.draft_tokens = true;
+        }
+        spec.dspark_greedy_keep  = product::kSpeedFastGreedyKeep;
+        spec.dspark_lookup_match = product::kSpeedFastLookupMatch;
+        if (options.dense_q8 == DenseQ8::Off) { options.dense_q8 = DenseQ8::Head; }
+    }
     product::apply_speculative_defaults(options.speculative);
     product::apply_speculative_cli_defaults(options.speculative, given);
     product::validate_speculative_cli_options(options.speculative, given);

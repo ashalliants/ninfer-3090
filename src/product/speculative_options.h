@@ -88,6 +88,11 @@ inline constexpr std::uint32_t kDSparkDefaultDraftTokens = 3;
 // round picks its draft count (+8.4% over a fixed 3 on 12 serve chats, ABBA on a V100;
 // docs/maintainer/inkling2-model.md, "Draft floor and adaptive width").
 inline constexpr float kDSparkDefaultDraftMinP = 0.5F;
+// --speed fast (Inkling-2, lossy): up to 7 drafts a round, a greedy round keeping a draft at a tenth or more of the
+// top token's probability, and prompt lookup on 3 matching tokens (docs/maintainer/inkling2-model.md, "Speed fast").
+inline constexpr std::uint32_t kSpeedFastDraftTokens = 7;
+inline constexpr float kSpeedFastGreedyKeep = 0.1F;
+inline constexpr std::uint32_t kSpeedFastLookupMatch = 3;
 
 // What the command line set explicitly (an omitted value may take a default).
 struct SpeculativeCliGiven {
