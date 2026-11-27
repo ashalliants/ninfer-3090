@@ -3428,6 +3428,29 @@ void test_fresh_point_on_a_reused_owner_ages_with_the_pool() {
             "a fresh point on a reused owner was left out of the unproven pool");
 }
 
+// Pinned prefixes (installed grafts) are never released, so they are not in the pool: beside
+// 30 of them, a lone one-off ages one turnover per write.
+void test_pinned_prefixes_are_not_in_the_ageing_pool() {
+    OneShotStream stream(4, 30 * OneShotStream::kImage);
+    auto& f         = stream.f;
+    using Cache     = decltype(f.cache);
+    const auto unit = static_cast<double>(Cache::kTurnoverUnit);
+    for (std::uint32_t i = 0; i < 30; ++i) {
+        const auto pinned = f.program.add(tokens(8, 800'000 + 100 * i),
+                                          {f.program.host_block(OneShotStream::kImage)});
+        f.cache.pin_shared(f.program, pinned);
+    }
+    require(stream.request(200), "a one-off was refused with free room");
+    const auto one_off = stream.saved.front();
+    const auto before  = f.cache.unproven_age(one_off);
+    for (int i = 0; i < 3; ++i) { (void)stream.capture_once(200); }
+    const auto after = f.cache.unproven_age(one_off);
+    require(before && after, "the one-off left the cache");
+    const double turnovers = static_cast<double>(*after - *before) / unit;
+    std::cout << "one-off beside 30 pinned prefixes: " << turnovers << " turnovers in 3 writes\n";
+    require(turnovers > 2.99 && turnovers < 3.01, "pinned prefixes slowed the ageing clock");
+}
+
 int main() {
     try {
         test_direct_victim_release_offers_the_continuation_first();
@@ -3446,6 +3469,7 @@ int main() {
         test_unproven_age_follows_the_pool_size();
         test_unproven_write_falls_back_when_only_proven_history_suffices();
         test_fresh_point_on_a_reused_owner_ages_with_the_pool();
+        test_pinned_prefixes_are_not_in_the_ageing_pool();
         test_reclaim_pricing_cap_stops_a_long_search_once_an_action_is_found();
         test_reclaim_pricing_cap_bounds_the_first_search();
         test_reclaim_pricing_cap_never_costs_progress();

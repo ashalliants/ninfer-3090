@@ -1957,7 +1957,10 @@ private:
                 add(point.handle, covered);
             }
         }
-        for (const auto& shared : shared_) { add(shared.handle, shared.priority.reused); }
+        // A pinned prefix is never released, so it never turns over and is not in the pool.
+        for (const auto& shared : shared_) {
+            if (!shared.pinned) { add(shared.handle, shared.priority.reused); }
+        }
         return static_cast<std::size_t>(std::count_if(
             unproven.begin(), unproven.end(), [&](Handle h) { return !contains(proven, h); }));
     }
