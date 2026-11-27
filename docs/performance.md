@@ -192,13 +192,24 @@ With two or more sequences in one MTP verify, the INT8-family small-T attention 
 count from CTA targets tuned for a 170-SM card. On the 3090 these kernels run two CTAs per SM (164
 per wave), so four 27B sequences past 79,360 keys got 21 splits: 336 CTAs, two full waves and 8 CTAs
 in a third. Above 8,198 keys a multi-row launch now takes the smallest split count, at or above the
-page limit, that keeps its waves at least 97% full (30 splits for four sequences at 80K). One
-sequence, windows of 8,198 keys or fewer, fp8, nvfp4, k8v4 and the V100 build keep the old rule.
+page limit, that keeps its waves at least 97% full (30 splits for four sequences at 80K). The fp8,
+nvfp4 and k8v4 kernels take the same rule, with their resident CTAs per SM read from the CUDA
+occupancy API once per device. One sequence, windows of 8,198 keys or fewer and the V100 build keep
+the old rule.
 
 **Op bench** (`ninfer_causal_softmax_attention_bench`, d256-h24-kv4, append, 4 columns, graph,
 exact envelope, ABBA in one lock hold, WSL build): four `rk4v4` sequences take 1,374 µs a call at
 79,872 keys against 1,710 (-19.6%), -19.3% at 81,920, -8.6% at 98,304 and -6.6% at 131,072. One
 sequence is unchanged (within ±3%).
+
+The same bench for the other quantised caches (two, three and four sequences, 16K-131K keys in 8K
+steps, ABBA): no cell got slower beyond noise (worst +0.4%), and the old rule's cliffs are gone.
+
+| cache | 2 sequences | 3 sequences | 4 sequences |
+|---|---|---|---|
+| fp8 | -28% at 81,920, -20% at 122,880 | -28% at 24,576 and 49,152, -20% at 81,920 | -24% at 40,960, -14% at 81,920 |
+| nvfp4 | -1% to -5% | -18% at 114,688 | -20% at 81,920, -13% at 122,880 |
+| k8v4 | -29% at 81,920, -21% at 122,880 | -28% at 49,152, -21% at 81,920 | -25% at 40,960, -15% at 81,920 |
 
 **Four concurrent agent sessions**: the workload, flags and machine of the next section (four
 75-84K-token sessions, ~95% cached follow-ups, 1,700 tokens out each, MTP3, `rk4v4`, the

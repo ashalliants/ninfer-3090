@@ -205,23 +205,35 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
             // keeps them within kCausalSmallTSplitKeys (small_t.cuh) past the split cap.
             const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
 #if !defined(NINFER_SM70)
-            // Past 8198 keys every INT8-family partial route runs two CTAs per SM
-            // (launch_tc_partial_i8), so the grid's waves are known: fill them. The CTA targets
-            // below date from a 170-SM card and left the 3090's waves part-empty (e.g. 21 splits
-            // x 4 heads x 4 rows past 79,360 keys: 2.05 waves).
-            if (envelope.max_visible_keys > 8198 &&
-                (cache_storage == KvCacheStorage::Int8Group64 ||
-                 cache_storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
-                 cache_storage == KvCacheStorage::RotatedLloyd4KeyInt4Value)) {
-                if (multiprocessor_count <= 0) {
-                    throw std::invalid_argument(
-                        "causal_softmax_attention split capacity: a multi-row INT8-family launch "
-                        "needs the device SM count");
+            // Past 8198 keys the grid's waves are known, so fill them. Every INT8-family partial
+            // route runs two CTAs per SM there (launch_tc_partial_i8); the fp8, nvfp4 and k8v4
+            // kernels report their own residency. The CTA targets below date from a 170-SM card
+            // and left the 3090's waves part-empty (e.g. 21 splits x 4 heads x 4 rows past
+            // 79,360 keys: 2.05 waves).
+            if (envelope.max_visible_keys > 8198) {
+                std::int32_t ctas_per_sm = 0;
+                if (cache_storage == KvCacheStorage::Int8Group64 ||
+                    cache_storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+                    cache_storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+                    ctas_per_sm = 2;
+                } else if (cache_storage == KvCacheStorage::Fp8E4M3Row256) {
+                    ctas_per_sm = causal_attention_small_t_fp8_ctas_per_sm(tokens);
+                } else if (cache_storage == KvCacheStorage::Nvfp4Group16) {
+                    ctas_per_sm = causal_attention_small_t_nvfp4_ctas_per_sm(tokens);
+                } else if (cache_storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+                    ctas_per_sm = causal_attention_small_t_k8v4_ctas_per_sm(tokens);
                 }
-                const int lower = std::min(capacity, std::max(4, page_limit));
-                return causal_small_t_wave_filled_splits(lower, capacity,
-                                                         CausalD256H24Kv4::KVHeads * batch_size,
-                                                         2 * multiprocessor_count);
+                if (ctas_per_sm > 0) {
+                    if (multiprocessor_count <= 0) {
+                        throw std::invalid_argument(
+                            "causal_softmax_attention split capacity: a multi-row launch past "
+                            "8198 keys needs the device SM count");
+                    }
+                    const int lower = std::min(capacity, std::max(4, page_limit));
+                    return causal_small_t_wave_filled_splits(lower, capacity,
+                                                             CausalD256H24Kv4::KVHeads * batch_size,
+                                                             ctas_per_sm * multiprocessor_count);
+                }
             }
 #endif
             // Keep complete grids within one or two 170-SM waves. Rounding from 160 CTAs
@@ -344,20 +356,20 @@ void causal_attention_small_t_launch(
     Tensor& out, cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_small_t_k8v4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
-                                             envelope, column_begin, width, partial_acc, partial_m,
-                                             partial_l, out, stream);
+                                             envelope, column_begin, width, multiprocessor_count,
+                                             partial_acc, partial_m, partial_l, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_small_t_fp8_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
-                                            envelope, column_begin, width, partial_acc, partial_m,
-                                            partial_l, out, stream);
+                                            envelope, column_begin, width, multiprocessor_count,
+                                            partial_acc, partial_m, partial_l, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         causal_attention_small_t_nvfp4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
-                                              envelope, column_begin, width, partial_acc, partial_m,
-                                              partial_l, out, stream);
+                                              envelope, column_begin, width, multiprocessor_count,
+                                              partial_acc, partial_m, partial_l, out, stream);
         return;
     }
     const CausalSmallTInvocation invocation{

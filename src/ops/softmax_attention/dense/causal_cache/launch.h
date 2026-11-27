@@ -80,11 +80,16 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& posit
                                             Tensor& partial_acc, Tensor& partial_m,
                                             Tensor& partial_l, Tensor& out, cudaStream_t stream);
 
+// Resident CTAs per SM of the multi-row 27B fp8 small-T partial kernel for `tokens` columns,
+// queried once per device: the multi-row split policy fills whole waves of them.
+std::int32_t causal_attention_small_t_fp8_ctas_per_sm(std::int32_t tokens);
+
 void causal_attention_small_t_fp8_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+    std::int32_t multiprocessor_count, Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+    Tensor& out, cudaStream_t stream);
 
 void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& positions,
                                                 float scale, const PagedKVLayerView& cache,
@@ -93,11 +98,16 @@ void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& p
                                                 Tensor& partial_l, Tensor& out,
                                                 cudaStream_t stream);
 
+// Resident CTAs per SM of the multi-row 27B nvfp4 small-T partial kernel for `tokens` columns,
+// queried once per device: the multi-row split policy fills whole waves of them.
+std::int32_t causal_attention_small_t_nvfp4_ctas_per_sm(std::int32_t tokens);
+
 void causal_attention_small_t_nvfp4_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+    std::int32_t multiprocessor_count, Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+    Tensor& out, cudaStream_t stream);
 
 void causal_attention_cached_small_t_nvfp4_launch(const Tensor& q, const Tensor& positions,
                                                   float scale, const PagedKVLayerView& cache,
@@ -106,11 +116,16 @@ void causal_attention_cached_small_t_nvfp4_launch(const Tensor& q, const Tensor&
                                                   Tensor& partial_l, Tensor& out,
                                                   cudaStream_t stream);
 
+// Resident CTAs per SM of the multi-row 27B k8v4 small-T partial kernel for `tokens` columns,
+// queried once per device: the multi-row split policy fills whole waves of them.
+std::int32_t causal_attention_small_t_k8v4_ctas_per_sm(std::int32_t tokens);
+
 void causal_attention_small_t_k8v4_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+    std::int32_t multiprocessor_count, Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+    Tensor& out, cudaStream_t stream);
 
 void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& positions,
                                                  float scale, const PagedKVLayerView& cache,
@@ -137,16 +152,17 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
                                               std::int32_t multiprocessor_count, Tensor& out,
                                               cudaStream_t stream);
 
-void causal_attention_prompt_i8_fa2_attention_launch(
-    const Tensor& q, const Tensor& positions, float scale, const PagedKVLayerView& cache,
-    CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-    std::int32_t multiprocessor_count, Tensor& out, cudaStream_t stream);
+void causal_attention_prompt_i8_fa2_attention_launch(const Tensor& q, const Tensor& positions,
+                                                     float scale, const PagedKVLayerView& cache,
+                                                     CausalAttentionExecutionEnvelope envelope,
+                                                     WorkspaceArena& workspace,
+                                                     std::int32_t multiprocessor_count, Tensor& out,
+                                                     cudaStream_t stream);
 
 void causal_attention_prompt_i8_fa2_batch_attention_launch(
     const Tensor& q, const Tensor& positions, const Tensor& valid_columns, const Tensor& table_rows,
     float scale, const PagedKVBatchLayerView& cache, CausalAttentionExecutionEnvelope envelope,
-    WorkspaceArena& workspace, std::int32_t multiprocessor_count, Tensor& out,
-    cudaStream_t stream);
+    WorkspaceArena& workspace, std::int32_t multiprocessor_count, Tensor& out, cudaStream_t stream);
 
 void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                         const Tensor& positions, const Tensor& valid_columns,

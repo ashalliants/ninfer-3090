@@ -3260,6 +3260,15 @@ int run_quantized_batch_cases(KvCacheStorage storage, std::uint32_t seed) {
                                 {7, 0, 5, 2, 6, 1, 4, 3},
                                 MappingPattern::Fragmented,
                                 seed + 3u});
+    // Four MTP3 lanes near 80K keys, one row masked and two far shorter than the envelope: the
+    // multi-row split policy fills the device's waves of this kernel's resident CTAs.
+    failures += run_batch_case(kGeometries[0], storage,
+                               {4,
+                                {79872, 30000, 81000, 9000},
+                                {4, 4, 3, 4},
+                                {2, 0, 3, 1},
+                                MappingPattern::Fragmented,
+                                seed + 4u});
     return failures;
 }
 
@@ -3326,6 +3335,16 @@ int run_batch_cases() {
             return run_batch_case(kGeometries[0], kPlanFp8,
                                   {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1},
                                    MappingPattern::Fragmented, 505u});
+        });
+    failures += run_case_allowing_arch_skip(
+        "causal_softmax_attention FP8 KV cache batched, four lanes near 80K keys", [&] {
+            return run_batch_case(kGeometries[0], kPlanFp8,
+                                  {4,
+                                   {79872, 30000, 81000, 9000},
+                                   {4, 4, 3, 4},
+                                   {2, 0, 3, 1},
+                                   MappingPattern::Fragmented,
+                                   514u});
         });
     return failures;
 }
