@@ -412,7 +412,8 @@ public:
                     {.handle   = handle,
                      .ordinal  = ++ordinal_,
                      .priority = demand_priority(program.checkpoint_key(handle, summary.frontier)),
-                     .retained_at = ++clock_});
+                     .retained_at = ++clock_,
+                     .since       = unproven_turnovers_});
                 index_.insert(program, handle, summary.frontier);
             }
         } else {
@@ -449,7 +450,7 @@ public:
                     release_unreferenced(program, handle);
                     return;
                 }
-                owner->points.push_back({handle, summary.role});
+                owner->points.push_back({handle, summary.role, unproven_turnovers_});
                 index_.insert(program, handle, summary.frontier);
             }
         }
@@ -477,7 +478,8 @@ public:
                                .ordinal     = ++ordinal_,
                                .priority    = {},
                                .retained_at = ++clock_,
-                               .pinned      = true});
+                               .pinned      = true,
+                               .since       = unproven_turnovers_});
         }
         index_.insert(program, handle, summary.frontier);
     }
@@ -581,6 +583,10 @@ public:
         cursor.rights    = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
         if (admission && !admission->demand.reused) {
             cursor.gain_limit = recovery_gain(program, *admission, surviving(program, {}));
+            // One unproven write is one turn of a pool of this size, so the clock counts pool
+            // turnovers however the pool grows or shrinks between decisions.
+            unproven_turnovers_ +=
+                kTurnoverUnit / std::max<std::size_t>(1, unproven_pool_size(program));
         }
         return cursor;
     }
@@ -659,6 +665,18 @@ public:
         }
         notify_releasing(program, {&handle, 1});
         return erase(program, handle, rights);
+    }
+
+    // One turnover of the unproven pool on the unproven-write clock (unproven_turnovers_).
+    static constexpr std::uint64_t kTurnoverUnit = std::uint64_t{1} << 20;
+
+    // How many turnovers of the unproven pool (in kTurnoverUnit) a cached checkpoint has sat
+    // through since it entered the cache unproven (unproven_claim); nullopt when the cache does
+    // not hold it. For tests and diagnostics.
+    [[nodiscard]] std::optional<std::uint64_t> unproven_age(Handle handle) const {
+        const auto since = recorded_since(handle);
+        if (!since) { return std::nullopt; }
+        return unproven_turnovers_ > *since ? unproven_turnovers_ - *since : 0;
     }
 
     // Victim selection reuses each candidate's facts across the plans of one reclaim. The tests turn
@@ -941,7 +959,7 @@ public:
             if (summary.role == CheckpointRole::SharedPrefix) {
                 throw std::logic_error("a restored continuation carried a public point");
             }
-            owner.points.push_back({handle, summary.role});
+            owner.points.push_back({handle, summary.role, unproven_turnovers_});
             index_.insert(program, handle, summary.frontier);
         }
         prune(program);
@@ -972,7 +990,7 @@ public:
             return false;
         }
         shared_.push_back({.handle = handle, .ordinal = ++ordinal_, .priority = {},
-                           .retained_at = ++clock_});
+                           .retained_at = ++clock_, .since = unproven_turnovers_});
         index_.insert(program, handle, program.checkpoint_metadata(handle).frontier);
         return true;
     }
@@ -1129,6 +1147,8 @@ private:
     struct Point {
         Handle handle;
         CheckpointRole role;
+        // unproven_turnovers_ when this point entered the cache unproven (unproven_claim).
+        std::uint64_t since = 0;
     };
 
     struct Owner {
@@ -1262,6 +1282,7 @@ private:
         CacheRetentionPriority priority;
         std::uint64_t retained_at;
         bool pinned = false;
+        std::uint64_t since = 0; // as Point::since
     };
 
     static bool contains(std::span<const Handle> handles, Handle handle) {
@@ -1337,14 +1358,20 @@ private:
     void replace_points(Program& program, Owner& owner, std::span<const Handle> carried) {
         std::vector<Handle> old;
         for (const auto& point : owner.points) { old.push_back(point.handle); }
+        // Carrying a point is not a use: a point the cache already holds keeps its age.
+        std::vector<std::optional<std::uint64_t>> carried_since;
+        carried_since.reserve(carried.size());
+        for (const auto handle : carried) { carried_since.push_back(recorded_since(handle)); }
         owner.points.clear();
-        for (const auto handle : carried) {
+        for (std::size_t i = 0; i < carried.size(); ++i) {
+            const auto handle = carried[i];
             if (!program.valid_checkpoint(handle)) { continue; }
             const auto summary = program.checkpoint_metadata(handle);
             if (summary.role == CheckpointRole::SharedPrefix) {
                 throw std::logic_error("Native carried a public point as a private continuation");
             }
-            owner.points.push_back({handle, summary.role});
+            owner.points.push_back(
+                {handle, summary.role, carried_since[i].value_or(unproven_turnovers_)});
             index_.insert(program, handle, summary.frontier);
         }
         for (const auto handle : old) { release_unreferenced(program, handle); }
@@ -1893,6 +1920,156 @@ private:
         return recovery_gain(program, *admission, kept, evaluation) > loss;
     }
 
+    // When the cache's newest holder of `handle` took it in unproven (Point::since); nullopt
+    // when no owner or shared entry holds it.
+    [[nodiscard]] std::optional<std::uint64_t> recorded_since(Handle handle) const {
+        std::optional<std::uint64_t> since;
+        const auto include = [&](std::uint64_t value) {
+            since = since ? std::max(*since, value) : value;
+        };
+        for (const auto& owner : owners_) {
+            for (const auto& point : owner.points) {
+                if (point.handle == handle) { include(point.since); }
+            }
+        }
+        for (const auto& shared : shared_) {
+            if (shared.handle == handle) { include(shared.since); }
+        }
+        return since;
+    }
+
+    // The unproven pool: distinct checkpoints no repeat demand protects. A reused owner's
+    // protection covers its points up to the position it was actually adopted at
+    // (proven_frontier); a newer point past it is as unproven as a one-off (action_priority
+    // treats it the same way when an earlier point survives to cover the proof; when none
+    // does, counting it here only makes the pool larger and the ageing slower).
+    [[nodiscard]] std::size_t unproven_pool_size(const Program& program) const {
+        std::vector<Handle> unproven, proven;
+        const auto add = [&](Handle handle, bool reused) {
+            auto& into = reused ? proven : unproven;
+            if (!contains(into, handle)) { into.push_back(handle); }
+        };
+        for (const auto& owner : owners_) {
+            for (const auto& point : owner.points) {
+                const bool covered =
+                    owner.priority.reused && program.valid_checkpoint(point.handle) &&
+                    program.checkpoint_metadata(point.handle).frontier <= owner.proven_frontier;
+                add(point.handle, covered);
+            }
+        }
+        // A pinned prefix is never released, so it never turns over and is not in the pool.
+        for (const auto& shared : shared_) {
+            if (!shared.pinned) { add(shared.handle, shared.priority.reused); }
+        }
+        return static_cast<std::size_t>(std::count_if(
+            unproven.begin(), unproven.end(), [&](Handle h) { return !contains(proven, h); }));
+    }
+
+    // How many turnovers of the unproven pool halve an unproven entry's claim to its place
+    // (unproven_claim).
+    static constexpr std::uint64_t kUnprovenClaimHalvingTurnovers = 32;
+
+    // What an unproven entry's place is worth to it against an unproven write: the tokens its
+    // release would cost (`loss`), halved for every kUnprovenClaimHalvingTurnovers turnovers of
+    // the unproven pool it has sat through unused. Each unproven write advances the clock by
+    // 1/pool of a turnover, the pool as it was at that write (begin_reclaim).
+    //
+    // Without it, a write had to outweigh the entry it displaces: a tier filled early by long
+    // one-off prompts then refused every later, shorter one-off for good, and the tier held
+    // whatever arrived first however stale. With it, a fresh entry keeps its full claim (so a
+    // stream of one-off prompts does not pay a Host write per request), and an old one is
+    // eventually replaced by anything at least half as valuable, oldest first. A long, costly
+    // prompt keeps its place proportionally longer than a short one. Proven (reused) history
+    // is not in this pool.
+    [[nodiscard]] std::uint64_t unproven_claim(std::span<const Handle> sources,
+                                               std::uint64_t loss) const {
+        std::uint64_t since = 0;
+        for (const auto handle : sources) {
+            since = std::max(since, recorded_since(handle).value_or(0));
+        }
+        const auto age      = unproven_turnovers_ > since ? unproven_turnovers_ - since : 0;
+        const auto period   = kTurnoverUnit * kUnprovenClaimHalvingTurnovers;
+        const auto halvings = age / period;
+        return halvings >= 64 ? 0 : loss >> halvings;
+    }
+
+    // The victims of an unproven optional write: one release action, from unproven history,
+    // whose claim (unproven_claim) is below the write's gain. Superseded history goes first,
+    // then the weakest claim, then reclaim order; history a waiting request holds goes last.
+    // An empty list when no release is needed, nullopt when the write is refused, and no
+    // answer at all (std::nullopt of the outer optional) when no single action it may take
+    // frees enough: the caller's combination search then decides as before. Cost: one pricing
+    // per action, each against the evaluation's prepared tables, and one byte check per chosen
+    // action.
+    [[nodiscard]] std::optional<std::optional<std::vector<Handle>>>
+    unproven_write_victims(Program& program, const auto& actions, std::size_t required,
+                           const Admission& admission, const ReclaimCursor& cursor,
+                           Evaluation& evaluation) const {
+        bool sufficient = false;
+        for (const auto& action : actions) {
+            if (action.released.host_bytes >= required) {
+                sufficient = true;
+                break;
+            }
+        }
+        if (!sufficient) { return std::nullopt; }
+        const auto gain  = base_recovery_gain(program, admission, {}, evaluation);
+        const auto claim = gain > cursor.sacrificed ? gain - cursor.sacrificed : 0;
+        struct Choice {
+            std::size_t action;
+            bool superseded;
+            std::uint64_t waiting;
+            std::uint64_t value;
+            std::size_t order;
+        };
+        // The actions this write may take: unproven history it may revoke. When none of them
+        // frees enough alone (only proven or protected history does), a combination might, so
+        // the caller's search decides.
+        struct Eligible {
+            std::size_t action;
+            ActionFacts facts;
+        };
+        std::vector<Eligible> eligible;
+        bool alone = false;
+        for (std::size_t i = 0; i < actions.size(); ++i) {
+            const auto& sources = actions[i].sources;
+            if (!may_revoke(sources, cursor.rights)) { continue; }
+            auto facts = action_facts(program, sources, cursor, evaluation);
+            if (facts.priority.reused) { continue; } // proven history: never for an unproven write
+            alone = alone || actions[i].released.host_bytes >= required;
+            eligible.push_back({i, std::move(facts)});
+        }
+        if (!alone) { return std::nullopt; }
+        std::vector<Choice> choices;
+        for (auto& [i, facts] : eligible) {
+            const auto& sources = actions[i].sources;
+            if (actions[i].released.host_bytes < required) { continue; }
+            const auto value =
+                facts.superseded
+                    ? 0
+                    : unproven_claim(sources, action_loss(program, sources, facts, evaluation));
+            if (value >= claim) { continue; }
+            choices.push_back({i, facts.superseded, waiting_ticket(sources), value, facts.order});
+        }
+        std::sort(choices.begin(), choices.end(), [](const Choice& a, const Choice& b) {
+            if (bool(a.waiting) != bool(b.waiting)) { return !a.waiting; }
+            if (a.superseded != b.superseded) { return a.superseded; }
+            if (a.value != b.value) { return a.value < b.value; }
+            return a.order < b.order;
+        });
+        // The plan's quote says what an action frees; the Program confirms the chosen one.
+        constexpr std::size_t kChecked = 4;
+        for (std::size_t i = 0; i < choices.size() && i < kChecked; ++i) {
+            const auto& sources = actions[choices[i].action].sources;
+            if (program.host_bytes_released(sources) >= required) {
+                return std::optional<std::vector<Handle>>(
+                    std::vector<Handle>(sources.begin(), sources.end()));
+            }
+        }
+        using Refused = std::optional<std::vector<Handle>>;
+        return std::optional<Refused>(Refused{}); // refused
+    }
+
     // recovery_gain of a capture (an admission with a base) against the retained checkpoints less
     // `removed`, which is what every candidate the victim search prices asks. Each retained
     // checkpoint's recovery frontier for the capture does not depend on the candidate, so it is
@@ -2048,6 +2225,16 @@ private:
             placing = unit != 0 && !bytes_are_shortage;
         }
         if (placing) { state_run = false; }
+        // An optional write that no second request has proven (the end of a one-off prompt, say)
+        // takes one unproven entry's place or nothing, decided without the combination search.
+        if (admission && admission->base && !admission->demand.reused && !placing &&
+            !state_run && later_snapshots.empty() &&
+            (!cursor.admission || !cursor.admission->demand.reused)) {
+            if (auto decided = unproven_write_victims(program, actions, required, *admission,
+                                                      cursor, evaluation)) {
+                return *decided;
+            }
+        }
         const auto placed = [&](std::span<const Handle> set) {
             if constexpr (requires { program.host_free_runs_after_release(set); }) {
                 return host_places(program.host_free_runs_after_release(set), bytes, unit,
@@ -2223,21 +2410,26 @@ private:
             std::uint64_t ordinal;
             std::vector<Handle> handles;
             std::optional<std::array<std::uint64_t, 4>> footprint;
+            std::vector<std::uint64_t*> since; // restarted when the entry loses protection
         };
 
         std::vector<ProtectedEntry> entries;
         for (auto& owner : owners_) {
             if (!owner.priority.reused) { continue; }
             std::vector<Handle> handles;
+            std::vector<std::uint64_t*> since;
             handles.reserve(owner.points.size());
-            for (const auto& point : owner.points) { handles.push_back(point.handle); }
-            entries.push_back(
-                {&owner.priority, &owner.retained_at, owner.token, std::move(handles)});
+            for (auto& point : owner.points) {
+                handles.push_back(point.handle);
+                since.push_back(&point.since);
+            }
+            entries.push_back({&owner.priority, &owner.retained_at, owner.token, std::move(handles),
+                               std::nullopt, std::move(since)});
         }
         for (auto& shared : shared_) {
             if (shared.priority.reused && !shared.pinned) {
-                entries.push_back(
-                    {&shared.priority, &shared.retained_at, shared.ordinal, {shared.handle}});
+                entries.push_back({&shared.priority, &shared.retained_at, shared.ordinal,
+                                   {shared.handle}, std::nullopt, {&shared.since}});
             }
         }
         if (entries.empty()) { return; }
@@ -2287,6 +2479,8 @@ private:
             if (!demote) { return; }
             demote->priority->reused = false;
             *demote->retained_at     = ++clock_;
+            // It re-enters the unproven pool as new: its claim fades from now (unproven_claim).
+            for (auto* since : demote->since) { *since = unproven_turnovers_; }
         }
     }
 
@@ -2296,6 +2490,9 @@ private:
     PrefixIndex<Model> index_;
     bool candidate_memo_ = true;
     std::uint64_t pricing_work_cap_ = kMaxReclaimPricingWork;
+    // Optional writes of unproven checkpoints decided so far (begin_reclaim): the clock an
+    // unproven entry ages by (unproven_claim).
+    std::uint64_t unproven_turnovers_ = 0;
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;
     std::vector<WaitingSource> waiting_;
