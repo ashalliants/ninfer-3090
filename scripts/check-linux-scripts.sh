@@ -259,6 +259,15 @@ expect_config '27B QAD default' "$recorded" qwen38-27b-qad-tuned-mtp
 expect_options '27B QAD default' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
   --max-concurrency 2 --max-context 262144 --kv-capacity 262144 \
   --spec mtp --draft-tokens 3 --lm-head-draft --prefill-chunk 2048
+recorded="$(record whole_qad_dflash2 NINFER_SPEC=dflash2 -- qwen38-27b-qad)"
+expect_config '27B QAD NINFER_SPEC=dflash2' "$recorded" qwen38-27b-qad-tuned-dflash2
+expect_options '27B QAD NINFER_SPEC=dflash2' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
+  --max-concurrency 2 --max-context 262144 --kv-capacity 262144 --ngram-draft-tokens 15 \
+  --spec dflash2 --draft-tokens 7 --lm-head-draft --prefill-chunk 2048
+refuse_flag '27B QAD MTP has no n-gram copies' "$(record whole_qad_mtp_ngram -- qwen38-27b-qad)" \
+  '--ngram-draft-tokens'
+expect_exit 2 '27B QAD NINFER_NGRAM=on with MTP' \
+  clear_env NINFER_NGRAM=on NINFER_MODEL_DIR="$tmp" "$root/run.sh" qwen38-27b-qad
 recorded="$(record whole_35b -- qwen36-35b-a3b)"
 expect_config '35B default' "$recorded" qwen36-35b-a3b-tuned-mtp
 expect_options '35B default' "$recorded" "${common_tuned[@]}" --fit-context 32768 \

@@ -36,8 +36,8 @@ This model card is the version-controlled source for
 
 The repository holds [NVIDIA's Qwen3.8-27B-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD)
 converted to NInfer's native `.ninfer` container by
-[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090), with the vision tower and the MTP
-speculative head in the same file. It is not a Transformers checkpoint, Safetensors distribution or GGUF
+[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090), with the vision tower, the MTP
+speculative head and (since revision 2026-11-27) the DFlash2 drafter in the same file. It is not a Transformers checkpoint, Safetensors distribution or GGUF
 file, and it needs this project's executables (a build from master after 2026-11-26).
 
 ## Which Qwen3.8-27B should I use?
@@ -49,8 +49,8 @@ Two builds of the same model, so you can pick:
 | Weights | This project's Q4/Q5 conversion | NVIDIA's quantization-aware-distilled NVFP4/FP8 |
 | Accuracy | Close to full precision | Closer: NVIDIA trained it against the BF16 model, and it scores lower perplexity than the default on every domain measured |
 | Decode on a V100 (MTP3, served) | 110 tok/s code, 77 story | 90 tok/s code, 59 story |
-| Speculation | MTP and DFlash2 | MTP |
-| File | 17.68 GiB | 16.91 GiB |
+| Speculation | MTP and DFlash2 | MTP (default) and DFlash2 |
+| File | 17.68 GiB | 18.99 GiB |
 
 Choose this one when answer quality matters more than speed. Choose the default for the fastest decode.
 
@@ -80,6 +80,11 @@ Recipe `qwen3_8_27b_nvfp4_qad` ([weight conversion](https://github.com/ashallian
 - The token embedding: Q8, generated from the checkpoint's BF16.
 - Vision: from the checkpoint. MTP: NVIDIA's export keeps 11 of the head's 15 tensors, so the head
   comes from [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)'s last shard.
+- DFlash2 (added 2026-11-27): the drafter of
+  [WarlaxZ/Qwen3.8-27B-NInfer-3090](https://huggingface.co/WarlaxZ/Qwen3.8-27B-NInfer-3090), its 66
+  tensors copied byte for byte with `tools/artifact/add_component.py`. It was trained against the BF16
+  model, not this checkpoint, so it accepts fewer drafts here than on the Q4/Q5 build (see below).
+  Everything else in the file is byte-identical to the first revision, and MTP output is unchanged.
 
 Source: `nvidia/Qwen3.8-27B-NVFP4-QAD` revision `cd46ab575a5a687f0bc3e54251016fc2cc1a6aef`.
 
@@ -87,7 +92,10 @@ Source: `nvidia/Qwen3.8-27B-NVFP4-QAD` revision `cd46ab575a5a687f0bc3e54251016fc
 
 | File | Bytes | SHA-256 |
 |---|---:|---|
-| `qwen3_8_27b_nvfp4_qad.ninfer` (the model, with vision and MTP) | 18,159,548,164 | `c79ff2d1f9b3c0f729327d073bfd0b9dbf085c5c300a53d51f260a0fd634de0d` |
+| `qwen3_8_27b_nvfp4_qad.ninfer` (the model, with vision, MTP and DFlash2) | 20,386,365,952 | `7c62491a31ce950f8ad2053861f03843dd1c75064028ab2e072607b6a8dadcb1` |
+
+The first revision (commit `2cd93ef5`, without DFlash2) was 18,159,548,164 bytes, SHA-256
+`c79ff2d1f9b3c0f729327d073bfd0b9dbf085c5c300a53d51f260a0fd634de0d`.
 
 ## Running it
 
@@ -103,7 +111,8 @@ NINFER_API_KEY=<a secret> scripts/run-v100.sh qwen38-27b-qad
 ```
 
 That serves MTP3 with the draft head, INT8 KV and two lanes sharing the full 262,144-token context,
-with images (vision in overlay residency), on port 8080. It is an OpenAI-compatible endpoint, and the
+with images (vision in overlay residency), on port 8080. `NINFER_SPEC=dflash2` serves DFlash2 K=7 with
+n-gram copies instead, same lanes and context: faster on code and JSON, slower on prose. It is an OpenAI-compatible endpoint, and the
 Anthropic Messages API is served too.
 
 **On an RTX 3090:** `download-model.bat qwen38-27b-qad` / `run.bat qwen38-27b-qad` (or the `.sh`
@@ -111,12 +120,19 @@ launchers) fetch and serve it, but it has not been measured on the 3090 yet.
 
 ## Performance (one Tesla V100-PCIE-32GB, 2026-11-26, 200 W)
 
-Served (`ninfer-serve`, MTP3, INT8 KV, greedy, thinking off, 400-token answers):
+Served (`ninfer-serve`, two lanes, INT8 KV, overlay vision, greedy, thinking off, 400-token
+answers, one request at a time; 2026-11-27, two runs per column agreeing within 1 tok/s):
 
-| Prompt | This model | Default `qwen38-27b`, MTP3 |
-|---|---:|---:|
-| Code | 90.0 tok/s | 110 tok/s |
-| Story | 59.0 tok/s | 77 tok/s |
+| Prompt | This model, MTP3 | This model, DFlash2 K=7 + n-gram | Default `qwen38-27b`, DFlash2 (one run) |
+|---|---:|---:|---:|
+| Code | 90.1-91.1 tok/s | **116.0-116.4** | 139.1 |
+| JSON | 93.2-94.1 | **114.6-114.8** | 151.3 |
+| Explanation | **66.5-67.1** | 63.6-63.7 | 84.3 |
+| Story | **58.5-59.0** | 49.1-49.3 | 63.4 |
+| French essay | **58.0-58.4** | 46.7-46.9 | 59.7 |
+
+DFlash2's drafter was trained against the BF16 model and drafts this checkpoint less well than the
+default build, so it wins on predictable text and loses on prose. MTP3 stays the default.
 
 One request through `ninfer`, no speculation, BF16 KV:
 
@@ -147,7 +163,8 @@ The model is governed by the
 [NVIDIA Open Model Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/),
 NVIDIA's terms for `nvidia/Qwen3.8-27B-NVFP4-QAD`. The base model, Qwen3.8-27B by Alibaba Cloud, is
 licensed under the Apache License 2.0 (`LICENSE` in this repository). The files here are a conversion
-of NVIDIA's checkpoint into the `.ninfer` format; the MTP head comes from Qwen/Qwen3.8-27B.
+of NVIDIA's checkpoint into the `.ninfer` format; the MTP head comes from Qwen/Qwen3.8-27B, and the
+DFlash2 companion weights (Apache License 2.0) from the Q4/Q5 `qwen38-27b` build.
 
 Model by the [Qwen team](https://huggingface.co/Qwen); quantization-aware distillation by
 [NVIDIA](https://huggingface.co/nvidia); this `.ninfer` conversion and the V100 engine by the

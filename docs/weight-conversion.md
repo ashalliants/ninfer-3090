@@ -569,6 +569,22 @@ codes/scales; the method should not duplicate that byte-layout logic. Direct out
 `output.write_values`. Keep source blocks and temporary device tensors bounded to the method's
 working set. `--rows-per-chunk` defaults to 512; custom methods own how they use it.
 
+## Add a speculative component from another artifact
+
+`tools/artifact/add_component.py` copies one component (its config, objects, bindings and uses) from a
+donor artifact into a new copy of a base artifact, byte for byte, without the original sources:
+
+```bash
+python3 -m tools.artifact.add_component base.ninfer donor.ninfer out.ninfer --component dflash2
+```
+
+Neither input changes, and every base object, binding and use is kept as it was, so the base's own
+components decode exactly as before. The component's objects must be its own in the donor, and its
+uses may reach the base only through parameters both artifacts bind with the same tensor shape
+(DFlash2 reads `text/output_head`). The NVFP4 QAD 27B's DFlash2 drafter was added this way from the
+Q4/Q5 build (revision 2026-11-27). A drafter trained against another target accepts differently, so
+measure it before you make it a default.
+
 ## Resources, files and inspection
 
 Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and

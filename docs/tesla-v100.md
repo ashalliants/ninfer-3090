@@ -443,9 +443,9 @@ Before these routes, the QAD artifact decoded at 8.6 tok/s and prefilled the lon
 25 tok/s. Short prompts now match the Q4/Q5 mix: with a plain template, 11 / 18 / 28 / 47 prompt
 tokens prefill at 184.8 / 235.8 / 324.2 / 305.6 tok/s against its 189.6 / 229.8 / 315.0 / 324.1.
 
-**Serving it.** `download-model.sh qwen38-27b-qad`, then `run-v100.sh qwen38-27b-qad`: MTP3 with the
-draft head, INT8 KV, two lanes sharing the full 262,144-token context, vision in overlay residency.
-It starts with 3.9 GiB of VRAM free. Speculation stays on because overlay vision borrows its encode
+**Serving it.** `download-model.sh qwen38-27b-qad`, then `run-v100.sh qwen38-27b-qad`: MTP3 (or
+DFlash2, below) with the draft head, INT8 KV, two lanes sharing the full 262,144-token context,
+vision in overlay residency. It starts with 3.9 GiB of VRAM free. Speculation stays on because overlay vision borrows its encode
 window from the MTP weights (`NINFER_SPEC=none` is refused rather than started without images).
 `ninfer-serve` on 127.0.0.1, MTP3, INT8 KV, `--prefill-cublas --prefill-chunk 2048 --gdn-state-fp16`,
 greedy, thinking off, 400-token answers, 200 W (2026-11-26):
@@ -454,6 +454,25 @@ greedy, thinking off, 400-token answers, 200 W (2026-11-26):
 |---|---:|---:|
 | Code (ISO 8601 parser with tests) | 90.0 tok/s | 110 tok/s |
 | Story | 59.0 tok/s | 77 tok/s |
+
+**DFlash2 (artifact revision 2026-11-27).** The artifact now also carries the Q4/Q5 build's DFlash2
+drafter, copied byte for byte (`tools/artifact/add_component.py`; MTP output on the five prompts below
+is byte-identical to the first revision's). `NINFER_SPEC=dflash2 run-v100.sh qwen38-27b-qad` serves it
+as K=7 with n-gram copies. Same server settings as above (two lanes, INT8 KV, overlay vision), greedy,
+thinking off, 400-token answers, one request at a time, 2026-11-27, 200 W, ABBA, the two legs of each
+column within 1 tok/s; the Q4/Q5 column is one run of the same settings:
+
+| Prompt | QAD, MTP3 | QAD, DFlash2 K=7 + n-gram | Q4/Q5 mix, DFlash2 K=7 + n-gram |
+|---|---:|---:|---:|
+| Code (ISO 8601 parser with tests) | 90.1-91.1 | **116.0-116.4** | 139.1 |
+| JSON list | 93.2-94.1 | **114.6-114.8** | 151.3 |
+| Explanation (TCP) | **66.5-67.1** | 63.6-63.7 | 84.3 |
+| Story | **58.5-59.0** | 49.1-49.3 | 63.4 |
+| French essay | **58.0-58.4** | 46.7-46.9 | 59.7 |
+
+The drafter was trained against the BF16 model, and on this checkpoint it drafts predictable text well
+and prose worse than on the Q4/Q5 mix, so MTP3 stays the default. DFlash2 leaves 2.29 GiB of VRAM free
+at startup against MTP3's 3.87. RTX 3090 NOT RUN.
 
 Single-request decode without speculation is within 4% (40.6 against 42.2, the table above); with
 MTP3 the gap widens to about 20% (the QAD accepted 287 drafts for its 400 code tokens; the Q4/Q5
