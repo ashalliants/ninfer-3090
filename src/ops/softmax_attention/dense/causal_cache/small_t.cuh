@@ -185,8 +185,16 @@ __device__ __forceinline__ void causal_small_t_store_byte_swizzled(Byte* tile, i
     tile[off]         = code;
 }
 
-__device__ __forceinline__ int causal_small_t_tc_swz32(int row, int col) {
-    return (((col >> 3) ^ (row & 3)) << 3) | (col & 7);
+// Swizzle for a [rows][Bc] FP16 tile read by ldmatrix (the P tile): XOR the 16-byte chunk index so
+// the eight rows of one ldmatrix phase land in eight different 16-byte bank groups. A Bc=64 row is
+// one 128-byte bank line, so the chunk takes row & 7. A Bc=32 row is half a line and rows 2r and
+// 2r+1 share one, so the chunk (four per row) takes (row >> 1) & 3; XOR-ing with row & 3 instead
+// left rows r and r+4 on the same banks, a 2-way conflict on every P load and store.
+template <int Bc>
+__device__ __forceinline__ int causal_small_t_p_swz(int row, int col) {
+    static_assert(Bc == 32 || Bc == 64);
+    const int key = Bc == 64 ? (row & 7) : ((row >> 1) & 3);
+    return (((col >> 3) ^ key) << 3) | (col & 7);
 }
 
 // Signed int8 QK MMA, k=32 contraction. A = 16x32 s8 (4 regs/thread, 4 s8 each),

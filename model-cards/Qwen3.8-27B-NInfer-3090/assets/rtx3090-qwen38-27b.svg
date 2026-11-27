@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 1635" width="960" height="1635" role="img" aria-label="Qwen3.8-27B on one RTX 3090, ashalliants/ninfer-3090 against the best published figures. Chat, one request, vs syv-ai HyperQwen: 1.02x decode (133.2 vs 131.2), 1.22x prefill. Code vs open-jet: 1.39x (194.6 vs 140). No drafts vs open-jet: 1.11x (47.7 vs 42.9). 98K-token context vs open-jet: 0.98x (93.9 vs 95.9). Eight requests at once vs syv-ai: 1.03x (421.4 vs 407.3).">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 1635" width="960" height="1635" role="img" aria-label="Qwen3.8-27B on one RTX 3090, ashalliants/ninfer-3090 against the best published figures. Chat, one request, vs syv-ai HyperQwen: 1.02x decode (133.2 vs 131.2), 1.22x prefill. Code vs open-jet: 1.39x (194.6 vs 140). No drafts vs open-jet: 1.11x (47.7 vs 42.9). 98K-token context vs open-jet: 0.98x (94.0 vs 95.9). Eight requests at once vs syv-ai: 1.03x (421.4 vs 407.3).">
   <title>Qwen3.8-27B on one RTX 3090: against the best published figures</title>
-  <desc>Qwen3.8-27B on one RTX 3090, ashalliants/ninfer-3090 against the best published figures. Chat, one request, vs syv-ai HyperQwen: 1.02x decode (133.2 vs 131.2), 1.22x prefill. Code vs open-jet: 1.39x (194.6 vs 140). No drafts vs open-jet: 1.11x (47.7 vs 42.9). 98K-token context vs open-jet: 0.98x (93.9 vs 95.9). Eight requests at once vs syv-ai: 1.03x (421.4 vs 407.3).</desc>
+  <desc>Qwen3.8-27B on one RTX 3090, ashalliants/ninfer-3090 against the best published figures. Chat, one request, vs syv-ai HyperQwen: 1.02x decode (133.2 vs 131.2), 1.22x prefill. Code vs open-jet: 1.39x (194.6 vs 140). No drafts vs open-jet: 1.11x (47.7 vs 42.9). 98K-token context vs open-jet: 0.98x (94.0 vs 95.9). Eight requests at once vs syv-ai: 1.03x (421.4 vs 407.3).</desc>
 
   <style>
     .surface { fill: #fcfcfb; stroke: rgba(11,11,11,0.10); }
@@ -66,11 +66,11 @@
   <line x1="32" y1="467.0" x2="928" y2="467.0" class="grid" stroke-width="1"/>
   <text x="32.0" y="494.0" class="t1" font-size="15" font-weight="700" text-anchor="start">98K-token context</text>
   <text x="32.0" y="513.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs the open-jet megakernel (7 drafts)</text>
-  <path class="rep" d="M302.0,483.0 h136.1 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-136.1 z"><title>98K-token context, Decode: 0.98x</title></path>
+  <path class="rep" d="M302.0,483.0 h136.3 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-136.3 z"><title>98K-token context, Decode: 0.98x</title></path>
   <line x1="445.1" y1="478.0" x2="445.1" y2="506.0" class="ref" stroke-width="1.5"/>
   <text x="452.1" y="498.0" class="loss" font-size="17" font-weight="700" text-anchor="start">0.98x</text>
   <text x="302.0" y="519.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: 98,362-token prompt, 512 tokens out</text>
-  <text x="302.0" y="533.0" class="t3" font-size="11" font-weight="400" text-anchor="start">(93.1-93.9 over two runs); syv-ai reports 78.5</text>
+  <text x="302.0" y="533.0" class="t3" font-size="11" font-weight="400" text-anchor="start">(93.8-94.0 over two runs); syv-ai reports 78.5</text>
   <text x="302.0" y="547.0" class="t3" font-size="11" font-weight="400" text-anchor="start">at 100K</text>
   <text x="629.0" y="496.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">open-jet publishes none; ours reads the 98K</text>
   <text x="629.0" y="511.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">prompt at 1,899 tok/s</text>
@@ -126,8 +126,8 @@
   <text x="783.3" y="903.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">381</text>
   <text x="807.3" y="903.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">syv-ai, 25K</text>
   <text x="172.0" y="937.5" class="t2" font-size="12.5" font-weight="400" text-anchor="end">98K-token context</text>
-  <path class="ours" d="M182.0,919.0 h143.0 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-143.0 z"><title>Ours, launcher settings: 98K-token context 93.9 tok/s</title></path>
-  <text x="334.0" y="929.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">93.9</text>
+  <path class="ours" d="M182.0,919.0 h143.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-143.1 z"><title>Ours, launcher settings: 98K-token context 94.0 tok/s</title></path>
+  <text x="334.1" y="929.5" class="t1" font-size="11.5" font-weight="600" text-anchor="start">94.0</text>
   <path class="rep" d="M182.0,934.0 h146.1 a4,4 0 0 1 4,4 v5.0 a4,4 0 0 1 -4,4 h-146.1 z"><title>Best other published figure (reported): 98K-token context 95.9 tok/s (open-jet)</title></path>
   <text x="337.1" y="944.5" class="t2" font-size="11.5" font-weight="400" text-anchor="start">95.9</text>
   <text x="367.8" y="944.5" class="t3" font-size="10.5" font-weight="400" text-anchor="start">open-jet</text>
@@ -187,11 +187,11 @@
   <path class="ours" d="M32.0,1455.0 h506.2 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-506.2 z"><title>Ours 98K-token prompt: 1,899</title></path>
   <text x="548.2" y="1466.5" class="t1" font-size="12" font-weight="600" text-anchor="start">1,899</text>
   <line x1="32" y1="1489.0" x2="928" y2="1489.0" class="grid" stroke-width="1"/>
-  <text x="32.0" y="1507.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Where we lose: at 98K tokens of context open-jet reports 95.9 tok/s against our 93.9 (0.98x). syv-ai&#x27;s batch mode reports about 1,035</text>
+  <text x="32.0" y="1507.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Where we lose: at 98K tokens of context open-jet reports 95.9 tok/s against our 94.0 (0.98x). syv-ai&#x27;s batch mode reports about 1,035</text>
   <text x="32.0" y="1522.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">tok/s at 64 requests; NInfer is built for one to eight.</text>
   <text x="32.0" y="1540.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Quants differ: ours is this fork&#x27;s Q4/Q5 group-quant mix (17.0 GiB), syv-ai runs W4A16 AutoRound with int8 Marlin layers, open-jet</text>
   <text x="32.0" y="1555.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Unsloth&#x27;s Q4_K_M. Conditions and sources for every figure: docs/performance.md, &quot;Qwen3.8-27B against the best published RTX 3090</text>
   <text x="32.0" y="1570.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">figures&quot;.</text>
-  <text x="32.0" y="1591.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One RTX 3090 24 GB, Windows 11, CUDA 12.8 · 315 W limit · 2026-11-26 · ours: master 178d3b5e (Release, launcher settings) ·</text>
-  <text x="32.0" y="1606.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">competitors measured on this box unless marked “reported”</text>
+  <text x="32.0" y="1591.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One RTX 3090 24 GB, Windows 11, CUDA 12.8 · 315 W limit · 2026-11-26 · ours: master 178d3b5e (Release, launcher settings); 98K with</text>
+  <text x="32.0" y="1606.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">the small-T P-tile fix · competitors measured on this box unless marked “reported”</text>
 </svg>
