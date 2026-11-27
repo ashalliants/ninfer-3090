@@ -13,6 +13,7 @@
 #include "ops/common/rowsplit_a8_mma.cuh"
 #include "ops/linear/t2/t2_prefill_i8.cuh"
 #include "ops/linear/t2/t2_small_t_i8.cuh"
+#include "ops/linear/t2/t2_small_t_dp4a.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -116,9 +117,88 @@ struct SmallParent {
     Epilogue epilogue;
 };
 
+#if defined(NINFER_SM70)
+// sm_70: the dp4a form of the small-T kernel (t2_small_t_dp4a.cuh) unless
+// NINFER_SM70_T2_DP4A=0 keeps the emulated m16n8k32 one (same-binary A/B).
+bool sm70_dp4a() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_SM70_T2_DP4A");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    return enabled;
+}
+
+// Rows per warp (NINFER_SM70_T2_DP4A_ROWS=1|2|4|8, default 4): more rows reuse each column's
+// activation bytes more, fewer give the narrow parents more CTAs.
+int sm70_dp4a_rows() {
+    static const int rows = [] {
+        const char* value = std::getenv("NINFER_SM70_T2_DP4A_ROWS");
+        const int r       = value != nullptr ? std::atoi(value) : 4;
+        return (r == 1 || r == 2 || r == 4 || r == 8) ? r : 4;
+    }();
+    return rows;
+}
+
+template <int Rows, int Columns, class Epilogue>
+void dp4a_gemm(const T2A8Activations& x, SmallColumns span, const SmallParent<Epilogue>& first,
+               const SmallParent<Epilogue>* second, cudaStream_t stream) {
+    constexpr int kRowsPerBlock = kT2Dp4aWarps * Rows;
+    const auto blocks           = [&](const Weight& w) {
+        if ((w.n % kRowsPerBlock) != 0 || (x.input_rows % (32 * kT2Dp4aChunkK)) != 0) {
+            throw std::invalid_argument("t2 small-T dp4a: unsupported shape");
+        }
+        return w.n / kRowsPerBlock;
+    };
+    const auto& other = second != nullptr ? *second : first;
+    const T2I8Parents<Epilogue> parents{{static_cast<const std::uint8_t*>(first.weight->qdata),
+                                         static_cast<const std::uint8_t*>(other.weight->qdata)},
+                                        {static_cast<const std::uint8_t*>(first.weight->scales),
+                                         static_cast<const std::uint8_t*>(other.weight->scales)},
+                                        {first.epilogue, other.epilogue},
+                                        blocks(*first.weight)};
+    const std::int32_t total =
+        parents.first_blocks + (second != nullptr ? blocks(*second->weight) : 0);
+    t2_small_t_dp4a_kernel<Rows, Columns, Epilogue>
+        <<<static_cast<unsigned>(total), kT2Dp4aThreads, 0, stream>>>(
+            x.codes, x.scales, parents, x.input_rows, span.col0, span.cols);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int Rows, class Epilogue>
+void dp4a_columns(const T2A8Activations& x, SmallColumns span, const SmallParent<Epilogue>& first,
+                  const SmallParent<Epilogue>* second, cudaStream_t stream) {
+    for (std::int32_t c0 = span.col0; c0 < span.col0 + span.cols; c0 += 8) {
+        const SmallColumns tile{c0, std::min<std::int32_t>(8, span.col0 + span.cols - c0)};
+        if (tile.cols == 1) {
+            dp4a_gemm<Rows, 1>(x, tile, first, second, stream);
+        } else if (tile.cols == 2) {
+            dp4a_gemm<Rows, 2>(x, tile, first, second, stream);
+        } else if (tile.cols <= 4) {
+            dp4a_gemm<Rows, 4>(x, tile, first, second, stream);
+        } else {
+            dp4a_gemm<Rows, 8>(x, tile, first, second, stream);
+        }
+    }
+}
+
+template <class Epilogue>
+void dp4a_route(const T2A8Activations& x, SmallColumns span, const SmallParent<Epilogue>& first,
+                const SmallParent<Epilogue>* second, cudaStream_t stream) {
+    switch (sm70_dp4a_rows()) {
+    case 1: dp4a_columns<1>(x, span, first, second, stream); return;
+    case 2: dp4a_columns<2>(x, span, first, second, stream); return;
+    case 8: dp4a_columns<8>(x, span, first, second, stream); return;
+    default: dp4a_columns<4>(x, span, first, second, stream); return;
+    }
+}
+#endif
+
 template <class Schedule, class Epilogue>
 void small_gemm(const T2A8Activations& x, SmallColumns span, const SmallParent<Epilogue>& first,
                 const SmallParent<Epilogue>* second, cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    if (sm70_dp4a()) { return dp4a_route(x, span, first, second, stream); }
+#endif
     const auto blocks = [&](const Weight& w) {
         if ((w.n % Schedule::kRows) != 0 || (x.input_rows % Schedule::kSlabK) != 0 ||
             span.cols > Schedule::kColumns) {
@@ -356,6 +436,14 @@ std::int32_t t2_a8_min_tokens() {
         return value != nullptr ? std::max(1, std::atoi(value)) : kT2A8MinTokens;
     }();
     return minimum;
+}
+
+bool t2_a8_small_t_dp4a() {
+#if defined(NINFER_SM70)
+    return sm70_dp4a();
+#else
+    return false;
+#endif
 }
 
 bool t2_a8_admits(LinearPolicy policy) {
