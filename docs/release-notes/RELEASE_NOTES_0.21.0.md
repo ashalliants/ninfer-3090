@@ -9,7 +9,7 @@
 - **You want the most accurate 27B.** `./run.sh qwen38-27b-qad` (`run qwen38-27b-qad` on Windows) serves NVIDIA's NVFP4 QAD checkpoint. It decodes slower than the default 27B. It has been measured on a Tesla V100 only, not on an RTX 3090, so treat it as a preview there.
 - **You run a router that switches between models, or run near the memory limit.** An unload now returns freed memory to the system and saves the model's conversations first, and a model whose conversation store cannot fit is decided before its weights are loaded, so a switch loads once instead of twice.
 - **You run Inkling-2 and need JSON.** Inkling-2 now serves `response_format` JSON, JSON schema, grammar, choice and regex constraints. It used to refuse them.
-- **You have a Tesla V100.** The NVFP4 QAD 27B runs there (details below), and the V100 server binary is about 70% smaller (448 MB, was 1,473 MB), so its archive is far under GitHub's size limit and `ninfer_bench` is back in it.
+- **You have a Tesla V100.** The NVFP4 QAD 27B runs there (details below), and the V100 server binary is about 60% smaller (524 MB, was 1.37 GB), so its archive is far under GitHub's size limit and `ninfer_bench` is back in it.
 - **You do nothing and nothing changes** if you run one chat at a time on a 3090 with a model already working: no flag was removed and no launcher variable was dropped.
 
 ## Breaking changes
@@ -96,7 +96,7 @@ With a full Host cache, the server prices which saved states to evict once per r
 ## The Tesla V100 archive
 
 - `ninfer-v100-linux-x64-0.21.0-rtx3090.tar.gz` with `SHA256SUMS-v0.21.0-linux-v100.txt`, Linux only, `sm_70` only: it does not start on an RTX 3090, and the 3090 archives do not start on a V100.
-- **`ninfer_bench` is back in it.** v0.20.0 dropped it for size; with the 448 MB server (no `-lineinfo`, no PTX) and `ninfer` as a link, the tarball is __V100_SIZE__ (v0.20.0: 1,498,182,285 bytes, v0.19.0: 2,125,147,854).
+- **`ninfer_bench` is back in it.** v0.20.0 dropped it for size; with the 524 MB server (no `-lineinfo`, no PTX) and `ninfer` as a link, the tarball is 343,226,948 bytes (v0.20.0: 1,498,182,285; v0.19.0: 2,125,147,854). The other archives are also smaller: Linux RTX 3090 432,832,068 bytes (was 1,247,812,155) and Windows 1,234,368,656 (was 1,843,612,384).
 - `run-v100.sh` serves `qwen38-27b-qad` with INT8 KV, and `NINFER_SPEC=dflash2` on it.
 
 ## Under the hood
@@ -107,7 +107,13 @@ New in this release: the NVFP4 decode on the int8 `dp4a` streaming kernels and a
 
 Tests: this release builds only the three products (`ninfer`, `ninfer-serve`, `ninfer_bench`); the full test suite and the real-model tests were not run for the release itself. The changes in it were tested in their own PRs; #637 and #639 record RTX 3090 runs as not run.
 
-__VERIFICATION__
+What was checked, on the build machine (Windows 11, and Ubuntu 24.04 under WSL), before publishing:
+
+- **Windows zip:** every file matches its inner `SHA256SUMS.txt`, and the zip matches `SHA256SUMS-v0.21.0-windows.txt`. `ninfer.exe` and `ninfer-serve.exe` start from an extracted copy with only Windows on `PATH` (the cuBLAS DLLs ship in the zip); `ninfer_bench.exe` starts too (it has no `--version`). Its default launcher, `run.bat qwen38-27b`, loaded Qwen3.8-27B and answered a chat completion on the RTX 3090 (TTFT 346 ms, decode 117 tok/s on a 73-token answer, MTP accepted 48 of 72 drafts).
+- **Linux RTX 3090 archive:** inner and outer checksums match, `./ninfer-serve --help` and `./run.sh --help` run from a fresh unpack, `ninfer` is a link to `ninfer-serve` and reports the same version, and `run.sh qwen38-27b` loaded the model under WSL and answered a chat completion on the RTX 3090 (the context was lowered to 241,664 tokens because the Windows desktop held video memory). The server holds `sm_86` code and no `sm_70` code. No dynamic library is missing, and its `ldd` list is identical to v0.20.0's.
+- **Linux Tesla V100 archive: built and checked, not run on a V100 before this release was published.** Inner and outer checksums match, the server holds `sm_70` code and no PTX or `sm_86` code, `--version` and `--help` run, `run-v100.sh` finds the server beside it, and its `ldd` list is identical to the 3090 archive's. Serving a model on a V100 from this archive was **not** done before publishing; the V100 figures above come from source builds of master on a V100. If `./run-v100.sh qwen38-27b` from the archive does not start on your card, please open an issue.
+- **Not run on an RTX 3090:** the NVFP4 QAD 27B (`qwen38-27b-qad`): no download, launch or speed run on that card.
+- **The version string:** the Windows executables report `0.21.0-rtx3090+299173951` (a clean tree one commit before the notes); the Linux ones, built from a clean export, report `0.21.0-rtx3090`.
 
 ## Install and upgrade
 
