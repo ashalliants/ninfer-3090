@@ -7,23 +7,39 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t_nvfp4.cuh"
 #include "ops/kv_cache/plane_types.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace ninfer::ops::detail {
 namespace {
+
+// The partial kernel's launch shape for TokenTile columns, shared by the launch and its
+// occupancy query (nvfp4_partial_ctas_per_sm).
+template <typename Geometry, int TokenTile>
+struct Nvfp4PartialShape {
+    static constexpr int RowCount  = TokenTile * Geometry::GroupSize;
+    static constexpr int RowTiles  = (RowCount + 15) / 16;
+    static constexpr int Warps     = RowTiles == 3 ? 12 : 8;
+    static constexpr int KeyBlock  = 32;
+    static constexpr int MinBlocks = RowTiles <= 2 ? 2 : 1;
+    static constexpr std::size_t DynamicBytes =
+        (RowTiles <= 2 ? 3u : 5u) * KeyBlock * kCausalHeadDim;
+};
 
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
 void launch_nvfp4_partial(const Tensor& q, CacheInput input, const Tensor& positions, float scale,
                           PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                           Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
-    constexpr int RowCount             = TokenTile * Geometry::GroupSize;
-    constexpr int RowTiles             = (RowCount + 15) / 16;
-    constexpr int Warps                = RowTiles == 3 ? 12 : 8;
-    constexpr int KeyBlock             = 32;
-    constexpr int MinBlocks            = RowTiles <= 2 ? 2 : 1;
-    constexpr std::size_t DynamicBytes = (RowTiles <= 2 ? 3u : 5u) * KeyBlock * kCausalHeadDim;
+    using Shape                        = Nvfp4PartialShape<Geometry, TokenTile>;
+    constexpr int Warps                = Shape::Warps;
+    constexpr int KeyBlock             = Shape::KeyBlock;
+    constexpr int MinBlocks            = Shape::MinBlocks;
+    constexpr std::size_t DynamicBytes = Shape::DynamicBytes;
     using KernelInput                  = CacheInput;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     const auto launch = [&]() {
@@ -66,6 +82,31 @@ void launch_nvfp4_partial(const Tensor& q, CacheInput input, const Tensor& posit
     launch();
 }
 
+// Resident CTAs per SM of the multi-row 27B partial kernel for TokenTile columns (the lower of
+// its masked and unmasked forms): the multi-row split policy fills whole waves of them.
+template <int TokenTile>
+std::int32_t nvfp4_partial_ctas_per_sm() {
+    using Shape      = Nvfp4PartialShape<CausalD256H24Kv4, TokenTile>;
+    std::int32_t low = 0;
+    const auto query = [&]<bool Masked>() {
+        auto kernel =
+            causal_attention_small_t_nvfp4_tiled_kernel<CausalD256H24Kv4, TokenTile, Shape::Warps,
+                                                        Shape::MinBlocks, Shape::KeyBlock, true,
+                                                        true, Masked, CausalAppendInput>;
+        configure_cuda_device_once([&] {
+            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(Shape::DynamicBytes));
+        });
+        int per_sm = 0;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, Shape::Warps * 32,
+                                                                 Shape::DynamicBytes));
+        low = low == 0 ? per_sm : std::min(low, per_sm);
+    };
+    query.template operator()<false>();
+    query.template operator()<true>();
+    return low;
+}
+
 template <typename Geometry, bool MultiBatch, bool Masked>
 void launch_nvfp4_reduce(const Tensor& positions, const CausalSmallTInvocation& invocation,
                          std::int32_t splits, const Tensor& partial_acc, const Tensor& partial_m,
@@ -100,8 +141,9 @@ void causal_attention_small_t_nvfp4_launch_for(
     CausalAttentionExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m,
     Tensor& partial_l, Tensor& out, cudaStream_t stream) {
     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits           = causal_attention_split_capacity(
-        Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
+    const auto splits =
+        causal_attention_split_capacity(Geometry::QHeads, invocation.width, cache.storage, envelope,
+                                        invocation.batch_size, invocation.multiprocessor_count);
 
     const auto launch_partial = [&]<int Tokens, bool MultiBatch, bool Masked>() {
         launch_nvfp4_partial<Geometry, Tokens, MultiBatch, Masked>(
@@ -178,20 +220,49 @@ void causal_attention_small_t_nvfp4_launch_for(
 
 } // namespace
 
+std::int32_t causal_attention_small_t_nvfp4_ctas_per_sm(std::int32_t tokens) {
+    if (tokens < 1 || tokens > 8) {
+        throw std::invalid_argument("causal_attention_small_t_nvfp4_ctas_per_sm: unsupported T");
+    }
+    static std::mutex mutex;
+    static std::unordered_map<int, std::array<std::int32_t, 9>> cache;
+    int device = -1;
+    CUDA_CHECK(cudaGetDevice(&device));
+    const std::scoped_lock lock(mutex);
+    auto& per_tokens = cache[device];
+    if (per_tokens[tokens] == 0) {
+        constexpr std::array<std::int32_t (*)(), 9> query = {
+            nullptr,
+            nvfp4_partial_ctas_per_sm<1>,
+            nvfp4_partial_ctas_per_sm<2>,
+            nvfp4_partial_ctas_per_sm<3>,
+            nvfp4_partial_ctas_per_sm<4>,
+            nvfp4_partial_ctas_per_sm<5>,
+            nvfp4_partial_ctas_per_sm<6>,
+            nvfp4_partial_ctas_per_sm<7>,
+            nvfp4_partial_ctas_per_sm<8>,
+        };
+        per_tokens[tokens] = query[tokens]();
+    }
+    return per_tokens[tokens];
+}
+
 void causal_attention_small_t_nvfp4_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+    std::int32_t multiprocessor_count, Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+    Tensor& out, cudaStream_t stream) {
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                   static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
-        .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
-        .table_rows    = &table_rows,
-        .full_width    = q.ne[2],
-        .column_begin  = column_begin,
-        .width         = width,
-        .batch_size    = q.ne[3],
+        .valid_columns        = valid_columns.data == nullptr ? nullptr : &valid_columns,
+        .table_rows           = &table_rows,
+        .full_width           = q.ne[2],
+        .column_begin         = column_begin,
+        .width                = width,
+        .batch_size           = q.ne[3],
+        .multiprocessor_count = multiprocessor_count,
     };
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_nvfp4_launch_for<CausalD256H24Kv4>(
