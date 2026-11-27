@@ -146,7 +146,7 @@
 #           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS NO_PREFILL_CUBLAS_PROJECTIONS CONTEXT_STORE_COMPRESS
 #           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
 #           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE
-#           LOSSY_PREFILL_SCOUT_A4 REQUEST_LOG_LOSSY_DETAIL
+#           LOSSY_PREFILL_SCOUT_A4 REQUEST_LOG_LOSSY_DETAIL MTP_STAGED_DRAFTS NO_MTP_CONSTRAINED
 # NINFER_GRAFT (NAME=PATH;NAME=PATH, each --graft: prompt grafts and GGUF control vectors) and
 # NINFER_DEFAULT_GRAFT (--default-graft, NAME or NAME+NAME).
 # NINFER_LORA (NAME=PATH;NAME=PATH, each --lora) and NINFER_DEFAULT_LORA (--default-lora).
@@ -713,7 +713,7 @@ passthrough_switch_flags=(
   no-prefill-a8 no-prefill-cublas no-prefill-cublas-projections context-store-compress no-exit-on-engine-failure
   admission-fit-check progress-anchors-shared model-suspend no-auto-resume
   lm-head-q4 lm-head-q6 embedding-q4 embedding-q6 lossy-prefill-scout-a4 request-log-lossy-detail
-  no-expert-state mtp-staged-drafts
+  no-expert-state mtp-staged-drafts no-mtp-constrained
 )
 env_name_for_flag() { printf 'NINFER_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
 for flag in "${passthrough_value_flags[@]}"; do

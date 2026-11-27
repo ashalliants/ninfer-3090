@@ -644,8 +644,10 @@ None has been measured on the RTX 3090 yet.
   - Basalt instead checks the grammar after each window and redraws the first refused row with
     the mask as a bias; that is exact for greedy rows only, so the per-position masks are used.
   - Checked by `ninfer_qwen4_exp_engine_real_test` (`mtp_constrained_matches_plain`: greedy ids for
-    a JSON-schema request equal plain constrained decoding), not run yet. Basalt's estimate is about
-    81 to 110 tok/s on greedy constrained requests. Not measured.
+    a JSON-schema request equal plain constrained decoding): passes on a Tesla V100 (2026-11-27,
+    124 ids identical, 36 MTP rounds). Measured there through `ninfer-serve` (router flags, 7
+    drafts, ABBA, byte-identical outputs): with tools offered 43.0-46.8 -> 70.3-115.5 tok/s, JSON
+    schema 21.4-21.8 -> 112.8-114.3 (Basalt estimated 81 to 110). RTX 3090 not measured.
 - **Joint-acceptance draft length** (`--mtp-joint-acceptance`, needs `--spec mtp`), phase A. Without
   it `choose_draft_length` picks the draft count before drafting from the per-position acceptance
   estimate (PR 13 found it no better than fixed 2 drafts). With it every round drafts the ceiling

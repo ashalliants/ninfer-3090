@@ -139,7 +139,7 @@ rem   on^|off: CORS GREEDY NO_THINKING PRESERVE_THINKING TOLERANT_TOOL_CALLS NO_
 rem           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS NO_PREFILL_CUBLAS_PROJECTIONS CONTEXT_STORE_COMPRESS
 rem           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
 rem           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE LOSSY_PREFILL_SCOUT_A4
-rem           REQUEST_LOG_LOSSY_DETAIL
+rem           REQUEST_LOG_LOSSY_DETAIL NO_MTP_CONSTRAINED
 rem Not here: the repeatable --graft (see NINFER_GRAFTS, NINFER_GRAFT), --lora (see NINFER_LORA) and --context-store-peer, and router mode
 rem (--models-*). The S3 store reads its credentials from the environment
 rem (NINFER_S3_ACCESS_KEY_ID, NINFER_S3_SECRET_ACCESS_KEY), never from a flag.
@@ -840,6 +840,7 @@ call :pass_switch EMBEDDING_Q6 --embedding-q6
 call :pass_switch NO_EXPERT_STATE --no-expert-state
 call :pass_switch LOSSY_PREFILL_SCOUT_A4 --lossy-prefill-scout-a4
 call :pass_switch REQUEST_LOG_LOSSY_DETAIL --request-log-lossy-detail
+call :pass_switch NO_MTP_CONSTRAINED --no-mtp-constrained
 if defined EXTRA_FAIL exit /b 2
 set "GRAFT_ARGS="
 if /i "%NINFER_GRAFTS%"=="off" goto :graft_done
