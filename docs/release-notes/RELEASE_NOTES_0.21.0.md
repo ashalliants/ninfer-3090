@@ -96,7 +96,7 @@ With a full Host cache, the server prices which saved states to evict once per r
 ## The Tesla V100 archive
 
 - `ninfer-v100-linux-x64-0.21.0-rtx3090.tar.gz` with `SHA256SUMS-v0.21.0-linux-v100.txt`, Linux only, `sm_70` only: it does not start on an RTX 3090, and the 3090 archives do not start on a V100.
-- **`ninfer_bench` is back in it.** v0.20.0 dropped it for size; with the 524 MB server (no `-lineinfo`, no PTX) and `ninfer` as a link, the tarball is 343,226,948 bytes (v0.20.0: 1,498,182,285; v0.19.0: 2,125,147,854). The other archives are also smaller: Linux RTX 3090 432,832,068 bytes (was 1,247,812,155) and Windows 1,234,368,656 (was 1,843,612,384).
+- **`ninfer_bench` is back in it.** v0.20.0 dropped it for size; with the 524 MB server (no `-lineinfo`, no PTX) and `ninfer` as a link, the tarball is about 343 MB (v0.20.0: 1,498,182,285 bytes; v0.19.0: 2,125,147,854). The other archives are also smaller: Linux RTX 3090 about 433 MB (was 1,247,812,155 bytes) and Windows about 1.23 GB (was 1,843,612,384).
 - `run-v100.sh` serves `qwen38-27b-qad` with INT8 KV, and `NINFER_SPEC=dflash2` on it.
 
 ## Under the hood
