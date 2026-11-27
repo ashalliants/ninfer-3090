@@ -109,6 +109,20 @@ shared. MTP and draft components reference Text's embedding/head rather than int
 copies by default. Shared weights keep independent Uses and activation permissions. The stored
 NVFP4 weight divisor belongs to its parent; an activation divisor belongs to a mathematical input.
 
+`--hot-embedding-rows N` (`LoadOptions::hot_embedding_rows`, off by default) binds the token
+embedding `Residency::Pinned`: the whole table lives in the mapped page-locked Host block and
+`materialize_model` copies rows `[0, N)` of its code and scale planes into one device payload
+(`Model::hot_embedding`). Every gather of Text, MTP and the DFlash drafters goes through
+`execution::embed_tokens`, which then calls `ops::embedding_split`: ids below N read the device copy,
+the rest are read over PCIe through the table's mapped device pointer, with the same values bit for
+bit. Load refuses it for a table that is not one whole Q4_G64_FP16 RowSplit object (so a rotated T2
+table too), with `--embedding-q4/q6`, and with more than one device. With overlay Vision the pinned
+table is not registered in the evictable tail, so the tail is the output head, the proposal head
+and the MTP or drafter weights. The device copy is outside the weight arenas and stays resident
+across a Model suspend. KV capacity needs no extra planning: `--kv-capacity auto` and
+`--fit-context` are sized from the device memory free after the weights load, which already
+excludes the table.
+
 ## Text block mathematics
 
 In the formulas below, activations are written with feature dimensions first and token columns

@@ -270,7 +270,8 @@ void fit_context_to_device(EngineOptions& options, ModelInstance& instance, Devi
 // The Flash-Next-only options (FlashNextOptions) are read by the Flash-Next model alone. A dense
 // Qwen3.5/3.6/3.8 model would drop them silently, so refuse each one that was set and say so.
 // --vram-headroom-mib is the one exception: a dense model reads it as the spare memory its context
-// fit (--fit-context) keeps, so it is refused only without a fit.
+// fit (--fit-context) keeps, so it is refused only without a fit. --hot-embedding-rows is read by
+// both (models::LoadOptions::hot_embedding_rows), so it is not refused here.
 void validate_flash_next_options_unused(const EngineOptions& options) {
     const FlashNextOptions& set = options.flash_next;
     const FlashNextOptions unset{};
@@ -293,7 +294,6 @@ void validate_flash_next_options_unused(const EngineOptions& options) {
     note(set.mtp_rows_verify, "--mtp-rows-verify");
     note(set.ngram_prefetch, "--ngram-prefetch");
     note(set.shared_expert_stream, "--shared-expert-stream");
-    note(set.hot_embedding_rows != 0, "--hot-embedding-rows");
     note(set.gdn_head_map, "--gdn-head-map");
     note(set.moe_precast_input, "--moe-precast-input");
     note(set.moe_gate_up_registers, "--moe-gate-up-registers");
@@ -769,6 +769,17 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.context_cost         = std::move(context_cost.summary);
+    if (const models::qwen3_5::HotEmbedding* hot = instance->model->hot_embedding()) {
+        // The KV capacity above was sized from the device memory free after the weights loaded, so
+        // it already holds what the pinned table freed.
+        const auto mib = [](std::uint64_t bytes) { return std::to_string(bytes >> 20); };
+        summary.notes.push_back(
+            "token embedding: " + std::to_string(hot->rows) + " of " +
+            std::to_string(instance->model->config().text.vocab_size) + " rows in VRAM (" +
+            mib(hot->hot_bytes) + " MiB), the rest read from pinned RAM (" + mib(hot->table_bytes) +
+            " MiB pinned): " + mib(hot->table_bytes - hot->hot_bytes) +
+            " MiB more VRAM for the KV cache");
+    }
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }
 

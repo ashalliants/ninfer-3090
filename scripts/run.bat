@@ -70,8 +70,19 @@ rem
 rem rk4v4 KV (Lloyd-Max 4-bit keys) is 31%% smaller than rk8v4 at the same decode speed, for +0.10%%
 rem perplexity over it. Measured on a desktop RTX 3090 (2026-10-02, 1.6 GiB held by the desktop), the
 rem DFlash2 set starts at 188,416 tokens with 721 MiB to spare and is refused at 196,608; its draft
-rem weights are why it stops short of 262,144. The mtp set starts at 262,144 with two
-rem lanes and about 1.2 GiB to spare. `none` is the mtp set without speculation.
+rem weights are why it stops short of 262,144. Re-measured 2026-11-26 with the desktop holding 1.5 GiB:
+rem 188,416 starts with 1.48-1.61 GiB free with the hot embedding rows below and fits to 182,272
+rem without them; 196,608 started once in two tries. The mtp set starts at 262,144 with two lanes and 1.90 GiB to spare. `none` is the mtp set without speculation.
+rem
+rem Every qwen38-27b profile but `none` (not qwen38-27b-qad: its embedding is Q8) keeps only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in
+rem the profile file): the rest of the table is read from pinned RAM, with the same output bit for bit
+rem and no measured speed change, and the 622 MiB freed goes to the KV cache. NINFER_HOT_EMBEDDING_ROWS=0
+rem keeps the whole table in VRAM; NINFER_EMBEDDING_Q4/Q6 turn it off (the server refuses the pair).
+rem
+rem SHARED POOL. NINFER_SPEC=mtp with NINFER_CONCURRENCY=3 or more caps each request at 131,072 tokens
+rem and sizes the lanes' shared KV pool to the card (--kv-capacity auto --device-state-slots 0), so
+rem several long agent sessions run at once instead of queueing behind a pool of one context. One and
+rem two lanes keep the pool of one context.
 rem The qwen3_8_27b.ninfer that download-model.bat fetches is the DFlash2 bundle and carries the
 rem MTP weights too, so one file serves both. It stores the embedding as Q4 and the head as Q6, so
 rem the --embedding-q4 and --lm-head-q6 load-time transcodes the upstream file needed are not passed.
@@ -125,6 +136,7 @@ rem           TEMPERATURE TOP_P TOP_K FREQUENCY_PENALTY SEED NGRAM_MIN_MATCH
 rem           MAX_REQUEST_MIB MEDIA_CACHE_MIB MEDIA_LIVE_MIB MEDIA_PREPROCESS_THREADS VISION_MAX_MERGED
 rem           RESPONSE_STORE_MAX_RECORDS RESPONSE_STORE_MAX_MIB CONTEXT_COST_PRESETS
 rem           PREFILL_STALL_BUDGET_MS YIELD_LONG_PREFILL_MS PREFILL_DECODE_SHARE PREFILL_LAYER_SLICES
+rem           HOT_EMBEDDING_ROWS (the qwen38-27b profiles keep 8192 of the token embedding's rows in VRAM; 0: all)
 rem           PROGRESS_ANCHOR_TOKENS SLEEP_IDLE_SECONDS SUSPEND_SNAPSHOT SUSPEND_WEIGHTS
 rem           CONTEXT_STORE_TTL_HOURS CONTEXT_STORE_IDLE_SECONDS CONTEXT_STORE_RESTORE_SECONDS
 rem           CONTEXT_STORE_FLUSH_SECONDS CONTEXT_STORE_PEER_POLL_MS CONTEXT_STORE_S3_ENDPOINT
@@ -362,6 +374,23 @@ if not "%NINFER_CONTEXT%"=="" set "CONTEXT=%NINFER_CONTEXT%"
 if not "%NINFER_CONCURRENCY%"=="" set "CONCURRENCY=%NINFER_CONCURRENCY%"
 if not "%NINFER_KV_DTYPE%"=="" set "KV_DTYPE=%NINFER_KV_DTYPE%"
 if not "%NINFER_PREFILL_CHUNK%"=="" set "PREFILL_CHUNK=%NINFER_PREFILL_CHUNK%"
+rem SHARED POOL: MTP at three or more lanes serves several long sessions at once. A pool of one context
+rem runs only as many of them as fit it, so here each request is capped at 131,072 tokens and the pool
+rem is sized to the card (--kv-capacity auto, with no device state slots beyond the active ones): four
+rem agent sessions of 75-84K tokens all ran at once (docs\performance.md, "Shared KV pool"). It needs no
+rem context fit (the server refuses --fit-context with an automatic pool). NINFER_CONTEXT sets the
+rem per-request cap, NINFER_DEVICE_STATE_SLOTS the slots.
+set "KV_CAPACITY=%CONTEXT%"
+set "POOL_ARGS="
+set "SHARED_POOL=0"
+if /i "%SPEC%"=="mtp" if %CONCURRENCY% GEQ 3 set "SHARED_POOL=1"
+if "%SHARED_POOL%"=="0" goto :shared_pool_done
+if "%NINFER_CONTEXT%"=="" set "CONTEXT=131072"
+set "KV_CAPACITY=auto"
+set "POOL_ARGS= --device-state-slots 0"
+set "FIT=0"
+set "CONTEXT_WORD=context"
+:shared_pool_done
 rem N-gram copy drafting rides on DFlash2 and is on at one and two lanes: +42%% decode at one lane on
 rem agent traffic that writes back files it has read, +15%% batch throughput at two, where a lane
 rem without a copy is widened only as far as its own balance allows (about 3%% of its round time).
@@ -384,9 +413,11 @@ call :tuned_overrides
 if /i "%SPEC%"=="dflash2" set "SPEC_LABEL=DFlash2 K=%DRAFT_TOKENS% + draft head"
 if /i "%NGRAM%"=="on" set "SPEC_LABEL=%SPEC_LABEL% + n-gram copies"
 if /i "%SPEC%"=="mtp" set "SPEC_LABEL=MTP%DRAFT_TOKENS% + draft head, full context"
+if "%SHARED_POOL%"=="1" set "SPEC_LABEL=MTP%DRAFT_TOKENS% + draft head"
 if /i "%SPEC%"=="none" set "SPEC_LABEL=no speculation"
-set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %CONTEXT%%OVERRIDE_ARGS%%SPEC_ARGS%"
+set "PROFILE_ARGS=--max-concurrency %CONCURRENCY% --max-context %CONTEXT% --kv-capacity %KV_CAPACITY%%POOL_ARGS%%OVERRIDE_ARGS%%SPEC_ARGS%"
 set "LABEL=C%CONCURRENCY%  ^|  %CONTEXT_WORD% %CONTEXT%  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
+if "%SHARED_POOL%"=="1" set "LABEL=C%CONCURRENCY%  ^|  context %CONTEXT% per request, KV pool sized to the card  ^|  %KV_DTYPE% KV  ^|  %SPEC_LABEL%"
 set "PREFILL_NOTE=Prefill: cuBLAS route, chunk %PREFILL_CHUNK%"
 if /i "%SPEC%"=="dflash2" set "HINT=Need the full 262K context or a second lane? Set NINFER_SPEC=mtp: slower decode."
 goto :profile_tuned_common
@@ -791,6 +822,7 @@ call :pass_value PREFILL_STALL_BUDGET_MS --prefill-stall-budget-ms
 call :pass_value YIELD_LONG_PREFILL_MS --yield-long-prefill-ms
 call :pass_value PREFILL_DECODE_SHARE --prefill-decode-share
 call :pass_value PREFILL_LAYER_SLICES --prefill-layer-slices
+call :pass_value HOT_EMBEDDING_ROWS --hot-embedding-rows
 call :pass_value PROGRESS_ANCHOR_TOKENS --progress-anchor-tokens
 call :pass_value SLEEP_IDLE_SECONDS --sleep-idle-seconds
 call :pass_value SUSPEND_SNAPSHOT --suspend-snapshot
@@ -850,6 +882,23 @@ call :pass_switch LOSSY_PREFILL_SCOUT_A4 --lossy-prefill-scout-a4
 call :pass_switch REQUEST_LOG_LOSSY_DETAIL --request-log-lossy-detail
 call :pass_switch NO_MTP_CONSTRAINED --no-mtp-constrained
 if defined EXTRA_FAIL exit /b 2
+rem The qwen38-27b profiles keep only the token embedding's first 8,192 rows in VRAM (hot-embedding-rows in the
+rem profile file; NINFER_HOT_EMBEDDING_ROWS=0 keeps the whole table there). The server refuses it with a
+rem load-time embedding transcode or more than one device, so those turn it off unless the caller asked
+rem for both, which is refused here. Branches use goto so no value sits inside a parenthesised block.
+set "HOT_CONFLICT=0"
+if /i "%NINFER_EMBEDDING_Q4%"=="on" set "HOT_CONFLICT=1"
+if /i "%NINFER_EMBEDDING_Q6%"=="on" set "HOT_CONFLICT=1"
+if not "%NINFER_DEVICES%"=="" echo(%NINFER_DEVICES%| findstr /c:"," >nul && set "HOT_CONFLICT=1"
+if "%HOT_CONFLICT%"=="0" goto :hot_rows_done
+if "%NINFER_HOT_EMBEDDING_ROWS%"=="0" goto :hot_rows_done
+if not "%NINFER_HOT_EMBEDDING_ROWS%"=="" goto :hot_rows_refused
+set "EXTRA_ARGS=%EXTRA_ARGS% --hot-embedding-rows 0"
+goto :hot_rows_done
+:hot_rows_refused
+echo NINFER_HOT_EMBEDDING_ROWS cannot be combined with NINFER_EMBEDDING_Q4/Q6 or several NINFER_DEVICES; set it to 0 1>&2
+exit /b 2
+:hot_rows_done
 set "GRAFT_ARGS="
 if /i "%NINFER_GRAFTS%"=="off" goto :graft_done
 if "%GRAFT_FILE%"=="" goto :graft_done
@@ -955,6 +1004,9 @@ findstr /c:"not enough free GPU memory" "%SERVER_LOG%" >nul 2>&1
 if not errorlevel 1 goto :memory_advice
 findstr /c:"requested Engine runtime reservation requires" "%SERVER_LOG%" >nul 2>&1
 if not errorlevel 1 goto :reservation_advice
+rem An automatic pool (the shared pool) that cannot fit one request's context: free GPU memory.
+findstr /c:"minimum Engine runtime reservation requires" "%SERVER_LOG%" >nul 2>&1
+if not errorlevel 1 goto :memory_advice
 if not "%HOST_RETRY%"=="1" goto :server_done
 if "%HOST_CONTEXT_MIB%"=="0" goto :server_done
 findstr /c:"cudaMallocHost failed" "%SERVER_LOG%" >nul 2>&1

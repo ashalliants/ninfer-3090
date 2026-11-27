@@ -335,13 +335,22 @@ DFlash2 round and runs it while a request's drafts are mostly rejected. See
 [the CLI guide](docs/cli.md#adaptive-draft-window).
 
 `NINFER_SPEC=mtp` swaps to `--spec mtp --draft-tokens 3` and `--prefill-chunk 2048`, which runs
-the full 262,144 tokens with two lanes sharing the pool:
+the full 262,144 tokens with two lanes sharing the pool. From three lanes (`NINFER_CONCURRENCY=3` or
+more) it caps each request at 131,072 tokens instead and sizes the lanes' shared pool to the card
+(`--kv-capacity auto --device-state-slots 0`): four long agent sessions then run at once rather than
+two: 114.5 tok/s aggregate against 98.7 (+16%), and the worst first-token wait 14 s instead of 41 s.
+
+Every `qwen38-27b` profile except `none` (not `qwen38-27b-qad`, whose token embedding is Q8) keeps only the token embedding's first 8,192 rows in VRAM
+(`--hot-embedding-rows 8192`; the rest is read from pinned RAM): the same output bit for bit, no
+measured speed change, and 622 MiB more for the KV cache. `NINFER_HOT_EMBEDDING_ROWS=0` turns it
+off. Measurements are in [performance](docs/performance.md#qwen38-27b-hot-embedding-rows-and-a-shared-kv-pool-for-long-agent-sessions-2026-11-26).
 
 | Profile | lanes | context | KV | measured beside a desktop |
 |---|---|---|---|---|
-| **`tuned`** (default, DFlash2), Windows | 1 | 188,416 | rk4v4 | starts with 721 MiB spare; 196,608 refused |
+| **`tuned`** (default, DFlash2), Windows | 1 | 188,416 | rk4v4 | starts with 1.48-1.61 GiB spare (2026-11-26, desktop holding 1.5 GiB); without the hot embedding rows it fitted to 182,272 that day; 196,608 started once in two tries |
 | `tuned` (default, DFlash2), Linux | 1 | 262,144 | rk4v4 | headless extrapolation; fitted to the free memory if it does not fit |
-| `NINFER_SPEC=mtp` | 2 | 262,144 | rk4v4 | 23.4 of 24.5 GiB used |
+| `NINFER_SPEC=mtp` | 2 | 262,144 | rk4v4 | starts with 1.90 GiB free on Windows (1.17 GiB without the hot embedding rows, 2026-11-26) |
+| `NINFER_SPEC=mtp NINFER_CONCURRENCY=4` | 4 | 131,072 each, pool sized to the card | rk4v4 | pool 330,240 tokens on Windows, 932 MiB free (2026-11-26): four 75-84K-token agent sessions all run at once, 114.5 tok/s aggregate against 98.7 with the old one-context pool |
 | `int8` | 1 | 65,536 | int8 | 2.85 GiB left unused |
 
 **Accuracy vs context: the profiles keep plain `rk4v4` on purpose.** It is the smallest KV format,

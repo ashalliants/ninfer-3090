@@ -198,6 +198,14 @@ void logical_data_and_instances() {
             "incomplete selected Vision was accepted");
     rejects([&] { (void)qwen::plan_load(reader, {.speculative = SpeculativeBackend::Mtp}); },
             "absent MTP was accepted");
+    // --hot-embedding-rows reads a Q4_G64_FP16 table's planes; this fixture's table is another
+    // format (and shared with the head), and a row count above the vocabulary is refused first.
+    rejects<std::invalid_argument>(
+        [&] { (void)qwen::plan_load(reader, {.hot_embedding_rows = 8}); },
+        "--hot-embedding-rows was accepted for a token embedding that is not Q4_G64_FP16");
+    rejects<std::invalid_argument>(
+        [&] { (void)qwen::plan_load(reader, {.hot_embedding_rows = 1U << 30}); },
+        "--hot-embedding-rows above the vocabulary was accepted");
 
     fixture.file.root["metadata"]["name"] = "another-training-run-and-recipe";
     fixture.file.root["components"]["text"]["config"]["num_hidden_layers"] = 2;

@@ -313,7 +313,7 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
         emb = input_embeddings->view({dimension(config_.hidden_size), T});
     } else {
         emb = roots.embedding;
-        embed_tokens(flat_ids, *embed_, parameters_.text.token_embedding_signs, emb, s);
+        embed_tokens(flat_ids, *embed_, emb, s);
     }
 
     Tensor e = roots.normalized_embedding;
@@ -722,7 +722,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
         Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
-        embed_tokens(ids, *embed_, parameters_.text.token_embedding_signs, x, stream);
+        embed_tokens(ids, *embed_, x, stream);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
@@ -780,7 +780,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
 
         Tensor x        = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
         Tensor flat_ids = ids.view({columns});
-        embed_tokens(flat_ids, *embed_, parameters_.text.token_embedding_signs, x, stream);
+        embed_tokens(flat_ids, *embed_, x, stream);
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
@@ -1735,7 +1735,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             Tensor x = roots.residual;
             if (slice_first) {
-                embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+                embed_tokens(ids_device, *embed_, x, s);
             } else {
                 // The residual stream was parked in prefill_hidden when the last slice ended.
                 Tensor parked = matrix_window(prefill_hidden_, len);
@@ -1887,8 +1887,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 if (multimodal != nullptr) {
                     mtp_input_embeddings =
                         work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-                    embed_tokens(mtp_ids, *embed_, parameters_.text.token_embedding_signs,
-                                 mtp_input_embeddings, s);
+                    embed_tokens(mtp_ids, *embed_, mtp_input_embeddings, s);
                     if (vision_chunk.control != nullptr) {
                         const qwen3_5::MtpVisualOverlap overlap = qwen3_5::shifted_visual_overlap(
                             vision_chunk.control->scatter_indices, alignment_tokens, mtp_window);
@@ -2140,7 +2139,7 @@ PrefillChunkResult TextContext::scout_chunk(const TextPrefill& prompt, std::uint
         ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
         Tensor x = roots.residual;
-        embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+        embed_tokens(ids_device, *embed_, x, s);
         for (const cudaEvent_t event : layer_ready_) { CUDA_CHECK(cudaStreamWaitEvent(s, event, 0)); }
         layer_ready_ = {};
         NullTap tap;

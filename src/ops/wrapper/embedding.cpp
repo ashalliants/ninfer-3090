@@ -330,26 +330,43 @@ void embedding_split(const Tensor& ids, const Weight& hot, const Weight& cold, s
     (void)numel_allow_zero(out, "out");
     require_ids_shape(ids);
     require_out_shape(ids, out);
-    if (hot.qtype != cold.qtype || (cold.qtype != QType::GGML_IQ4_XS && cold.qtype != QType::GGML_Q6_K)) {
-        throw std::invalid_argument("embedding_split: both planes must be GGML IQ4_XS or both GGML Q6_K");
+    if (hot.qtype != cold.qtype ||
+        (cold.qtype != QType::GGML_IQ4_XS && cold.qtype != QType::GGML_Q6_K && cold.qtype != QType::Q4_G64_FP16)) {
+        throw std::invalid_argument(
+            "embedding_split: both planes must be GGML IQ4_XS, both GGML Q6_K or both Q4_G64_FP16");
     }
-    const bool q6 = cold.qtype == QType::GGML_Q6_K;
-    if (q6) {
+    switch (cold.qtype) {
+    case QType::GGML_Q6_K:
         require_ggml_metadata(hot, out, "Q6_K", 210);
         require_ggml_metadata(cold, out, "Q6_K", 210);
-    } else {
+        break;
+    case QType::Q4_G64_FP16:
+        require_q4_metadata(hot, out);
+        require_q4_metadata(cold, out);
+        if (hot.padded_shape[1] != cold.padded_shape[1]) {
+            throw std::invalid_argument("embedding_split: Q4_G64_FP16 planes must share one row layout");
+        }
+        break;
+    default:
         require_ggml_iq4_xs_metadata(hot, out);
         require_ggml_iq4_xs_metadata(cold, out);
+        break;
     }
     if (hot_rows < 1 || hot_rows > cold.shape[0] || hot.shape[0] != hot_rows) {
         throw std::invalid_argument("embedding_split: hot must hold rows [0,hot_rows), 1 <= hot_rows <= vocab");
     }
     if (is_empty_T(ids, out)) { return; }
     require_non_empty_tensors(ids, out);
-    if (q6) {
+    switch (cold.qtype) {
+    case QType::GGML_Q6_K:
         detail::embed_gather_ggml_q6_k_split_launch(ids, hot, cold, hot_rows, out, stream);
-    } else {
+        break;
+    case QType::Q4_G64_FP16:
+        detail::embed_gather_q4_split_launch(ids, hot, cold, hot_rows, out, stream);
+        break;
+    default:
         detail::embed_gather_ggml_iq4_xs_split_launch(ids, hot, cold, hot_rows, out, stream);
+        break;
     }
 }
 

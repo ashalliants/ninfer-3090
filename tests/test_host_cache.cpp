@@ -359,6 +359,10 @@ int check_flash_next_options_refused() {
     };
     ninfer::EngineOptions options;
     failures += check(refusal(options).empty(), "options with no Flash-Next flag were refused");
+    // --hot-embedding-rows is read by the dense model too (its token embedding in pinned RAM).
+    ninfer::EngineOptions hot_rows;
+    hot_rows.flash_next.hot_embedding_rows = 8192;
+    failures += check(refusal(hot_rows).empty(), "--hot-embedding-rows was refused for a dense model");
 
     struct Case {
         const char* flag;
@@ -380,7 +384,6 @@ int check_flash_next_options_refused() {
         {"--mtp-rows-verify", [](auto& n) { n.mtp_rows_verify = true; }},
         {"--ngram-prefetch", [](auto& n) { n.ngram_prefetch = true; }},
         {"--shared-expert-stream", [](auto& n) { n.shared_expert_stream = true; }},
-        {"--hot-embedding-rows", [](auto& n) { n.hot_embedding_rows = 8192; }},
         {"--gdn-head-map", [](auto& n) { n.gdn_head_map = true; }},
         {"--moe-precast-input", [](auto& n) { n.moe_precast_input = true; }},
         {"--moe-gate-up-registers", [](auto& n) { n.moe_gate_up_registers = true; }},

@@ -94,26 +94,44 @@ void embed_gather_dense_launch(const Tensor& ids, const Tensor& table, Tensor& o
     CUDA_CHECK(cudaGetLastError());
 }
 
-void embed_gather_q4_launch(const Tensor& ids, const Weight& table, Tensor& out,
-                            cudaStream_t stream) {
+namespace {
+
+// The Q4_G64 gather of every row from `table`, or (Split) rows below hot_rows from `hot`.
+template <bool Split>
+void launch_q4(const Tensor& ids, const Weight& table, const Weight* hot, std::int32_t hot_rows,
+               Tensor& out, cudaStream_t stream) {
     const std::int32_t d = out.ne[0];
     const std::int32_t T = ids.ne[0];
     const std::int64_t n = static_cast<std::int64_t>(d) * T;
     const auto* codes    = static_cast<const std::uint8_t*>(table.qdata);
     const auto* scales   = static_cast<const std::uint8_t*>(table.scales);
+    const auto* hot_codes  = hot != nullptr ? static_cast<const std::uint8_t*>(hot->qdata) : nullptr;
+    const auto* hot_scales = hot != nullptr ? static_cast<const std::uint8_t*>(hot->scales) : nullptr;
     if (d == table.padded_shape[1] && d % kEmbedGatherQ4Group == 0) {
         const std::int32_t group_blocks = div_up(d / kEmbedGatherQ4Group, kEmbedGatherQ4GroupsPerBlock);
-        embed_gather_q4_grouped_kernel<<<T * group_blocks, kQ4GroupedBlock, 0, stream>>>(
-            static_cast<const std::int32_t*>(ids.data), codes, scales,
+        embed_gather_q4_grouped_kernel<Split><<<T * group_blocks, kQ4GroupedBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data), codes, scales, hot_codes, hot_scales, hot_rows,
             static_cast<__nv_bfloat16*>(out.data), d, T);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
 
-    embed_gather_q4_kernel<<<grid_for(n), kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(ids.data), codes, scales,
+    embed_gather_q4_kernel<Split><<<grid_for(n), kBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), codes, scales, hot_codes, hot_scales, hot_rows,
         static_cast<__nv_bfloat16*>(out.data), d, T, table.padded_shape[1]);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void embed_gather_q4_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                            cudaStream_t stream) {
+    launch_q4<false>(ids, table, nullptr, 0, out, stream);
+}
+
+void embed_gather_q4_split_launch(const Tensor& ids, const Weight& hot, const Weight& cold,
+                                  std::int32_t hot_rows, Tensor& out, cudaStream_t stream) {
+    launch_q4<true>(ids, cold, &hot, hot_rows, out, stream);
 }
 
 void embed_gather_q6_launch(const Tensor& ids, const Weight& table, Tensor& out,

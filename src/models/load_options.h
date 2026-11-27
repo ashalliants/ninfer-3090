@@ -21,6 +21,10 @@ struct LoadOptions {
     bool embedding_q4   = false;
     bool embedding_q6   = false;
     bool mtp_experts_q4 = false;
+    // --hot-embedding-rows N (FlashNextOptions::hot_embedding_rows): the token embedding is bound in
+    // the pinned Host block and only its first N rows get a device copy (Model::hot_embedding). 0:
+    // the whole table in device memory.
+    std::uint32_t hot_embedding_rows = 0;
     // Execution selection carried with the instance: admit the integer small-T gate_up route at
     // verify widths (see execution::DenseParameters::verify_gate_up_policy).
     bool mlp_a8_decode = false;
@@ -102,6 +106,7 @@ struct LoadOptions {
             .embedding_q4   = options.embedding_q4,
             .embedding_q6   = options.embedding_q6,
             .mtp_experts_q4 = options.mtp_experts_q4,
+            .hot_embedding_rows = options.flash_next.hot_embedding_rows,
             .mlp_a8_decode  = options.mlp_a8_decode,
             .prefill_a8     = options.prefill_a8,
             .prefill_cublas = options.prefill_cublas,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/model.h"
 
 #include <ninfer/types.h>
@@ -64,10 +65,8 @@ struct BlockParameters {
 };
 
 struct TextParameters {
-    Weight token_embedding;
-    // A token table stored in the rotated basis (T2) is restored after the gather with the
-    // hidden-width sign vector; empty for an ordinary table.
-    Tensor token_embedding_signs;
+    // The table, its T2 sign vector and the --hot-embedding-rows planes (see TokenEmbedding).
+    TokenEmbedding token_embedding;
     LinearParameters output_head;
     Tensor final_norm;
     std::vector<BlockParameters> layers;

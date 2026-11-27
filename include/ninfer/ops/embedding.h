@@ -47,9 +47,10 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
  *   [0,hot_rows): the Op reads those rows from `hot` and never reads them from `cold`.
  *
  * Supported domain:
- *   GGML_IQ4_XS or GGML_Q6_K ggml_blocks_v1 planes, both in the same format (D a multiple of 256),
- *   each plane in any memory the device can read (device memory, or mapped page-locked host memory
- *   through its device pointer).
+ *   GGML_IQ4_XS or GGML_Q6_K ggml_blocks_v1 planes (D a multiple of 256), or Q4_G64_FP16 RowSplit
+ *   planes (codes and FP16 scales; both planes with the same padded row width, the 27B's
+ *   [248320,5120]), both in the same format, each plane in any memory the device can read (device
+ *   memory, or mapped page-locked host memory through its device pointer).
  *
  * Numeric:
  *   Each value is decoded as `embedding` decodes a table of that format (an exact output): the result

@@ -309,7 +309,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
         Tensor residual = work.alloc(DType::BF16, {dimension(target.hidden_size), width, batch});
         Tensor flat_residual = residual.view({dimension(target.hidden_size), columns});
         embed_tokens(ids.view({columns}), state.execution.parameters.text.token_embedding,
-                     state.execution.parameters.text.token_embedding_signs, flat_residual, stream);
+                     flat_residual, stream);
         for (std::size_t layer_index = 0; layer_index < weights.layers.size(); ++layer_index) {
             const auto& layer = weights.layers[layer_index];
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
@@ -446,7 +446,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
         Tensor residual =
             state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size), columns});
         embed_tokens(ids.view({columns}), state.execution.parameters.text.token_embedding,
-                     state.execution.parameters.text.token_embedding_signs, residual,
+                     residual,
                      state.execution.device.stream);
 
         for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {

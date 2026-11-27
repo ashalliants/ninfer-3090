@@ -1278,6 +1278,161 @@ int test_embedding_split_matches_embedding() {
     return failures;
 }
 
+// A Q4_G64_FP16 RowSplit payload of `rows` rows (codes, then the FP16 scales at the next 256-byte
+// boundary): random codes and finite random scales.
+struct Q4Planes {
+    std::int32_t rows = 0, groups = 0;
+    std::size_t code_bytes = 0, scale_offset = 0;
+    std::vector<std::uint8_t> payload;
+};
+
+Q4Planes q4_planes(std::int32_t rows, std::int32_t padded_d, std::uint32_t seed) {
+    Q4Planes out;
+    out.rows         = rows;
+    out.groups       = padded_d / kQ4Group;
+    out.code_bytes   = static_cast<std::size_t>(rows) * out.groups * 32;
+    out.scale_offset = align_up(out.code_bytes, 256);
+    out.payload.assign(out.scale_offset + static_cast<std::size_t>(rows) * out.groups * 2, 0);
+    std::uint32_t state = seed;
+    const auto next     = [&] {
+        state = state * 1664525U + 1013904223U;
+        return state >> 8;
+    };
+    for (std::size_t i = 0; i < out.code_bytes; ++i) { out.payload[i] = static_cast<std::uint8_t>(next()); }
+    for (std::size_t g = 0; g < static_cast<std::size_t>(rows) * out.groups; ++g) {
+        // Sign, a normal exponent and any mantissa: finite, so every code * scale is exact in FP32.
+        const auto bits = static_cast<std::uint16_t>((next() & 0x83FFU) | ((1U + next() % 16U) << 10));
+        store_u16_le(out.payload, out.scale_offset + g * 2, bits);
+    }
+    return out;
+}
+
+// The host decode of each id's row: code * scale in FP32 (exact), rounded once to BF16.
+std::vector<std::uint16_t> q4_expected(const Q4Planes& table, std::int32_t d, const std::vector<std::int32_t>& ids) {
+    std::vector<std::uint16_t> out(static_cast<std::size_t>(d) * ids.size());
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        for (std::int32_t v = 0; v < d; ++v) {
+            const std::size_t group    = static_cast<std::size_t>(ids[t]) * table.groups + v / kQ4Group;
+            const std::int32_t lane    = v % kQ4Group;
+            const std::uint32_t nibble = (table.payload[group * 32 + lane / 2] >> ((lane & 1) * 4)) & 0x0FU;
+            const int code    = (nibble & 0x08U) != 0 ? static_cast<int>(nibble) - 16 : static_cast<int>(nibble);
+            const float scale = f16_to_f32(load_u16_le(table.payload, table.scale_offset + group * 2));
+            out[t * d + v]    = f32_to_bf16(static_cast<float>(code) * scale);
+        }
+    }
+    return out;
+}
+
+Weight q4_plane_weight(const void* payload, const Q4Planes& planes, std::int32_t d, std::int32_t padded_d) {
+    Weight w{};
+    w.qtype           = QType::Q4_G64_FP16;
+    w.layout          = QuantLayout::RowSplit;
+    w.scale_dtype     = DType::FP16;
+    w.payload         = payload;
+    w.payload_bytes   = planes.payload.size();
+    w.qdata           = payload;
+    w.scales          = static_cast<const std::uint8_t*>(payload) + planes.scale_offset;
+    w.group_size      = kQ4Group;
+    w.group           = kQ4Group;
+    w.ndim            = 2;
+    w.shape[0]        = planes.rows;
+    w.shape[1]        = d;
+    w.padded_shape[0] = planes.rows;
+    w.padded_shape[1] = padded_d;
+    w.n               = planes.rows;
+    w.k               = d;
+    return w;
+}
+
+// embedding_split over Q4_G64_FP16 RowSplit planes (the Qwen3.8-27B token embedding with
+// --hot-embedding-rows): the first kHot rows in a device payload of their own, the whole table in
+// mapped page-locked host memory read through its device pointer, as production binds it. The cold
+// payload's hot rows (codes and scales) are overwritten, so reading one from there is caught. Ids
+// across the boundary (0, N - 1, N, V - 1, repeats) give exactly the host decode and bitwise what
+// ops::embedding gives over the unsplit device table. D = 5120 takes the grouped kernel, D = 320
+// (padded to 384) the scalar one.
+int test_embedding_split_q4(std::int32_t d) {
+    constexpr std::int32_t kVocab = 1000, kHot = 300;
+    const auto padded_d  = static_cast<std::int32_t>(align_up(static_cast<std::size_t>(d), 128));
+    const Q4Planes table = q4_planes(kVocab, padded_d, 0x13579BDU + static_cast<std::uint32_t>(d));
+    const std::vector<std::int32_t> ids = {0, kHot - 1, kHot, kVocab - 1, 17, 17, kHot, kHot, kHot - 1,
+                                           0, kVocab - 1, 523, kHot + 1, 2, 999, kHot - 2};
+    const std::vector<std::uint16_t> expected = q4_expected(table, d, ids);
+
+    // The hot payload: rows [0,kHot) of both planes, in a RowSplit layout of kHot rows.
+    Q4Planes hot_rows;
+    hot_rows.rows         = kHot;
+    hot_rows.groups       = table.groups;
+    hot_rows.code_bytes   = static_cast<std::size_t>(kHot) * table.groups * 32;
+    hot_rows.scale_offset = align_up(hot_rows.code_bytes, 256);
+    hot_rows.payload.assign(hot_rows.scale_offset + static_cast<std::size_t>(kHot) * table.groups * 2, 0);
+    std::memcpy(hot_rows.payload.data(), table.payload.data(), hot_rows.code_bytes);
+    std::memcpy(hot_rows.payload.data() + hot_rows.scale_offset, table.payload.data() + table.scale_offset,
+                static_cast<std::size_t>(kHot) * table.groups * 2);
+
+    GuardedDeviceBuffer device_table(table.payload.size());
+    device_table.copy_from_host(table.payload.data(), table.payload.size());
+    GuardedDeviceBuffer hot(hot_rows.payload.size());
+    hot.copy_from_host(hot_rows.payload.data(), hot_rows.payload.size());
+    PinnedHostBuffer cold(table.payload.size());
+    std::memcpy(cold.data(), table.payload.data(), table.payload.size());
+    const Q4Planes other = q4_planes(kHot, padded_d, 0x0BADF00DU);
+    auto* cold_bytes     = static_cast<std::uint8_t*>(cold.data());
+    std::memcpy(cold_bytes, other.payload.data(), other.code_bytes);
+    std::memcpy(cold_bytes + table.scale_offset, other.payload.data() + other.scale_offset,
+                static_cast<std::size_t>(kHot) * table.groups * 2);
+    void* cold_device = nullptr;
+    cuda_check(cudaHostGetDevicePointer(&cold_device, cold.data(), 0), "cudaHostGetDevicePointer");
+
+    GuardedDeviceBuffer device_ids(ids.size() * sizeof(std::int32_t));
+    device_ids.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer reference(expected.size() * sizeof(std::uint16_t));
+    reference.fill(0xff);
+    GuardedDeviceBuffer output(expected.size() * sizeof(std::uint16_t));
+    output.fill(0xff);
+    const auto T = static_cast<std::int32_t>(ids.size());
+    Tensor input(device_ids.data(), DType::I32, {T});
+    Tensor reference_out(reference.data(), DType::BF16, {d, T});
+    Tensor result(output.data(), DType::BF16, {d, T});
+    const Weight whole      = q4_plane_weight(device_table.data(), table, d, padded_d);
+    const Weight hot_plane  = q4_plane_weight(hot.data(), hot_rows, d, padded_d);
+    const Weight cold_plane = q4_plane_weight(cold_device, table, d, padded_d);
+    ops::embedding(input, whole, reference_out, nullptr);
+    ops::embedding_split(input, hot_plane, cold_plane, kHot, result, nullptr);
+    cuda_synchronize();
+
+    const std::string shape = "[1000," + std::to_string(d) + "] hot 300";
+    const std::vector<std::uint16_t> got = guarded_to_host<std::uint16_t>(output, expected.size());
+    int failures = verify_exact(("embedding_split Q4_G64_FP16 " + shape).c_str(), got, expected);
+    failures += verify_exact(("embedding_split Q4_G64_FP16 equals embedding bitwise " + shape).c_str(), got,
+                             guarded_to_host<std::uint16_t>(reference, expected.size()));
+    failures += output.verify_guards("embedding_split Q4 output");
+    failures += hot.verify_guards("embedding_split Q4 hot plane");
+
+    // Every row hot (N = V): the cold plane is never read.
+    output.fill(0xff);
+    ops::embedding_split(input, whole, cold_plane, kVocab, result, nullptr);
+    cuda_synchronize();
+    failures += verify_exact(("embedding_split Q4 with every row hot " + shape).c_str(),
+                             guarded_to_host<std::uint16_t>(output, expected.size()), expected);
+
+    const auto refuses = [&](const char* label, const Weight& h, const Weight& c, std::int32_t rows) {
+        try {
+            ops::embedding_split(input, h, c, rows, result, nullptr);
+        } catch (const std::invalid_argument&) {
+            return 0;
+        }
+        std::cerr << "FAIL: embedding_split Q4 accepted " << label << '\n';
+        return 1;
+    };
+    failures += refuses("a hot plane of another row count", hot_plane, cold_plane, kHot + 1);
+    failures += refuses("an IQ4_XS cold plane", hot_plane, iq4_xs_weight(cold_device, kVocab, 2560), kHot);
+    Weight padded = hot_plane;
+    padded.padded_shape[1] += 128;
+    failures += refuses("a hot plane of another padded width", padded, cold_plane, kHot);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1299,6 +1454,8 @@ int main() {
         failures += test_ggml_q6_k();
         failures += test_embedding_split_q6_k();
         failures += test_embedding_split_matches_embedding();
+        failures += test_embedding_split_q4(5120);
+        failures += test_embedding_split_q4(320);
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';
         return 1;

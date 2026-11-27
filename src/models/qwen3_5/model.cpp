@@ -8,10 +8,12 @@ namespace ninfer::models::qwen3_5 {
 Model::Model(Config config, LoadOptions options, ModelWeights weights,
              std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
              artifact::MaterializedArtifact backing,
-             std::optional<VisionOverlayLayout> vision_overlay)
+             std::optional<VisionOverlayLayout> vision_overlay,
+             std::optional<HotEmbedding> hot_embedding)
     : backing_(std::move(backing)), config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), resources_(std::move(resources)),
-      info_(std::move(info)), vision_overlay_(std::move(vision_overlay)) {}
+      info_(std::move(info)), vision_overlay_(std::move(vision_overlay)),
+      hot_embedding_(std::move(hot_embedding)) {}
 
 Model::~Model() = default;
 
