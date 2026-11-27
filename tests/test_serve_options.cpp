@@ -593,7 +593,7 @@ int main() {
     }
     failures += check(!defaults.flash_next.mtp_constrained.has_value(),
                       "MTP for constrained requests is not left to the --spec default");
-    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--no-mtp-constrained"}))
                               .flash_next.mtp_constrained == std::optional<bool>{false},
                       "--no-mtp-constrained does not reach the Engine");
