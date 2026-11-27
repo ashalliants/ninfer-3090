@@ -591,10 +591,18 @@ int main() {
         }
         failures += check(named, "--gdn-async-commit without --spec mtp was not refused naming both flags");
     }
-    failures += check(!defaults.flash_next.mtp_constrained, "MTP for constrained requests is on by default");
+    failures += check(!defaults.flash_next.mtp_constrained.has_value(),
+                      "MTP for constrained requests is not left to the --spec default");
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                                 "--no-mtp-constrained"}))
+                              .flash_next.mtp_constrained == std::optional<bool>{false},
+                      "--no-mtp-constrained does not reach the Engine");
+    failures += check(!make_engine_options(parse({"ninfer-serve", "model.ninfer", "--no-mtp-constrained"}))
+                           .flash_next.mtp_constrained.value_or(true),
+                      "--no-mtp-constrained without --spec mtp was refused or lost");
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                                                  "--mtp-constrained"}))
-                          .flash_next.mtp_constrained,
+                          .flash_next.mtp_constrained.value_or(false),
                       "--mtp-constrained does not reach the Engine");
     for (const auto& spec : {std::vector<std::string>{}, std::vector<std::string>{"--spec", "dflash"}}) {
         std::vector<std::string> args{"ninfer-serve", "model.ninfer", "--mtp-constrained"};
