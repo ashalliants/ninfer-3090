@@ -863,6 +863,24 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
     require_rowsplit(qk_weight, QType::T2_G128_FP16, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::T2_G128_FP16, kValueRows + kZRows, "value/z weight");
     auto scope = workspace.scope();
+    // sm_70's FP16 cuBLAS prefill route (detail::cublas_prefill_admits_t2): q/k fills the head of
+    // qkv, value the tail and z its own plane, from one FP16 carry of x and one exact
+    // materialisation per parent.
+    if (allows_cublas_prefill(policy) && cols >= cublas_prefill_min_tokens(policy) &&
+        detail::cublas_prefill_admits_t2()) {
+        const detail::CublasProjectionDestination qk_dests[] = {
+            {qkv.data, 0, kQkRows, kQkvRows, 0}};
+        const detail::CublasProjectionDestination vz_dests[] = {
+            {qkv.data, 0, kValueRows, kQkvRows, kQkRows}, {z.data, kValueRows, kZRows, kZRows, 0}};
+        const detail::CublasProjection parents[] = {
+            {&qk_weight, qk_dests, 1}, {&value_z_weight, vz_dests, 2}};
+        if (detail::w4_cublas_projection_supported(parents, 2, cols) &&
+            (cols >= kCublasPrefillMinTokens ||
+             detail::w4_cublas_projection_fits(workspace, parents, 2, cols))) {
+            detail::w4_cublas_projection_launch(x, parents, 2, workspace, stream);
+            return;
+        }
+    }
     if (detail::t2_a8_admits(policy) && detail::t2_a8_supported(qk_weight, cols) &&
         detail::t2_a8_supported(value_z_weight, cols)) {
         // One quantisation of x; q/k and value land in qkv directly and z in its own plane.
@@ -901,6 +919,14 @@ std::size_t t2_two_parent_projection_bytes(std::int32_t min_columns, std::int32_
             (void)layout.alloc(DType::BF16, {6144, columns});
         }
         bytes = std::max(bytes, layout.peak_bytes(1));
+    }
+    // sm_70's FP16 cuBLAS route, from its width gate (the wider parent is materialised).
+    if (allows_cublas_prefill(policy) && detail::cublas_prefill_admits_t2() &&
+        max_columns >= cublas_prefill_min_tokens(policy)) {
+        bytes = std::max(bytes, detail::w4_cublas_projection_workspace_capacity_bytes(
+                                    12288, 5120,
+                                    std::max(min_columns, cublas_prefill_min_tokens(policy)),
+                                    max_columns));
     }
     return bytes;
 }

@@ -11,6 +11,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -257,6 +259,36 @@ __global__ void dequantise_q8_row_to_fp16(const std::int8_t* __restrict__ codes,
             values[j]      = __float2half_rn(static_cast<float>(code) * group);
         }
         *reinterpret_cast<uint4*>(o_row + w * 8) = *reinterpret_cast<const uint4*>(values);
+    }
+}
+
+// The FP16 route's T2_G128_FP16 (ternary) weight (sm_70 only): one block per row, each thread turning
+// one 32-bit word of sixteen 2-bit codes (00 = 0, 01 = +1, 11 = -1; t2_rowsplit_storage.cuh) of a
+// 128-value group into sixteen FP16 values code * group_scale, written as two 16-byte stores. Exact:
+// the product is +-scale or zero, and the scale is already binary16. The row scale is 1.
+constexpr int kT2Group = 128;
+__global__ void dequantise_t2_row_to_fp16(const std::uint32_t* __restrict__ codes,
+                                          const __half* __restrict__ scales, int k,
+                                          __half* __restrict__ out, float* __restrict__ row_scale) {
+    const int row        = blockIdx.x;
+    const auto* c_row    = codes + static_cast<std::size_t>(row) * (k / 16);
+    const __half* s_row  = scales + static_cast<std::size_t>(row) * (k / kT2Group);
+    __half* o_row        = out + static_cast<std::size_t>(row) * k;
+    if (threadIdx.x == 0) { row_scale[row] = 1.0F; }
+    const int words = k / 16;
+    for (int w = threadIdx.x; w < words; w += kThreads) {
+        const std::uint32_t packed = c_row[w];
+        const __half scale         = s_row[(w * 16) / kT2Group];
+        const __half zero          = __ushort_as_half(0);
+        const __half neg           = __hneg(scale);
+        __align__(16) __half values[16];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const std::uint32_t field = (packed >> (2 * j)) & 0x3u;
+            values[j] = (field & 0x1u) ? ((field & 0x2u) ? neg : scale) : zero;
+        }
+        *reinterpret_cast<uint4*>(o_row + w * 16)     = *reinterpret_cast<const uint4*>(values);
+        *reinterpret_cast<uint4*>(o_row + w * 16 + 8) = *reinterpret_cast<const uint4*>(values + 8);
     }
 }
 
@@ -574,6 +606,9 @@ void materialise_weight(const Weight& weight, const Scratch& s, cudaStream_t str
         } else if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
             dequantise_fp8_row_to_fp16<<<n, kThreads, 0, stream>>>(
                 codes, static_cast<const __nv_bfloat16*>(weight.scales), k, w16, s.row_scale);
+        } else if (weight.qtype == QType::T2_G128_FP16) {
+            dequantise_t2_row_to_fp16<<<n, kThreads, 0, stream>>>(
+                static_cast<const std::uint32_t*>(weight.qdata), scales, k, w16, s.row_scale);
         } else if (weight.qtype == QType::Q8_G32_FP16) {
             dequantise_q8_row_to_fp16<<<n, kThreads, 0, stream>>>(
                 static_cast<const std::int8_t*>(weight.qdata), scales, k, w16, s.row_scale);
@@ -648,6 +683,12 @@ bool w4_cublas_prefill_supported(const Weight& weight, std::int32_t tokens) {
         weight.scales == nullptr || weight.scale_dtype != DType::FP16) {
         return false;
     }
+    if (weight.qtype == QType::T2_G128_FP16) {
+        // The FP16 route only (cublas_prefill_admits_t2); unpadded rows of whole 16-code words.
+        return cublas_prefill_admits_t2() && weight.group == kT2Group &&
+               weight.k % kT2Group == 0 && weight.padded_shape[1] == weight.k &&
+               weight.qhigh == nullptr;
+    }
     if (weight.qtype == QType::Q8_G32_FP16) {
         // The FP16 route only (cublas_prefill_admits_q8); unpadded rows of whole 8-code words.
         return kFp16Route && weight.group == kQ8Group && weight.k % kQ8Group == 0 &&
@@ -660,6 +701,14 @@ bool w4_cublas_prefill_supported(const Weight& weight, std::int32_t tokens) {
 
 bool cublas_prefill_admits_q8() noexcept { return kFp16Route; }
 bool cublas_prefill_admits_fp() noexcept { return kFp16Route; }
+bool cublas_prefill_admits_t2() noexcept {
+    // NINFER_SM70_T2_PREFILL_CUBLAS=0 keeps T2 prefill on its own kernels (same-binary A/B).
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_SM70_T2_PREFILL_CUBLAS");
+        return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+    }();
+    return kFp16Route && enabled;
+}
 
 // The FP formats share the Q4 / Q5 gates: below the narrow gate (65) NVFP4 and FP8 run 2..64 tokens
 // on the streaming tensor-core tiles (nvfp4_stream_format.cuh, fp8_stream_format.cuh), which beat

@@ -77,6 +77,15 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
                                               LinearPolicy::A16Only, min_tokens, max_tokens);
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::BF16, {gate_up_rows, max_tokens});
+        // sm_70's FP16 cuBLAS route (detail::cublas_prefill_admits_t2) from its width gate.
+        if (allows_cublas_prefill(policy) && detail::cublas_prefill_admits_t2() &&
+            max_tokens >= cublas_prefill_min_tokens(policy)) {
+            return std::max(layout.peak_bytes(1),
+                            detail::w4_cublas_prefill_workspace_capacity_bytes(
+                                gate_up_rows, input_rows,
+                                std::max(min_tokens, cublas_prefill_min_tokens(policy)),
+                                max_tokens));
+        }
         return layout.peak_bytes(1);
     }
     if (qtype == QType::Q8_G32_FP16) {
@@ -211,8 +220,17 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (t2_weight) {
+        // sm_70: prefill widths on the FP16 cuBLAS route, exact in the weight (w4_cublas_prefill.h).
+        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+            detail::cublas_prefill_admits_t2() &&
+            detail::w4_cublas_prefill_supported(gate_up_weight, t) &&
+            (t >= kCublasPrefillMinTokens ||
+             detail::w4_cublas_prefill_fits(ws, gate_up_weight.n, gate_up_weight.k, t))) {
+            detail::w4_cublas_swiglu_launch(x, gate_up_weight, out, ws, stream);
+            return;
+        }
         // Ternary rows project gate and up into one plane; SwiGLU is a separate elementwise pass
-        // over its two halves. A16 by construction.
+        // over its two halves. A16 otherwise.
         auto scope     = ws.scope();
         Tensor gate_up = ws.alloc(DType::BF16, {gate_up_weight.n, t});
         linear(x, gate_up_weight, gate_up, stream);
@@ -301,8 +319,9 @@ namespace {
 
 // The FP16 cuBLAS route's NVFP4 / FP8 forms (sm_70 only, detail::cublas_prefill_admits_fp).
 bool plane_fp_route(QType qtype) {
-    return (qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16) &&
-           detail::cublas_prefill_admits_fp();
+    return ((qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16) &&
+            detail::cublas_prefill_admits_fp()) ||
+           (qtype == QType::T2_G128_FP16 && detail::cublas_prefill_admits_t2());
 }
 
 // The routes linear_swiglu takes that can hand out the gate/up plane: the cuBLAS prefill route

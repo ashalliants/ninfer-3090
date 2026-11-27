@@ -190,8 +190,18 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                               min_tokens, max_tokens);
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::BF16, {output_rows, max_tokens});
-        return std::max(layout.peak_bytes(1),
-                        detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens));
+        std::size_t bytes = std::max(
+            layout.peak_bytes(1),
+            detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens));
+        // sm_70's FP16 cuBLAS route (detail::cublas_prefill_admits_t2) from its width gate.
+        if (allows_cublas_prefill(policy) && detail::cublas_prefill_admits_t2() &&
+            max_tokens >= cublas_prefill_min_tokens(policy)) {
+            bytes = std::max(bytes, detail::w4_cublas_prefill_workspace_capacity_bytes(
+                                        output_rows, input_rows,
+                                        std::max(min_tokens, cublas_prefill_min_tokens(policy)),
+                                        max_tokens));
+        }
+        return bytes;
     }
     if (qtype == QType::BF16) {
         (void)detail::bf16_linear_add_select(output_rows, input_rows, min_tokens);
@@ -289,6 +299,13 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     }
 
     if (w.qtype == QType::T2_G128_FP16) {
+        // sm_70: prefill widths on the FP16 cuBLAS route, exact in the weight (w4_cublas_prefill.h).
+        if (allows_cublas_prefill(policy) && t >= cublas_prefill_min_tokens(policy) &&
+            detail::cublas_prefill_admits_t2() && detail::w4_cublas_prefill_supported(w, t) &&
+            (t >= kCublasPrefillMinTokens || detail::w4_cublas_prefill_fits(ws, w.n, w.k, t))) {
+            detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);
+            return;
+        }
         if (detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, t)) {
             detail::t2_a8_linear_add(x, w, residual_out, ws, stream);
             return;
