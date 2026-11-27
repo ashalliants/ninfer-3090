@@ -443,9 +443,9 @@ Before these routes, the QAD artifact decoded at 8.6 tok/s and prefilled the lon
 25 tok/s. Short prompts now match the Q4/Q5 mix: with a plain template, 11 / 18 / 28 / 47 prompt
 tokens prefill at 184.8 / 235.8 / 324.2 / 305.6 tok/s against its 189.6 / 229.8 / 315.0 / 324.1.
 
-**Serving it.** `download-model.sh qwen38-27b-qad`, then `run-v100.sh qwen38-27b-qad`: MTP3 with the
-draft head, INT8 KV, two lanes sharing the full 262,144-token context, vision in overlay residency.
-It starts with 3.9 GiB of VRAM free. Speculation stays on because overlay vision borrows its encode
+**Serving it.** `download-model.sh qwen38-27b-qad`, then `run-v100.sh qwen38-27b-qad`: MTP3 (or
+DFlash2, below) with the draft head, INT8 KV, two lanes sharing the full 262,144-token context,
+vision in overlay residency. It starts with 3.9 GiB of VRAM free. Speculation stays on because overlay vision borrows its encode
 window from the MTP weights (`NINFER_SPEC=none` is refused rather than started without images).
 `ninfer-serve` on 127.0.0.1, MTP3, INT8 KV, `--prefill-cublas --prefill-chunk 2048 --gdn-state-fp16`,
 greedy, thinking off, 400-token answers, 200 W (2026-11-26):
@@ -454,6 +454,25 @@ greedy, thinking off, 400-token answers, 200 W (2026-11-26):
 |---|---:|---:|
 | Code (ISO 8601 parser with tests) | 90.0 tok/s | 110 tok/s |
 | Story | 59.0 tok/s | 77 tok/s |
+
+**DFlash2 (artifact revision 2026-11-27).** The artifact now also carries the Q4/Q5 build's DFlash2
+drafter, copied byte for byte (`tools/artifact/add_component.py`; MTP output on the five prompts below
+is byte-identical to the first revision's). `NINFER_SPEC=dflash2 run-v100.sh qwen38-27b-qad` serves it
+as K=7 with n-gram copies. Same server settings as above (two lanes, INT8 KV, overlay vision), greedy,
+thinking off, 400-token answers, one request at a time, 2026-11-27, 200 W, ABBA, the two legs of each
+column within 1 tok/s; the Q4/Q5 column is one run of the same settings:
+
+| Prompt | QAD, MTP3 | QAD, DFlash2 K=7 + n-gram | Q4/Q5 mix, DFlash2 K=7 + n-gram |
+|---|---:|---:|---:|
+| Code (ISO 8601 parser with tests) | 90.1-91.1 | **116.0-116.4** | 139.1 |
+| JSON list | 93.2-94.1 | **114.6-114.8** | 151.3 |
+| Explanation (TCP) | **66.5-67.1** | 63.6-63.7 | 84.3 |
+| Story | **58.5-59.0** | 49.1-49.3 | 63.4 |
+| French essay | **58.0-58.4** | 46.7-46.9 | 59.7 |
+
+The drafter was trained against the BF16 model, and on this checkpoint it drafts predictable text well
+and prose worse than on the Q4/Q5 mix, so MTP3 stays the default. DFlash2 leaves 2.29 GiB of VRAM free
+at startup against MTP3's 3.87. RTX 3090 NOT RUN.
 
 Single-request decode without speculation is within 4% (40.6 against 42.2, the table above); with
 MTP3 the gap widens to about 20% (the QAD accepted 287 drafts for its 400 code tokens; the Q4/Q5
@@ -585,7 +604,49 @@ mixer projections the cuBLAS FP16 prefill route; before, both ran Ampere `mma.sy
 emulation. With those two the gap to llama.cpp's 2,745 at 4.2K was 12%. Prefill-scored PPL (PG-19,
 8,192 context) is 6.171 with both against 6.174 with neither.
 
+Many short requests at once (a labelling or classification job), through `ninfer-serve` with the
+router's 35B flags (the decode flags above plus `--max-concurrency 8 --max-context 262144
+--kv-capacity auto --host-context-mib 8192 --vision`), 2026-11-26, 200 W, no thermal throttling.
+- **Workload:** 1,200 requests, 8 in flight. Each is a shared 190-token instruction prefix, a unique
+  item of about 200 tokens and a one-word label (24 tokens at most), greedy, thinking off.
+- **Client:** sends no cache hints, so every request also asks to keep its own end-of-prompt state
+  in a Host tier that is full.
+- **Scoring:** requests per second after the first 400 requests, once the tier is full. Runs in the
+  order ABBA. The two legs of each side agreed within 1%.
+
+| Build | requests/s | Engine-thread host time per request, GPU idle |
+|---|---:|---:|
+| this build | **6.04-6.14** | 26-28 ms |
+| before (master 4cbff744) | 4.74-4.76 | 65 ms |
+
+The difference is victim selection for the Host tier. Each candidate eviction used to be priced
+against every retained checkpoint, rebuilt per candidate; the retained set is now prepared once per
+decision (#644), and an unproven one-off write now takes a single release action from unproven
+history instead of a full search (#645). #644 alone measured 6.09-6.14 requests/s against
+6.10 with both: on this workload, nearly all the gain is #644's. Cache decisions are unchanged:
+the same saves failed (0.89 per request) and the same bytes moved (21.6 MB per request) in both
+builds. 1,187-1,194 of the 1,200 labels matched between any two
+runs, of one build or both: run-to-run variation from batch timing, the same size within a build as
+across builds. RTX 3090 NOT RUN.
+
 ### Qwen3.8-Flash-Next
+
+**2026-11-27: requests that offer tools, or ask for JSON, now use MTP** (#501). Such a request's whole
+output follows a grammar (the tool-call grammar when tools are offered), and Flash-Next decoded every
+constrained request without MTP unless `--mtp-constrained` was set. Constrained requests now speculate
+by default, accepting each draft under its own grammar mask; `--no-mtp-constrained` restores the old
+behaviour. Through `ninfer-serve` with the router's flags (7 drafts, joint acceptance, 32,768
+context), greedy, thinking off, 2026-11-27, 200 W, no thermal throttling, ABBA, with every output and
+tool call byte-identical between the arms:
+
+| Request | before | now |
+|---|---:|---:|
+| 7 tools offered, an explanation (467 tokens) | 43.0-44.7 | **70.3-70.6** |
+| 7 tools offered, code (500 tokens) | 45.4-46.8 | **114.3-115.5** |
+| 7 tools offered, a story (410 tokens) | 45.5-46.0 | **72.2-72.4** |
+| JSON schema, a list of cities (495 tokens) | 21.4-21.8 | **112.8-114.3** |
+
+RTX 3090 NOT RUN.
 
 **2026-11-25: the MTP draft vocabulary comes from the model's tokenizer**, with the same output.
 On a V100 `--mtp-draft-vocab auto` (the default) no longer reads the Basalt list beside the model: the

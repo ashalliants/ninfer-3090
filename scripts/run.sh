@@ -156,7 +156,7 @@
 #           NO_PREFIX_REUSE NO_PREFILL_A8 NO_PREFILL_CUBLAS NO_PREFILL_CUBLAS_PROJECTIONS CONTEXT_STORE_COMPRESS
 #           NO_EXIT_ON_ENGINE_FAILURE ADMISSION_FIT_CHECK PROGRESS_ANCHORS_SHARED MODEL_SUSPEND
 #           NO_AUTO_RESUME LM_HEAD_Q4 LM_HEAD_Q6 EMBEDDING_Q4 EMBEDDING_Q6 NO_EXPERT_STATE
-#           LOSSY_PREFILL_SCOUT_A4 REQUEST_LOG_LOSSY_DETAIL
+#           LOSSY_PREFILL_SCOUT_A4 REQUEST_LOG_LOSSY_DETAIL MTP_STAGED_DRAFTS NO_MTP_CONSTRAINED
 # NINFER_GRAFT (NAME=PATH;NAME=PATH, each --graft: prompt grafts and GGUF control vectors) and
 # NINFER_DEFAULT_GRAFT (--default-graft, NAME or NAME+NAME).
 # NINFER_LORA (NAME=PATH;NAME=PATH, each --lora) and NINFER_DEFAULT_LORA (--default-lora).
@@ -357,30 +357,47 @@ case "$model_key/$profile" in
 
   qwen38-27b-qad/tuned)
     # NVIDIA's quantization-aware-distilled NVFP4/FP8 weights: closer to BF16 than the Q4/Q5 mix, and
-    # slower to decode. The artifact has no DFlash2 bundle, so MTP is the only speculation. Overlay
-    # vision borrows its encode window from the MTP weights, so speculation stays on (NINFER_SPEC=none
-    # would need NINFER_VISION_RESIDENCY=resident). Measured on the Tesla V100 only (docs/tesla-v100.md);
-    # not yet measured on the RTX 3090.
+    # slower to decode. MTP3 is the default. Since revision 2026-11-27 the artifact also carries the
+    # Q4/Q5 build's DFlash2 drafter (NINFER_SPEC=dflash2): faster on code and JSON, slower on prose
+    # (docs/tesla-v100.md). Overlay vision borrows its encode window from the speculative weights,
+    # so speculation stays on (NINFER_SPEC=none would need NINFER_VISION_RESIDENCY=resident).
+    # Measured on the Tesla V100 only; not yet on the RTX 3090.
     SPEC="${NINFER_SPEC:-mtp}"
     case "$SPEC" in
-      mtp) ;;
-      *) printf 'NINFER_SPEC must be mtp for qwen38-27b-qad, got %s\n' "$SPEC" >&2; exit 2 ;;
+      mtp|dflash2) ;;
+      *) printf 'NINFER_SPEC must be mtp or dflash2 for qwen38-27b-qad, got %s\n' "$SPEC" >&2; exit 2 ;;
     esac
-    case "${NINFER_NGRAM:-off}" in
-      off) ;;
-      on) printf 'NINFER_NGRAM=on needs NINFER_SPEC=dflash2, which only qwen38-27b has\n' >&2; exit 2 ;;
-      *) printf 'NINFER_NGRAM must be on or off, got %s\n' "$NINFER_NGRAM" >&2; exit 2 ;;
-    esac
-    use_profile qwen38-27b-qad-tuned-mtp
+    use_profile "qwen38-27b-qad-tuned-$SPEC"
     DRAFT_TOKENS="${NINFER_DRAFT_TOKENS:-$(profile_value draft-tokens)}"
     CONTEXT="${NINFER_CONTEXT:-262144}"
     CONCURRENCY="${NINFER_CONCURRENCY:-2}"
     KV_CAPACITY="${NINFER_KV_CAPACITY:-$CONTEXT}"
     KV_DTYPE="${NINFER_KV_DTYPE:-$(profile_value kv-dtype)}"
     PREFILL_CHUNK="${NINFER_PREFILL_CHUNK:-$(profile_value prefill-chunk)}"
-    profile_args=(--max-concurrency "$CONCURRENCY" --max-context "$CONTEXT" --kv-capacity "$KV_CAPACITY")
+    spec_args=()
+    case "$SPEC" in
+      mtp) spec_label="MTP$DRAFT_TOKENS + draft head, two lanes" ;;
+      dflash2) spec_label="DFlash2 K=$DRAFT_TOKENS + draft head" ;;
+    esac
+    # N-gram copies ride on DFlash2, on at one and two lanes as for qwen38-27b.
+    default_ngram=off
+    if [[ "$SPEC" == 'dflash2' && ( "$CONCURRENCY" == '1' || "$CONCURRENCY" == '2' ) ]]; then
+      default_ngram=on
+    fi
+    case "${NINFER_NGRAM:-$default_ngram}" in
+      on)
+        [[ "$SPEC" == 'dflash2' ]] || { printf 'NINFER_NGRAM=on needs NINFER_SPEC=dflash2\n' >&2; exit 2; }
+        spec_args+=(--ngram-draft-tokens 15)
+        spec_label="$spec_label + n-gram copies" ;;
+      off) ;;
+      *) printf 'NINFER_NGRAM must be on or off, got %s\n' "$NINFER_NGRAM" >&2; exit 2 ;;
+    esac
+    profile_args=(
+      --max-concurrency "$CONCURRENCY" --max-context "$CONTEXT" --kv-capacity "$KV_CAPACITY"
+      ${spec_args[@]+"${spec_args[@]}"}
+    )
     tuned_overrides
-    label="C$CONCURRENCY  |  context $CONTEXT  |  KV pool $KV_CAPACITY  |  $KV_DTYPE  |  MTP$DRAFT_TOKENS + draft head, two lanes"
+    label="C$CONCURRENCY  |  context $CONTEXT  |  KV pool $KV_CAPACITY  |  $KV_DTYPE  |  $spec_label"
     prefill_note="Prefill: cuBLAS route, chunk $PREFILL_CHUNK" ;;
 
   qwen36-35b-a3b/tuned)
@@ -748,7 +765,7 @@ passthrough_switch_flags=(
   no-prefill-a8 no-prefill-cublas no-prefill-cublas-projections context-store-compress no-exit-on-engine-failure
   admission-fit-check progress-anchors-shared model-suspend no-auto-resume
   lm-head-q4 lm-head-q6 embedding-q4 embedding-q6 lossy-prefill-scout-a4 request-log-lossy-detail
-  no-expert-state mtp-staged-drafts
+  no-expert-state mtp-staged-drafts no-mtp-constrained
 )
 env_name_for_flag() { printf 'NINFER_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
 for flag in "${passthrough_value_flags[@]}"; do

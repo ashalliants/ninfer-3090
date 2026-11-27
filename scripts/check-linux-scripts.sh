@@ -259,6 +259,15 @@ expect_config '27B QAD default' "$recorded" qwen38-27b-qad-tuned-mtp
 expect_options '27B QAD default' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
   --max-concurrency 2 --max-context 262144 --kv-capacity 262144 \
   --spec mtp --draft-tokens 3 --lm-head-draft --prefill-chunk 2048
+recorded="$(record whole_qad_dflash2 NINFER_SPEC=dflash2 -- qwen38-27b-qad)"
+expect_config '27B QAD NINFER_SPEC=dflash2' "$recorded" qwen38-27b-qad-tuned-dflash2
+expect_options '27B QAD NINFER_SPEC=dflash2' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
+  --max-concurrency 2 --max-context 262144 --kv-capacity 262144 --ngram-draft-tokens 15 \
+  --spec dflash2 --draft-tokens 7 --lm-head-draft --prefill-chunk 2048
+refuse_flag '27B QAD MTP has no n-gram copies' "$(record whole_qad_mtp_ngram -- qwen38-27b-qad)" \
+  '--ngram-draft-tokens'
+expect_exit 2 '27B QAD NINFER_NGRAM=on with MTP' \
+  clear_env NINFER_NGRAM=on NINFER_MODEL_DIR="$tmp" "$root/run.sh" qwen38-27b-qad
 recorded="$(record whole_35b -- qwen36-35b-a3b)"
 expect_config '35B default' "$recorded" qwen36-35b-a3b-tuned-mtp
 expect_options '35B default' "$recorded" "${common_tuned[@]}" --fit-context 32768 \
@@ -469,6 +478,10 @@ refuse_flag '27B int8 NINFER_REASONING_LOOP=stop' \
   "$(record loop_int8 NINFER_REASONING_LOOP=stop -- qwen38-27b int8)" '--reasoning-loop'
 # Flash-Next takes the guard too, and the sampling guard's two overrides only when they are set:
 # its registered presets stay in force by default, unlike the 27B's small-quant defaults.
+# Constrained requests (tools, JSON) speculate by default; NINFER_NO_MTP_CONSTRAINED=on opts out.
+refuse_flag 'Flash-Next constrained MTP default' "$(record fn_constrained_default -- qwen38-flash-next)" '--no-mtp-constrained'
+expect_flags 'Flash-Next NINFER_NO_MTP_CONSTRAINED=on' \
+  "$(record fn_no_constrained NINFER_NO_MTP_CONSTRAINED=on -- qwen38-flash-next)" '--no-mtp-constrained'
 refuse_flag 'Flash-Next reasoning loop unset' "$(record fn_loop_unset -- qwen38-flash-next)" '--reasoning-loop'
 expect_flags 'Flash-Next NINFER_REASONING_LOOP=conclude' \
   "$(record fn_loop_conclude NINFER_REASONING_LOOP=conclude -- qwen38-flash-next)" '--reasoning-loop conclude'

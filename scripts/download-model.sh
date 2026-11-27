@@ -15,11 +15,12 @@ set -euo pipefail
 #                    --spec dflash2. Executables older than the 5120x17408 Q4 linear_add route refuse
 #                    it at startup. Figures published before 2026-10 were measured against the
 #                    upstream neroued pin 1cbd84e7 (v2 18dfc887), 19.0 GiB.
-#   qwen38-27b-qad   Qwen3.8-27B from NVIDIA's NVFP4 QAD checkpoint, 16.9 GiB
+#   qwen38-27b-qad   Qwen3.8-27B from NVIDIA's NVFP4 QAD checkpoint, 19.0 GiB
 #                    (WarlaxZ/Qwen3.8-27B-NVFP4-QAD-NInfer-V100, recipe qwen3_8_27b_nvfp4_qad): the same
 #                    model as qwen38-27b, quantization-aware distilled by NVIDIA so its NVFP4/FP8 weights
 #                    track BF16 more closely (lower perplexity than qwen38-27b on every domain measured),
-#                    but slower to decode. Carries vision and MTP, not DFlash2. Measured on the Tesla
+#                    but slower to decode. Carries vision, MTP and (revision 2026-11-27) the Q4/Q5 build's
+#                    DFlash2 drafter (NINFER_SPEC=dflash2). Measured on the Tesla
 #                    V100; not yet on the RTX 3090. Needs a build from master after 2026-11-26.
 #   bonsai2-27b      Ternary Bonsai 2 27B, 8.9 GiB. Prism ML's ternary Qwen3.8-27B (2.125 bits per
 #                    weight, Hadamard-rotated) converted by this fork's bonsai2_27b_ternary recipe
@@ -82,10 +83,10 @@ case "${1:-}" in
     artifact='qwen3_8_27b_nvfp4_qad.ninfer'
     owner='WarlaxZ'
     repo='Qwen3.8-27B-NVFP4-QAD-NInfer-V100'
-    revision='2cd93ef54b0a68b33f5d1a10abad68fef2cbbd2f'
-    expected_size=18159548164
-    expected_sha256='c79ff2d1f9b3c0f729327d073bfd0b9dbf085c5c300a53d51f260a0fd634de0d'
-    label='the Qwen3.8-27B NVIDIA NVFP4 QAD model (16.9 GiB)'
+    revision='ca21fddeb4077f717f23505144005901f7339a5f'
+    expected_size=20386365952
+    expected_sha256='7c62491a31ce950f8ad2053861f03843dd1c75064028ab2e072607b6a8dadcb1'
+    label='the Qwen3.8-27B NVIDIA NVFP4 QAD model (19.0 GiB)'
     tests_variable=''  # no real-model test reads this artifact
     ;;
   bonsai2-27b)

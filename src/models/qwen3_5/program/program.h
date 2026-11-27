@@ -4,10 +4,12 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/host_placement.h"
 #include "runtime/contract/resources.h"
+#include "runtime/engine/context_cache/recovery_loss.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -247,6 +249,10 @@ private:
     friend struct ContextReclaimPlan;
 };
 
+// Recovery loss of releasing a set (first span) from a prepared retained set, with further
+// checkpoints (second span) also gone but not counted as lost (runtime::RecoveryLossTable).
+using PreparedRecoveryLoss = runtime::PreparedRecoveryLoss<CheckpointHandle>;
+
 // Read-only facts for one synchronous evaluation. Discard before any Native mutation or yield.
 // start_demote independently revalidates the selected quote before reserving destinations.
 struct ContextReclaimPlan {
@@ -256,6 +262,9 @@ struct ContextReclaimPlan {
     [[nodiscard]] ContextDemotionBatch begin_kv_batch(runtime::ContextResourceUsage shortage) const;
     [[nodiscard]] std::uint64_t recovery_loss(std::span<const CheckpointHandle> removed,
                                               std::span<const CheckpointHandle> surviving) const;
+    // recovery_loss against `retained` less the removed set, prepared once for many queries.
+    [[nodiscard]] PreparedRecoveryLoss
+    prepare_recovery_loss(std::span<const CheckpointHandle> retained) const;
 
 private:
     std::shared_ptr<detail::ReclaimPlan> impl_;
@@ -554,6 +563,8 @@ public:
     [[nodiscard]] std::uint64_t
     checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
                              std::span<const CheckpointHandle> surviving) const;
+    [[nodiscard]] PreparedRecoveryLoss
+    prepare_checkpoint_recovery_loss(std::span<const CheckpointHandle> retained) const;
     [[nodiscard]] bool valid_checkpoint(CheckpointHandle checkpoint) const noexcept;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle checkpoint) noexcept;
     [[nodiscard]] bool revoke_snapshot(ResumeState& paused) noexcept;

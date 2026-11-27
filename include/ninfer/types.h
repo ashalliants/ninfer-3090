@@ -711,10 +711,12 @@ struct FlashNextOptions {
     // relative to a plain round, and a measurement mode that always drafts --draft-tokens.
     double mtp_width_cost = 0.38;
     bool mtp_fixed_drafts = false;
-    // Keep MTP speculation on for constrained requests (JSON schema, grammar, tool calls) with one
-    // grammar mask per verified position, as the Qwen3.5 path does (--mtp-constrained; needs
-    // --spec mtp). Off: a constrained request decodes plain rounds.
-    bool mtp_constrained = false;
+    // MTP speculation for constrained requests (JSON schema, grammar, and every request that
+    // offers tools, whose whole output follows the tool-call grammar), with one grammar mask per
+    // verified position, as the Qwen3.5 path does. Unset: on whenever --spec mtp is.
+    // --mtp-constrained sets it (and needs --spec mtp); --no-mtp-constrained turns it off, so a
+    // constrained request decodes plain rounds.
+    std::optional<bool> mtp_constrained;
     // Basalt's joint-acceptance draft length (--mtp-joint-acceptance; needs --spec mtp): each round
     // drafts --draft-tokens and verifies the longest prefix whose estimated chance of being accepted
     // whole, from each draft's probability, stays above a per-request adaptive threshold. Off: the

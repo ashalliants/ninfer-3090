@@ -130,8 +130,8 @@ ninfer_add_test(ninfer_qwen4_exp_engine_real_test
 set_tests_properties(ninfer_qwen4_exp_engine_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # GPU, real artifact with the MTP drafter (skips otherwise): mtp_constrained_matches_plain, the
-# engine test's --mtp-constrained mode. A greedy JSON-schema request with --mtp-constrained (MTP
-# rounds, a grammar mask per verified position) gives the ids of plain constrained decoding.
+# engine test's --mtp-constrained mode. A greedy JSON-schema request under --spec mtp's default (MTP
+# rounds, a grammar mask per verified position) gives the ids of --no-mtp-constrained's plain rounds.
 add_test(NAME ninfer_qwen4_exp_mtp_constrained_test
   COMMAND ninfer_tests ninfer_qwen4_exp_engine_real_test --mtp-constrained)
 set_tests_properties(ninfer_qwen4_exp_mtp_constrained_test PROPERTIES SKIP_RETURN_CODE 77)

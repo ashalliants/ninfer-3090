@@ -289,7 +289,7 @@ void validate_flash_next_options_unused(const EngineOptions& options) {
     note(set.ram_headroom_bytes_set || set.ram_headroom_bytes != unset.ram_headroom_bytes, "--ram-headroom-mib");
     note(set.allow_unlocked_host_memory, "--allow-unlocked-host-memory");
     note(set.partial_ram_residency, "--partial-ram-residency");
-    note(set.mtp_constrained, "--mtp-constrained");
+    note(set.mtp_constrained.has_value(), "--mtp-constrained / --no-mtp-constrained");
     note(set.mtp_joint_acceptance, "--mtp-joint-acceptance");
     note(set.mtp_rows_verify, "--mtp-rows-verify");
     note(set.ngram_prefetch, "--ngram-prefetch");

@@ -183,6 +183,15 @@ void test_prefix_and_recovery_loss() {
     require(store.recovery_loss(forks, all) == 900, "independent lineages add");
     // Nothing survives: the whole frontier is lost.
     require(store.recovery_loss({&r100, 1}, {}) == 100, "no fallback");
+    // The prepared table the reclaim planner uses answers the same, against `all` less the
+    // removed (and any further excluded) checkpoints.
+    const auto prepared = store.prepare_recovery_loss(all);
+    require(prepared({&r900, 1}, {}) == 500 && prepared(pair, {}) == 800 &&
+                prepared(forks, {}) == 900,
+            "the prepared table disagrees with recovery_loss");
+    require(prepared({&r900, 1}, {&r400, 1}) == store.recovery_loss({&r900, 1}, std::span(all, 1)) &&
+                prepared({&r900, 1}, {&r400, 1}) == 800,
+            "an excluded checkpoint still served as a fallback");
     std::printf("ok: prefixes and recovery loss\n");
 }
 

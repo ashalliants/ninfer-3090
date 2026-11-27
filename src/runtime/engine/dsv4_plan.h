@@ -108,7 +108,7 @@ inline Dsv4Plan plan_dsv4_options(const EngineOptions& options) {
     note(next.ram_headroom_bytes_set || next.ram_headroom_bytes != unset.ram_headroom_bytes, "--ram-headroom-mib");
     note(next.allow_unlocked_host_memory, "--allow-unlocked-host-memory");
     note(next.partial_ram_residency, "--partial-ram-residency");
-    note(next.mtp_constrained || next.mtp_joint_acceptance || next.mtp_rows_verify || next.mtp_staged_drafts || next.mtp_fixed_drafts ||
+    note(next.mtp_constrained.has_value() || next.mtp_joint_acceptance || next.mtp_rows_verify || next.mtp_staged_drafts || next.mtp_fixed_drafts ||
              next.mtp_width_cost != unset.mtp_width_cost || next.mtp_draft_vocab != unset.mtp_draft_vocab,
          "the --mtp-* options");
     note(next.kv_base_tokens != unset.kv_base_tokens, "--kv-base-tokens");
