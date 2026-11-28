@@ -623,7 +623,7 @@ does not use the Qwen3.5 frontend, Program contract or scheduler.
   resumed forwards are the cold ones call for call and, as the tensor-core routes dispatch on a call's width, bit for
   bit. Reuse is therefore chunk-grained (2048 positions at chunk 2048, the chunk the engine picks up to 262,144 with DSpark and vision; `--prefill-chunk 256` for finer reuse). With `--spec dspark` the drafter's sliding rings and anchor context are kept with it (`DSparkProgram::save_async`; of each ring only the positions its attention reads, at most the window); every request runs the drafter, so it resumes only from a snapshot whose drafter state is at the same position. Images wholly in the reused prefix are not encoded. The
   result reports `reused_prompt_tokens`. One snapshot is kept; a prompt that does not resume from it replaces it (or clears it, when no longer than one chunk).
-- `--spec dspark` (up to 3 drafts, `--draft-min-p 0.5` and `--dspark-adaptive on` by default; see "Draft floor and
+- `--spec dspark` (up to 7 drafts on `sm_70` builds and 3 elsewhere, `--draft-min-p 0.5` and `--dspark-adaptive on` by default; see "Draft floor and
   adaptive width") speculates on every request, greedy and sampled (`Inkling2Core::run`):
   - A round drafts n tokens after the anchor, forwards `[anchor, drafts]`, and consumes each column
     whose input is the token the previous column chose; the first that differs ends the round, and
@@ -1581,6 +1581,33 @@ Tried and dropped: the Markov P in Q4 (106.5 vs 106.9, no gain); drafting from t
 common tokens sit above it); a vectorised argmax (31 us either way); CUDA graphs for the 2..8-column verify (107.9
 graphs vs 109.5 eager, cause not investigated; the WIP is in the `ninfer-inkfast` worktree, commit `84802669b`). Lapilli on the same prompts: 108 / 99 / 211 (lossy: 8-bit dense and head, a 2-bit
 screening head, wider drafts).
+
+**Candidate picks (2026-11-28).** Each Markov step scored the whole vocabulary (`dspark_markov_logits`, 58 MB of
+Q8 P a step, then `argmax_fp32`: ~157 us a draft), so a wide round cost ~0.7 ms more to draft than a 3-draft one and
+chats lost when the cap was raised. A greedy round now takes, once, each 2048-id tile's top 8 by base + hb
+(`ops::dspark_tile_candidates`, ~800 candidates a column, 30 us for 7 columns) and each step scores only those
+(`ops::dspark_candidate_pick` over a row-major Q8 copy of P, `ops::markov_rows_from_q8`, 58 MB of VRAM: 10 us with
+the softmax probability over the candidates that `--draft-min-p` reads). Sampled drafts keep the whole vocabulary.
+The adaptive width now times a round by the columns it verified, not the width it drafted (with cheap drafting the
+verify is the cost), and V100 builds draft up to 7 (`kDSparkDefaultDraftTokens`; 3 elsewhere, the RTX 3090 not
+measured at 7). Greedy output unchanged (md5 `d740eaf34d9b` / `8388c2ecf2dc`).
+
+Measured (V100, 200 W, untraced; Lapilli's prompts and the 12 chats at 8,192 context unless noted):
+
+| Configuration | conv | prose | struct | 12 chats |
+|---|---|---|---|---|
+| before: 3 drafts, full-vocabulary steps | 93.3 | 74.8 | 140.4 | 109.4 |
+| 7 drafts, full-vocabulary steps | 91.9 | 73.6 | 167.0 | 105.2 |
+| candidate picks, 3 drafts | 94.0 | 74.8 | 143.9 | 111.8 |
+| candidate picks, 7 drafts, timed by drafted width | 91.6 | 73.9 | 172.6 | 108.7 |
+| **candidate picks, 7 drafts, timed by verified width (default)** | **92.3** | **74.3** | **170.2** | **111.4** |
+| the default at 262,144, vision, INT8 KV | | | | **110.7** (108.9 before) |
+| `--speed fast --mxfp8-experts on --dense-q8 all` (lossy) | 85.6 | 81.8 | 162.7 | 125.8 (116.9 before; maths 40/40, JSON 9/10) |
+
+The default trades ~2% on conv and ~0.4% on chats for +21% on structured output against candidate picks at 3.
+Tried and dropped: a cumulative-probability cut (product of draft probabilities, 0.2-0.3) in place of the per-draft
+floor (109.6-109.7), `--dspark-adaptive off` at 7 (92-96), carrying the measured width costs from request to
+request (110.2), prompt lookup in exact mode (lk3 108.9, +3% struct only). Run-to-run spread on repeats: ~0.1 tok/s.
 
 At startup the engine picks the widest prefill chunk whose programs fit beside `--max-context` with 256 MiB to spare
 (`kStartupSpare`). With `--spec dspark` it tries, for each chunk, the drafter at its best and then gives up what costs

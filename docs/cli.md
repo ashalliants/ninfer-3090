@@ -314,7 +314,8 @@ component when selected. Vision, MTP and DFlash follow the same rule: their weig
 only when that component is enabled at startup.
 
 `--spec dspark` runs Inkling-2's DSpark block drafter (Inkling-2 artifacts only; the drafter ships in the
-artifact). `--draft-tokens` is optional, 1 through 7, default 3: the most drafts a round verifies.
+artifact). `--draft-tokens` is optional, 1 through 7, default 7 on V100 (`sm_70`) builds and 3 elsewhere: the most drafts a
+round verifies.
 Greedy and sampled requests speculate. The output is the same as without it, token for token, including
 stop strings, the thinking budget's forced close and the context limit; a sampled request draws the
 tokens plain sampling draws under the same seed (its drafts are the drafter's draws under the uniforms

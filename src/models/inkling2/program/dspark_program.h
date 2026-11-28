@@ -113,6 +113,11 @@ private:
     // target's re-encoded head when it has one, else the drafter's own copy in head_memory_).
     ops::MarkovHead markov_{};
     DeviceBuffer markov_memory_;
+    // P's row-major Q8 copy for candidate picks (ops::markov_rows_from_q8) and the picks' 2 work words.
+    DeviceBuffer rows_memory_;
+    std::int8_t* rows_codes_  = nullptr;
+    float* rows_scales_       = nullptr;
+    std::uint64_t* pick_work_ = nullptr;
     DeviceBuffer head_memory_;
     ops::Q8Weight head_q8_{};
     ops::Q4Matrix head_q4_{};   // the drafter's own 4-bit head copy (the default copy)

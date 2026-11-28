@@ -17,6 +17,21 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Inkling-2-Mini DSpark candidate picks, up to 7 drafts (2026-11-28)
+
+Each draft step now scores ~800 candidate tokens (each 2048-id tile's top 8 by the base logits) instead of all
+201,088, so a pick costs 10 us instead of ~157, and V100 builds draft up to 7 a round (adaptive, timed by the
+columns verified). Same greedy output. 200 W, untraced:
+
+| Configuration | before (`f7e751dd4`) | now |
+|---|---|---|
+| 12 chats, 262,144 context, vision, INT8 KV | 108.9 | **110.7** |
+| 12 chats, 8,192 | 109.6 | **111.4** |
+| Lapilli's conv / prose / struct prompts | 93.7 / 75.5 / 140.7 | 92.3 / 74.3 / **170.2** |
+| `--speed fast --mxfp8-experts on --dense-q8 all` (lossy): chats / conv / struct | 116.9 / 91.3 / 166.5 | **125.8** / 85.6 / 162.7 |
+
+RTX 3090: NOT RUN (its default stays 3 drafts). Details in the [maintainer spec](maintainer/inkling2-model.md), "Candidate picks".
+
 ## Tesla V100 (`sm_70`): Inkling-2-Mini cheaper DSpark rounds (2026-11-28)
 
 The DSpark drafter's projections now run on int8 activations with dp4a, its copy of the head is 4 bits, and a

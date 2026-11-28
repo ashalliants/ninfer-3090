@@ -133,6 +133,14 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
         markov_.codes  = markov_memory_.p;
         markov_.scales = reinterpret_cast<const float*>(static_cast<std::byte*>(markov_memory_.p) + codes);
         ops::dspark_markov_quantize(pt, markov_, stream_);
+        // Its row-major copy for greedy drafts: each step scores only the round's candidates (each 2048-id tile's top 8
+        // by the base logits), one coalesced row each, instead of the whole vocabulary.
+        rows_memory_ = DeviceBuffer(v * r + v * (r / 32) * 4 + 16);
+        rows_codes_  = static_cast<std::int8_t*>(rows_memory_.p);
+        rows_scales_ = reinterpret_cast<float*>(rows_codes_ + v * r);
+        pick_work_   = reinterpret_cast<std::uint64_t*>(rows_scales_ + v * (r / 32));
+        ops::markov_rows_from_q8(markov_, rows_codes_, rows_scales_, stream_);
+        cuda(cudaMemsetAsync(pick_work_, 0, 16, stream_), "pick work");
         cuda(cudaStreamSynchronize(stream_), "P"); // before pt_memory is freed
     }
     if (head_q8 != nullptr) {
@@ -382,6 +390,18 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
     Tensor joint_weight;
     if (joint_bf16) { joint_weight = model_.tensor(w.joint, {i32(joint_in_.numel()), 3 * r}); }
     const Tensor* joint_weights[] = {&joint_weight};
+    // Greedy drafts from candidates (rows_codes_): each tile's top 8 by base + hb, once a round.
+    // Sampled drafts (pick) take the whole vocabulary; a greedy one's probability (probs) is over the candidates.
+    const bool candidates = !sampled && rows_codes_ != nullptr;
+    const std::int32_t valid = i32(text_.unpadded_vocab_size);
+    const std::int32_t count = (valid + ops::kCandidateTile - 1) / ops::kCandidateTile * ops::kCandidatesPerTile;
+    Tensor cand;
+    Tensor scores;
+    if (candidates) {
+        cand   = workspace_.alloc(DType::I32, {count, n_drafts});
+        scores = workspace_.alloc(DType::FP32, {count});
+        ops::dspark_tile_candidates(base, hb_, valid, cand, stream_);
+    }
     for (std::int32_t i = 1; i <= n_drafts; ++i) {
         ops::embedding_bf16_fp32(ids_.slice(0, i - 1, 1), w1, prev_row, stream_);
         cuda(cudaMemcpyAsync(static_cast<float*>(joint_in_.data) + 2 * r, static_cast<const float*>(x.data) + std::size_t(i) * h,
@@ -396,6 +416,14 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
             ops::dense_projection_fp32(joint_in, joint_matrix, &joint_bias, joint_out, stream_);
         }
         ops::dspark_markov_update_fp32(joint, state, latent, stream_);
+        if (candidates) {
+            ops::dspark_candidate_pick(base.slice(1, i - 1, 1).reshape({vocab}), hb_, rows_codes_, rows_scales_, r, latent,
+                                       static_cast<const std::int32_t*>(cand.data) + std::size_t(i - 1) * count, count,
+                                       c.final_logit_softcap, static_cast<float*>(scores.data), pick_work_,
+                                       static_cast<std::int32_t*>(ids_.data) + i,
+                                       probs != nullptr ? static_cast<float*>(probs_.data) + (i - 1) : nullptr, stream_);
+            continue;
+        }
         Tensor logits = base.slice(1, i - 1, 1).reshape({vocab});
         ops::dspark_markov_logits(logits, hb_, markov_, latent, c.final_logit_softcap, logits, stream_);
         Tensor next = ids_.slice(0, i, 1);

@@ -953,6 +953,153 @@ dense_projection_a8q4_kernel(const std::int8_t* __restrict__ xq, const float* __
     }
 }
 
+
+// ---- candidate drafting ----
+__global__ void markov_rows_kernel(const std::int8_t* __restrict__ codes, const float* __restrict__ scales, int v_rows, int r,
+                                   std::int8_t* __restrict__ rc, float* __restrict__ rs) {
+    const std::int64_t v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int k = blockIdx.y; // r index
+    if (v >= v_rows) { return; }
+    rc[v * r + k] = codes[static_cast<std::int64_t>(k) * v_rows + v];
+    if (k % 32 == 0) { rs[v * (r / 32) + k / 32] = scales[static_cast<std::int64_t>(k / 32) * v_rows + v]; }
+}
+
+// Orders (score, id) so a larger key is a larger score, then a lower id; NaN maps below every number.
+__device__ __forceinline__ std::uint64_t cand_key(float score, int id) {
+    std::uint32_t b = __float_as_uint(score);
+    if (score != score) { b = 0U; } else { b = (b & 0x80000000U) ? ~b : (b | 0x80000000U); }
+    return (static_cast<std::uint64_t>(b) << 32) | (0xFFFFFFFFU - static_cast<std::uint32_t>(id));
+}
+__device__ __forceinline__ std::uint64_t warp_max_u64(std::uint64_t k) {
+    for (int o = 16; o > 0; o >>= 1) {
+        const std::uint64_t other = __shfl_xor_sync(0xFFFFFFFFU, k, o);
+        k = other > k ? other : k;
+    }
+    return k;
+}
+
+// grid (tiles, n), 256 threads, 8 rows a thread: kCandidatesPerTile rounds of a block max, each removing its winner.
+__global__ void __launch_bounds__(256) tile_candidates_kernel(const float* __restrict__ base, const float* __restrict__ hb, int v_rows,
+                                                               int valid, int* __restrict__ cand, int count) {
+    constexpr int kPer = kCandidateTile / 256;
+    __shared__ std::uint64_t warp_best[8];
+    __shared__ std::uint64_t best;
+    const int t = blockIdx.y, tile0 = blockIdx.x * kCandidateTile;
+    std::uint64_t keys[kPer];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        const int v = tile0 + j * 256 + threadIdx.x;
+        keys[j] = v < valid ? cand_key(base[static_cast<std::int64_t>(t) * v_rows + v] + hb[v], v) : 0ULL;
+    }
+    for (int k = 0; k < kCandidatesPerTile; ++k) {
+        std::uint64_t m = 0;
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) { m = keys[j] > m ? keys[j] : m; }
+        m = warp_max_u64(m);
+        if ((threadIdx.x & 31) == 0) { warp_best[threadIdx.x >> 5] = m; }
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            std::uint64_t w = threadIdx.x < 8 ? warp_best[threadIdx.x] : 0ULL;
+            w = warp_max_u64(w);
+            if (threadIdx.x == 0) { best = w; }
+        }
+        __syncthreads();
+        const std::uint64_t b = best;
+        __syncthreads();
+        const int id = b == 0ULL ? -1 : static_cast<int>(0xFFFFFFFFU - static_cast<std::uint32_t>(b & 0xFFFFFFFFULL));
+        if (threadIdx.x == 0) {
+            int* col = cand + static_cast<std::int64_t>(t) * count + blockIdx.x * kCandidatesPerTile;
+            col[k] = id >= 0 ? id : (k > 0 ? col[k - 1] : tile0);
+        }
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) {
+            if (keys[j] == b) { keys[j] = 0ULL; }
+        }
+    }
+}
+
+// grid ceil(count / 8), 256 threads: warp w scores candidate 8 * block + w (lane: 8 of R's codes a step), the block's
+// best goes to work[0] by atomicMax, and the last block writes the winner's id to out and zeroes work.
+__global__ void __launch_bounds__(256) candidate_pick_kernel(const float* __restrict__ base, const float* __restrict__ hb,
+                                                              const std::int8_t* __restrict__ rc, const float* __restrict__ rs, int r,
+                                                              const float* __restrict__ latent, const int* __restrict__ cand, int count,
+                                                              float cap, float* __restrict__ scores, unsigned long long* work,
+                                                              int* out, float* prob) {
+    __shared__ std::uint64_t warp_best[8];
+    __shared__ float red[8];
+    __shared__ bool last;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, i = blockIdx.x * 8 + warp;
+    std::uint64_t key = 0;
+    if (i < count) {
+        const int v = cand[i];
+        const std::int8_t* row = rc + static_cast<std::int64_t>(v) * r;
+        float acc = 0.0F;
+        for (int k = lane * 8; k < r; k += 256) {
+            const uint2 w = __ldg(reinterpret_cast<const uint2*>(row + k));
+            const char4 a = *reinterpret_cast<const char4*>(&w.x), b = *reinterpret_cast<const char4*>(&w.y);
+            float p = 0.0F;
+            p = fmaf(static_cast<float>(a.x), latent[k + 0], p);
+            p = fmaf(static_cast<float>(a.y), latent[k + 1], p);
+            p = fmaf(static_cast<float>(a.z), latent[k + 2], p);
+            p = fmaf(static_cast<float>(a.w), latent[k + 3], p);
+            p = fmaf(static_cast<float>(b.x), latent[k + 4], p);
+            p = fmaf(static_cast<float>(b.y), latent[k + 5], p);
+            p = fmaf(static_cast<float>(b.z), latent[k + 6], p);
+            p = fmaf(static_cast<float>(b.w), latent[k + 7], p);
+            acc = fmaf(p, rs[static_cast<std::int64_t>(v) * (r / 32) + k / 32], acc);
+        }
+        for (int o = 16; o > 0; o >>= 1) { acc += __shfl_xor_sync(0xFFFFFFFFU, acc, o); }
+        const float score = base[v] + hb[v] + acc;
+        key = cand_key(score, v);
+        if (lane == 0 && scores != nullptr) { scores[i] = score == score ? cap * tanhf(score / cap) : -INFINITY; }
+    }
+    __threadfence(); // the scores before this block counts itself done
+    if (lane == 0) { warp_best[warp] = key; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        std::uint64_t m = 0;
+        for (int w = 0; w < 8; ++w) { m = warp_best[w] > m ? warp_best[w] : m; }
+        if (m != 0ULL) { atomicMax(&work[0], static_cast<unsigned long long>(m)); }
+        __threadfence();
+        last = atomicAdd(&work[1], 1ULL) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) { return; }
+    __threadfence();
+    // The last block: the winner, and (prob) its softmax probability over the candidates' capped logits.
+    if (prob != nullptr && scores != nullptr) {
+        float mx = -INFINITY;
+        for (int k = threadIdx.x; k < count; k += blockDim.x) { mx = fmaxf(mx, __ldcg(scores + k)); }
+        for (int o = 16; o > 0; o >>= 1) { mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFU, mx, o)); }
+        if (lane == 0) { red[warp] = mx; }
+        __syncthreads();
+        mx = red[0];
+        for (int w = 1; w < 8; ++w) { mx = fmaxf(mx, red[w]); }
+        __syncthreads();
+        float sum = 0.0F;
+        // Each id once: a short tile repeats its last pick, so count a candidate only where it first appears in its run.
+        for (int k = threadIdx.x; k < count; k += blockDim.x) {
+            const bool repeat = k % kCandidatesPerTile != 0 && cand[k] == cand[k - 1];
+            const float l = __ldcg(scores + k);
+            if (!repeat && l > -INFINITY) { sum += __expf(l - mx); }
+        }
+        for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xFFFFFFFFU, sum, o); }
+        if (lane == 0) { red[warp] = sum; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float total = 0.0F;
+            for (int w = 0; w < 8; ++w) { total += red[w]; }
+            *prob = total > 0.0F ? 1.0F / total : 0.0F;
+        }
+    }
+    if (threadIdx.x == 0) {
+        const std::uint64_t m = atomicAdd(&work[0], 0ULL);
+        *out = m == 0ULL ? cand[0] : static_cast<int>(0xFFFFFFFFU - static_cast<std::uint32_t>(m & 0xFFFFFFFFULL));
+        work[0] = 0ULL;
+        work[1] = 0ULL;
+    }
+}
+
 } // namespace
 
 void dense_projection_fp32(const Tensor& x, const DenseMatrix& w, const Tensor* bias, Tensor& out, cudaStream_t stream) {
@@ -1312,6 +1459,41 @@ void dspark_draft_pick(const Tensor& logits, std::int32_t valid_rows, const Draf
     require(pick.temperature <= 0.0F || canonical != nullptr, op, "a sampled pick needs its uniform");
     draft_pick_kernel<<<1, kDraftPickCandidates, 0, stream>>>(static_cast<const float*>(logits.data), valid_rows, pick, canonical,
                                                               static_cast<int*>(id.data), static_cast<float*>(prob.data));
+    check_launch(op);
+}
+
+
+void markov_rows_from_q8(const MarkovHead& head, std::int8_t* rows_codes, float* rows_scales, cudaStream_t stream) {
+    constexpr const char* op = "markov_rows_from_q8";
+    check_head(head, op);
+    require(head.form == MarkovForm::Q8 && rows_codes != nullptr && rows_scales != nullptr && head.r % 8 == 0, op, "a Q8 head");
+    markov_rows_kernel<<<dim3((head.v + 255) / 256, head.r), 256, 0, stream>>>(static_cast<const std::int8_t*>(head.codes), head.scales,
+                                                                                head.v, head.r, rows_codes, rows_scales);
+    check_launch(op);
+}
+
+void dspark_tile_candidates(const Tensor& base, const Tensor& hb, std::int32_t valid, Tensor& cand, cudaStream_t stream) {
+    constexpr const char* op = "dspark_tile_candidates";
+    const Columns b = columns(base, op, "base", true), h = columns(hb, op, "hb", true);
+    require(h.cols == 1 && h.rows == b.rows && valid > 0 && valid <= b.rows && cand.dtype == DType::I32 && cand.is_contiguous(), op, "shapes");
+    const int tiles = (valid + kCandidateTile - 1) / kCandidateTile, count = tiles * kCandidatesPerTile;
+    require(cand.ne[0] == count && cand.ne[1] == b.cols, op, "cand [tiles * 8, n]");
+    tile_candidates_kernel<<<dim3(tiles, b.cols), 256, 0, stream>>>(static_cast<const float*>(base.data), static_cast<const float*>(hb.data),
+                                                                    b.rows, valid, static_cast<int*>(cand.data), count);
+    check_launch(op);
+}
+
+void dspark_candidate_pick(const Tensor& base, const Tensor& hb, const std::int8_t* rows_codes, const float* rows_scales, std::int32_t r,
+                           const Tensor& latent, const std::int32_t* cand, std::int32_t count, float cap, float* scores,
+                           std::uint64_t* work, std::int32_t* out, float* prob, cudaStream_t stream) {
+    constexpr const char* op = "dspark_candidate_pick";
+    const Columns b = columns(base, op, "base", true), h = columns(hb, op, "hb", true), l = columns(latent, op, "latent", true);
+    require(b.cols == 1 && h.rows == b.rows && l.rows == r && r % 256 == 0 && count > 0 && cand != nullptr && work != nullptr && out != nullptr &&
+                cap > 0 && (prob == nullptr || scores != nullptr),
+            op, "shapes");
+    candidate_pick_kernel<<<(count + 7) / 8, 256, 0, stream>>>(static_cast<const float*>(base.data), static_cast<const float*>(hb.data), rows_codes,
+                                                               rows_scales, r, static_cast<const float*>(latent.data), cand, count,
+                                                               cap, scores, reinterpret_cast<unsigned long long*>(work), out, prob);
     check_launch(op);
 }
 

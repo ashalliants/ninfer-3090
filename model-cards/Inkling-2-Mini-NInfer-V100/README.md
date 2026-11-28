@@ -46,7 +46,7 @@ needs NInfer's executables. It runs on one **Tesla V100 32 GB** (`sm_70`, Linux,
   DSpark speculation never changes the answer: greedy output equals plain greedy decode, and sampled requests draw
   the same tokens plain sampling draws under the same seed. Unsloth's DSpark notes for llama.cpp say its greedy
   output with the drafter "is not guaranteed to be bit identical to a run without it".
-- **Fast on a V100.** At 200 W: 108.9 tok/s with DSpark and 78.0 plain over 12 chats at the full 262,144-token
+- **Fast on a V100.** At 200 W: 110.7 tok/s with DSpark and 78.0 plain over 12 chats at the full 262,144-token
   context with images and INT8 KV (120.7 on maths at 250 W), and 2,727 tok/s prefill at 8K with `--prefill-chunk 8192`
   (2,170 at the default chunk; 2,125 with DSpark and images at the full 262,144-token context). The other published V100 port (Csavoldi's, onto Lapilli)
   reports 69 tok/s without a drafter and 850 tok/s prompt reading, on a different machine and prompts
@@ -123,15 +123,15 @@ Get [NInfer-3090](https://github.com/ashalliants/ninfer-3090) and build it for t
 git clone https://github.com/ashalliants/ninfer-3090 && cd ninfer-3090
 BUILD_DIR=$HOME/build-v100 scripts/v100_build.sh ninfer ninfer-serve
 scripts/download-model.sh inkling2-mini                         # this repository, pinned and verified
-~/build-v100/apps/ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark   # DSpark, up to 3 drafts a round
+~/build-v100/apps/ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark   # DSpark, up to 7 drafts a round
 ```
 
 `ninfer-serve` serves the OpenAI chat, Anthropic messages and Responses routes, with streaming, tool
 calls (`parallel_tool_calls` honoured), reasoning and thinking budgets, stop strings, and images with
 `--vision`. The full 262,144-token context fits with DSpark and vision on.
 
-- **DSpark** (`--spec dspark`) speculates on greedy and sampled requests. By default each round drafts 1 to 3
-  tokens, picked from the request's recent acceptance (`--dspark-adaptive on`), and drops drafts the drafter gives
+- **DSpark** (`--spec dspark`) speculates on greedy and sampled requests. By default each round drafts 1 to 7
+  tokens (1 to 3 on builds other than the V100's), picked from the request's recent acceptance (`--dspark-adaptive on`), and drops drafts the drafter gives
   under 0.5 probability (`--draft-min-p 0.5`). Greedy output equals plain greedy decode, and a sampled request
   draws the tokens plain sampling draws under the same seed. Both held on every DSpark request measured below.
 - **Several requests at once:** `--max-concurrency N` (2 to 8) decodes up to N requests together. Each request's
@@ -179,7 +179,7 @@ clean run first, then the typical range across repeated or ABBA legs.
 |---|---:|---|---|
 | **Decode, DSpark** | **120.7 tok/s** | maths prompt, greedy, 300 tokens, `--spec dspark` | 114.3-120.7 on maths, 105.5-115.4 on code, 81.2-99.8 on prose and lists |
 | **Decode, DSpark, 12 chats** | **94.4 tok/s** | 12 chat requests of 300 tokens, greedy, mean of each request's tok/s | 93.4-94.4 over four legs, 60.5-60.7% of drafts accepted; plain 78.5-78.8 |
-| **Decode, 12 chats at 262,144** (200 W) | **108.9 tok/s** DSpark, **78.0** plain | the 12 chats, `--max-context 262144 --vision --kv-dtype int8 --spec dspark` (2026-11-28, cheaper drafting rounds; 99.4 on master `eb265563e` the same day, same greedy output) | DSpark 91.7-138.9 per chat; plain 78.03-78.04 (master `dc867300`, 2026-11-23; the plain path is unchanged) |
+| **Decode, 12 chats at 262,144** (200 W) | **110.7 tok/s** DSpark, **78.0** plain | the 12 chats, `--max-context 262144 --vision --kv-dtype int8 --spec dspark` (2026-11-28, cheaper drafting rounds and candidate picks; 99.4 on master `eb265563e` the same day, 108.9 on `f7e751dd4`; same greedy output) | DSpark 91.7-138.9 per chat; plain 78.03-78.04 (master `dc867300`, 2026-11-23; the plain path is unchanged) |
 | **Decode, `--speed fast`** (opt-in, lossy) | **163.5 tok/s** | structured output, greedy, 8,069 tokens; 12 chats **109.3-110.3** against 101.1-101.3 exact (2026-11-27, 200 W, `perf/inkling-speed-fast` at `42b5ec8e7`) | +23% on struct, +8.5% on the 12 chats, +2-6% on sampled prose; see Accuracy |
 | **Decode, DSpark, sampled** | **83.5 tok/s** | the same 12 chats at temperature 0.8, top-p 0.95, seeded | 83.4-83.5; plain sampled 74.9 |
 | **Decode, plain** | **78.8 tok/s** | the 12 chats, greedy | 78.2-78.8 |

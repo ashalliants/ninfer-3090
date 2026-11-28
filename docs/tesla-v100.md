@@ -40,7 +40,7 @@ rows marked 200 W, re-measured 2026-11-23 (prefill 2026-11-24); the
 | **Context** | 262,144 tokens with DSpark and vision |
 | **Decode**, one stream, DSpark | **up to 120.7 tok/s** (maths prompt); 93.4-94.4 average over 12 chats |
 | **Decode**, plain | 78.5-78.8 tok/s; 48 tok/s at 100K context |
-| **Decode at 262,144** (200 W) | **108.9 tok/s** DSpark (99.4 before the 2026-11-28 drafter changes), **78.0** plain, average over 12 chats (`--max-context 262144 --vision --kv-dtype int8`) |
+| **Decode at 262,144** (200 W) | **110.7 tok/s** DSpark (99.4 before the 2026-11-28 drafter changes; 108.9 before candidate picks), **78.0** plain, average over 12 chats (`--max-context 262144 --vision --kv-dtype int8`) |
 | **Decode**, `--max-concurrency 8` | **198.2 tok/s** aggregate (plain) |
 | **Prefill** (200 W) | **2,727 tok/s** at 8K (131,072 context, `--prefill-chunk 8192`); 2,227 at 34K, 1,577 at 100K. At the default chunk 2048: 2,170 at 8K, 1,962 at 1K, 1,339 at 100K. At 262,144 with DSpark and vision (chunk 2048): 2,125 at 8K, 1,930 at 1K, 1,324 at 100K |
 | **Low-bit KV** (`--kv-dtype rk4v4`, opt-in, lossy) | plain decode **41.1 tok/s at 200K** (FP16 34.8), 53.2 at 100K (47.8); frees 5,952 MiB at 262,144; KLD 2.8x the FP32 floor (`int8`: 1.06x, 40.7 tok/s) |
@@ -926,7 +926,7 @@ can't disagree with the per-model charts.
 | Qwen3.8-27B, long context | `3c6a616d` with #608/#609 | MTP3 84.6 at 4,215 tokens, 69.5 at 42,663, 56.7 at 172,487 (master before them: 75.9 / 53.0 / 26.4) | |
 | Qwen3.8-Flash-Next | `fdcac347` (#611), like-for-like with Lapilli: 150-token thinking budget | story 89.2, code 126.0, Chinese 83.6, French 84.3, thinking 120.0; 129.6 on code with the router's flags | ~990 at 3.8K (250 W, 2026-11-18) |
 | Qwen3.6-35B-A3B | #614 (MTP3 + draft head, `rk4v4` KV, the default), #618 (DFlash K7), #621 (prefill) | MTP3: story 172.6, code 253.7, Chinese 189.5, French 191.0, thinking 265.0, conversation 192.7, JSON 302.9; DFlash K7: JSON 319.1, code 233.6; plain 155. Two requests at once: 197.5-200.4 total | 3,984 at 4.2K, 3,866 at 13.4K, 3,118 at 40.2K |
-| Inkling-2-Mini | decode DSpark 2026-11-28 (cheaper drafting rounds), plain master `dc867300` (2026-11-23); prefill since #596 (2026-11-24, `--prefill-cublas`) | DSpark 108.9, plain 78.0: average over 12 chats at 262,144 context with vision and INT8 KV, byte-exact UD-Q8_K_XL repack | 2,727 at 8K with `--prefill-chunk 8192` (131,072 context); 2,170 at 8K and 1,962 at 1K with the default chunk 2048 |
+| Inkling-2-Mini | decode DSpark 2026-11-28 (cheaper drafting rounds), plain master `dc867300` (2026-11-23); prefill since #596 (2026-11-24, `--prefill-cublas`) | DSpark 110.7, plain 78.0: average over 12 chats at 262,144 context with vision and INT8 KV, byte-exact UD-Q8_K_XL repack | 2,727 at 8K with `--prefill-chunk 8192` (131,072 context); 2,170 at 8K and 1,962 at 1K with the default chunk 2048 |
 
 ### Competitors measured on our box
 

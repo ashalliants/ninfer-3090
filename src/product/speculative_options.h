@@ -81,9 +81,16 @@ inline void validate_ngram_cli_options(const SpeculativeOptions& options) {
     }
 }
 
-// --spec dspark without --draft-tokens drafts up to 3 per round, the measured best on a V100 (1.28x plain greedy over
-// chat prompts at a fixed 3; 2 and 4 drafts 1.24x and 1.26x).
+// --spec dspark without --draft-tokens: the most drafts a round verifies. sm_70 builds: 7. With the candidate picks
+// (a draft step scores ~800 candidates, not the vocabulary) a wider round costs little to draft, and the adaptive
+// width, timed by the columns it verifies, narrows chat rounds itself: on a V100 structured output +18% against 3,
+// chats -0.7%, Lapilli's conv prompt -2.4% (docs/maintainer/inkling2-model.md, "Candidate picks"). Elsewhere 3, the
+// measured best before them (the RTX 3090 is not measured at 7).
+#if defined(NINFER_SM70)
+inline constexpr std::uint32_t kDSparkDefaultDraftTokens = 7;
+#else
 inline constexpr std::uint32_t kDSparkDefaultDraftTokens = 3;
+#endif
 // --spec dspark without --draft-min-p or --dspark-adaptive: drafts stop under a drafter probability of 0.5 and each
 // round picks its draft count (+8.4% over a fixed 3 on 12 serve chats, ABBA on a V100;
 // docs/maintainer/inkling2-model.md, "Draft floor and adaptive width").

@@ -1327,9 +1327,6 @@ void Inkling2Core::run(Job& job) {
     std::int32_t col     = static_cast<std::int32_t>(logits.ne[1]) - 1; // the column the next token is read from
     bool in_round        = false;
     std::int32_t round_drafts = 0; // the drafts the current round forwards (fewer than n_drafts near the output limit)
-    // The width the current round drafted (DSparkProgram::draft runs that many steps): --draft-min-p may keep fewer
-    // of them, but the round's time is that width's cost.
-    std::int32_t round_width = 0;
     std::int32_t held_n  = 0;
     double accept_ema = 1.0, round_seconds = 0.0, plain_seconds = 0.0;
     int since_probe = 0, probe_interval = 8;
@@ -1397,7 +1394,9 @@ void Inkling2Core::run(Job& job) {
             double& cost = forward_was_round ? round_seconds : plain_seconds;
             const double elapsed = seconds_between(forward_at, now);
             cost = cost == 0.0 ? elapsed : 0.8 * cost + 0.2 * elapsed;
-            if (forward_was_round && width) { width->time(round_width, elapsed); }
+            // By the columns it verified: --draft-min-p may verify fewer than it drafted, and with candidate picks the
+            // drafting is the small part of a round.
+            if (forward_was_round && width) { width->time(round_drafts, elapsed); }
         }
         forward_unmeasured = false;
         // The first step runs plain and the next as a round, so both costs are measured before they are compared.
@@ -1458,7 +1457,6 @@ void Inkling2Core::run(Job& job) {
                 round_lookup       = true;
                 forward_was_lookup = true;
             }
-            round_width  = drafts;
             round_drafts = static_cast<std::int32_t>(drafted.size());
             if (round_drafts == 0) {
                 // Every draft under --draft-min-p: a plain step (a fallback step), whose time (with the draft's) times

@@ -146,7 +146,7 @@ different from the Qwen3.5 models:
   effect for this model.
 - **DSpark speculation** (Inkling-2, `--spec dspark [--draft-tokens N] [--draft-min-p P] [--dspark-adaptive on|off]`):
   greedy and sampled requests, output unchanged token for token (a sampled request draws the tokens plain sampling
-  draws under the same seed); see [cli.md](cli.md#speculative-decoding). `N` (1 to 7, default 3) is the most drafts
+  draws under the same seed); see [cli.md](cli.md#speculative-decoding). `N` (1 to 7, default 7 on V100 builds, 3 elsewhere) is the most drafts
   a round verifies; by default each round picks its count from the request's recent acceptance and measured round
   costs (`--dspark-adaptive on`) and drops the drafts from the first one the drafter gives under 0.5 probability on
   (`--draft-min-p 0.5`; `0` keeps them all). On a Tesla V100 (master `dad1623b`, 2026-11-22), up to 120.7 tok/s on
