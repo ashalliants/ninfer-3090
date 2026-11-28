@@ -464,6 +464,13 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     if (options_.max_concurrency < 1 || options_.max_concurrency > static_cast<std::uint32_t>(ink::kMaxBatchColumns)) {
         throw std::invalid_argument("Inkling-2 takes --max-concurrency 1 to " + std::to_string(ink::kMaxBatchColumns));
     }
+    // A batched decode step is one forward of up to N columns, which the prefill chunk bounds: the chunk is at most
+    // the context and an explicit --prefill-chunk (the automatic ones are 256 and up), so both must take N.
+    if (options_.max_concurrency > 1 &&
+        (options_.max_context < options_.max_concurrency || (!options_.prefill_chunk_auto && options_.prefill_chunk < options_.max_concurrency))) {
+        throw std::invalid_argument("Inkling-2 --max-concurrency " + std::to_string(options_.max_concurrency) +
+                                    " needs --max-context and --prefill-chunk of at least " + std::to_string(options_.max_concurrency));
+    }
     slots_             = static_cast<std::int32_t>(options_.max_concurrency);
     requested_context_ = options_.max_context;
     StartupPhaseScope inspect(options_.startup_observer, StartupPhase::ArtifactInspect);

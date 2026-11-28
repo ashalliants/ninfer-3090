@@ -227,6 +227,22 @@ int main() {
                 ninfer::Engine too_wide(past);
             } catch (const std::invalid_argument&) { refused = true; }
             check(refused, "seventeen slots are refused");
+            // A step of 16 columns needs a prefill chunk of 16: a context or --prefill-chunk under that is refused.
+            for (const bool by_chunk : {false, true}) {
+                auto small            = base_options(artifact);
+                small.max_concurrency = ninfer::kMaximumInkling2Concurrency;
+                if (by_chunk) {
+                    small.prefill_chunk_auto = false;
+                    small.prefill_chunk      = 8;
+                } else {
+                    small.max_context = 12;
+                }
+                bool small_refused = false;
+                try {
+                    ninfer::Engine too_small(small);
+                } catch (const std::invalid_argument& e) { small_refused = std::string(e.what()).find("--max-concurrency 16") != std::string::npos; }
+                check(small_refused, by_chunk ? "16 slots with --prefill-chunk 8 are refused" : "16 slots at a context of 12 are refused");
+            }
             std::printf("16 slots: %zu requests each gave its solo output\n", handles.size());
         }
         if (std::getenv("NINFER_INKLING2_BATCH_FIT") == nullptr || std::string(std::getenv("NINFER_INKLING2_BATCH_FIT")) != "0") {
