@@ -281,6 +281,13 @@ bool want_mxfp8(const artifact::Reader& reader, const LoadComponents& components
     }
     if (!any) { return false; } // every layer's experts are NVFP4 records
     if (components.experts_mxfp8 == ExpertsMxfp8::On) { return true; }
+    // sm_70: the MXFP8 expert kernels are faster than the BF16 ones it holds the same values in (Tesla V100 serve,
+    // 2026-11-28), so auto re-encodes whatever the memory.
+    int device = 0, major = 0;
+    if (cudaGetDevice(&device) == cudaSuccess && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+        major == 7) {
+        return true;
+    }
     std::set<std::size_t> seen;
     std::uint64_t need = 0;
     const bool vision = components.vision && !components.vision_overlay;

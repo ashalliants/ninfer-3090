@@ -46,7 +46,7 @@ needs NInfer's executables. It runs on one **Tesla V100 32 GB** (`sm_70`, Linux,
   DSpark speculation never changes the answer: greedy output equals plain greedy decode, and sampled requests draw
   the same tokens plain sampling draws under the same seed. Unsloth's DSpark notes for llama.cpp say its greedy
   output with the drafter "is not guaranteed to be bit identical to a run without it".
-- **Fast on a V100.** At 200 W: 110.7 tok/s with DSpark and 78.0 plain over 12 chats at the full 262,144-token
+- **Fast on a V100.** At 200 W: 112.5 tok/s with DSpark and 79.8 plain over 12 chats at the full 262,144-token
   context with images and INT8 KV (120.7 on maths at 250 W), and 2,727 tok/s prefill at 8K with `--prefill-chunk 8192`
   (2,170 at the default chunk; 2,125 with DSpark and images at the full 262,144-token context). The other published V100 port (Csavoldi's, onto Lapilli)
   reports 69 tok/s without a drafter and 850 tok/s prompt reading, on a different machine and prompts
@@ -162,8 +162,9 @@ ninfer-serve models/inkling2-mini-q8.ninfer --vision --max-context 65536
 ```
 
 Layers 20-23 keep their experts in BF16 in this file (7.6 GiB); they are the checkpoint's MXFP8 values, so on a 24 GB
-card the engine holds them as MXFP8 (3.9 GiB), re-encoded at load and checked exact: every output is the same, bit
-for bit (`--mxfp8-experts auto`, the default; `off` keeps BF16). `--fit-context MIN` starts at the largest context that
+card, and always on a V100 (where the MXFP8 kernels are faster), the engine holds them as MXFP8 (3.9 GiB),
+re-encoded at load and checked exact: every output is the same, bit for bit (`--mxfp8-experts auto`, the default;
+`off` keeps BF16). `--fit-context MIN` starts at the largest context that
 fits. On Windows, `scripts\download-model.bat inkling2-mini` downloads and verifies this file.
 
 ## Performance (one Tesla V100-PCIE-32GB, 2026-11-22 and 2026-11-23)
@@ -179,10 +180,10 @@ clean run first, then the typical range across repeated or ABBA legs.
 |---|---:|---|---|
 | **Decode, DSpark** | **120.7 tok/s** | maths prompt, greedy, 300 tokens, `--spec dspark` | 114.3-120.7 on maths, 105.5-115.4 on code, 81.2-99.8 on prose and lists |
 | **Decode, DSpark, 12 chats** | **94.4 tok/s** | 12 chat requests of 300 tokens, greedy, mean of each request's tok/s | 93.4-94.4 over four legs, 60.5-60.7% of drafts accepted; plain 78.5-78.8 |
-| **Decode, 12 chats at 262,144** (200 W) | **110.7 tok/s** DSpark, **78.0** plain | the 12 chats, `--max-context 262144 --vision --kv-dtype int8 --spec dspark` (2026-11-28, cheaper drafting rounds and candidate picks; 99.4 on master `eb265563e` the same day, 108.9 on `f7e751dd4`; same greedy output) | DSpark 91.7-138.9 per chat; plain 78.03-78.04 (master `dc867300`, 2026-11-23; the plain path is unchanged) |
+| **Decode, 12 chats at 262,144** (200 W) | **112.5 tok/s** DSpark, **79.8** plain | the 12 chats, `--max-context 262144 --vision --kv-dtype int8 --spec dspark` (2026-11-28, cheaper drafting rounds, candidate picks, MXFP8 experts; 110.5 and 78.2 on master `feb203752` the same day, 99.4 on `eb265563e`; same greedy output) | DSpark 95.1-144.2 per chat; plain 79.6-80.1 |
 | **Decode, `--speed fast`** (opt-in, lossy) | **163.5 tok/s** | structured output, greedy, 8,069 tokens; 12 chats **109.3-110.3** against 101.1-101.3 exact (2026-11-27, 200 W, `perf/inkling-speed-fast` at `42b5ec8e7`) | +23% on struct, +8.5% on the 12 chats, +2-6% on sampled prose; see Accuracy |
 | **Decode, DSpark, sampled** | **83.5 tok/s** | the same 12 chats at temperature 0.8, top-p 0.95, seeded | 83.4-83.5; plain sampled 74.9 |
-| **Decode, plain** | **78.8 tok/s** | the 12 chats, greedy | 78.2-78.8 |
+| **Decode, plain** | **80.1 tok/s** | the 12 chats, greedy, 8,192 context, 200 W (2026-11-28) | 80.0-80.5 per chat; 78.9 on master `feb203752` before MXFP8 experts |
 | **Batched decode, aggregate** | **198.2 tok/s** | `--max-concurrency 8`, 8 greedy chats of 256 tokens at once, prefill included | 196.8-198.2 at N = 8 (26.4 tok/s each); 170.5 at N = 4, 121.8 at N = 2 |
 | **Prefill** (200 W) | **2,727 tok/s** | 7,974-token prompt, TTFT 2.92 s, `--max-context 131072 --prefill-chunk 8192` | 2,682-2,727 over ABBA legs (2,657-2,694 with layers 20-23's experts on cuBLAS); 2,227 at 34,674 and 1,577 at 100,074 tokens. Chunk 4096 (2026-11-23, before the layers 20-23 change): 2,360-2,394 at 8K, 2,004 at 34K, 1,459 at 100K |
 | **Prefill, default chunk** (200 W) | **2,170 tok/s** | 7,974-token prompt, TTFT 3.68 s, `--max-context 131072` (chunk 2048, picked by the engine) | 2,153-2,170; 1,954-1,962 at 1,074 (0.55 s), 1,839 at 34,674 (18.9 s), 1,339 at 100,074 (74.8 s). With layers 20-23's experts on cuBLAS: 2,052-2,071, 1,799-1,807, 1,764, 1,300. With `--no-prefill-cublas` (2026-11-23): 1,885-1,893, 1,703-1,719, 1,644, 1,226 |
