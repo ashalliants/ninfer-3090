@@ -285,6 +285,11 @@ EngineOptions refuse_inkling2_cache_tiers(EngineOptions options) {
 // a CausalScoring Engine's speculative options: those values would otherwise vanish without a refusal there too.
 EngineOptions refuse_off_route_dspark_options(EngineOptions options) {
     const auto& spec = options.speculative;
+    // A DFlash2 release directory serves Inkling-2 generation only (scoring would clear it below).
+    if (!spec.draft_model.empty() && !(options.purpose == EnginePurpose::Generation && spec.backend == SpeculativeBackend::DFlash2 &&
+                                       runtime::artifact_is_inkling2(options.artifact_path))) {
+        throw std::invalid_argument("--draft-model applies to Inkling-2 generation with --spec dflash2 only");
+    }
     if (!spec.dspark_window_explicit && spec.draft_min_p == 0.0F && !spec.dspark_adaptive) { return options; }
     const bool on_route = options.purpose == EnginePurpose::Generation && is_block_drafter(spec) &&
                           runtime::artifact_is_inkling2(options.artifact_path);

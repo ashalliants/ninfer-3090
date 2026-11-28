@@ -164,6 +164,16 @@ int main() {
                 ninfer::Engine stray_engine(stray);
             } catch (const std::invalid_argument& e) { stray_refused = std::string(e.what()).find("--spec dflash2") != std::string::npos; }
             check(stray_refused, "--draft-model with --spec dspark is refused");
+            // A scoring Engine clears its speculative options: a release directory there is refused, not dropped.
+            auto scoring                    = options;
+            scoring.purpose                 = ninfer::EnginePurpose::CausalScoring;
+            scoring.speculative.backend     = ninfer::SpeculativeBackend::DFlash2;
+            scoring.speculative.draft_model = "some-dflash2-release";
+            bool scoring_refused            = false;
+            try {
+                ninfer::Engine scoring_engine(scoring);
+            } catch (const std::invalid_argument& e) { scoring_refused = std::string(e.what()).find("--draft-model") != std::string::npos; }
+            check(scoring_refused, "--draft-model on a scoring Engine is refused");
         }
         if (const char* dir = std::getenv("NINFER_TEST_INKLING2_DFLASH2"); dir != nullptr && *dir != '\0') {
             // A release whose taps do not end in the final state (here [5, 23, 41]) is refused at load.

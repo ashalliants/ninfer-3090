@@ -13,7 +13,7 @@
       "desc": "Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata's reported figures: 1.83x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).",
       "build": "35B-A3B #614/#618/#621, 27B d309f3d8, Flash-Next fdcac347 (#611), Inkling-2-Mini 2026-11-28 (DFlash2) and #596",
       "panels": [
-        {"type": "ratio", "columns": ["Decode", "Prefill"], "max": 1.6,
+        {"type": "ratio", "columns": ["Decode", "Prefill"], "max": 2.0,
          "rows": [
            {"section": "Measured on this box, same prompts, greedy"},
            {"model": "Qwen3.6-35B-A3B", "versus": "vs llama.cpp 36d818e16, best of MTP n2 / MTP n3 / DFlash n7 per prompt",

@@ -31,38 +31,38 @@
   <text x="32.0" y="209.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Qwen3.6-35B-A3B</text>
   <text x="32.0" y="228.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs llama.cpp 36d818e16, best of MTP n2</text>
   <text x="32.0" y="243.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">/ MTP n3 / DFlash n7 per prompt</text>
-  <path class="ours" d="M302.0,198.0 h187.4 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-187.4 z"><title>Qwen3.6-35B-A3B, Decode: 1.34x</title></path>
-  <line x1="445.1" y1="193.0" x2="445.1" y2="221.0" class="ref" stroke-width="1.5"/>
-  <text x="500.4" y="213.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.34x</text>
+  <path class="ours" d="M302.0,198.0 h149.1 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-149.1 z"><title>Qwen3.6-35B-A3B, Decode: 1.34x</title></path>
+  <line x1="416.5" y1="193.0" x2="416.5" y2="221.0" class="ref" stroke-width="1.5"/>
+  <text x="462.1" y="213.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.34x</text>
   <text x="302.0" y="234.0" class="t3" font-size="11" font-weight="400" text-anchor="start">7 prompts; ours MTP3, DFlash K7 on JSON (range</text>
   <text x="302.0" y="248.0" class="t3" font-size="11" font-weight="400" text-anchor="start">1.09-1.50x)</text>
-  <path class="ours" d="M629.0,198.0 h168.0 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-168.0 z"><title>Qwen3.6-35B-A3B, Prefill: 1.20x</title></path>
-  <line x1="772.1" y1="193.0" x2="772.1" y2="221.0" class="ref" stroke-width="1.5"/>
-  <text x="808.0" y="213.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.20x</text>
+  <path class="ours" d="M629.0,198.0 h133.6 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-133.6 z"><title>Qwen3.6-35B-A3B, Prefill: 1.20x</title></path>
+  <line x1="743.5" y1="193.0" x2="743.5" y2="221.0" class="ref" stroke-width="1.5"/>
+  <text x="773.6" y="213.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.20x</text>
   <text x="629.0" y="234.0" class="t3" font-size="11" font-weight="400" text-anchor="start">4.2K and 13K prompts; llama.cpp with tuned</text>
   <text x="629.0" y="248.0" class="t3" font-size="11" font-weight="400" text-anchor="start">batch (-ub 2048 -b 4096) (range 1.19-1.21x)</text>
   <line x1="32" y1="266.0" x2="928" y2="266.0" class="grid" stroke-width="1"/>
   <text x="32.0" y="293.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Qwen3.8-27B</text>
   <text x="32.0" y="312.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs Lapilli f9b7dd09 (DFlash2, its</text>
   <text x="32.0" y="327.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">default)</text>
-  <path class="ours" d="M302.0,282.0 h169.0 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-169.0 z"><title>Qwen3.8-27B, Decode: 1.21x</title></path>
-  <line x1="445.1" y1="277.0" x2="445.1" y2="305.0" class="ref" stroke-width="1.5"/>
-  <text x="482.0" y="297.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.21x</text>
+  <path class="ours" d="M302.0,282.0 h134.4 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-134.4 z"><title>Qwen3.8-27B, Decode: 1.21x</title></path>
+  <line x1="416.5" y1="277.0" x2="416.5" y2="305.0" class="ref" stroke-width="1.5"/>
+  <text x="447.4" y="297.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.21x</text>
   <text x="302.0" y="318.0" class="t3" font-size="11" font-weight="400" text-anchor="start">7 prompts, the faster of our MTP3 and DFlash2</text>
   <text x="302.0" y="332.0" class="t3" font-size="11" font-weight="400" text-anchor="start">per prompt; DFlash2 alone 1.07x, MTP3 alone</text>
   <text x="302.0" y="346.0" class="t3" font-size="11" font-weight="400" text-anchor="start">1.04x (range 1.04-1.52x)</text>
-  <path class="ours" d="M629.0,282.0 h193.4 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-193.4 z"><title>Qwen3.8-27B, Prefill: 1.38x</title></path>
-  <line x1="772.1" y1="277.0" x2="772.1" y2="305.0" class="ref" stroke-width="1.5"/>
-  <text x="833.4" y="297.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.38x</text>
+  <path class="ours" d="M629.0,282.0 h154.0 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-154.0 z"><title>Qwen3.8-27B, Prefill: 1.38x</title></path>
+  <line x1="743.5" y1="277.0" x2="743.5" y2="305.0" class="ref" stroke-width="1.5"/>
+  <text x="794.0" y="297.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.38x</text>
   <text x="629.0" y="318.0" class="t3" font-size="11" font-weight="400" text-anchor="start">4.2K and 13.4K prompts (range 1.37-1.39x)</text>
   <line x1="32" y1="364.0" x2="928" y2="364.0" class="grid" stroke-width="1"/>
   <text x="32.0" y="391.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Qwen3.8-Flash-Next</text>
   <text x="32.0" y="410.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs Lapilli f9b7dd09 (its UD-IQ2_XS;</text>
   <text x="32.0" y="425.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">ours a different quant of the same</text>
   <text x="32.0" y="440.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">size)</text>
-  <path class="ours" d="M302.0,380.0 h142.5 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-142.5 z"><title>Qwen3.8-Flash-Next, Decode: 1.02x</title></path>
-  <line x1="445.1" y1="375.0" x2="445.1" y2="403.0" class="ref" stroke-width="1.5"/>
-  <text x="455.5" y="395.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.02x</text>
+  <path class="ours" d="M302.0,380.0 h113.2 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-113.2 z"><title>Qwen3.8-Flash-Next, Decode: 1.02x</title></path>
+  <line x1="416.5" y1="375.0" x2="416.5" y2="403.0" class="ref" stroke-width="1.5"/>
+  <text x="426.2" y="395.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.02x</text>
   <text x="302.0" y="416.0" class="t3" font-size="11" font-weight="400" text-anchor="start">5 prompts; ahead on all five, by 0.2% to 8%</text>
   <text x="302.0" y="430.0" class="t3" font-size="11" font-weight="400" text-anchor="start">(range 1.00-1.08x)</text>
   <text x="629.0" y="393.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">Not compared: Lapilli&#x27;s Flash-Next prefill</text>
@@ -72,17 +72,17 @@
   <text x="32.0" y="510.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Inkling-2-Mini</text>
   <text x="32.0" y="529.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs Strata, reported on its model card</text>
   <text x="32.0" y="544.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">(the fastest other figure found)</text>
-  <path class="rep" d="M302.0,499.0 h225.0 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-225.0 z"><title>Inkling-2-Mini, Decode: 1.83x</title></path>
-  <line x1="445.1" y1="494.0" x2="445.1" y2="522.0" class="ref" stroke-width="1.5"/>
-  <text x="538.0" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.83x</text>
+  <path class="rep" d="M302.0,499.0 h205.5 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-205.5 z"><title>Inkling-2-Mini, Decode: 1.83x</title></path>
+  <line x1="416.5" y1="494.0" x2="416.5" y2="522.0" class="ref" stroke-width="1.5"/>
+  <text x="518.5" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.83x</text>
   <text x="302.0" y="535.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: the DFlash2 drafter (112.5 with DSpark),</text>
   <text x="302.0" y="549.0" class="t3" font-size="11" font-weight="400" text-anchor="start">12-chat average at 262,144 context, full</text>
   <text x="302.0" y="563.0" class="t3" font-size="11" font-weight="400" text-anchor="start">Q8_K_XL (23.9 GB). Strata runs smaller packs</text>
   <text x="302.0" y="577.0" class="t3" font-size="11" font-weight="400" text-anchor="start">(SQ-20 19.4 GB / SQ-10 10.5 GB); its decode</text>
   <text x="302.0" y="591.0" class="t3" font-size="11" font-weight="400" text-anchor="start">figure doesn&#x27;t say which</text>
-  <path class="rep" d="M629.0,499.0 h166.7 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-166.7 z"><title>Inkling-2-Mini, Prefill: 1.19x</title></path>
-  <line x1="772.1" y1="494.0" x2="772.1" y2="522.0" class="ref" stroke-width="1.5"/>
-  <text x="806.7" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.19x</text>
+  <path class="rep" d="M629.0,499.0 h132.5 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-132.5 z"><title>Inkling-2-Mini, Prefill: 1.19x</title></path>
+  <line x1="743.5" y1="494.0" x2="743.5" y2="522.0" class="ref" stroke-width="1.5"/>
+  <text x="772.5" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.19x</text>
   <text x="629.0" y="535.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: 8K prompt with --prefill-chunk 8192. At</text>
   <text x="629.0" y="549.0" class="t3" font-size="11" font-weight="400" text-anchor="start">the default chunk 2048 (2,170) it is 0.95x:</text>
   <text x="629.0" y="563.0" class="t3" font-size="11" font-weight="400" text-anchor="start">Strata&#x27;s reported prefill is higher</text>
