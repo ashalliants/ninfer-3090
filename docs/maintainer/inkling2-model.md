@@ -1900,6 +1900,10 @@ Exactness: each request's tokens and logits are bit-identical to its solo run.
   - Calls of fewer than 64 entries (up to 7 columns at top 8, so batched decode up to B = 7 and DSpark verify) also
     run per entry. Entries of one expert run at the same time, so its second read mostly hits the L2, and the
     per-entry kernels' occupancy (64 registers, four blocks an SM) beats the expert-major kernels at these widths.
+    The NVFP4 kernels decode eight e2m1 nibbles in registers (`e2m1_twice8`): byte permutes pick each doubled value's
+    top float byte (sign included) and second byte from 8-byte tables, and one more permute pairs them, so a value
+    costs 1.5 instructions instead of a permute and a subtraction. It gives the old decode's bits on every 32-bit word
+    (`ops::nvfp4_e2m1_decode_mismatches`, run by `ninfer_inkling2_fp32_ops_test`); V100 plain 80.1 -> 80.6 tok/s.
     NVFP4 calls on `sm_70` stay per entry up to 95 entries (11 columns, so DSpark's 8-column verify and batched decode
     up to B = 11): the V100 op sweep (`NINFER_INKLING2_OP_SWEEP=1`, 2026-11-28) measured T = 8 at 374 against 416 us
     expert-major, T = 9 432 against 478, T = 12 591 against 603 and T = 16 804 against 753. BF16 there, and every

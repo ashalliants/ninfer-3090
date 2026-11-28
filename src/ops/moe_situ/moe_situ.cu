@@ -371,23 +371,28 @@ __device__ __forceinline__ float lane_of(const float4& v, int i) { return i == 0
 
 // One 36-byte NVFP4 block (4 ue4m3 half-scales, then 32 bytes of nibbles; byte j of sub-block s holds values j and
 // j + 8), as 9 words in shared memory, dotted with 64 staged activations.
-// The e2m1 values of eight nibbles, decoded in registers (no table loads): each nibble picks one byte of a 16-byte
-// table of 2 * value + 12 (0..24) with __byte_perm, and a byte b becomes the float 2^23 + b by placing it under the
-// exponent of 2^23, so 2 * value = that float - (2^23 + 12), exactly. out[0..3] are the values of the low nibble,
-// high nibble, low, high of bytes 0 and 1 of `q`; out[4..7] the same for bytes 2 and 3.
+// The e2m1 values of eight nibbles, doubled, decoded in registers (no table loads). Doubled, they are 0 1 2 3 4 6
+// 8 12, whose floats are zero below their top two bytes; __byte_perm picks each nibble's top byte (sign included)
+// and second byte from 8-byte tables, and one more __byte_perm pairs them for two values, whose floats are then the
+// pair's low half shifted up and its high half masked. A negative zero comes out +0. out[0..3] are the values of
+// the low nibble, high nibble, low, high of bytes 0 and 1 of `q`; out[4..7] the same for bytes 2 and 3.
 __device__ __forceinline__ void e2m1_twice8(std::uint32_t q, float (&out)[8]) {
-    constexpr std::uint32_t kPos0 = 0x0F0E0D0CU, kPos1 = 0x18141210U; // nibbles 0..7: 2v + 12 = 12 13 14 15 16 18 20 24
-    constexpr std::uint32_t kNeg0 = 0x090A0B0CU, kNeg1 = 0x00040608U; // nibbles 8..15: 12 11 10 9 8 6 4 0
+    constexpr std::uint32_t kTopPos0 = 0x40403F00U, kTopPos1 = 0x41414040U; // nibbles 0..7: 0 1 2 3 4 6 8 12
+    constexpr std::uint32_t kTopNeg0 = 0xC0C0BF00U, kTopNeg1 = 0xC1C1C0C0U; // nibbles 8..15: their negatives
+    constexpr std::uint32_t kSecond0 = 0x40008000U, kSecond1 = 0x4000C080U; // the second byte, either sign
     const std::uint32_t index = q & 0x77777777U, pick = 0x32103210U | ((q & 0x88888888U) >> 1);
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        const std::uint32_t pos = __byte_perm(kPos0, kPos1, index >> (16 * i));
-        const std::uint32_t neg = __byte_perm(kNeg0, kNeg1, index >> (16 * i));
-        const std::uint32_t biased = __byte_perm(pos, neg, pick >> (16 * i));
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            out[4 * i + k] = __uint_as_float(__byte_perm(biased, 0x4B000000U, 0x7540U | k)) - 8388620.0F; // 2^23 + 12
-        }
+        const std::uint32_t pos    = __byte_perm(kTopPos0, kTopPos1, index >> (16 * i));
+        const std::uint32_t neg    = __byte_perm(kTopNeg0, kTopNeg1, index >> (16 * i));
+        const std::uint32_t top    = __byte_perm(pos, neg, pick >> (16 * i));
+        const std::uint32_t second = __byte_perm(kSecond0, kSecond1, index >> (16 * i));
+        const std::uint32_t pair01 = __byte_perm(second, top, 0x5140U); // second 0, top 0, second 1, top 1
+        const std::uint32_t pair23 = __byte_perm(second, top, 0x7362U);
+        out[4 * i + 0] = __uint_as_float(pair01 << 16);
+        out[4 * i + 1] = __uint_as_float(pair01 & 0xFFFF0000U);
+        out[4 * i + 2] = __uint_as_float(pair23 << 16);
+        out[4 * i + 3] = __uint_as_float(pair23 & 0xFFFF0000U);
     }
 }
 
@@ -1723,6 +1728,49 @@ void nvfp4_tile_records(SituExpertBank& bank, std::uint8_t* records, void* scrat
         check_launch(op);
     }
     bank.tiled = true;
+}
+
+namespace {
+// The decode e2m1_twice8 replaced: each nibble picks a byte of 2 * value + 12 under the exponent of 2^23, and the bias
+// 2^23 + 12 is subtracted. Kept for nvfp4_e2m1_decode_mismatches only.
+__device__ __forceinline__ void e2m1_twice8_biased(std::uint32_t q, float (&out)[8]) {
+    constexpr std::uint32_t kPos0 = 0x0F0E0D0CU, kPos1 = 0x18141210U, kNeg0 = 0x090A0B0CU, kNeg1 = 0x00040608U;
+    const std::uint32_t index = q & 0x77777777U, pick = 0x32103210U | ((q & 0x88888888U) >> 1);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const std::uint32_t pos = __byte_perm(kPos0, kPos1, index >> (16 * i)), neg = __byte_perm(kNeg0, kNeg1, index >> (16 * i));
+        const std::uint32_t biased = __byte_perm(pos, neg, pick >> (16 * i));
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { out[4 * i + k] = __uint_as_float(__byte_perm(biased, 0x4B000000U, 0x7540U | k)) - 8388620.0F; }
+    }
+}
+
+__global__ void e2m1_decode_compare_kernel(unsigned long long* mismatches) {
+    const std::uint64_t base = (static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4096ULL;
+    unsigned long long bad = 0;
+    for (std::uint64_t j = 0; j < 4096; ++j) {
+        const auto q = static_cast<std::uint32_t>(base + j);
+        float now[8], before[8];
+        e2m1_twice8(q, now);
+        e2m1_twice8_biased(q, before);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) { bad += __float_as_uint(now[k]) != __float_as_uint(before[k]) ? 1 : 0; }
+    }
+    if (bad != 0) { atomicAdd(mismatches, bad); }
+}
+} // namespace
+
+unsigned long long nvfp4_e2m1_decode_mismatches() {
+    const char* op = "nvfp4_e2m1_decode_mismatches";
+    unsigned long long* device = nullptr;
+    require(cudaMalloc(&device, sizeof(unsigned long long)) == cudaSuccess, op, "allocation failed");
+    unsigned long long host = 0;
+    const bool ok = cudaMemset(device, 0, sizeof(host)) == cudaSuccess &&
+                    (e2m1_decode_compare_kernel<<<4096, 256>>>(device), cudaGetLastError() == cudaSuccess) &&
+                    cudaMemcpy(&host, device, sizeof(host), cudaMemcpyDeviceToHost) == cudaSuccess;
+    cudaFree(device);
+    require(ok, op, "the comparison failed");
+    return host;
 }
 
 } // namespace ninfer::ops

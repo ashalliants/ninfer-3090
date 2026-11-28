@@ -17,6 +17,21 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Inkling-2-Mini cheaper NVFP4 expert decode (2026-11-28)
+
+The NVFP4 expert kernels decode each e2m1 nibble to its float in fewer instructions: one byte permute builds the
+float's top two bytes from small in-register tables, where the old decode put a biased byte under 2^23 and subtracted
+the bias. The values are the same bits on every one of the 2^32 words (`ninfer_inkling2_fp32_ops_test` checks all of
+them), so the output is unchanged (same md5 on every set). 200 W, 12 chats at 8,192, A B B A against master
+`592337dcc` the same day:
+
+| Configuration | master | this build |
+|---|---|---|
+| plain | 80.11 / 80.11 | **80.61 / 80.61** |
+| DSpark | 111.9 | **112.7-112.8** |
+
+262,144-context figures were not re-measured with this change. RTX 3090: NOT RUN (it takes the same decode).
+
 ## Tesla V100 (`sm_70`): Inkling-2-Mini DFlash2 drafter (2026-11-28)
 
 `--spec dflash2 --draft-model DIR` drafts with Inco's DFlash2 drafter (`incoai/Inkling-2-Mini-DFlash2`, read from its

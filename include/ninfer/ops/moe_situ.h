@@ -133,6 +133,13 @@ inline constexpr int kNvfp4GateGroupRows = 4, kNvfp4DownGroupRows = 8;
 void nvfp4_tile_records(SituExpertBank& bank, std::uint8_t* records, void* scratch, cudaStream_t stream);
 
 /**
+ * Test hook: the NVFP4 experts' register decode of eight e2m1 nibbles (doubled values) against the earlier decode it
+ * replaced (a biased byte under 2^23, minus the bias), on every one of the 2^32 words. Returns how many decoded values
+ * differ in any bit (0 when the decodes agree). Synchronous; about a second on a V100.
+ */
+[[nodiscard]] unsigned long long nvfp4_e2m1_decode_mismatches();
+
+/**
  * Op: moe_situ_experts
  *
  * Math / indexing:
