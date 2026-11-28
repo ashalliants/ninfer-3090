@@ -841,6 +841,38 @@ void test_candidates(int v, int valid, int n) {
     }
 }
 
+// The ordering edge cases: a tile of NaN (its first id, never a pick), and -0 / +0 as one score (the lower id first).
+void test_candidate_edges() {
+    using ninfer::ops::kCandidatesPerTile;
+    using ninfer::ops::kCandidateTile;
+    const int v = 2 * kCandidateTile, r = 256;
+    std::vector<float> base(v, -5.0F), hb(v, 0.0F);
+    for (int i = 0; i < kCandidateTile; ++i) { base[i] = std::numeric_limits<float>::quiet_NaN(); }
+    base[kCandidateTile + 10] = -0.0F;
+    base[kCandidateTile + 20] = 0.0F;
+    const std::vector<float> latent(r, 0.0F);
+    Buf dbase(base), dhb(hb), dlat(latent);
+    Tensor tb = dbase.tensor({v, 1}), th = dhb.tensor({v}), tl = dlat.tensor({r});
+    const int count = 2 * kCandidatesPerTile;
+    ninfer::DeviceBuffer cand(count * 4), work(16), out(4), rc(static_cast<std::size_t>(v) * r), rs(static_cast<std::size_t>(v) * r / 32 * 4);
+    rc.fill(0), rs.fill(0), work.fill(0);
+    Tensor tc(cand.p, DType::I32, {count, 1});
+    ninfer::ops::dspark_tile_candidates(tb, th, v, tc, nullptr);
+    std::vector<std::int32_t> hc(count);
+    cand.copy_to_host(hc.data(), count * 4);
+    bool ok = true;
+    for (int k = 0; k < kCandidatesPerTile; ++k) { ok = ok && hc[k] == 0; } // the NaN tile: its first id
+    ok = ok && hc[kCandidatesPerTile] == kCandidateTile + 10 && hc[kCandidatesPerTile + 1] == kCandidateTile + 20;
+    ninfer::ops::dspark_candidate_pick(tb.slice(1, 0, 1).reshape({v}), th, static_cast<const std::int8_t*>(rc.p), static_cast<const float*>(rs.p), r,
+                                       tl, static_cast<const std::int32_t*>(cand.p), count, 30.0F, nullptr, static_cast<std::uint64_t*>(work.p),
+                                       static_cast<std::int32_t*>(out.p), nullptr, nullptr);
+    std::int32_t got = -1;
+    out.copy_to_host(&got, 4);
+    ok = ok && got == kCandidateTile + 10;
+    check(ok, "candidates: a NaN tile or a signed-zero tie is not ordered by the contract");
+    std::printf("candidate edges: %s\n", ok ? "ok" : "differs");
+}
+
 int main() {
     try {
         test_projection(true, 3072, 2304, 8, false, 1e-7);
@@ -862,6 +894,7 @@ int main() {
         test_projection_a8(1000, 128, 3, true, 5e-3); // rows not a multiple of a block's
         test_copy_runs();
         test_candidates(5000, 4999, 3);
+        test_candidate_edges();
         test_candidates(201088, 201088 - 64, 7);
         test_projection_a8q4(1000, 2304, 3, 5e-3);
         test_projection_a8q4(2048, 2304, 8, 5e-3);

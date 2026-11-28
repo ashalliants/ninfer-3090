@@ -280,8 +280,8 @@ void dspark_draft_pick(const Tensor& logits, std::int32_t valid_rows, const Draf
  *
  * dspark_tile_candidates: for each column t of base FP32 [V, n] (with hb FP32 [V]), the kCandidatesPerTile ids with the
  * largest base + hb in each tile of kCandidateTile rows below `valid` (lowest id among equals; NaN never chosen):
- * cand int32 [tiles * kCandidatesPerTile, n], tiles = ceil(valid / kCandidateTile). A tile with fewer valid rows than
- * kCandidatesPerTile repeats its last pick.
+ * cand int32 [tiles * kCandidatesPerTile, n], tiles = ceil(valid / kCandidateTile). -0 and +0 are one score. A tile
+ * with fewer valid non-NaN rows than kCandidatesPerTile repeats its last pick (its first id when every row is NaN).
  *
  * dspark_candidate_pick: out[0] = the candidate c of cand FP32 column (count ids) with the largest
  *   base[c] + hb[c] + sum_g scale[c, g] * sum_{r in g} code[c, r] * latent[r]

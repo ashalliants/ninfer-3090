@@ -155,7 +155,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options, 
         return;
     case SpeculativeBackend::DSpark:
         if (options.draft_tokens == 0 || options.draft_tokens > 7) {
-            throw std::invalid_argument("--spec dspark takes --draft-tokens in [1,7] (default 3)");
+            throw std::invalid_argument("--spec dspark takes --draft-tokens in [1,7] (default " + std::to_string(kDSparkDefaultDraftTokens) + ")");
         }
         if (options.ngram_draft_tokens != 0 || options.adaptive_draft_tokens != 0) {
             throw std::invalid_argument("--spec dspark takes no n-gram or adaptive draft windows");

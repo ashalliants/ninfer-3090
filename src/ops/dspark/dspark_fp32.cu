@@ -964,10 +964,13 @@ __global__ void markov_rows_kernel(const std::int8_t* __restrict__ codes, const 
     if (k % 32 == 0) { rs[v * (r / 32) + k / 32] = scales[static_cast<std::int64_t>(k / 32) * v_rows + v]; }
 }
 
-// Orders (score, id) so a larger key is a larger score, then a lower id; NaN maps below every number.
+// Orders (score, id) so a larger key is a larger score, then a lower id; -0 and +0 are one score. A NaN's key is 0,
+// the "none" every real key beats (ids are below 2^31, so a real key's low word is never 0 either).
 __device__ __forceinline__ std::uint64_t cand_key(float score, int id) {
+    if (score != score) { return 0ULL; }
+    if (score == 0.0F) { score = 0.0F; }
     std::uint32_t b = __float_as_uint(score);
-    if (score != score) { b = 0U; } else { b = (b & 0x80000000U) ? ~b : (b | 0x80000000U); }
+    b = (b & 0x80000000U) ? ~b : (b | 0x80000000U);
     return (static_cast<std::uint64_t>(b) << 32) | (0xFFFFFFFFU - static_cast<std::uint32_t>(id));
 }
 __device__ __forceinline__ std::uint64_t warp_max_u64(std::uint64_t k) {
