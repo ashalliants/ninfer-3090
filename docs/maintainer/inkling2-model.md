@@ -799,9 +799,10 @@ command line left unset (`ServeOptions::speed_fast`, applied in `parse_serve_opt
 - **Prompt lookup** (`dspark_lookup_match` = 3): when a round's drafts are the start of what followed the latest earlier
   occurrence of the sequence's last 3 tokens (prompt or output), the round verifies the rest of that copy too, up to 7
   drafts. The verifier decides every token, so this part is lossless (`ninfer_inkling2_engine_dspark_test` checks its
-  greedy output equals plain), and the greedy keep never takes a copied token. An index of each 3-gram's latest start,
+  greedy output equals plain), and the greedy keep never applies in a lookup round. An index of each 3-gram's latest start,
   filled once over the prompt and then a token a step, makes each round's lookup one hash probe. Such rounds count as
-  `ngram_rounds` (with their drafted and accepted tokens) and stay out of the drafter's width and cost statistics.
+  `ngram_rounds` (with their drafted and accepted tokens) and stay out of the drafter's width and cost statistics and
+  its per-position acceptance.
 - The 8-bit dense head (`--dense-q8 head`, "Dense 8-bit re-encoding": KLD mean 8.8e-6, argmax agrees at 99.77%).
 
 An explicit `--draft-tokens` or `--dense-q8` keeps its value. `--speed fast` with another `--spec` backend, on a model

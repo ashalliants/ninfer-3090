@@ -1358,7 +1358,9 @@ void Inkling2Core::run(Job& job) {
         ++out.speculative.rounds;
         out.speculative.drafted_tokens += static_cast<std::uint64_t>(round_drafts);
         out.speculative.accepted_tokens += static_cast<std::uint64_t>(col);
-        for (std::int32_t i = 0; i < col && i < n_drafts; ++i) { ++out.speculative.accepted_per_position[static_cast<std::size_t>(i)]; }
+        if (!round_lookup) { // copy rounds count only in the n-gram counters (SpeculativeStats)
+            for (std::int32_t i = 0; i < col && i < n_drafts; ++i) { ++out.speculative.accepted_per_position[static_cast<std::size_t>(i)]; }
+        }
         std::lock_guard lock(stats_mutex_);
         ++totals_.speculative_rounds;
         totals_.speculative_draft_tokens += static_cast<std::uint64_t>(round_drafts);
@@ -1533,9 +1535,8 @@ void Inkling2Core::run(Job& job) {
                 }
                 // dspark_greedy_keep (lossy, opt-in): a round's draft the target gives at least that fraction of its
                 // top token's probability is taken in place of the top token, so the round goes on. Never into or out of
-                // a stop token, and never a lookup round's copied token (those stay exact).
-                if (greedy_keep > 0.0F && in_round && col < static_cast<std::int32_t>(drafted.size()) &&
-                    !(round_lookup && col >= round_dspark) &&
+                // a stop token, and never in a lookup round (its drafts are the copy, verified exactly).
+                if (greedy_keep > 0.0F && in_round && !round_lookup && col < static_cast<std::int32_t>(drafted.size()) &&
                     drafted[static_cast<std::size_t>(col)] != next) {
                     const TokenId d = drafted[static_cast<std::size_t>(col)];
                     const bool stops = std::find(stop_ids.begin(), stop_ids.end(), d) != stop_ids.end() ||
