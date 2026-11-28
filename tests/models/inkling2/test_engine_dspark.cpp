@@ -177,22 +177,24 @@ int main() {
             lookup.speculative.dspark_lookup_match = 3;
             lookup.speculative.dspark_adaptive     = true; // as --speed fast runs: rounds draft 1 .. 7, so a copy can be longer
             lookup.speculative.draft_min_p         = 0.5F;
-            ninfer::Engine lookup_engine(lookup);
-            std::printf("dspark, 7 drafts per round, prompt lookup on 3 tokens:\n");
-            const Run with_lookup = run_all(lookup_engine, tokens);
-            for (std::size_t i = 0; i < kPrompts.size(); ++i) {
-                check(with_lookup.tokens[i] == plain.tokens[i], "prompt " + std::to_string(i) + ": prompt lookup changed greedy output");
-            }
-            const std::uint64_t lookup_rounds = lookup_engine.runtime_stats().speculative_ngram_rounds;
-            std::printf("  lookup rounds %llu\n", static_cast<unsigned long long>(lookup_rounds));
-            check(lookup_rounds > 0, "no round verified a prompt lookup copy");
             {
-                const auto st = lookup_engine.runtime_stats();
-                check(st.speculative_ngram_draft_tokens > 0 && st.speculative_ngram_accepted_tokens <= st.speculative_ngram_draft_tokens &&
-                          st.speculative_ngram_draft_tokens <= st.speculative_draft_tokens &&
-                          st.speculative_ngram_accepted_tokens <= st.speculative_accepted_tokens,
-                      "the lookup rounds' drafted and accepted tokens are counted, a subset of the rounds'");
-            }
+                ninfer::Engine lookup_engine(lookup);
+                std::printf("dspark, 7 drafts per round, prompt lookup on 3 tokens:\n");
+                const Run with_lookup = run_all(lookup_engine, tokens);
+                for (std::size_t i = 0; i < kPrompts.size(); ++i) {
+                    check(with_lookup.tokens[i] == plain.tokens[i], "prompt " + std::to_string(i) + ": prompt lookup changed greedy output");
+                }
+                const std::uint64_t lookup_rounds = lookup_engine.runtime_stats().speculative_ngram_rounds;
+                std::printf("  lookup rounds %llu\n", static_cast<unsigned long long>(lookup_rounds));
+                check(lookup_rounds > 0, "no round verified a prompt lookup copy");
+                {
+                    const auto st = lookup_engine.runtime_stats();
+                    check(st.speculative_ngram_draft_tokens > 0 && st.speculative_ngram_accepted_tokens <= st.speculative_ngram_draft_tokens &&
+                              st.speculative_ngram_draft_tokens <= st.speculative_draft_tokens &&
+                              st.speculative_ngram_accepted_tokens <= st.speculative_accepted_tokens,
+                          "the lookup rounds' drafted and accepted tokens are counted, a subset of the rounds'");
+                }
+            } // one Engine on the device at a time
             // One slot only: batched decode runs without the drafter.
             {
                 auto batched            = lookup;
