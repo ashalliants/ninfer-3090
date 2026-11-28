@@ -851,7 +851,8 @@ int main() {
                               "--speed exact changed the output settings");
         }
         for (const auto& args : {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--speed", "quick"},
-                                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--speed", "fast", "--spec", "mtp"}}) {
+                                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--speed", "fast", "--spec", "mtp"},
+                                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--speed", "fast", "--max-concurrency", "2"}}) {
             bool refused = false;
             try {
                 (void)parse(args);

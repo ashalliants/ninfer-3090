@@ -1676,6 +1676,10 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         if (spec.backend != SpeculativeBackend::DSpark) {
             throw std::invalid_argument("--speed fast is for Inkling-2 and drafts with its DSpark drafter (--spec dspark)");
         }
+        if (options.max_concurrency > 1) {
+            // Batched Inkling-2 decode runs without the drafter, which is what --speed fast changes.
+            throw std::invalid_argument("--speed fast drafts with one request at a time: use --max-concurrency 1");
+        }
         if (!given.draft_tokens) {
             spec.draft_tokens  = product::kSpeedFastDraftTokens;
             given.draft_tokens = true;

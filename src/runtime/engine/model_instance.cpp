@@ -85,6 +85,9 @@ void validate_engine_options(const EngineOptions& options) {
     if ((spec.dspark_greedy_keep != 0.0F || spec.dspark_lookup_match != 0) && spec.backend != SpeculativeBackend::DSpark) {
         throw std::invalid_argument("--speed fast needs Inkling-2's drafter (--spec dspark)");
     }
+    if ((spec.dspark_greedy_keep != 0.0F || spec.dspark_lookup_match != 0) && options.max_concurrency > 1) {
+        throw std::invalid_argument("--speed fast drafts with one request at a time: use --max-concurrency 1");
+    }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit:
         if (options.kv_capacity.explicit_tokens == 0) {

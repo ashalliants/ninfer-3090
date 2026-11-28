@@ -1293,6 +1293,10 @@ void Inkling2Core::run(Job& job) {
     std::vector<TokenId> lookup;
     std::int32_t round_dspark = 0; // the drafter's own drafts of the current round
     bool round_lookup = false, forward_was_lookup = false;
+    // An index of every N-gram's latest start, filled as the sequence grows (once over the prompt, then a few entries a
+    // step), so a round's lookup is one hash probe rather than a scan of the history.
+    std::unordered_map<std::uint64_t, std::int64_t> lookup_index;
+    std::int64_t lookup_indexed = 0; // N-grams starting before this are in the index
     const auto find_lookup = [&](std::int64_t max_n) {
         lookup.clear();
         const auto& pt = prompt.tokens;
@@ -1300,13 +1304,22 @@ void Inkling2Core::run(Job& job) {
         const auto np = static_cast<std::int64_t>(pt.size()), len = np + static_cast<std::int64_t>(gt.size());
         const auto at = [&](std::int64_t i) { return i < np ? pt[static_cast<std::size_t>(i)] : gt[static_cast<std::size_t>(i - np)]; };
         if (lookup_match <= 0 || max_n < 1 || len < lookup_match + 1) { return; }
-        for (std::int64_t start = len - lookup_match - 1; start >= 0; --start) { // the match ends before the suffix
-            bool match = true;
-            for (std::int64_t k = 0; k < lookup_match && match; ++k) { match = at(start + k) == at(len - lookup_match + k); }
-            if (!match) { continue; }
-            for (std::int64_t i = start + lookup_match; i < len && static_cast<std::int64_t>(lookup.size()) < max_n; ++i) { lookup.push_back(at(i)); }
-            return;
+        const auto key = [&](std::int64_t start) {
+            std::uint64_t h = 1469598103934665603ULL; // FNV-1a over the N tokens
+            for (std::int64_t k = 0; k < lookup_match; ++k) {
+                h = (h ^ static_cast<std::uint32_t>(at(start + k))) * 1099511628211ULL;
+            }
+            return h;
+        };
+        // A match ends before the suffix: starts up to len - N - 1.
+        for (; lookup_indexed <= len - lookup_match - 1; ++lookup_indexed) { lookup_index[key(lookup_indexed)] = lookup_indexed; }
+        const auto hit = lookup_index.find(key(len - lookup_match));
+        if (hit == lookup_index.end()) { return; }
+        const std::int64_t start = hit->second;
+        for (std::int64_t k = 0; k < lookup_match; ++k) {
+            if (at(start + k) != at(len - lookup_match + k)) { return; } // a hash collision
         }
+        for (std::int64_t i = start + lookup_match; i < len && static_cast<std::int64_t>(lookup.size()) < max_n; ++i) { lookup.push_back(at(i)); }
     };
     std::vector<TokenId> drafted; // the last forward's inputs at columns 1 ..
     std::vector<std::int32_t> argmax_host; // the last forward's greedy tokens from column argmax_from, when not stale
@@ -1329,6 +1342,7 @@ void Inkling2Core::run(Job& job) {
         out.speculative.enabled      = true;
         out.speculative.draft_window = static_cast<std::uint32_t>(n_drafts);
         out.speculative.accepted_per_position.assign(static_cast<std::size_t>(n_drafts), 0);
+        if (lookup_match > 0) { out.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(ink::kMaxBatchColumns - 1); }
     }
     // Positions whose inputs the loop has consumed (a round's unread columns are not yet the sequence's).
     const auto committed = [&] {
@@ -1351,6 +1365,14 @@ void Inkling2Core::run(Job& job) {
         totals_.speculative_accepted_tokens += static_cast<std::uint64_t>(col);
         lanes_[0].drafted_tokens += static_cast<std::uint64_t>(round_drafts);
         lanes_[0].accepted_tokens += static_cast<std::uint64_t>(col);
+        if (round_lookup) { // a lookup round's counts are also the n-gram ones
+            ++out.speculative.ngram_rounds;
+            out.speculative.ngram_drafted_tokens += static_cast<std::uint64_t>(round_drafts);
+            out.speculative.ngram_accepted_tokens += static_cast<std::uint64_t>(col);
+            ++totals_.speculative_ngram_rounds;
+            totals_.speculative_ngram_draft_tokens += static_cast<std::uint64_t>(round_drafts);
+            totals_.speculative_ngram_accepted_tokens += static_cast<std::uint64_t>(col);
+        }
     };
     const auto close_round = [&] {
         const std::int32_t kept = col + 1; // the anchor and the drafts consumed
@@ -1359,13 +1381,6 @@ void Inkling2Core::run(Job& job) {
         count_round();
         if (width && !round_lookup) { width->observe(round_drafts, col); }
         if (width && round_lookup && round_dspark > 0) { width->observe(round_dspark, std::min(col, round_dspark)); }
-        if (round_lookup) {
-            ++out.speculative.ngram_rounds;
-            out.speculative.ngram_drafted_tokens += static_cast<std::uint64_t>(round_drafts);
-            out.speculative.ngram_accepted_tokens += static_cast<std::uint64_t>(col);
-            std::lock_guard lock(stats_mutex_);
-            ++totals_.speculative_ngram_rounds;
-        }
         accept_ema = 0.8 * accept_ema + 0.2 * col;
         in_round   = false;
     };
@@ -1518,8 +1533,9 @@ void Inkling2Core::run(Job& job) {
                 }
                 // dspark_greedy_keep (lossy, opt-in): a round's draft the target gives at least that fraction of its
                 // top token's probability is taken in place of the top token, so the round goes on. Never into or out of
-                // a stop token.
+                // a stop token, and never a lookup round's copied token (those stay exact).
                 if (greedy_keep > 0.0F && in_round && col < static_cast<std::int32_t>(drafted.size()) &&
+                    !(round_lookup && col >= round_dspark) &&
                     drafted[static_cast<std::size_t>(col)] != next) {
                     const TokenId d = drafted[static_cast<std::size_t>(col)];
                     const bool stops = std::find(stop_ids.begin(), stop_ids.end(), d) != stop_ids.end() ||

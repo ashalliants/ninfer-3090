@@ -799,12 +799,13 @@ command line left unset (`ServeOptions::speed_fast`, applied in `parse_serve_opt
 - **Prompt lookup** (`dspark_lookup_match` = 3): when a round's drafts are the start of what followed the latest earlier
   occurrence of the sequence's last 3 tokens (prompt or output), the round verifies the rest of that copy too, up to 7
   drafts. The verifier decides every token, so this part is lossless (`ninfer_inkling2_engine_dspark_test` checks its
-  greedy output equals plain). Such rounds count as `ngram_rounds` and stay out of the drafter's width and cost
-  statistics.
+  greedy output equals plain), and the greedy keep never takes a copied token. An index of each 3-gram's latest start,
+  filled once over the prompt and then a token a step, makes each round's lookup one hash probe. Such rounds count as
+  `ngram_rounds` (with their drafted and accepted tokens) and stay out of the drafter's width and cost statistics.
 - The 8-bit dense head (`--dense-q8 head`, "Dense 8-bit re-encoding": KLD mean 8.8e-6, argmax agrees at 99.77%).
 
-An explicit `--draft-tokens` or `--dense-q8` keeps its value. `--speed fast` with another `--spec` backend, or on a model
-without DSpark, is refused.
+An explicit `--draft-tokens` or `--dense-q8` keeps its value. `--speed fast` with another `--spec` backend, on a model
+without DSpark, or with `--max-concurrency` above 1 (batched decode runs without the drafter) is refused.
 
 **Output.** Greedy text differs from the default's on some requests (on the 12 chats below, all 4 whose 300
 tokens reached the answer worded it differently; the arithmetic answer held). Because the greedy keep acts on the drafts, and the adaptive width picks drafts from
