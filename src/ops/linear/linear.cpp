@@ -14,6 +14,9 @@
 #include "ops/linear/q8/q8_dispatch.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_dispatch.h"
+#include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
+
+#include <algorithm>
 
 #include <cstdint>
 #include <limits>
@@ -88,6 +91,31 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     validate_linear_policy(policy);
 }
 
+// sm_70's FP16 cuBLAS prefill route for a T2 weight (detail::cublas_prefill_admits_t2): the ternary
+// codes times their group scales materialise exactly in FP16, where the T2 prefill kernels run
+// Ampere mma.sync (or the int8 one) under emulation. The vocabulary heads are left out: their
+// materialised weight alone would be 2.5 GB, and prefill reads them for the last token only.
+constexpr std::int32_t kT2CublasMaxRows = 34816;
+
+bool t2_cublas_admits(LinearPolicy policy, std::int32_t rows, std::int32_t tokens) {
+    return allows_cublas_prefill(policy) && tokens >= cublas_prefill_min_tokens(policy) &&
+           rows <= kT2CublasMaxRows && detail::cublas_prefill_admits_t2();
+}
+
+bool t2_cublas_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                      WorkspaceArena* workspace, cudaStream_t stream) {
+    const std::int32_t t = x.ne[1];
+    if (workspace == nullptr || !t2_cublas_admits(policy, w.n, t)) { return false; }
+    const detail::CublasProjectionDestination destination{out.data, 0, w.n, w.n, 0};
+    const detail::CublasProjection parent{&w, &destination, 1};
+    if (!detail::w4_cublas_projection_supported(&parent, 1, t) ||
+        (t < kCublasPrefillMinTokens && !detail::w4_cublas_projection_fits(*workspace, &parent, 1, t))) {
+        return false;
+    }
+    detail::w4_cublas_projection_launch(x, &parent, 1, *workspace, stream);
+    return true;
+}
+
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
     // sm_70 opt-in (NINFER_SM70_TENSOR_CORES=1): A16 group-format linears of 64+ tokens on the FP16
@@ -107,6 +135,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q8_dispatch(x, w, out, policy, stream);
         return;
     case QType::T2_G128_FP16:
+        if (t2_cublas_linear(x, w, out, policy, workspace, stream)) { return; }
         if (workspace != nullptr && detail::t2_a8_admits(policy) &&
             detail::t2_a8_supported(w, x.ne[1])) {
             detail::t2_a8_linear(x, w, out, *workspace, stream);
@@ -176,6 +205,12 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::T2_G128_FP16:
         (void)detail::select_t2_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_t2_launch(output_rows, input_rows, max_tokens, policy);
+        if (t2_cublas_admits(policy, output_rows, max_tokens)) {
+            return std::max(detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens),
+                            detail::w4_cublas_projection_workspace_capacity_bytes(
+                                output_rows, input_rows,
+                                std::max(min_tokens, cublas_prefill_min_tokens(policy)), max_tokens));
+        }
         return detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens);
     case QType::BF16:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);

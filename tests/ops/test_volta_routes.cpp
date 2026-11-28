@@ -4,6 +4,7 @@
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/t2/t2_dispatch.h"
+#include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8_fa2_plan.h"
 
 #include <cstdint>
@@ -42,7 +43,8 @@ int main() {
                "q4 ksplit shapes without a GEMV instance are not rerouted");
     }
 
-    // Ternary: GEMV at T=1, SIMT for T<=8, then the sm_86 tensor-core bands.
+    // Ternary, A16Only table: GEMV at T=1, SIMT for T<=8, then the sm_86 tensor-core bands.
+    // (The integer-route policy the ternary profile registers does not reach it; below.)
     expect(select_t2_a16_launch(6144, 5120, 1) == launch_t2_gemv_r8_w1_k5120, "t2 T=1 -> GEMV");
     for (const std::int32_t t : {2, 3, 4}) {
         expect(select_t2_a16_launch(6144, 5120, t) == launch_t2_simt_r8_c4, "t2 T=2..4 -> SIMT c4");
@@ -52,6 +54,10 @@ int main() {
     }
     expect(select_t2_a16_launch(6144, 5120, 9) == launch_t2_small_t_v2, "t2 T=9 -> small-T mma");
     expect(select_t2_a16_launch(6144, 5120, 64) == launch_t2_mma_r64_c64, "t2 T=64 -> mma");
+
+    // Ternary under the registered integer-route policy (AllowPrefillCublas): from the cuBLAS
+    // gate up the FP16 cuBLAS route (exact ternary materialisation), not the emulated s8 mma.
+    expect(cublas_prefill_admits_t2(), "t2 prefill -> FP16 cuBLAS route");
 #endif
 
     // FA2 INT8 prompt plan. Eight warps need 100,352 B (INT8 values) or 84,992 B (packed values).

@@ -761,6 +761,24 @@ prompt through the sequential FP32 recurrence, +3.6-4% prefill at 1k-4k tokens w
 greedy output and perplexity 6.00650 vs 6.00980 (an idea from geoffwatts/ninfer-v100, measured
 here).
 
+**Ternary (T2G128) prefill on the same route.** A ternary checkpoint's linears (Ternary Bonsai,
+`T2_G128_FP16`) registered the integer policy too, so on sm_70 every T2 prefill GEMM ran
+`t2_prefill_i8` / the small-T s8 kernel on the emulated m16n8k32 `mma`, and the rotated FFN's
+gate_up (plain `ops::linear`) the same. `detail::cublas_prefill_admits_t2()` admits T2 to the FP16
+route: `dequantise_t2_row_to_fp16` writes code x group scale (+-scale or 0, exact in binary16), and
+`linear`, `linear_add`, `linear_swiglu` (+ plane), the attention pair and the GDN two-parent
+projection take it from `cublas_prefill_min_tokens(policy)` up (129, or 65 under the prefill-phase
+narrow policy with a fit check). The vocabulary heads stay off it (rows > 34,816: their FP16 copy
+alone would be 2.5 GB, and prefill reads them for one token). `NINFER_SM70_T2_PREFILL_CUBLAS=0`
+keeps the old kernels (same-binary A/B). Ternary Bonsai 2.5 27B (Hadamard-rotated Qwen3.8-27B,
+6.70 GiB of weights) on a CMP 100-210 (V100 silicon, 68 SMs, 120 W cap), `ninfer-serve
+--fit-context 1024 --kv-dtype int8 --max-concurrency 2`, cold prompts: 2K 216 -> 626, 8K 213 -> 576,
+36.5K 500 tok/s (chunk 1024; 2048 / 4096: 8K 613 / 632, 36.5K 498 / 508). Prefill-scored
+perplexity (35,598 tokens, ctx 2048 / stride 1024, INT8 KV) 8.542602 -> 8.545279 (+0.031%); greedy
+output identical on one of five prompts and diverging at near-ties on the others. The Bonsai
+shapes' `cublasGemmEx` runs at 58-69 TFLOPS on that card (85-90% of its measured 74 TFLOPS HMMA
+peak), so the rest of prefill is now the non-GEMM work.
+
 **Chunk size and the narrow tail.** `--prefill-chunk` past the default 1,024 is worth 1-4% here
 (Qwen3.8-27B, 2k and 4k prompts, chunks 1,024 / 2,048 / 4,096: 796-802 and 748-774 tok/s). What
 cost far more was a narrow segment: the route admits a call from `kCublasPrefillMinTokens` (129,

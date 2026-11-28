@@ -125,6 +125,12 @@ inline constexpr std::size_t kCublasTileBudgetBytes = 256u << 20;
 // and the tensor or row multiplier is the epilogue's FP32 row scale. There their own prefill
 // kernels run Ampere mma.sync under emulation.
 [[nodiscard]] bool cublas_prefill_admits_fp() noexcept;
+// Whether the route takes T2_G128_FP16 (ternary) weights: on the FP16 route (sm_70) only, where a
+// code in {-1, 0, +1} times its binary16 group scale is exact in FP16, so the weight half is
+// lossless and only the activations' FP16 carry (exact for BF16 under the power-of-two token scale)
+// differs from the A16 kernels. There the T2 prefill kernels run Ampere mma.sync under emulation.
+// NINFER_SM70_T2_PREFILL_CUBLAS=0 turns it off.
+[[nodiscard]] bool cublas_prefill_admits_t2() noexcept;
 
 [[nodiscard]] std::size_t w4_cublas_prefill_workspace_capacity_bytes(std::int32_t rows,
                                                                     std::int32_t cols,

@@ -416,6 +416,28 @@ loss. On this card `int8` stays the right choice (it fits 262K at two lanes with
 prefills fastest); the mixes are for when KV bytes are short. See
 [the README](../README.md#per-layer-mixes---kv-dtype-rk4v4x12int8x4-opt-in).
 
+### Ternary Bonsai 2.5 27B
+
+Measured on an NVIDIA CMP 100-210 (V100 silicon: 68 SMs, 16 GB HBM2, 120 W power cap, 1,380 MHz
+max SM clock), not on the Tesla V100-PCIE-32GB the other sections use; driver 580.178.04, CUDA
+12.8. Model: Ternary Bonsai 2.5 27B (Hadamard-rotated Qwen3.8-27B, `T2_G128_FP16`, 6.70 GiB of
+weights), `ninfer-serve <model> --max-context 131072 --fit-context 1024 --kv-dtype int8
+--max-concurrency 2`, OpenAI streaming requests, cold prompts (unique prefix), prompt from the
+repository's documentation, 128 output tokens, one run each. Throttle reasons were not sampled
+during these runs.
+
+| | before (emulated `mma`) | after |
+|---|---:|---:|
+| Prefill, 2K-token prompt | 216 tok/s | **626 tok/s** |
+| Prefill, 8K | 213 tok/s | **576 tok/s** (613 at `--prefill-chunk 2048`, 632 at 4096) |
+| Prefill, 36.5K | | **500 tok/s** |
+
+The capacity line is unchanged (`KV 131,072 tokens, int8, explicit | pages 2,048/4,096 | runtime
+5.64 GiB | free 3.15 GiB`). `NINFER_SM70_T2_PREFILL_CUBLAS=0` restores the previous route (same binary);
+design and quality in [the Volta port notes](maintainer/volta-port.md). The "after" column was
+measured with the small-T decode change (`perf(sm70): ternary small-T decode on dp4a`) also in the
+binary; it does not take prefill calls of 129+ tokens.
+
 ### Qwen3.8-27B, NVIDIA's NVFP4 QAD checkpoint
 
 [nvidia/Qwen3.8-27B-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD) is NVIDIA's
