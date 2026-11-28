@@ -219,7 +219,8 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--draft-min-p P` | Inkling-2 `--spec dspark`: a round's drafts stop before the first whose drafter probability is under P, in [0,1); `0` keeps every draft. Only speed changes, never the output | `0.5` |
 | `--dspark-adaptive on\|off` | Inkling-2 `--spec dspark`: each round drafts 1 to `--draft-tokens`, the count recent acceptance and measured round costs favour; `off` drafts `--draft-tokens` every round. Only speed changes | `on` |
 | `--dspark-window auto\|N` | Inkling-2 `--spec dspark` only (refused otherwise, `auto` included): the drafter's global layer attends over the last N context positions (`0`: the whole context; else at least the drafter's sliding window). Only the drafts change, never the output. `auto` keeps the whole context when it fits beside `--max-context` and falls back to 32768, then 16384 | `auto` |
-| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
+| `--draft-model DIR` | Inkling-2 `--spec dflash2` only (refused otherwise): drafts with Inco's DFlash2 drafter read from its Hugging Face release directory (`config.json` and `model.safetensors` of `incoai/Inkling-2-Mini-DFlash2`) in DSpark's place. It takes DSpark's round options and defaults, `--draft-tokens` 1 to 7; only the speed changes, never the output. See [Speculative decoding](#speculative-decoding) | unset |
+| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 (Inkling-2 `--spec dflash2 --draft-model`: `1..7`) | unset |
 | `--lm-head-draft` | optimized proposal head; implied by `--spec`, accepted for compatibility | on with `--spec` |
 | `--ngram-draft-tokens 0\|15` | n-gram copy drafting beside `--spec dflash2`: when the text being written already appeared in the request (the prompt, a tool result -- including `cat -n` numbered ones -- or the output so far), a round verifies up to 15 copied tokens instead of the draft model's proposal; verification licenses every token, so a wrong copy costs speed, never output. Copies run at one or two lanes in a round; see [Speculative decoding](#n-gram-copy-drafting) | `0` (off) |
 | `--adaptive-draft-tokens 0\|3` | adaptive draft window beside `--spec dflash2` with `--draft-tokens` above 3: a second, narrower neural round (3 drafts) is captured next to the configured one and a round runs it when the requests' recent acceptance is low, since a captured graph costs the same however few drafts are live and only its captured width matters; it costs one more set of CUDA Graphs (startup refuses when they do not fit; it is not available at the concurrency where DFlash2 itself does not fit) and the target still verifies every token. Experimental: measured on an RTX 3090 at +2.9% on a low-acceptance prompt and no worse than -0.5% elsewhere, short of the +5% aimed for, and it can change greedy output; see [Adaptive draft window](#adaptive-draft-window) | `0` (off) |
@@ -325,7 +326,14 @@ round costs, and `--draft-min-p 0.5` (the default; `0` turns it off) drops the d
 one the drafter gives under that probability on. A round runs only while its measured cost beats the
 plain steps it replaces; otherwise the request decodes plainly and probes again after 8 to 64 steps.
 Relaxed drafting, `--draft-context-rows`, `--ngram-draft-tokens` and `--adaptive-draft-tokens` are
-refused. With `--max-concurrency` above 1 requests decode without DSpark. `ninfer-serve --speed fast` (lossy, opt-in,
+refused. With `--max-concurrency` above 1 requests decode without DSpark.
+
+`--spec dflash2 --draft-model DIR` drafts with Inco's DFlash2 drafter for Inkling-2-Mini instead
+(`incoai/Inkling-2-Mini-DFlash2`; `DIR` is the downloaded release, its `config.json` and `model.safetensors`, read
+as-is). Rounds, verification and every option above work as with DSpark, so the output is again the plain decode's.
+It accepts more drafts a round than DSpark (3.4 against 2.4 of 7 over 12 chat requests in a reference run) and is
+the faster drafter on chat and prose; see [the Inkling-2 notes](maintainer/inkling2-model.md#dflash2-drafter).
+`ninfer-serve --speed fast` (lossy, opt-in,
 server only) trades exactness for more speed on top of these defaults; see [serving.md](serving.md). Measured on a Tesla V100 (master
 `dad1623b`, 2026-11-22): up to 120.7 tok/s on a maths prompt; over 12 chat requests of 300 tokens (ABBA), 93.4-94.4
 tok/s greedy against 78.5-78.8 plain, and 83.4-83.5 against 74.9 plain sampled at temperature 0.8 (the same tokens).

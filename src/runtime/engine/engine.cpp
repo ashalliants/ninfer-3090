@@ -285,8 +285,13 @@ EngineOptions refuse_inkling2_cache_tiers(EngineOptions options) {
 // a CausalScoring Engine's speculative options: those values would otherwise vanish without a refusal there too.
 EngineOptions refuse_off_route_dspark_options(EngineOptions options) {
     const auto& spec = options.speculative;
+    // A DFlash2 release directory serves Inkling-2 generation only (scoring would clear it below).
+    if (!spec.draft_model.empty() && !(options.purpose == EnginePurpose::Generation && spec.backend == SpeculativeBackend::DFlash2 &&
+                                       runtime::artifact_is_inkling2(options.artifact_path))) {
+        throw std::invalid_argument("--draft-model applies to Inkling-2 generation with --spec dflash2 only");
+    }
     if (!spec.dspark_window_explicit && spec.draft_min_p == 0.0F && !spec.dspark_adaptive) { return options; }
-    const bool on_route = options.purpose == EnginePurpose::Generation && spec.backend == SpeculativeBackend::DSpark &&
+    const bool on_route = options.purpose == EnginePurpose::Generation && is_block_drafter(spec) &&
                           runtime::artifact_is_inkling2(options.artifact_path);
     if (!on_route && spec.dspark_window_explicit) {
         throw std::invalid_argument("--dspark-window applies to Inkling-2 generation with --spec dspark only");
@@ -332,6 +337,9 @@ public:
         }
         if (options.experts_mxfp8 != ExpertsMxfp8::Auto && !runtime::artifact_is_inkling2(options.artifact_path)) {
             throw std::invalid_argument("--mxfp8-experts selects how Inkling-2 holds its BF16 experts; this model has its own weight options");
+        }
+        if (!options.speculative.draft_model.empty() && !runtime::artifact_is_inkling2(options.artifact_path)) {
+            throw std::invalid_argument("--draft-model is Inkling-2's DFlash2 drafter; this model's DFlash2 drafter is in its artifact");
         }
         if (!options.split_attention && !runtime::artifact_is_inkling2(options.artifact_path)) {
             throw std::invalid_argument("--no-split-attention selects Inkling-2's attention kernel; this model has its own");
@@ -752,13 +760,18 @@ private:
         options.context_cache.host_capacity_bytes = 0;
         // max_concurrency requests run at once (1: one at a time, the drafter's; more: batched decode, each in its
         // own slot of the text Program); the rest wait in the max_pending_requests queue.
-        if (options.speculative.backend != SpeculativeBackend::None && options.speculative.backend != SpeculativeBackend::DSpark) {
-            throw std::invalid_argument("Inkling-2 speculates with its DSpark drafter only (--spec dspark)");
+        // A release directory is read only by --spec dflash2: with any other backend it would be silently unused.
+        if (!options.speculative.draft_model.empty() && options.speculative.backend != SpeculativeBackend::DFlash2) {
+            throw std::invalid_argument("--draft-model names a DFlash2 release: use it with --spec dflash2");
+        }
+        if (options.speculative.backend != SpeculativeBackend::None && !is_block_drafter(options.speculative)) {
+            throw std::invalid_argument("Inkling-2 speculates with its DSpark drafter (--spec dspark) or a DFlash2 release "
+                                        "(--spec dflash2 --draft-model DIR)");
         }
         // The CLI's range, checked before the load (the core also bounds it by the artifact's block).
-        if (options.speculative.backend == SpeculativeBackend::DSpark &&
+        if (is_block_drafter(options.speculative) &&
             (options.speculative.draft_tokens < 1 || options.speculative.draft_tokens > 7)) {
-            throw std::invalid_argument("--spec dspark takes --draft-tokens 1 to 7");
+            throw std::invalid_argument("--spec dspark and --spec dflash2 --draft-model take --draft-tokens 1 to 7");
         }
         // Plain decode takes no draft count, draft floor or adaptive width.
         if (options.speculative.backend == SpeculativeBackend::None &&
@@ -775,7 +788,7 @@ private:
         const auto& spec = options.speculative;
         if (options.relaxed_drafting || options.draft_context_rows != 0 || spec.ngram_draft_tokens != 0 ||
             spec.adaptive_draft_tokens != 0 || spec.ngram_min_match != defaults.ngram_min_match ||
-            (spec.backend != SpeculativeBackend::DSpark && spec.proposal_head != defaults.proposal_head)) {
+            (!is_block_drafter(spec) && spec.proposal_head != defaults.proposal_head)) {
             throw std::invalid_argument("Inkling-2 takes no relaxed drafting, draft-context rows, n-gram or adaptive "
                                         "draft windows, n-gram match lengths or proposal heads");
         }

@@ -17,6 +17,22 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Inkling-2-Mini DFlash2 drafter (2026-11-28)
+
+`--spec dflash2 --draft-model DIR` drafts with Inco's DFlash2 drafter (`incoai/Inkling-2-Mini-DFlash2`, read from its
+release directory) in DSpark's place, with the same rounds and options. It accepts more drafts a round (3.4 against
+2.4 of 7 in a reference run). Same output as plain decode (same md5 on every set). 200 W, untraced, the same build
+(MXFP8 experts):
+
+| Configuration | DSpark | DFlash2 |
+|---|---|---|
+| 12 chats, 262,144 context, vision, INT8 KV | 112.5 | **129.0** |
+| 12 chats, 8,192 | 111.8 | **130.6** |
+| Lapilli's conv / prose / struct prompts | 94.4 / 76.0 / 172.7 | **106.0** / **92.6** / **172.7** |
+| `--speed fast` (lossy): 12 chats | 125.8 (before MXFP8 experts) | **140.5** |
+
+RTX 3090: NOT RUN. Details in the [maintainer spec](maintainer/inkling2-model.md#dflash2-drafter).
+
 ## Tesla V100 (`sm_70`): Inkling-2-Mini MXFP8 experts and per-entry NVFP4 verify (2026-11-28)
 
 V100 builds now hold layers 20-23's experts as MXFP8 by default (`--mxfp8-experts auto`; they are the checkpoint's

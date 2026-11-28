@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -873,7 +874,172 @@ void test_candidate_edges() {
     std::printf("candidate edges: %s\n", ok ? "ok" : "differs");
 }
 
+// DFlash2's convolution: both sides, accumulate on and off, a strided input, against FP64.
+void test_dflash2_conv(int h, int w, int group) {
+    const std::string label = "dflash2 conv H " + std::to_string(h) + " W " + std::to_string(w);
+    const int g = h / group, stride = h + 32;
+    const auto x = randoms(static_cast<std::size_t>(stride) * w), base = randoms(static_cast<std::size_t>(h) * 4, -1.5F, 1.5F);
+    const auto delta = randoms(static_cast<std::size_t>(4) * g * w, -0.5F, 0.5F), start = randoms(static_cast<std::size_t>(h) * w);
+    Buf dx(x), db(base), dd(delta);
+    Tensor tx(dx.b.p, DType::FP32, {h, w});
+    tx.nb[1] = static_cast<std::size_t>(stride) * 4;
+    tx.nb[2] = tx.nb[3] = tx.nb[1] * w;
+    for (int side = 0; side < 2; ++side) {
+        for (const bool accumulate : {false, true}) {
+            Buf dout(start);
+            Tensor to = dout.tensor({h, w});
+            ninfer::ops::dflash2_conv_fp32(tx, db.tensor({h, 4}), dd.tensor({4 * g, w}), group, side, to, accumulate, nullptr);
+            Vec want(static_cast<std::size_t>(h) * w);
+            for (int t = 0; t < w; ++t) {
+                for (int i = 0; i < h; ++i) {
+                    const int gi = i / group;
+                    double v = (double(base[(2 * side) * h + i]) + delta[std::size_t(t) * 4 * g + 2 * side * g + gi]) * x[std::size_t(t) * stride + i];
+                    if (t > 0) {
+                        v += (double(base[(2 * side + 1) * h + i]) + delta[std::size_t(t) * 4 * g + (2 * side + 1) * g + gi]) *
+                             x[std::size_t(t - 1) * stride + i];
+                    }
+                    want[std::size_t(t) * h + i] = (accumulate ? double(start[std::size_t(t) * h + i]) : 0.0) + v;
+                }
+            }
+            compare(label + " side " + std::to_string(side) + (accumulate ? " +=" : ""), dout.get(want.size()), want, 2e-6);
+        }
+    }
+}
+
+std::uint16_t bf16_of(float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return static_cast<std::uint16_t>((u + 0x7FFFU + ((u >> 16) & 1U)) >> 16);
+}
+double bf16_value(std::uint16_t w) {
+    const std::uint32_t u = std::uint32_t(w) << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+// DFlash2's exact top 16 (through the 16-a-tile candidates) and the selector path, against FP64, with a NaN and ties.
+void test_dflash2_select(int v, int valid, int n, bool with_probs, const ninfer::ops::DraftPick& pick = {}) {
+    using ninfer::ops::kCandidateTile;
+    using ninfer::ops::kDFlash2Rank;
+    using ninfer::ops::kDFlash2TopK;
+    const bool sampled = pick.temperature > 0.0F;
+    const std::string label = "dflash2 select V " + std::to_string(v) + " n " + std::to_string(n) + (sampled ? " sampled" : "");
+    const int r = kDFlash2Rank, k = kDFlash2TopK;
+    auto logits = randoms(static_cast<std::size_t>(v) * n, -8, 8);
+    logits[5] = std::numeric_limits<float>::quiet_NaN();
+    logits[17] = logits[19] = 9.5F; // a tie inside the top 16 of column 0: the lower id first
+    const auto gv = randoms(static_cast<std::size_t>(r) * n, -1, 1);
+    std::vector<std::uint16_t> pred(static_cast<std::size_t>(v) * r), succ(pred.size());
+    for (auto& x : pred) { x = bf16_of(uniform(-0.3F, 0.3F)); }
+    for (auto& x : succ) { x = bf16_of(uniform(-0.3F, 0.3F)); }
+    const auto upload = [](const std::vector<std::uint16_t>& h) {
+        ninfer::DeviceBuffer b(h.size() * 2);
+        if (cudaMemcpy(b.p, h.data(), h.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) { throw std::runtime_error("copy"); }
+        return b;
+    };
+    Buf dl(logits), dg(gv);
+    ninfer::DeviceBuffer dp = upload(pred), ds = upload(succ);
+    const int tiles = (valid + kCandidateTile - 1) / kCandidateTile, count = tiles * 16;
+    ninfer::DeviceBuffer cand(std::size_t(count) * n * 4), ids(std::size_t(k) * n * 4), sc(std::size_t(k) * n * 4), tokens(std::size_t(n + 1) * 4),
+        probs(std::size_t(n) * 4);
+    Tensor tl = dl.tensor({v, n}), tc(cand.p, DType::I32, {count, n}), ti(ids.p, DType::I32, {k, n}), ts(sc.p, DType::FP32, {k, n});
+    ninfer::ops::tile_top_candidates(tl, nullptr, valid, 16, tc, nullptr);
+    ninfer::ops::dflash2_top_candidates(tc, tl, ti, ts, nullptr);
+    const std::int32_t anchor = 3;
+    if (cudaMemcpy(tokens.p, &anchor, 4, cudaMemcpyHostToDevice) != cudaSuccess) { throw std::runtime_error("copy"); }
+    std::vector<double> uniforms(static_cast<std::size_t>(n));
+    for (auto& x : uniforms) { x = (uniform(0.0F, 1.0F) + 1.0) / 2.0 * 0.999; }
+    ninfer::DeviceBuffer du(uniforms.size() * 8);
+    if (cudaMemcpy(du.p, uniforms.data(), uniforms.size() * 8, cudaMemcpyHostToDevice) != cudaSuccess) { throw std::runtime_error("copy"); }
+    ninfer::ops::dflash2_select(ti, ts, dg.tensor({r, n}), Tensor(dp.p, DType::BF16, {r, v}), Tensor(ds.p, DType::BF16, {r, v}), 30.0F, pick,
+                                sampled ? static_cast<const double*>(du.p) : nullptr, static_cast<std::int32_t*>(tokens.p), with_probs ? static_cast<float*>(probs.p) : nullptr, nullptr);
+    std::vector<std::int32_t> hids(std::size_t(k) * n), htok(std::size_t(n + 1));
+    std::vector<float> hprob(static_cast<std::size_t>(n));
+    ids.copy_to_host(hids.data(), hids.size() * 4);
+    tokens.copy_to_host(htok.data(), htok.size() * 4);
+    if (with_probs) { probs.copy_to_host(hprob.data(), hprob.size() * 4); }
+    int prev = anchor;
+    for (int t = 0; t < n; ++t) {
+        std::vector<std::pair<float, int>> all;
+        for (int i = 0; i < valid; ++i) {
+            const float x = logits[std::size_t(t) * v + i];
+            if (!std::isnan(x)) { all.push_back({x, i}); }
+        }
+        std::partial_sort(all.begin(), all.begin() + k, all.end(), [](auto a, auto b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+        bool top_ok = true;
+        for (int c = 0; c < k; ++c) { top_ok = top_ok && hids[std::size_t(t) * k + c] == all[c].second; }
+        check(top_ok, label + ": column " + std::to_string(t) + "'s top 16");
+        std::vector<double> e(k);
+        int best = 0;
+        for (int c = 0; c < k; ++c) {
+            double dot = 0;
+            for (int q = 0; q < r; ++q) {
+                dot += bf16_value(pred[std::size_t(prev) * r + q]) * gv[std::size_t(t) * r + q] * bf16_value(succ[std::size_t(all[c].second) * r + q]);
+            }
+            e[c] = 30.0 * std::tanh((all[c].first + dot) / 30.0);
+            if (e[c] > e[best]) { best = c; }
+        }
+        const int got = htok[std::size_t(t) + 1];
+        if (sampled) { // the host sampler's draw over the 16 sorted by e (then id), in FP64
+            std::vector<int> order(k);
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](int a, int b) {
+                return e[a] != e[b] ? e[a] > e[b] : all[a].second < all[b].second;
+            });
+            const int kk = std::min(std::max(pick.top_k, 1), k);
+            const double top = e[order[0]];
+            double sum = 0;
+            for (int c = 0; c < kk; ++c) { sum += std::exp((e[order[c]] - top) / pick.temperature); }
+            const auto w = [&](int c) { return std::exp((e[order[c]] - top) / pick.temperature) / sum; };
+            int keep = kk;
+            while (pick.min_p > 0 && keep > 1 && w(keep - 1) < pick.min_p * w(0)) { --keep; }
+            if (pick.top_p < 1.0F) {
+                double mass = 0;
+                for (int c = 0; c < keep; ++c) {
+                    if ((mass += w(c)) >= pick.top_p) {
+                        keep = c + 1;
+                        break;
+                    }
+                }
+            }
+            double total = 0;
+            for (int c = 0; c < keep; ++c) { total += w(c); }
+            double u   = uniforms[t] * total;
+            int chosen = keep - 1;
+            for (int c = 0; c < keep; ++c) {
+                if ((u -= w(c)) < 0) {
+                    chosen = c;
+                    break;
+                }
+            }
+            check(got == all[order[chosen]].second, label + ": sampled draft " + std::to_string(t));
+            if (with_probs) { check(std::abs(hprob[t] - w(chosen) / total) <= 1e-4, label + ": sampled probability " + std::to_string(t)); }
+            prev = got;
+            continue;
+        }
+        // A near tie may pick either; the token must then score within FP32 rounding of the best.
+        int got_rank = -1;
+        for (int c = 0; c < k; ++c) {
+            if (all[c].second == got) { got_rank = c; }
+        }
+        check(got_rank >= 0 && e[best] - e[got_rank] <= 1e-4 * (1 + std::abs(e[best])), label + ": draft " + std::to_string(t));
+        if (with_probs) {
+            double sum = 0;
+            for (int c = 0; c < k; ++c) { sum += std::exp(e[c] - e[best]); }
+            check(std::abs(hprob[t] - 1.0 / sum) <= 1e-4, label + ": probability " + std::to_string(t));
+        }
+        prev = got;
+    }
+}
+
 int main() {
+    test_dflash2_conv(2304, 8, 16);
+    test_dflash2_conv(64, 3, 16);
+    test_dflash2_select(201088, 201024, 7, true);
+    test_dflash2_select(5000, 4999, 3, false);
+    test_dflash2_select(201088, 201024, 7, true, {.temperature = 0.8F, .top_k = 10, .top_p = 0.9F, .min_p = 0.02F});
+    test_dflash2_select(5000, 4999, 5, true, {.temperature = 1.5F, .top_k = 40, .top_p = 1.0F, .min_p = 0.0F});
     try {
         test_projection(true, 3072, 2304, 8, false, 1e-7);
         test_projection(true, 2304, 9216, 8, false, 1e-7);

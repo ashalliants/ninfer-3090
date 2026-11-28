@@ -9,7 +9,8 @@
 // - relaxed drafting, which DSpark does not implement, and draft counts outside 1..7 are refused;
 // - --draft-min-p and --dspark-adaptive yield plain greedy's tokens too;
 // - reported, not judged: rounds, drafts accepted, plain fallback steps, and decode tok/s of both Engines.
-// Skips without NINFER_TEST_INKLING2_ARTIFACT. NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default 3, the serving default);
+// Skips without NINFER_TEST_INKLING2_ARTIFACT. NINFER_TEST_INKLING2_DFLASH2 (the DFlash2 release directory) runs every
+// check with --spec dflash2 --draft-model in DSpark's place. NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default 3, the serving default);
 // NINFER_INKLING2_SPEC_TOKENS: output tokens per prompt (default 256).
 
 #include "ninfer/engine.h"
@@ -17,9 +18,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -60,6 +64,16 @@ const std::vector<std::string> kPrompts = {
     "Explain what this C code prints and why:\n\n#include <stdio.h>\nint main(void) {\n    int a[5] = {1, 2, 3, 4, 5};\n"
     "    int s = 0;\n    for (int i = 0; i < 5; ++i) s += a[i] * a[i];\n    printf(\"%d\\n\", s);\n    return 0;\n}",
 };
+
+// The drafter under test: DSpark, or DFlash2 from NINFER_TEST_INKLING2_DFLASH2.
+void set_drafter(ninfer::SpeculativeOptions& spec) {
+    if (const char* dir = std::getenv("NINFER_TEST_INKLING2_DFLASH2"); dir != nullptr && *dir != '\0') {
+        spec.backend     = ninfer::SpeculativeBackend::DFlash2;
+        spec.draft_model = dir;
+    } else {
+        spec.backend = ninfer::SpeculativeBackend::DSpark;
+    }
+}
 
 struct Run {
     std::vector<std::vector<ninfer::TokenId>> tokens;
@@ -136,10 +150,53 @@ int main() {
             stop.stop.strings.push_back({.text = "def ", .channel = ninfer::OutputChannel::Content});
             plain_stop = engine.generate(engine.prepare(user_turn(kPrompts[0])), stop).generated_token_ids;
         }
-        options.speculative.backend      = ninfer::SpeculativeBackend::DSpark;
+        set_drafter(options.speculative);
         options.speculative.draft_tokens = drafts;
         // As ninfer serve normalizes it (an LM-head proposal for every backend), which DSpark has no use for.
         ninfer::product::apply_speculative_defaults(options.speculative);
+        {
+            // A release directory with the artifact's DSpark would be silently unused: refused.
+            auto stray                          = options;
+            stray.speculative.backend           = ninfer::SpeculativeBackend::DSpark;
+            stray.speculative.draft_model       = "some-dflash2-release";
+            bool stray_refused                  = false;
+            try {
+                ninfer::Engine stray_engine(stray);
+            } catch (const std::invalid_argument& e) { stray_refused = std::string(e.what()).find("--spec dflash2") != std::string::npos; }
+            check(stray_refused, "--draft-model with --spec dspark is refused");
+            // A scoring Engine clears its speculative options: a release directory there is refused, not dropped.
+            auto scoring                    = options;
+            scoring.purpose                 = ninfer::EnginePurpose::CausalScoring;
+            scoring.speculative.backend     = ninfer::SpeculativeBackend::DFlash2;
+            scoring.speculative.draft_model = "some-dflash2-release";
+            bool scoring_refused            = false;
+            try {
+                ninfer::Engine scoring_engine(scoring);
+            } catch (const std::invalid_argument& e) { scoring_refused = std::string(e.what()).find("--draft-model") != std::string::npos; }
+            check(scoring_refused, "--draft-model on a scoring Engine is refused");
+        }
+        if (const char* dir = std::getenv("NINFER_TEST_INKLING2_DFLASH2"); dir != nullptr && *dir != '\0') {
+            // A release whose taps do not end in the final state (here [5, 23, 41]) is refused at load.
+            namespace fs          = std::filesystem;
+            const fs::path broken = fs::temp_directory_path() / "ninfer-dflash2-taps-test";
+            fs::remove_all(broken);
+            fs::create_directories(broken);
+            std::ifstream in(fs::path(dir) / "config.json");
+            std::string config((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            const std::string cut = std::regex_replace(config, std::regex(R"(,\s*48\s*\])"), "]");
+            check(cut != config, "the release config lists tap 48 last");
+            config = cut;
+            std::ofstream(broken / "config.json") << config;
+            fs::create_symlink(fs::absolute(fs::path(dir) / "model.safetensors"), broken / "model.safetensors");
+            auto taps                    = options;
+            taps.speculative.draft_model = broken.string();
+            bool taps_refused            = false;
+            try {
+                ninfer::Engine taps_engine(taps);
+            } catch (const std::invalid_argument& e) { taps_refused = std::string(e.what()).find("final state") != std::string::npos; }
+            fs::remove_all(broken);
+            check(taps_refused, "a DFlash2 release whose taps miss the final state is refused");
+        }
         {
             auto relaxed             = options;
             relaxed.relaxed_drafting = 0.5F;
@@ -309,7 +366,7 @@ int main() {
         const auto s1 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
         const auto s2 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
         check(s1.speculative.rounds > 0 && s1.generated_token_ids == s2.generated_token_ids, "a sampled request speculates and repeats");
-        check(s1.speculative.backend == ninfer::SpeculativeBackend::DSpark && s1.speculative.draft_window == drafts,
+        check(s1.speculative.backend == options.speculative.backend && s1.speculative.draft_window == drafts,
               "a sampled request reports the configured backend");
         // A sampled request's output is the plain Engine's under the same seed, and a greedy request after it drafts
         // and yields plain greedy's tokens.
@@ -330,7 +387,7 @@ int main() {
         ninfer::EngineOptions options;
         options.artifact_path               = artifact_path;
         options.max_context                 = 4096;
-        options.speculative.backend         = ninfer::SpeculativeBackend::DSpark;
+        set_drafter(options.speculative);
         options.speculative.draft_tokens    = 5;
         options.speculative.draft_min_p     = 0.5F;
         options.speculative.dspark_adaptive = true;
@@ -365,7 +422,7 @@ int main() {
         q8_plain.dense_q8      = ninfer::DenseQ8::Head;
         q8_plain.prefill_chunk_auto = true;
         auto q8_spec           = q8_plain;
-        q8_spec.speculative.backend      = ninfer::SpeculativeBackend::DSpark;
+        set_drafter(q8_spec.speculative);
         q8_spec.speculative.draft_tokens = drafts;
         ninfer::product::apply_speculative_defaults(q8_spec.speculative);
         Run want;

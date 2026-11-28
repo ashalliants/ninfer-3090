@@ -298,4 +298,43 @@ void dspark_candidate_pick(const Tensor& base, const Tensor& hb, const std::int8
                            const Tensor& latent, const std::int32_t* cand, std::int32_t count, float cap, float* scores,
                            std::uint64_t* work, std::int32_t* out, float* prob, cudaStream_t stream);
 
+
+/**
+ * tile_top_candidates: dspark_tile_candidates with `per_tile` (8 or 16) ids a tile and hb optional (null: base alone):
+ * cand int32 [tiles * per_tile, n]. The union of the tiles' top k holds the column's top k exactly.
+ */
+void tile_top_candidates(const Tensor& base, const Tensor* hb, std::int32_t valid, std::int32_t per_tile, Tensor& cand, cudaStream_t stream);
+
+/**
+ * DFlash2 (docs/maintainer/inkling2-model.md, "DFlash2 drafter"): the two-tap dynamic convolution and the candidate
+ * selector. Lossy forms are the caller's (the drafts only); these Ops are FP32 with FP64 oracles.
+ *
+ * dflash2_conv_fp32: for side s (0: the input side, 1: the output side), x FP32 [H, W] (columns strided),
+ *   y[h, t] = (base[s][0][h] + delta[(2s) G + g, t]) x[h, t] + I(t > 0) (base[s][1][h] + delta[(2s + 1) G + g, t]) x[h, t - 1]
+ * with g = h / group, G = H / group; out = y, or out += y with `accumulate`. base FP32 [H, 4] contiguous (column 2s + k:
+ * the release's [side][tap][H]); delta FP32 [4 G, W] contiguous (the kernel projection of the normed input). Column 0 has
+ * no previous tap: the block's first position. out must not alias x.
+ *
+ * dflash2_top_candidates: for each column t, the kDFlash2TopK ids of cand[:, t] (count <= 2048, from
+ * tile_top_candidates with per_tile 16) with the largest logits[id, t], in descending order (lowest id among equals;
+ * NaN never chosen): ids I32 and scores FP32 [16, n] (scores = their logits). Fewer distinct finite candidates repeat
+ * the last one.
+ *
+ * dflash2_select: the selector path. tokens[0] (device) is the anchor; for i < n, with prev = tokens[i]:
+ *   e[c] = cap tanh((scores[c, i] + sum_r pred[r, prev] g[r, i] succ[r, ids[c, i]]) / cap)
+ *   tokens[i + 1] = ids[argmax_c e, i]   (the lowest rank c among equals)
+ * pred, succ BF16 [256, V] (the release's [V][256]) contiguous and 16-byte aligned; g FP32 [256, n]. probs (device,
+ * n floats; may be null): the winner's softmax probability over the column's distinct candidates' e (the vocabulary
+ * past the 16 left out, so a little high), for --draft-min-p.
+ * A sampled pick (pick.temperature > 0; canonical FP64 [n] device, one uniform per draft) draws each draft as
+ * dspark_draft_pick does, over the column's distinct candidates sorted by e descending (id ascending) in place of the
+ * vocabulary, and probs gets the draw's weight over the kept mass.
+ */
+inline constexpr std::int32_t kDFlash2TopK = 16, kDFlash2Rank = 256;
+void dflash2_conv_fp32(const Tensor& x, const Tensor& base, const Tensor& delta, std::int32_t group, std::int32_t side, Tensor& out,
+                       bool accumulate, cudaStream_t stream);
+void dflash2_top_candidates(const Tensor& cand, const Tensor& logits, Tensor& ids, Tensor& scores, cudaStream_t stream);
+void dflash2_select(const Tensor& ids, const Tensor& scores, const Tensor& g, const Tensor& predecessor, const Tensor& successor, float cap,
+                    const DraftPick& pick, const double* canonical, std::int32_t* tokens, float* probs, cudaStream_t stream);
+
 } // namespace ninfer::ops

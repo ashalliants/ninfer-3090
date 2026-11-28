@@ -154,6 +154,9 @@ different from the Qwen3.5 models:
   sampled at temperature 0.8 against 74.9 plain (the same tokens). The defaults beat a fixed 3 drafts by 8.4%
   (88.8 against 81.9 tok/s, 2026-11-21) ([measurements](maintainer/inkling2-model.md#draft-floor-and-adaptive-width)).
   With `--max-concurrency` above 1 requests decode without DSpark.
+- **DFlash2 drafter** (Inkling-2, `--spec dflash2 --draft-model DIR`): Inco's DFlash2 drafter, read from its
+  Hugging Face release directory (`incoai/Inkling-2-Mini-DFlash2`), drafts in DSpark's place with the same options
+  and defaults; output unchanged token for token. See [cli.md](cli.md#speculative-decoding).
 - **Speed fast** (Inkling-2, `--speed fast`; **lossy**, opt-in, one request at a time): sets `--spec dspark`,
   `--draft-tokens 7` and `--dense-q8 head` unless given, keeps a greedy round's draft the target gives at least a
   tenth of its top token's probability, and extends a round with text copied from earlier in the request (copied

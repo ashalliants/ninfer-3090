@@ -262,7 +262,17 @@ struct SpeculativeOptions {
     // the sequence's last N tokens (prompt or output), the round also verifies the rest of that copy, up to 7 drafts
     // (0: off). Only speed changes, never the output.
     std::uint32_t dspark_lookup_match = 0;
+    // Inkling-2 with --spec dflash2 (--draft-model DIR): the DFlash2 drafter's release directory (config.json and
+    // model.safetensors, incoai/Inkling-2-Mini-DFlash2), drafting in DSpark's place with the same round options
+    // (--draft-tokens 1..7, --draft-min-p, --dspark-adaptive, --speed fast). Empty: no such drafter.
+    std::string draft_model;
 };
+
+// Inkling-2's block drafters, which share the DSpark round options: DSpark (the artifact's component), or DFlash2 from
+// its release directory (draft_model).
+[[nodiscard]] inline bool is_block_drafter(const SpeculativeOptions& s) noexcept {
+    return s.backend == SpeculativeBackend::DSpark || (s.backend == SpeculativeBackend::DFlash2 && !s.draft_model.empty());
+}
 
 enum class StartupPhase : std::uint8_t {
     EngineStartup,

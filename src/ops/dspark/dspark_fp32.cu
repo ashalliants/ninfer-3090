@@ -981,7 +981,8 @@ __device__ __forceinline__ std::uint64_t warp_max_u64(std::uint64_t k) {
     return k;
 }
 
-// grid (tiles, n), 256 threads, 8 rows a thread: kCandidatesPerTile rounds of a block max, each removing its winner.
+// grid (tiles, n), 256 threads, 8 rows a thread: kPerTile rounds of a block max, each removing its winner (hb may be null).
+template <int kPerTile>
 __global__ void __launch_bounds__(256) tile_candidates_kernel(const float* __restrict__ base, const float* __restrict__ hb, int v_rows,
                                                                int valid, int* __restrict__ cand, int count) {
     constexpr int kPer = kCandidateTile / 256;
@@ -992,9 +993,9 @@ __global__ void __launch_bounds__(256) tile_candidates_kernel(const float* __res
 #pragma unroll
     for (int j = 0; j < kPer; ++j) {
         const int v = tile0 + j * 256 + threadIdx.x;
-        keys[j] = v < valid ? cand_key(base[static_cast<std::int64_t>(t) * v_rows + v] + hb[v], v) : 0ULL;
+        keys[j] = v < valid ? cand_key(base[static_cast<std::int64_t>(t) * v_rows + v] + (hb != nullptr ? hb[v] : 0.0F), v) : 0ULL;
     }
-    for (int k = 0; k < kCandidatesPerTile; ++k) {
+    for (int k = 0; k < kPerTile; ++k) {
         std::uint64_t m = 0;
 #pragma unroll
         for (int j = 0; j < kPer; ++j) { m = keys[j] > m ? keys[j] : m; }
@@ -1011,7 +1012,7 @@ __global__ void __launch_bounds__(256) tile_candidates_kernel(const float* __res
         __syncthreads();
         const int id = b == 0ULL ? -1 : static_cast<int>(0xFFFFFFFFU - static_cast<std::uint32_t>(b & 0xFFFFFFFFULL));
         if (threadIdx.x == 0) {
-            int* col = cand + static_cast<std::int64_t>(t) * count + blockIdx.x * kCandidatesPerTile;
+            int* col = cand + static_cast<std::int64_t>(t) * count + blockIdx.x * kPerTile;
             col[k] = id >= 0 ? id : (k > 0 ? col[k - 1] : tile0);
         }
 #pragma unroll
@@ -1476,13 +1477,27 @@ void markov_rows_from_q8(const MarkovHead& head, std::int8_t* rows_codes, float*
 }
 
 void dspark_tile_candidates(const Tensor& base, const Tensor& hb, std::int32_t valid, Tensor& cand, cudaStream_t stream) {
-    constexpr const char* op = "dspark_tile_candidates";
-    const Columns b = columns(base, op, "base", true), h = columns(hb, op, "hb", true);
-    require(h.cols == 1 && h.rows == b.rows && valid > 0 && valid <= b.rows && cand.dtype == DType::I32 && cand.is_contiguous(), op, "shapes");
-    const int tiles = (valid + kCandidateTile - 1) / kCandidateTile, count = tiles * kCandidatesPerTile;
-    require(cand.ne[0] == count && cand.ne[1] == b.cols, op, "cand [tiles * 8, n]");
-    tile_candidates_kernel<<<dim3(tiles, b.cols), 256, 0, stream>>>(static_cast<const float*>(base.data), static_cast<const float*>(hb.data),
-                                                                    b.rows, valid, static_cast<int*>(cand.data), count);
+    tile_top_candidates(base, &hb, valid, kCandidatesPerTile, cand, stream);
+}
+
+void tile_top_candidates(const Tensor& base, const Tensor* hb, std::int32_t valid, std::int32_t per_tile, Tensor& cand, cudaStream_t stream) {
+    constexpr const char* op = "tile_top_candidates";
+    const Columns b = columns(base, op, "base", true);
+    if (hb != nullptr) {
+        const Columns h = columns(*hb, op, "hb", true);
+        require(h.cols == 1 && h.rows == b.rows, op, "hb [V]");
+    }
+    require(valid > 0 && valid <= b.rows && cand.dtype == DType::I32 && cand.is_contiguous(), op, "shapes");
+    require(per_tile == 8 || per_tile == 16, op, "per_tile is 8 or 16");
+    const int tiles = (valid + kCandidateTile - 1) / kCandidateTile, count = tiles * per_tile;
+    require(cand.ne[0] == count && cand.ne[1] == b.cols, op, "cand [tiles * per_tile, n]");
+    const float* bias = hb != nullptr ? static_cast<const float*>(hb->data) : nullptr;
+    auto* out         = static_cast<int*>(cand.data);
+    if (per_tile == 8) {
+        tile_candidates_kernel<8><<<dim3(tiles, b.cols), 256, 0, stream>>>(static_cast<const float*>(base.data), bias, b.rows, valid, out, count);
+    } else {
+        tile_candidates_kernel<16><<<dim3(tiles, b.cols), 256, 0, stream>>>(static_cast<const float*>(base.data), bias, b.rows, valid, out, count);
+    }
     check_launch(op);
 }
 
@@ -1497,6 +1512,214 @@ void dspark_candidate_pick(const Tensor& base, const Tensor& hb, const std::int8
     candidate_pick_kernel<<<(count + 7) / 8, 256, 0, stream>>>(static_cast<const float*>(base.data), static_cast<const float*>(hb.data), rows_codes,
                                                                rows_scales, r, static_cast<const float*>(latent.data), cand, count,
                                                                cap, scores, reinterpret_cast<unsigned long long*>(work), out, prob);
+    check_launch(op);
+}
+
+
+// DFlash2 (include/ninfer/ops/dspark_fp32.h, "DFlash2").
+namespace {
+
+// base FP32 [H, 4] (side s, tap k: column 2s + k); delta [4G, W] (row (s * 2 + k) * G + g).
+__global__ void dflash2_conv_kernel(const float* __restrict__ x, std::int64_t x_stride, const float* __restrict__ base,
+                                    const float* __restrict__ delta, int h_size, int group, int side, float* __restrict__ out,
+                                    std::int64_t out_stride, bool accumulate) {
+    const int h = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (h >= h_size) { return; }
+    const int groups = h_size / group, g = h / group;
+    const float* d = delta + static_cast<std::int64_t>(t) * 4 * groups + side * 2 * groups;
+    float v = (base[side * 2 * h_size + h] + d[g]) * x[t * x_stride + h];
+    if (t > 0) { v = fmaf(base[side * 2 * h_size + h_size + h] + d[groups + g], x[(t - 1) * x_stride + h], v); }
+    float* o = out + t * out_stride + h;
+    *o = accumulate ? *o + v : v;
+}
+
+// grid n, 256 threads: column t's top kDFlash2TopK of the tile candidates by logits (lowest id among equals).
+__global__ void __launch_bounds__(256) dflash2_top_kernel(const int* __restrict__ cand, int count, const float* __restrict__ logits, int v_rows,
+                                                          int* __restrict__ ids, float* __restrict__ scores) {
+    constexpr int kMax = 8; // count <= 2048
+    __shared__ std::uint64_t warp_best[8];
+    __shared__ std::uint64_t best;
+    const int t = blockIdx.x;
+    std::uint64_t keys[kMax];
+#pragma unroll
+    for (int j = 0; j < kMax; ++j) {
+        const int i = j * 256 + threadIdx.x;
+        const int v = i < count ? cand[static_cast<std::int64_t>(t) * count + i] : -1;
+        keys[j] = v >= 0 ? cand_key(logits[static_cast<std::int64_t>(t) * v_rows + v], v) : 0ULL;
+    }
+    for (int k = 0; k < kDFlash2TopK; ++k) {
+        std::uint64_t m = 0;
+#pragma unroll
+        for (int j = 0; j < kMax; ++j) { m = keys[j] > m ? keys[j] : m; }
+        m = warp_max_u64(m);
+        if ((threadIdx.x & 31) == 0) { warp_best[threadIdx.x >> 5] = m; }
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            std::uint64_t w = threadIdx.x < 8 ? warp_best[threadIdx.x] : 0ULL;
+            w = warp_max_u64(w);
+            if (threadIdx.x == 0) { best = w; }
+        }
+        __syncthreads();
+        const std::uint64_t b = best;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int* col = ids + t * kDFlash2TopK;
+            float* sc = scores + t * kDFlash2TopK;
+            if (b != 0ULL) {
+                col[k] = static_cast<int>(0xFFFFFFFFU - static_cast<std::uint32_t>(b & 0xFFFFFFFFULL));
+                sc[k]  = logits[static_cast<std::int64_t>(t) * v_rows + col[k]];
+            } else { // fewer distinct finite candidates than kDFlash2TopK: repeat the last (never preferred: rank order)
+                col[k] = k > 0 ? col[k - 1] : cand[static_cast<std::int64_t>(t) * count];
+                sc[k]  = k > 0 ? sc[k - 1] : -INFINITY;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kMax; ++j) {
+            if (keys[j] == b) { keys[j] = 0ULL; }
+        }
+    }
+}
+
+__device__ __forceinline__ float bf16_word(std::uint16_t w) { return __uint_as_float(static_cast<std::uint32_t>(w) << 16); }
+
+// One block of 256 threads (thread r holds rank r): the drafts in order, each from its column's 16 candidates.
+__global__ void __launch_bounds__(256) dflash2_select_kernel(const int* __restrict__ ids, const float* __restrict__ scores,
+                                                             const float* __restrict__ g, const std::uint16_t* __restrict__ pred,
+                                                             const std::uint16_t* __restrict__ succ, int n, float cap, DraftPick pick,
+                                                             const double* __restrict__ canonical, int* __restrict__ tokens,
+                                                             float* __restrict__ probs) {
+    constexpr int R = kDFlash2Rank, K = kDFlash2TopK;
+    __shared__ float s[R];
+    __shared__ float e[K];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int i = 0; i < n; ++i) {
+        const int prev = tokens[i];
+        s[threadIdx.x] = bf16_word(pred[static_cast<std::int64_t>(prev) * R + threadIdx.x]) * g[i * R + threadIdx.x];
+        __syncthreads();
+        for (int c = warp; c < K; c += 8) {
+            const int id = ids[i * K + c];
+            const uint4 w = __ldg(reinterpret_cast<const uint4*>(succ + static_cast<std::int64_t>(id) * R + lane * 8));
+            const std::uint32_t words[4] = {w.x, w.y, w.z, w.w};
+            float acc = 0.0F;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                acc = fmaf(s[lane * 8 + 2 * q], __uint_as_float(words[q] << 16), acc);
+                acc = fmaf(s[lane * 8 + 2 * q + 1], __uint_as_float(words[q] & 0xFFFF0000U), acc);
+            }
+            for (int o = 16; o > 0; o >>= 1) { acc += __shfl_xor_sync(0xFFFFFFFFU, acc, o); }
+            if (lane == 0) { e[c] = cap * tanhf((scores[i * K + c] + acc) / cap); }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0 && pick.temperature > 0.0F) {
+            // Sampled: dspark_draft_pick's draw over the column's distinct candidates sorted by e (then id).
+            float v[K];
+            int id[K], m = 0;
+            for (int c = 0; c < K; ++c) {
+                if (c > 0 && ids[i * K + c] == ids[i * K + c - 1]) { continue; }
+                int at = m++;
+                for (; at > 0 && (v[at - 1] < e[c] || (v[at - 1] == e[c] && id[at - 1] > ids[i * K + c])); --at) {
+                    v[at] = v[at - 1], id[at] = id[at - 1];
+                }
+                v[at] = e[c], id[at] = ids[i * K + c];
+            }
+            const int k = min(max(pick.top_k, 1), m);
+            const double t = pick.temperature, top = v[0];
+            double sum = 0.0;
+            for (int c = 0; c < k; ++c) { sum += exp((v[c] - top) / t); }
+            int keep = k;
+            if (pick.min_p > 0.0F) {
+                while (keep > 1 && exp((v[keep - 1] - top) / t) / sum < pick.min_p * (1.0 / sum)) { --keep; }
+            }
+            if (pick.top_p < 1.0F) {
+                double mass = 0.0;
+                for (int c = 0; c < keep; ++c) {
+                    mass += exp((v[c] - top) / t) / sum;
+                    if (mass >= pick.top_p) {
+                        keep = c + 1;
+                        break;
+                    }
+                }
+            }
+            double total = 0.0;
+            for (int c = 0; c < keep; ++c) { total += exp((v[c] - top) / t) / sum; }
+            double u   = canonical[i] * total;
+            int chosen = keep - 1;
+            for (int c = 0; c < keep; ++c) {
+                if ((u -= exp((v[c] - top) / t) / sum) < 0.0) {
+                    chosen = c;
+                    break;
+                }
+            }
+            tokens[i + 1] = id[chosen];
+            if (probs != nullptr) { probs[i] = static_cast<float>(exp((v[chosen] - top) / t) / sum / total); }
+        } else if (threadIdx.x == 0) {
+            int best = 0;
+            for (int c = 1; c < K; ++c) {
+                if (e[c] > e[best]) { best = c; }
+            }
+            tokens[i + 1] = ids[i * K + best];
+            if (probs != nullptr) {
+                // Each id once: a column with fewer distinct candidates repeats its last one.
+                float sum = 0.0F;
+                for (int c = 0; c < K; ++c) {
+                    if (c > 0 && ids[i * K + c] == ids[i * K + c - 1]) { continue; }
+                    sum += __expf(e[c] - e[best]);
+                }
+                probs[i] = 1.0F / sum;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+} // namespace
+
+void dflash2_conv_fp32(const Tensor& x, const Tensor& base, const Tensor& delta, std::int32_t group, std::int32_t side, Tensor& out,
+                       bool accumulate, cudaStream_t stream) {
+    constexpr const char* op = "dflash2_conv_fp32";
+    const Columns cx = columns(x, op, "x"), co = columns(out, op, "out");
+    const Columns cb = columns(base, op, "base", true), cd = columns(delta, op, "delta", true);
+    require(group > 0 && cx.rows % group == 0 && (side == 0 || side == 1), op, "group divides H; side 0 or 1");
+    require(co.rows == cx.rows && co.cols == cx.cols && cb.rows * cb.cols == 4 * cx.rows && cd.rows == 4 * (cx.rows / group) && cd.cols == cx.cols,
+            op, "x, out [H, W]; base [H, 4]; delta [4 H / group, W]");
+    require(out.data != x.data, op, "out must not alias x");
+    dflash2_conv_kernel<<<dim3((cx.rows + 255) / 256, cx.cols), 256, 0, stream>>>(
+        static_cast<const float*>(x.data), cx.stride, static_cast<const float*>(base.data), static_cast<const float*>(delta.data), cx.rows,
+        group, side, static_cast<float*>(out.data), co.stride, accumulate);
+    check_launch(op);
+}
+
+void dflash2_top_candidates(const Tensor& cand, const Tensor& logits, Tensor& ids, Tensor& scores, cudaStream_t stream) {
+    constexpr const char* op = "dflash2_top_candidates";
+    const Columns l = columns(logits, op, "logits", true), sc = columns(scores, op, "scores", true);
+    require(cand.dtype == DType::I32 && cand.is_contiguous() && cand.ne[1] == l.cols && cand.ne[0] > 0 && cand.ne[0] <= 2048, op,
+            "cand I32 [count <= 2048, n]");
+    require(ids.dtype == DType::I32 && ids.is_contiguous() && ids.ne[0] == kDFlash2TopK && ids.ne[1] == l.cols && sc.rows == kDFlash2TopK &&
+                sc.cols == l.cols,
+            op, "ids I32, scores FP32 [16, n]");
+    dflash2_top_kernel<<<l.cols, 256, 0, stream>>>(static_cast<const int*>(cand.data), cand.ne[0], static_cast<const float*>(logits.data), l.rows,
+                                                   static_cast<int*>(ids.data), static_cast<float*>(scores.data));
+    check_launch(op);
+}
+
+void dflash2_select(const Tensor& ids, const Tensor& scores, const Tensor& g, const Tensor& predecessor, const Tensor& successor, float cap,
+                    const DraftPick& pick, const double* canonical, std::int32_t* tokens, float* probs, cudaStream_t stream) {
+    constexpr const char* op = "dflash2_select";
+    const Columns sc = columns(scores, op, "scores", true), cg = columns(g, op, "g", true);
+    const int n = sc.cols;
+    require(ids.dtype == DType::I32 && ids.is_contiguous() && ids.ne[0] == kDFlash2TopK && ids.ne[1] == n && sc.rows == kDFlash2TopK, op,
+            "ids, scores [16, n]");
+    require(cg.rows == kDFlash2Rank && cg.cols == n && n >= 1, op, "g FP32 [256, n]");
+    for (const Tensor* cb : {&predecessor, &successor}) {
+        require(cb->data != nullptr && cb->dtype == DType::BF16 && cb->is_contiguous() && cb->ne[0] == kDFlash2Rank, op, "codebooks BF16 [256, V]");
+        require(reinterpret_cast<std::uintptr_t>(cb->data) % 16 == 0, op, "codebooks 16-byte aligned");
+    }
+    require(tokens != nullptr && cap > 0, op, "tokens [n + 1]; cap > 0");
+    require(pick.temperature <= 0.0F || canonical != nullptr, op, "a sampled pick takes one uniform per draft");
+    dflash2_select_kernel<<<1, 256, 0, stream>>>(static_cast<const int*>(ids.data), static_cast<const float*>(scores.data),
+                                                 static_cast<const float*>(g.data), static_cast<const std::uint16_t*>(predecessor.data),
+                                                 static_cast<const std::uint16_t*>(successor.data), n, cap, pick, canonical, tokens,
+                                                 probs);
     check_launch(op);
 }
 

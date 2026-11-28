@@ -41,6 +41,7 @@ rows marked 200 W, re-measured 2026-11-23 (prefill 2026-11-24); the
 | **Decode**, one stream, DSpark | **up to 120.7 tok/s** (maths prompt); 93.4-94.4 average over 12 chats |
 | **Decode**, plain | 80.1 tok/s at 8,192 (2026-11-28, 200 W); 48 tok/s at 100K context |
 | **Decode at 262,144** (200 W) | **112.5 tok/s** DSpark (99.4 before the 2026-11-28 drafter changes; 108.9 before candidate picks; 110.5 before MXFP8 experts), **79.8** plain (78.2 before), average over 12 chats (`--max-context 262144 --vision --kv-dtype int8`) |
+| **Decode**, DFlash2 drafter | **129.0 tok/s** at 262,144 (`--spec dflash2 --draft-model DIR`, vision, INT8 KV; 130.6 at 8,192), average over 12 chats; same output |
 | **Decode**, `--max-concurrency 8` | **198.2 tok/s** aggregate (plain) |
 | **Prefill** (200 W) | **2,727 tok/s** at 8K (131,072 context, `--prefill-chunk 8192`); 2,227 at 34K, 1,577 at 100K. At the default chunk 2048: 2,170 at 8K, 1,962 at 1K, 1,339 at 100K. At 262,144 with DSpark and vision (chunk 2048): 2,125 at 8K, 1,930 at 1K, 1,324 at 100K |
 | **Low-bit KV** (`--kv-dtype rk4v4`, opt-in, lossy) | plain decode **41.1 tok/s at 200K** (FP16 34.8), 53.2 at 100K (47.8); frees 5,952 MiB at 262,144; KLD 2.8x the FP32 floor (`int8`: 1.06x, 40.7 tok/s) |

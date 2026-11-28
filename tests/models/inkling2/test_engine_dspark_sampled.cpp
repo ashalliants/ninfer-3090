@@ -8,6 +8,7 @@
 // - sampled requests draft and accept drafts (rounds run);
 // - reported, not judged: tok/s and drafts accepted per configuration.
 // Skips without NINFER_TEST_INKLING2_ARTIFACT. NINFER_INKLING2_SPEC_TOKENS: output tokens per request (default 128).
+// NINFER_TEST_INKLING2_DFLASH2 (the DFlash2 release directory) runs the drafted variants with --spec dflash2 --draft-model.
 
 #include "ninfer/engine.h"
 #include "product/speculative_options.h"
@@ -136,6 +137,10 @@ int main() {
         for (const Variant& v : {Variant{"dspark 3", 3, 0.0F, false}, Variant{"min-p, adaptive", 5, 0.1F, true}}) {
             auto spec                        = options;
             spec.speculative.backend         = ninfer::SpeculativeBackend::DSpark;
+            if (const char* dir = std::getenv("NINFER_TEST_INKLING2_DFLASH2"); dir != nullptr && *dir != '\0') {
+                spec.speculative.backend     = ninfer::SpeculativeBackend::DFlash2;
+                spec.speculative.draft_model = dir;
+            }
             spec.speculative.draft_tokens    = v.drafts;
             spec.speculative.draft_min_p     = v.min_p;
             spec.speculative.dspark_adaptive = v.adaptive;

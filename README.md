@@ -714,7 +714,9 @@ Gen3 x4 eGPU) unless a figure says 200 W:
   Candidate picks and up to 7 drafts a round on V100 builds (2026-11-28, same output) take it to **110.7 tok/s**, and
   structured output from 140.7 to **170.2** at 8,192 context. MXFP8 experts and per-entry NVFP4 verify on V100
   builds (2026-11-28, same output) take it to **112.5 tok/s** (110.5 on master the same day) and plain to **79.8**
-  (78.2) in that configuration, and struct to **172.7** at 8,192.
+  (78.2) in that configuration, and struct to **172.7** at 8,192. Inco's DFlash2 drafter
+  (`--spec dflash2 --draft-model DIR`, read from its `incoai/Inkling-2-Mini-DFlash2` release, same output) reaches
+  **129.0 tok/s** in that configuration, and 106.0 / 92.6 / 172.7 on Lapilli's conv, prose and struct prompts at 8,192.
 - **Prefill** (200 W, 2026-11-24, real-text prompts; the `--prefill-cublas` default of a V100 build: the
   prefill's controllers, router and busiest experts on cuBLAS, and layers 20-23's BF16-bank experts on the
   tensor-core kernels): up to **2,727 tok/s** (a 7,974-token prompt, TTFT 2.92 s, at
@@ -773,9 +775,10 @@ BF16 weights would leave under 4 GiB free; a V100 build always does, as the MXFP
   unless the work is mostly code.
 
 ```bash
-scripts/download-model.sh inkling2-mini      # WarlaxZ/Inkling-2-Mini-NInfer-V100, 22.3 GiB, pinned and verified
+scripts/download-model.sh inkling2-mini      # WarlaxZ/Inkling-2-Mini-NInfer-V100, 22.3 GiB, and the DFlash2 drafter, pinned and verified
 #   on Windows: scripts\download-model.bat inkling2-mini
-ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark                        # Tesla V100
+ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dflash2 --draft-model models/inkling2-dflash2   # Tesla V100, fastest
+ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark                        # Tesla V100, no drafter download
 ninfer-serve models/inkling2-mini-q8.ninfer --vision --max-context 65536                  # RTX 3090
 ```
 

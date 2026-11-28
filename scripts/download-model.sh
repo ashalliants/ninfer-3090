@@ -47,6 +47,9 @@ set -euo pipefail
 #   inkling2-mini    Inkling-2-Mini (Tesla V100 32 GB or RTX 3090, Linux), 22.3 GiB: this fork's exact conversion of
 #                    Unsloth's UD-Q8_K_XL GGUF with the model's DSpark drafter and vision tower
 #                    (WarlaxZ/Inkling-2-Mini-NInfer-V100). One file serves --vision and --spec dspark.
+#                    Also fetches Inco's DFlash2 drafter (incoai/Inkling-2-Mini-DFlash2, Apache-2.0, 944 MiB)
+#                    into inkling2-dflash2/ beside it, for --spec dflash2 --draft-model <that folder>, the
+#                    fastest drafter. NINFER_DFLASH2=off skips it.
 #
 # To repin a model, edit its block below: take the size and sha256 from what HuggingFace reports for
 # the new revision (X-Linked-Size and X-Linked-ETag on the resolve URL, or the revision's
@@ -67,7 +70,7 @@ usage() {
 }
 
 # Only the qwen38-flash-next models have continuation parts and an n-gram volume.
-part_sizes=() part_sha256s=() ngram_name='' ngram_repo='' draft_vocab=''
+part_sizes=() part_sha256s=() ngram_name='' ngram_repo='' draft_vocab='' dflash2=''
 case "${1:-}" in
   qwen38-27b)
     artifact='qwen3_8_27b.ninfer'
@@ -128,6 +131,7 @@ case "${1:-}" in
     expected_sha256='2167c0c0ff2ebb5d9dcf7ea5c8289ce13239bdc5104aac053af79a3b8cf009c1'
     label='the Inkling-2-Mini model for the Tesla V100 and RTX 3090 (22.3 GiB)'
     tests_variable='NINFER_TEST_INKLING2_ARTIFACT'
+    dflash2=1
     ;;
   # The n-gram volume is pinned to the commit that uploaded it; the model file and its part are pinned
   # to the revision that published the model card with them. The volume is unchanged in that revision.
@@ -324,6 +328,22 @@ fetch_draft_vocab() {
   printf 'MTP draft vocabulary ready: %s\n' "$path"
 }
 
+# Inkling-2-Mini's DFlash2 drafter: Inco's release folder (config.json and model.safetensors, Apache-2.0),
+# which ninfer-serve reads as it is (--spec dflash2 --draft-model <folder>). Pinned to a revision and sha256
+# like the model; NINFER_DFLASH2=off skips it. A failure stops the script, as for the model: rerun to resume.
+fetch_dflash2() {
+  [ -n "$dflash2" ] && [ "${NINFER_DFLASH2:-}" != 'off' ] || return 0
+  local dir="$model_dir/inkling2-dflash2" rev='4f9088ea66c21f2b99ed657d1941c306b03e84d2'
+  mkdir -p -- "$dir" || return 1
+  owner='incoai' repo='Inkling-2-Mini-DFlash2'
+  fetch_file "$dir" config.json 1311 'd094e435eb939e01fca6297f637c5af35e3da4b552f8e1ab0a181cd278a1cefa' \
+    "$rev" "the DFlash2 drafter's config" drafter || return 1
+  fetch_file "$dir" model.safetensors 989975616 '217980ab00d116693fa5946df7bbfd967caf5fac1f529afd541fbd470ddb54ee' \
+    "$rev" 'the DFlash2 drafter (944 MiB)' drafter || return 1
+  printf 'DFlash2 drafter ready: %s\n' "$dir"
+  printf 'Serve with:  --spec dflash2 --draft-model %s\n' "$dir"
+}
+
 # Fetches one pinned file: folder, name, size, sha256, revision, description, and kind (model, part or
 # volume). Returns non-zero unless the file ends at its final name, verified. A file already there that
 # verifies is kept without any download.
@@ -427,4 +447,5 @@ if [ -n "$ngram_name" ]; then
 fi
 [ -z "$tests_variable" ] || printf 'Point the tests at it with:  export %s=%s\n' "$tests_variable" "$model"
 fetch_draft_vocab
+fetch_dflash2 || exit 1
 fetch_graft "$1"

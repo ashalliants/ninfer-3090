@@ -473,6 +473,76 @@ for plain and DSpark at every temperature, on every leg:
 Plain sampled decode is slower than plain greedy (about 70 against 72 tok/s; 74.9 against 78.7 on `dad1623b`): each token downloads its column's
 logits and sorts on the host, and so does each verified column.
 
+## DFlash2 drafter
+
+`--spec dflash2 --draft-model DIR` (`incoai/Inkling-2-Mini-DFlash2`): Inco's second drafter for Inkling-2-Mini. It drafts in DSpark's place
+with the same rounds: the target verifies every draft (greedy and sampled requests), so the output is the plain
+decode's, and `--draft-tokens` (1 to 7), `--draft-min-p`, `--dspark-adaptive` and `--speed fast` work as with DSpark.
+It is read from the release directory itself (`config.json`, `model.safetensors`: 944 MiB of BF16), the way
+`--lora` reads a PEFT directory: an artifact must hold a text component (`schema.cpp`), and a merged artifact would
+be a second copy of the whole target.
+
+Architecture (the release's `DFlash2DraftModel`; `src/models/inkling2/program/dflash2_program.cpp`):
+
+- **Taps:** `target_layer_ids = [5, 23, 41, 48]`, Hugging Face `hidden_states` indices, which are DSpark's
+  `target_visits` (k < 48: the input of visit k; 48: the final normed state).
+- **Context:** `c = rmsnorm(fc [tap5; tap23; tap41; tap48], hidden_norm)` (fc [2304, 9216]); each of the five
+  layers' context K is `rope(k_norm(Wk c))` and V is `Wv c` (the layer's own k and v projections), kept in a ring of
+  the 2048-position sliding window.
+- **Block:** `[anchor, mask x 7]`, each the target's embedding normed by the target's embedding norm (the mask is
+  token 200056). Without the embedding norm almost no draft is accepted (0.01 a round in the reference below).
+- **Layer** (five, all sliding window 2048, non-causal, 32/8 heads of 128, SiLU MLP of 6912, RoPE theta 1e4):
+  ```text
+  n = rmsnorm(x, input_norm);  d = Kp_attn n                      Kp: [4 * 144, 2304], one row per (side, tap, group of 16)
+  p = (B[0,0] + d[0,0]) n_t + (B[0,1] + d[0,1]) n_{t-1}            the input side of a two-tap dynamic convolution
+  a = attention(q_norm/k_norm + RoPE of Wq p, Wk p, Wv p; the context ring and the block)
+  z = Wo a;  x += (B[1,0] + d[1,0]) z_t + (B[1,1] + d[1,1]) z_{t-1}  the output side, same d
+  ```
+  then the MLP the same way through its own convolution (`post_attention_layernorm`, `mlp_conv`).
+- **Selector:** `h = rmsnorm(x, norm)` for the 7 mask columns; the target head's logits `u = W_head h` and their
+  top 16 per column (`C`); `g = W_hidden h` (rank 256). From the anchor, each draft is
+  `argmax_c 30 tanh((u[c] + sum_r Pred[prev, r] g[r] Succ[C[c], r]) / 30)` and becomes the next `prev`
+  (`selector_softcap_mode = after_correction`).
+
+Device forms (lossy for the drafts only): every matrix re-encoded at load to Q8 (`ops::quantize_q8_g32`) and run by
+int8 activations (`ops::dense_projection_a8_fp32`); the base logits through DSpark's 4-bit head copy (or the target's
+Q8 head with `--dense-q8`); the codebooks BF16 (2 x 103 MB). New Ops: `ops::dflash2_conv_fp32` (either side of the
+convolution), `ops::tile_top_candidates` (16 a tile; their union holds the exact top 16) with
+`ops::dflash2_top_candidates`, and `ops::dflash2_select` (the selector path in one block; a sampled request draws
+each draft over the 16 with the request's processors and the uniform the target will draw, as
+`ops::dspark_draft_pick` does over the vocabulary). Block attention and the rings are DSpark's Ops
+(`dspark_block_attention_fp32` with a window of 2048: every block query sees the last 2048 context positions,
+where the reference's per-query window drops the first t of them for query t: drafts only).
+
+Measured on the Tesla V100 (2026-11-28, 200 W, `ninfer-serve`, untraced; DSpark is master `feb203752` the same day;
+the same md5 on every set as plain decode; NumPy reference: `df2_accept.py`, the release's modelling code over taps
+dumped from the target):
+
+| | DSpark | DFlash2 |
+|---|---|---|
+| drafts accepted a round of 7, 12 chats (reference, every 4th position) | 2.37 | **3.36** |
+| 12 chats, 8,192 | 111.3-111.4 | **128.3** |
+| 12 chats at 262,144, vision, INT8 KV | 110.5 | **127.1** |
+| Lapilli's conv / prose / struct prompts | 92.1-92.5 / 74.5-75.3 / 171.0-171.4 | **104.5** / **90.7** / **171.7** |
+| `--speed fast` (lossy): 12 chats / conv / prose / struct | 125.8 / 85.6 / 81.8 / 162.7 (with `--dense-q8 all`) | **138.8** / 99.9 / 88.4 / 168.2 |
+| sampled (`ninfer_inkling2_engine_dspark_sampled_test`), drafts accepted | | 61-69% |
+
+With the MXFP8 experts V100 builds hold since #662 (master `592337dcc`, same day, same md5s): **129.0** at 262,144,
+**130.6** on the 12 chats at 8,192, 106.0 / 92.6 / 172.7 on conv / prose / struct, and 140.5 with `--speed fast`
+(DSpark on that build: 112.5, 111.8, 94.4 / 76.0 / 172.7).
+
+DSpark's round settings suit it too (`--draft-min-p` 0, 0.3, 0.5 and 0.7 gave 126.8, 127.8, 128.3 and 123.5 on the
+chats; `--dspark-adaptive off` at 7, 100.4). With 7 drafts fixed its rounds accept 3.2 a round on the chats, the
+reference's rate, so the port loses no acceptance. A round costs 2.4 ms of drafting and a verify of 18.3 / 23.6 /
+30.7 / ~38 ms at 1 / 3 / 5 / 7 drafts against a 12.5 ms plain step: the verify's experts are most of it, so wider
+rounds pay only on predictable text. Each draft call is about 70 small launches, not yet a CUDA Graph.
+
+Tested by `ninfer_dspark_fp32_ops_test` (the convolution, the top 16 and the selector, greedy and sampled, against
+FP64 oracles) and, with `NINFER_TEST_INKLING2_DFLASH2=<release dir>`, `ninfer_inkling2_engine_dspark_test` (greedy
+output equals plain, every DSpark check) and `ninfer_inkling2_engine_dspark_sampled_test` (sampled output equals plain
+sampling under the same seed). With `--max-concurrency` above 1 requests decode without it, as with DSpark. RTX
+3090: NOT RUN (it takes the same code; its default stays 3 drafts).
+
 ## Vision tower (`mmproj-BF16.gguf`, `clip`, projector `inkling2v`)
 
 Sources: llama.cpp at the [L] revision, `tools/mtmd/models/inkling2v.cpp`, `mtmd_graph::build_vit`, and the

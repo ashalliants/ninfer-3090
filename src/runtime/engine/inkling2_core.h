@@ -8,6 +8,7 @@
 
 #include "core/device.h"
 #include "models/inkling2/frontend/constraint.h"
+#include "models/inkling2/dflash2.h"
 #include "models/inkling2/frontend/frontend.h"
 #include "models/inkling2/model.h"
 #include "ninfer/types.h"
@@ -114,6 +115,9 @@ private:
     void build_programs(models::inkling2::ProgramLimits limits, std::unique_ptr<models::inkling2::DenseWeightsQ8>& dense,
                         const models::inkling2::VisionConfig* vision, bool dspark);
     std::unique_ptr<Programs> programs_;
+    // --spec dflash2 --draft-model: the release read at startup, kept until the programs are built (each fit attempt
+    // builds its drafter from it), then dropped.
+    std::unique_ptr<models::inkling2::DFlash2Release> dflash2_;
     // The opt-in adapters (models/inkling2/program/adapters.h): options_.loras and options_.grafts in order, which a
     // prompt's lora and graft index, and their digests (prefix reuse keys a snapshot on the pair a prompt ran with).
     std::vector<std::unique_ptr<models::inkling2::DeviceLora>> loras_;

@@ -82,8 +82,8 @@ void validate_engine_options(const EngineOptions& options) {
         throw std::invalid_argument("the DSpark greedy keep fraction must be in [0,1)");
     }
     if (spec.dspark_lookup_match > 64) { throw std::invalid_argument("the DSpark lookup match must be 0 to 64 tokens"); }
-    if ((spec.dspark_greedy_keep != 0.0F || spec.dspark_lookup_match != 0) && spec.backend != SpeculativeBackend::DSpark) {
-        throw std::invalid_argument("--speed fast needs Inkling-2's drafter (--spec dspark)");
+    if ((spec.dspark_greedy_keep != 0.0F || spec.dspark_lookup_match != 0) && !is_block_drafter(spec)) {
+        throw std::invalid_argument("--speed fast needs Inkling-2's drafter (--spec dspark, or --spec dflash2 --draft-model)");
     }
     if ((spec.dspark_greedy_keep != 0.0F || spec.dspark_lookup_match != 0) && options.max_concurrency > 1) {
         throw std::invalid_argument("--speed fast drafts with one request at a time: use --max-concurrency 1");

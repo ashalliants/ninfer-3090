@@ -10,6 +10,8 @@
 #include "core/host_memory.h"
 #include "core/startup.h"
 #include "models/inkling2/program/adapters.h"
+#include "models/inkling2/dflash2.h"
+#include "models/inkling2/program/dflash2_program.h"
 #include "models/inkling2/program/dspark_program.h"
 #include "ninfer/ops/dspark_fp32.h"
 #include "ninfer/ops/sampling.h"
@@ -65,7 +67,7 @@ constexpr std::int32_t kBankExpertsMin = 512;
 constexpr std::int32_t kFitStep = 256;
 
 // The drafter's extend of n taps' columns, in pieces of at most its max_chunk.
-void extend_drafter(ink::DSparkProgram& drafter, std::span<const Tensor> taps, std::int32_t n) {
+void extend_drafter(ink::Drafter& drafter, std::span<const Tensor> taps, std::int32_t n) {
     for (std::int32_t s = 0; s < n; s += drafter.max_chunk()) {
         const std::int32_t len = std::min(drafter.max_chunk(), n - s);
         std::vector<Tensor> piece;
@@ -261,8 +263,9 @@ struct Inkling2Core::Programs {
     std::unique_ptr<ink::DenseWeightsQ8> dense;
     ink::TextProgram text;
     std::unique_ptr<ink::VisionEncoder> vision;
-    // --spec dspark: the drafter, and plain steps' taps held for its next extend (FP32 [hidden, kHeld] each).
-    std::unique_ptr<ink::DSparkProgram> drafter;
+    // --spec dspark (or dflash2 --draft-model): the drafter, and plain steps' taps held for its next extend (FP32
+    // [hidden, kHeld] each).
+    std::unique_ptr<ink::Drafter> drafter;
     std::vector<DeviceBuffer> held_memory;
     std::vector<Tensor> held;
     DeviceBuffer argmax{64 * 4}; // I32 [<= 64]: a forward's greedy tokens, one per column
@@ -271,7 +274,7 @@ struct Inkling2Core::Programs {
     ink::TextProgram::Snapshot snapshot;
     std::vector<std::uint64_t> snapshot_keys;
     std::uint64_t snapshot_adapters = 0; // the adapters the snapshot's prompt ran with (adapter_key)
-    ink::DSparkProgram::Snapshot draft_snapshot; // the drafter's, with --spec dspark
+    ink::Drafter::Snapshot draft_snapshot; // the drafter's, with a drafter
     // max_concurrency > 1: one snapshot per slot instead (slot_snapshots[s] is slot s's, its keys beside it): a
     // snapshot's global caches are its slot's own, so a prompt resumes only in the slot that saved it.
     std::vector<ink::TextProgram::Snapshot> slot_snapshots;
@@ -296,12 +299,21 @@ void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink
     // The tower encodes in the text Program's workspace, before the prompt's forwards: it holds the larger of the two.
     if (vision != nullptr) { limits.min_workspace_bytes = ink::VisionEncoder::workspace_bytes(*model_); }
     // Its extends take at most its sliding window; a wider chunk's taps go in pieces (extend_drafter).
-    const std::int32_t draft_chunk = std::min(chunk_, static_cast<std::int32_t>(model_->dspark_config() != nullptr ? model_->dspark_config()->sliding_window : 1));
+    const std::uint32_t draft_window = dflash2_ ? dflash2_->config().sliding_window
+                                       : model_->dspark_config() != nullptr ? model_->dspark_config()->sliding_window : 1;
+    const std::int32_t draft_chunk = std::min(chunk_, static_cast<std::int32_t>(draft_window));
     // The drafter runs between the text Program's forwards, so its workspace is the text workspace's lent top: never
     // where a forward's results are (TextProgram::lent()), and free while the drafter runs.
-    if (dspark) { limits.lend_bytes = ink::DSparkProgram::workspace_bytes(*model_, draft_chunk); }
-    programs_ = std::make_unique<Programs>(*model_, dense.get(), limits, stream_);
     if (dspark) {
+        limits.lend_bytes = dflash2_ ? ink::DFlash2Program::workspace_bytes(*model_, dflash2_->config(), draft_chunk)
+                                     : ink::DSparkProgram::workspace_bytes(*model_, draft_chunk);
+    }
+    programs_ = std::make_unique<Programs>(*model_, dense.get(), limits, stream_);
+    if (dspark && dflash2_) {
+        programs_->drafter = std::make_unique<ink::DFlash2Program>(*model_, *dflash2_, limits.max_context, draft_chunk, stream_,
+                                                                   dense ? &dense->head() : nullptr, limits.kv_fp16, drafter_head_copy_,
+                                                                   programs_->text.lent());
+    } else if (dspark) {
         // With --dense-q8 the drafter proposes from the target's re-encoded head, the one it verifies against.
         const std::uint32_t window = drafter_window_;
         if (window != 0 && window < model_->dspark_config()->sliding_window) {
@@ -311,6 +323,8 @@ void Inkling2Core::build_programs(ink::ProgramLimits limits, std::unique_ptr<ink
         programs_->drafter = std::make_unique<ink::DSparkProgram>(*model_, limits.max_context, draft_chunk, stream_,
                                                                   dense ? &dense->head() : nullptr, limits.kv_fp16,
                                                                   static_cast<std::int32_t>(window), drafter_head_copy_, programs_->text.lent());
+    }
+    if (dspark) {
         const std::int32_t hidden = static_cast<std::int32_t>(model_->config().hidden_size);
         for (std::size_t i = 0; i < limits.tap_visits.size(); ++i) {
             programs_->held_memory.emplace_back(static_cast<std::size_t>(hidden) * kHeld * 4);
@@ -503,6 +517,10 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                               .experts_mxfp8  = options_.experts_mxfp8},
                              &options_.startup_observer);
     const ink::VisionConfig* vision = options_.enable_vision ? model_->vision_config() : nullptr;
+    // --spec dflash2 --draft-model: the release, read once (its device forms are built with the programs).
+    if (options_.speculative.backend == SpeculativeBackend::DFlash2 && slots_ == 1) {
+        dflash2_ = ink::DFlash2Release::load(options_.speculative.draft_model, model_->config());
+    }
     for (const auto& adapter : loras) {
         loras_.push_back(std::make_unique<ink::DeviceLora>(adapter));
         lora_digests_.push_back(adapter.digest);
@@ -581,8 +599,15 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         }
         limits.slots = slots_;
         // Batched decode runs every request plain: with several slots there is no drafter.
-        const bool dspark  = options_.speculative.backend == SpeculativeBackend::DSpark && slots_ == 1;
-        if (dspark) {
+        const bool dspark  = is_block_drafter(options_.speculative) && slots_ == 1;
+        if (dspark && dflash2_) {
+            const ink::DFlash2Config& fc = dflash2_->config();
+            if (options_.speculative.draft_tokens < 1 || options_.speculative.draft_tokens >= fc.block_size) {
+                throw std::invalid_argument("--spec dflash2 takes --draft-tokens 1 to " + std::to_string(fc.block_size - 1));
+            }
+            limits.tap_visits   = fc.target_visits;
+            limits.max_rollback = static_cast<std::int32_t>(fc.block_size);
+        } else if (dspark) {
             const ink::DSparkConfig* dc = model_->dspark_config();
             if (dc == nullptr) { throw std::invalid_argument("--spec dspark: this Inkling-2 artifact has no DSpark drafter"); }
             if (options_.speculative.draft_tokens < 1 || options_.speculative.draft_tokens >= dc->block_size) {
@@ -618,7 +643,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
             bool head_copy;
             std::uint32_t window;
         };
-        const std::uint32_t asked = options_.speculative.dspark_window;
+        const std::uint32_t asked = dflash2_ ? 0U : options_.speculative.dspark_window; // DFlash2: sliding layers only
         const bool auto_window    = asked == SpeculativeOptions::kDSparkWindowAuto;
         std::vector<Attempt> attempts;
         const auto make_attempts = [&] {
@@ -776,6 +801,13 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         release_stream();
         throw;
     }
+    std::string drafter_note;
+    if (programs_->drafter) {
+        drafter_note = std::string(dflash2_ ? " | drafter DFlash2 " + dflash2_->source() : std::string(" | drafter DSpark")) +
+                       (drafter_head_copy_ ? " | drafter head 4-bit copy" : " | drafter head: the target's BF16") +
+                       (dflash2_ ? std::string() : " | drafter window " + (drafter_window_ == 0 ? std::string("whole context") : std::to_string(drafter_window_)));
+    }
+    dflash2_.reset(); // the drafter holds its own device forms
     const auto& stats         = model_->storage_stats();
     load_.architecture        = "inkling2";
     load_.model_name          = "Inkling-2-Mini";
@@ -797,9 +829,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     check_cuda(cudaMemGetInfo(&device_free, &device_total), "memory info");
     load_.notes.push_back("prefill | chunk " + std::to_string(chunk_) + (options_.prefill_chunk_auto ? " (widest that fits)" : " (--prefill-chunk)") +
                           " | workspace " + std::to_string(programs_->text.workspace().capacity() >> 20) + " MiB" +
-                          (programs_->drafter ? std::string(drafter_head_copy_ ? " | drafter head 4-bit copy" : " | drafter head: the target's BF16") +
-                                                    " | drafter window " + (drafter_window_ == 0 ? std::string("whole context") : std::to_string(drafter_window_))
-                                              : std::string()) +
+                          drafter_note +
                           " | " + (fp32_prefill ? "FP32"
                                    : options_.prefill_cublas ? "tensor cores, controllers and router on cuBLAS (--no-prefill-cublas: on our FP32 kernels; "
                                                                "--prefill-math fp32: the exact FP32 prefill)"
@@ -832,7 +862,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                               (options_.max_context < requested_context_
                                    ? " (fitted to the device; asked " + std::to_string(requested_context_) + ")"
                                    : std::string()) +
-                              (options_.speculative.backend == SpeculativeBackend::DSpark ? " | DSpark off: every request decodes plain"
+                              (is_block_drafter(options_.speculative) ? " | drafter off: every request decodes plain"
                                                                                            : std::string()));
     }
     load_.takes_video         = false;
@@ -1335,7 +1365,7 @@ void Inkling2Core::run(Job& job) {
     bool forward_was_round = false;
     // Every request of a --spec dspark Engine reports the backend; a sampled one runs plain, with no rounds.
     if (programs_->drafter != nullptr) {
-        out.speculative.backend      = SpeculativeBackend::DSpark;
+        out.speculative.backend      = options_.speculative.backend;
         out.speculative.enabled      = true;
         out.speculative.draft_window = static_cast<std::uint32_t>(n_drafts);
         out.speculative.accepted_per_position.assign(static_cast<std::size_t>(n_drafts), 0);

@@ -1008,6 +1008,33 @@ int main() {
     };
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "8"}, "[1,7]"),
                       "--spec dspark accepted 8 drafts");
+    // Inkling-2's DFlash2 (--spec dflash2 --draft-model DIR) takes DSpark's round options and defaults; --draft-model
+    // needs --spec dflash2, and Qwen's DFlash2 still needs its explicit --draft-tokens.
+    {
+        const ninfer::EngineOptions df2 =
+            make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-model", "/drafter"}));
+        failures += check(df2.speculative.backend == ninfer::SpeculativeBackend::DFlash2 && df2.speculative.draft_model == "/drafter" &&
+                              ninfer::is_block_drafter(df2.speculative) &&
+                              df2.speculative.draft_tokens == ninfer::product::kDSparkDefaultDraftTokens &&
+                              df2.speculative.draft_min_p == 0.5F && df2.speculative.dspark_adaptive,
+                          "--spec dflash2 --draft-model does not take DSpark's round defaults");
+        const ninfer::EngineOptions df2_fixed = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-model",
+                                                                           "/drafter", "--draft-tokens", "4", "--draft-min-p", "0",
+                                                                           "--dspark-adaptive", "off"}));
+        failures += check(df2_fixed.speculative.draft_tokens == 4 && df2_fixed.speculative.draft_min_p == 0.0F &&
+                              !df2_fixed.speculative.dspark_adaptive,
+                          "--spec dflash2 --draft-model's round options did not reach the Engine options");
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-model", "/drafter", "--draft-tokens", "8"},
+                                        "[1,7]"),
+                          "--spec dflash2 --draft-model accepted 8 drafts");
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-model", "/drafter"}, "--spec dflash2") &&
+                              serve_rejects({"ninfer-serve", "model.ninfer", "--draft-model", "/drafter"}, "--spec dflash2"),
+                          "--draft-model accepted without --spec dflash2");
+        failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dflash2"}, "[1,15]") &&
+                              serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "4", "--draft-min-p", "0.3"},
+                                            "--draft-min-p"),
+                          "Qwen's --spec dflash2 lost its own validation");
+    }
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "0"}, "[1,7]"),
                       "--spec dspark accepted an explicit 0 drafts");
     failures += check(serve_rejects({"ninfer-serve", "model.ninfer", "--spec", "dflash2",

@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 703" width="960" height="703" role="img" aria-label="Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata&#x27;s reported figures: 1.34x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 732" width="960" height="732" role="img" aria-label="Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata&#x27;s reported figures: 1.83x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).">
   <title>One Tesla V100 32 GB: faster than the next-best engine</title>
-  <desc>Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata&#x27;s reported figures: 1.34x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).</desc>
+  <desc>Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata&#x27;s reported figures: 1.83x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).</desc>
 
   <style>
     .surface { fill: #fcfcfb; stroke: rgba(11,11,11,0.10); }
@@ -20,7 +20,7 @@
     }
   </style>
   <defs><pattern id="hatch-v100-headline" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" class="hatchbg"/><line x1="0" y1="0" x2="0" y2="6" class="hatchln" stroke-width="2"/></pattern></defs>
-  <rect x="1" y="1" width="958" height="701" rx="14" class="surface" stroke-width="1"/>
+  <rect x="1" y="1" width="958" height="730" rx="14" class="surface" stroke-width="1"/>
   <text x="32.0" y="48.0" class="t1" font-size="22" font-weight="700" text-anchor="start">One Tesla V100 32 GB: faster than the next-best engine</text>
   <text x="32.0" y="72.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">Speed of ashalliants/ninfer-3090 divided by the fastest other engine we could run or find for each model on the</text>
   <text x="32.0" y="91.0" class="t2" font-size="13.5" font-weight="400" text-anchor="start">same card. Above 1.0x means ours is faster. Decode is the geometric mean over the prompts in each model&#x27;s chart.</text>
@@ -31,38 +31,38 @@
   <text x="32.0" y="209.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Qwen3.6-35B-A3B</text>
   <text x="32.0" y="228.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs llama.cpp 36d818e16, best of MTP n2</text>
   <text x="32.0" y="243.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">/ MTP n3 / DFlash n7 per prompt</text>
-  <path class="ours" d="M302.0,198.0 h187.4 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-187.4 z"><title>Qwen3.6-35B-A3B, Decode: 1.34x</title></path>
-  <line x1="445.1" y1="193.0" x2="445.1" y2="221.0" class="ref" stroke-width="1.5"/>
-  <text x="500.4" y="213.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.34x</text>
+  <path class="ours" d="M302.0,198.0 h149.1 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-149.1 z"><title>Qwen3.6-35B-A3B, Decode: 1.34x</title></path>
+  <line x1="416.5" y1="193.0" x2="416.5" y2="221.0" class="ref" stroke-width="1.5"/>
+  <text x="462.1" y="213.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.34x</text>
   <text x="302.0" y="234.0" class="t3" font-size="11" font-weight="400" text-anchor="start">7 prompts; ours MTP3, DFlash K7 on JSON (range</text>
   <text x="302.0" y="248.0" class="t3" font-size="11" font-weight="400" text-anchor="start">1.09-1.50x)</text>
-  <path class="ours" d="M629.0,198.0 h168.0 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-168.0 z"><title>Qwen3.6-35B-A3B, Prefill: 1.20x</title></path>
-  <line x1="772.1" y1="193.0" x2="772.1" y2="221.0" class="ref" stroke-width="1.5"/>
-  <text x="808.0" y="213.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.20x</text>
+  <path class="ours" d="M629.0,198.0 h133.6 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-133.6 z"><title>Qwen3.6-35B-A3B, Prefill: 1.20x</title></path>
+  <line x1="743.5" y1="193.0" x2="743.5" y2="221.0" class="ref" stroke-width="1.5"/>
+  <text x="773.6" y="213.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.20x</text>
   <text x="629.0" y="234.0" class="t3" font-size="11" font-weight="400" text-anchor="start">4.2K and 13K prompts; llama.cpp with tuned</text>
   <text x="629.0" y="248.0" class="t3" font-size="11" font-weight="400" text-anchor="start">batch (-ub 2048 -b 4096) (range 1.19-1.21x)</text>
   <line x1="32" y1="266.0" x2="928" y2="266.0" class="grid" stroke-width="1"/>
   <text x="32.0" y="293.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Qwen3.8-27B</text>
   <text x="32.0" y="312.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs Lapilli f9b7dd09 (DFlash2, its</text>
   <text x="32.0" y="327.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">default)</text>
-  <path class="ours" d="M302.0,282.0 h169.0 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-169.0 z"><title>Qwen3.8-27B, Decode: 1.21x</title></path>
-  <line x1="445.1" y1="277.0" x2="445.1" y2="305.0" class="ref" stroke-width="1.5"/>
-  <text x="482.0" y="297.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.21x</text>
+  <path class="ours" d="M302.0,282.0 h134.4 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-134.4 z"><title>Qwen3.8-27B, Decode: 1.21x</title></path>
+  <line x1="416.5" y1="277.0" x2="416.5" y2="305.0" class="ref" stroke-width="1.5"/>
+  <text x="447.4" y="297.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.21x</text>
   <text x="302.0" y="318.0" class="t3" font-size="11" font-weight="400" text-anchor="start">7 prompts, the faster of our MTP3 and DFlash2</text>
   <text x="302.0" y="332.0" class="t3" font-size="11" font-weight="400" text-anchor="start">per prompt; DFlash2 alone 1.07x, MTP3 alone</text>
   <text x="302.0" y="346.0" class="t3" font-size="11" font-weight="400" text-anchor="start">1.04x (range 1.04-1.52x)</text>
-  <path class="ours" d="M629.0,282.0 h193.4 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-193.4 z"><title>Qwen3.8-27B, Prefill: 1.38x</title></path>
-  <line x1="772.1" y1="277.0" x2="772.1" y2="305.0" class="ref" stroke-width="1.5"/>
-  <text x="833.4" y="297.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.38x</text>
+  <path class="ours" d="M629.0,282.0 h154.0 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-154.0 z"><title>Qwen3.8-27B, Prefill: 1.38x</title></path>
+  <line x1="743.5" y1="277.0" x2="743.5" y2="305.0" class="ref" stroke-width="1.5"/>
+  <text x="794.0" y="297.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.38x</text>
   <text x="629.0" y="318.0" class="t3" font-size="11" font-weight="400" text-anchor="start">4.2K and 13.4K prompts (range 1.37-1.39x)</text>
   <line x1="32" y1="364.0" x2="928" y2="364.0" class="grid" stroke-width="1"/>
   <text x="32.0" y="391.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Qwen3.8-Flash-Next</text>
   <text x="32.0" y="410.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs Lapilli f9b7dd09 (its UD-IQ2_XS;</text>
   <text x="32.0" y="425.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">ours a different quant of the same</text>
   <text x="32.0" y="440.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">size)</text>
-  <path class="ours" d="M302.0,380.0 h142.5 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-142.5 z"><title>Qwen3.8-Flash-Next, Decode: 1.02x</title></path>
-  <line x1="445.1" y1="375.0" x2="445.1" y2="403.0" class="ref" stroke-width="1.5"/>
-  <text x="455.5" y="395.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.02x</text>
+  <path class="ours" d="M302.0,380.0 h113.2 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-113.2 z"><title>Qwen3.8-Flash-Next, Decode: 1.02x</title></path>
+  <line x1="416.5" y1="375.0" x2="416.5" y2="403.0" class="ref" stroke-width="1.5"/>
+  <text x="426.2" y="395.0" class="win" font-size="17" font-weight="700" text-anchor="start">1.02x</text>
   <text x="302.0" y="416.0" class="t3" font-size="11" font-weight="400" text-anchor="start">5 prompts; ahead on all five, by 0.2% to 8%</text>
   <text x="302.0" y="430.0" class="t3" font-size="11" font-weight="400" text-anchor="start">(range 1.00-1.08x)</text>
   <text x="629.0" y="393.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">Not compared: Lapilli&#x27;s Flash-Next prefill</text>
@@ -72,22 +72,24 @@
   <text x="32.0" y="510.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Inkling-2-Mini</text>
   <text x="32.0" y="529.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs Strata, reported on its model card</text>
   <text x="32.0" y="544.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">(the fastest other figure found)</text>
-  <path class="rep" d="M302.0,499.0 h224.4 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-224.4 z"><title>Inkling-2-Mini, Decode: 1.60x</title></path>
-  <line x1="445.1" y1="494.0" x2="445.1" y2="522.0" class="ref" stroke-width="1.5"/>
-  <text x="537.4" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.60x</text>
-  <text x="302.0" y="535.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: DSpark, 12-chat average at 262,144</text>
-  <text x="302.0" y="549.0" class="t3" font-size="11" font-weight="400" text-anchor="start">context, full Q8_K_XL (23.9 GB). Strata runs</text>
-  <text x="302.0" y="563.0" class="t3" font-size="11" font-weight="400" text-anchor="start">smaller packs (SQ-20 19.4 GB / SQ-10 10.5 GB);</text>
-  <text x="302.0" y="577.0" class="t3" font-size="11" font-weight="400" text-anchor="start">its decode figure doesn&#x27;t say which</text>
-  <path class="rep" d="M629.0,499.0 h166.7 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-166.7 z"><title>Inkling-2-Mini, Prefill: 1.19x</title></path>
-  <line x1="772.1" y1="494.0" x2="772.1" y2="522.0" class="ref" stroke-width="1.5"/>
-  <text x="806.7" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.19x</text>
+  <path class="rep" d="M302.0,499.0 h205.5 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-205.5 z"><title>Inkling-2-Mini, Decode: 1.83x</title></path>
+  <line x1="416.5" y1="494.0" x2="416.5" y2="522.0" class="ref" stroke-width="1.5"/>
+  <text x="518.5" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.83x</text>
+  <text x="302.0" y="535.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: the DFlash2 drafter (112.5 with DSpark),</text>
+  <text x="302.0" y="549.0" class="t3" font-size="11" font-weight="400" text-anchor="start">12-chat average at 262,144 context, full</text>
+  <text x="302.0" y="563.0" class="t3" font-size="11" font-weight="400" text-anchor="start">Q8_K_XL (23.9 GB). Strata runs smaller packs</text>
+  <text x="302.0" y="577.0" class="t3" font-size="11" font-weight="400" text-anchor="start">(SQ-20 19.4 GB / SQ-10 10.5 GB); its decode</text>
+  <text x="302.0" y="591.0" class="t3" font-size="11" font-weight="400" text-anchor="start">figure doesn&#x27;t say which</text>
+  <path class="rep" d="M629.0,499.0 h132.5 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-132.5 z"><title>Inkling-2-Mini, Prefill: 1.19x</title></path>
+  <line x1="743.5" y1="494.0" x2="743.5" y2="522.0" class="ref" stroke-width="1.5"/>
+  <text x="772.5" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.19x</text>
   <text x="629.0" y="535.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: 8K prompt with --prefill-chunk 8192. At</text>
   <text x="629.0" y="549.0" class="t3" font-size="11" font-weight="400" text-anchor="start">the default chunk 2048 (2,170) it is 0.95x:</text>
   <text x="629.0" y="563.0" class="t3" font-size="11" font-weight="400" text-anchor="start">Strata&#x27;s reported prefill is higher</text>
-  <line x1="32" y1="605.0" x2="928" y2="605.0" class="grid" stroke-width="1"/>
-  <text x="32.0" y="623.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Per-model charts, prompts, quants and the pinned sources for every competitor figure: docs/tesla-v100.md, &quot;Methodology and sources&quot;.</text>
-  <text x="32.0" y="638.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Competitor versions: llama.cpp 36d818e16 with ggml-org Q4_K_M and its MTP / DFlash Q8_0 sidecars; Lapilli f9b7dd09.</text>
-  <text x="32.0" y="659.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM · 200 W limit · 2026-11-25 · ours: 35B-A3B #614/#618/#621, 27B</text>
-  <text x="32.0" y="674.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">d309f3d8, Flash-Next fdcac347 (#611), Inkling-2-Mini 2026-11-28 and #596 · competitors measured on this box unless marked “reported”</text>
+  <line x1="32" y1="619.0" x2="928" y2="619.0" class="grid" stroke-width="1"/>
+  <text x="32.0" y="637.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Per-model charts, prompts, quants and the pinned sources for every competitor figure: docs/tesla-v100.md, &quot;Methodology and sources&quot;.</text>
+  <text x="32.0" y="652.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Competitor versions: llama.cpp 36d818e16 with ggml-org Q4_K_M and its MTP / DFlash Q8_0 sidecars; Lapilli f9b7dd09.</text>
+  <text x="32.0" y="673.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM · 200 W limit · 2026-11-25 · ours: 35B-A3B #614/#618/#621, 27B</text>
+  <text x="32.0" y="688.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">d309f3d8, Flash-Next fdcac347 (#611), Inkling-2-Mini 2026-11-28 (DFlash2) and #596 · competitors measured on this box unless marked</text>
+  <text x="32.0" y="703.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">“reported”</text>
 </svg>
