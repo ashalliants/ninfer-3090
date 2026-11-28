@@ -864,6 +864,16 @@ int main() {
         }
         failures += check(kv_help.find("--speed exact|fast") != std::string::npos, "serve help omits --speed");
     }
+    // --max-concurrency takes up to 16 (Inkling-2's batched decode; the Engine holds every other model to 8), not 0 or 17.
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "16"}).max_concurrency == 16,
+                      "--max-concurrency 16 was refused");
+    for (const char* n : {"0", "17"}) {
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--max-concurrency", n});
+        } catch (const std::invalid_argument&) { refused = true; }
+        failures += check(refused, (std::string("--max-concurrency ") + n + " was accepted").c_str());
+    }
     // --mxfp8-experts auto|on|off reaches the Engine options (Inkling-2's exact MXFP8 experts); auto by default.
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--mxfp8-experts", "on"})).experts_mxfp8 == ninfer::ExpertsMxfp8::On &&
                           make_engine_options(parse({"ninfer-serve", "model.ninfer", "--mxfp8-experts", "off"})).experts_mxfp8 == ninfer::ExpertsMxfp8::Off &&

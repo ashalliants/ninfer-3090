@@ -7,6 +7,7 @@
 // - streaming gives the aggregate's text; cancellation ends one request and the others finish;
 // - prefix reuse keeps one snapshot per slot: a repeated long prompt resumes (in its slot) and decodes what it did cold;
 // - the runtime stats report the slots as lanes, and the counters add up;
+// - sixteen slots (Inkling-2's limit, past the other models' 8) give every request its solo output; seventeen are refused;
 // - with max_concurrency 8 at a context that cannot fit 8 times, the Engine fits a smaller context per slot and
 //   reports it (options().max_context and the load note).
 // Skips without NINFER_TEST_INKLING2_ARTIFACT. NINFER_INKLING2_BATCH_FIT=0 skips the fitting case (a slow startup).
@@ -195,6 +196,38 @@ int main() {
             check(again.reused_prompt_tokens > 0 && again.reused_prompt_tokens % 256 == 0 && again.generated_token_ids == alone[6].generated_token_ids &&
                       cold.generated_token_ids == alone[6].generated_token_ids,
                   "a repeated prompt resumes from its slot's snapshot (" + std::to_string(again.reused_prompt_tokens) + " reused) and decodes the same");
+        }
+        {
+            // The widest batch Inkling-2 takes (ninfer::kMaximumInkling2Concurrency, past the 8 of the other models'
+            // routes): every case at once, twice over, each with its solo output, and the stats report every lane.
+            auto options            = base_options(artifact);
+            options.max_concurrency = ninfer::kMaximumInkling2Concurrency;
+            ninfer::Engine engine(options);
+            check(engine.options().max_concurrency == ninfer::kMaximumInkling2Concurrency, "sixteen slots");
+            std::vector<ninfer::GenerationHandle> handles;
+            for (int round = 0; round < 2; ++round) {
+                for (const Case& c : all) {
+                    auto o                         = c.options;
+                    o.execution.allow_prefix_reuse = false;
+                    handles.push_back(engine.submit(engine.prepare(user_turn(c.prompt)), o, ninfer::OutputConsumerMode::Aggregate, {}));
+                }
+            }
+            for (std::size_t i = 0; i < handles.size(); ++i) {
+                const auto r     = handles[i].wait(nullptr);
+                const auto& want = alone[i % all.size()];
+                check(r.generated_token_ids == want.generated_token_ids && r.content == want.content && r.finish_reason == want.finish_reason,
+                      "request " + std::to_string(i) + " at 16 slots gives its solo output");
+            }
+            const auto stats = engine.runtime_stats();
+            check(stats.lane_count == ninfer::kMaximumInkling2Concurrency && stats.running_requests == 0, "sixteen lanes reported, idle after");
+            auto past            = base_options(artifact);
+            past.max_concurrency = ninfer::kMaximumInkling2Concurrency + 1;
+            bool refused         = false;
+            try {
+                ninfer::Engine too_wide(past);
+            } catch (const std::invalid_argument&) { refused = true; }
+            check(refused, "seventeen slots are refused");
+            std::printf("16 slots: %zu requests each gave its solo output\n", handles.size());
         }
         if (std::getenv("NINFER_INKLING2_BATCH_FIT") == nullptr || std::string(std::getenv("NINFER_INKLING2_BATCH_FIT")) != "0") {
             // A context floor under which the fit refuses to start: one step under 262144 does not fit 8 times.

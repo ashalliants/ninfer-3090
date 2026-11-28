@@ -3,7 +3,7 @@
 // Batched decode of Inkling-2-Mini (TextProgram::forward_batch) against each request decoded alone, on the real
 // artifact. Every prompt first runs alone through a one-slot Program (the Engine's single-request path: chunked
 // prefill, then the single-token decode graph), greedy, keeping each step's logits. Then the same prompts run through
-// one Program of kMaxBatchColumns slots with at most B in flight at once (B = 2, 4, 8): requests arrive staggered (one
+// one Program of kMaxBatchColumns slots with at most B in flight at once (B = 2, 4, 8, 16): requests arrive staggered (one
 // every few steps, waiting for a free slot), each prefills alone in its slot between decode steps, and every step
 // decodes all the requests in flight as the columns of one forward_batch. They finish at different lengths, so the
 // batches shrink and grow and the slots are reused.
@@ -14,7 +14,7 @@
 //
 // Environment: NINFER_TEST_INKLING2_ARTIFACT; skips (77) without it. NINFER_INKLING2_BATCH_TOKENS: tokens per
 // request (default 48). NINFER_INKLING2_KV=fp32: FP32 rings (default FP16, the Engine's). NINFER_INKLING2_BATCH_BENCH=1
-// also times full batches of B = 1, 2, 4, 8 (64 steps each after a warm-up step, at a context of about 1,000);
+// also times full batches of B = 1, 2, 4, 8, 12, 16 (64 steps each after a warm-up step, at a context of about 1,000);
 // NINFER_INKLING2_BATCH_WIDTH=B times only that B and skips the comparison (for a profiler).
 
 #include "artifact/reader.h"
@@ -117,7 +117,7 @@ int main() {
         std::printf("KV rings %s; %d tokens a request\n", fp32 ? "FP32" : "FP16", n_tokens);
 
         // Prompts across the split threshold (512 keys) and the sliding window (1024), finishing at different lengths.
-        const std::int32_t lengths[] = {37, 300, 470, 505, 700, 1030, 1500, 2100};
+        const std::int32_t lengths[] = {37, 300, 470, 505, 700, 1030, 1500, 2100, 90, 260, 520, 610, 900, 1100, 1800, 2400};
         std::vector<Prompt> prompts;
         std::uint32_t seed = 12345;
         for (std::size_t i = 0; i < std::size(lengths); ++i) {
@@ -152,7 +152,7 @@ int main() {
         ink::ProgramLimits batch_limits = limits;
         batch_limits.slots = ink::kMaxBatchColumns;
         ink::TextProgram program(*model, batch_limits, stream);
-        for (const std::int32_t in_flight : {2, 4, 8}) {
+        for (const std::int32_t in_flight : {2, 4, 8, 16}) {
             if (only > 0) { break; }
             struct Active {
                 std::size_t request;
@@ -256,7 +256,7 @@ int main() {
                 program.reset();
                 prefill(program, p, kChunk, last, vocab, stream);
             }
-            for (const std::int32_t b : {1, 2, 4, 8}) {
+            for (const std::int32_t b : {1, 2, 4, 8, 12, 16}) {
                 if (only > 0 && b != only) { continue; }
                 std::vector<std::int32_t> slots(static_cast<std::size_t>(b)), tokens(static_cast<std::size_t>(b), argmax(last));
                 for (std::int32_t i = 0; i < b; ++i) {

@@ -42,7 +42,7 @@ rows marked 200 W, re-measured 2026-11-23 (prefill 2026-11-24); the
 | **Decode**, plain | 80.1 tok/s at 8,192 (2026-11-28, 200 W); 48 tok/s at 100K context |
 | **Decode at 262,144** (200 W) | **112.5 tok/s** DSpark (99.4 before the 2026-11-28 drafter changes; 108.9 before candidate picks; 110.5 before MXFP8 experts), **79.8** plain (78.2 before), average over 12 chats (`--max-context 262144 --vision --kv-dtype int8`) |
 | **Decode**, DFlash2 drafter | **129.0 tok/s** at 262,144 (`--spec dflash2 --draft-model DIR`, vision, INT8 KV; 130.6 at 8,192), average over 12 chats; same output |
-| **Decode**, `--max-concurrency 8` | **198.2 tok/s** aggregate (plain) |
+| **Decode**, `--max-concurrency 16` | **248.2 tok/s** aggregate (plain, 2026-11-28; 210.8 at 8, 17.2 tok/s per request at 16), each request's output the same as alone |
 | **Prefill** (200 W) | **2,727 tok/s** at 8K (131,072 context, `--prefill-chunk 8192`); 2,227 at 34K, 1,577 at 100K. At the default chunk 2048: 2,170 at 8K, 1,962 at 1K, 1,339 at 100K. At 262,144 with DSpark and vision (chunk 2048): 2,125 at 8K, 1,930 at 1K, 1,324 at 100K |
 | **Low-bit KV** (`--kv-dtype rk4v4`, opt-in, lossy) | plain decode **41.1 tok/s at 200K** (FP16 34.8), 53.2 at 100K (47.8); frees 5,952 MiB at 262,144; KLD 2.8x the FP32 floor (`int8`: 1.06x, 40.7 tok/s) |
 | **`--speed fast`** (opt-in, lossy) | **163.5 tok/s** on structured output (133.1 exact), **109.3-110.3** over 12 chats (101.1-101.3 exact); 2026-11-27, 200 W. With the 2026-11-28 drafter changes at 8,192 context: **117.4** over 12 chats (exact DSpark 109.6), maths 39/40, JSON 10/10 ([spec](maintainer/inkling2-model.md#speed-fast)) |
@@ -888,8 +888,8 @@ come over the PCIe link when needed.
   CUDA-core kernel run correctly but slowly; these are mainly prompt tails under 129 tokens for the
   27B.
 - **One request at a time** has been measured for Flash-Next. Two lanes (`NINFER_CONCURRENCY=2`)
-  are allowed but have not been tuned on the V100. Inkling-2-Mini batches up to 8 requests
-  (`--max-concurrency 8`), without DSpark or adapters at N > 1.
+  are allowed but have not been tuned on the V100. Inkling-2-Mini batches up to 16 requests
+  (`--max-concurrency 16`), without DSpark or adapters at N > 1.
 - **Known `sm_70` test failures:**
   - `capped_prefill_steps` and `explicit_positions_equal_rope_delta_path`: workspace `bad_alloc`
     with the cuBLAS prefill route.

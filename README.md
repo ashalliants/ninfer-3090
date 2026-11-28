@@ -658,7 +658,7 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 | Qwen3.6-35B-A3B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6) | 21.23 GiB | Carries the DFlash bundle for `--spec dflash` |
 | Qwen3.6-27B | [pinned v3 artifact](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/tree/3e3d9a3951c452c1ca80bd7a2860c7f3bfc5a829) | 16.29 GiB | Supported with more runtime headroom |
 | Qwen3.8-Flash-Next (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090/tree/c7dfb9694fc3cb3d40298afbfe2e3a8c172241fa) | 38.20 GiB in two files + 27.13 GiB n-gram volume | Windows, one request at a time (two lanes opt-in), 64 GB RAM. This fork's [exact conversion](model-cards/Qwen3.8-Flash-Next-NInfer-3090/README.md) of the GSQ-RCO IQ2_XS GGUF with the MTP drafter and vision tower. Keep the n-gram volume on NVMe |
-| **Inkling-2-Mini** (new, V100 and RTX 3090) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Inkling-2-Mini-NInfer-V100/tree/e348ad671599db1db110447b9d9ebfb898070f67) | 22.27 GiB with DSpark and vision | Tesla V100 32 GB (Linux, up to 8 requests at once) or RTX 3090 (measured under WSL and on Windows). This fork's [exact conversion](model-cards/Inkling-2-Mini-NInfer-V100/README.md) of Unsloth's UD-Q8_K_XL GGUF: lossless, unpacking the expert records reproduces every source tensor byte for byte. See [Inkling-2-Mini](#inkling-2-mini-new-v100-and-rtx-3090) |
+| **Inkling-2-Mini** (new, V100 and RTX 3090) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Inkling-2-Mini-NInfer-V100/tree/e348ad671599db1db110447b9d9ebfb898070f67) | 22.27 GiB with DSpark and vision | Tesla V100 32 GB (Linux, up to 16 requests at once) or RTX 3090 (measured under WSL and on Windows). This fork's [exact conversion](model-cards/Inkling-2-Mini-NInfer-V100/README.md) of Unsloth's UD-Q8_K_XL GGUF: lossless, unpacking the expert records reproduces every source tensor byte for byte. See [Inkling-2-Mini](#inkling-2-mini-new-v100-and-rtx-3090) |
 | Qwen3.8-Flash-Next, UD-IQ3_XXS (preview) | [pinned v3 artifact](https://huggingface.co/WarlaxZ/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/tree/196f11834dfe4fc21342f0255bcee034a5120ae7) | 53.17 GiB in two files + the 27.13 GiB n-gram volume of the row above | Windows, one request at a time, 64 GB RAM (about 42 GiB available), text only. This fork's [conversion](model-cards/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-3090/README.md) of Unsloth's Dynamic v3.1 UD-IQ3_XXS GGUF with the MTP drafter: lower perplexity than the row above, about half the speed |
 
 `download-model qwen38-27b`, `qwen38-27b-qad`, `bonsai2-27b`, `qwen36-35b-a3b`, `qwen36-27b` or `inkling2-mini` (`.bat` on Windows, `.sh` on Linux)
@@ -733,8 +733,8 @@ Gen3 x4 eGPU) unless a figure says 200 W:
   262,144 (`int8`: 3,968), so DSpark keeps its Q8 head and whole-context window beside vision (12 chats 93.4 against
   89.4 tok/s). KLD from FP16 is 2.8x the FP32 noise floor for `rk4v4` and 1.06x for `int8`; needles at 100K and 200K
   are found. One request at a time; prefill past 100K is 5-8% slower. Off by default.
-- **Several requests:** `--max-concurrency` up to 8, **198.2 tok/s** aggregate at 8 (121.8 at 2, 170.5 at 4),
-  each request's tokens the same as alone. Requests at N > 1 decode without DSpark.
+- **Several requests:** `--max-concurrency` up to 16, **248.2 tok/s** aggregate at 16 (210.8 at 8, 179.4 at 4;
+  2026-11-28), each request's tokens the same as alone. Requests at N > 1 decode without DSpark.
 - **Adapters:** two opt-in uncensoring adapters (`--lora`, `--graft`, selected per request) take the refusals
   on 20 harmful prompts from 20/20 to 0/20, and decode 4-5% slower than without an adapter. Other requests run the base model unchanged.
 - **Accuracy:** with the exact FP32 program (`--kv-dtype fp32`), greedy text matches CPU llama.cpp (Unsloth's
@@ -769,7 +769,7 @@ BF16 weights would leave under 4 GiB free; a V100 build always does, as the MXFP
   8.4K (TTFT 3.5 s) and 2,416 at 1.2K (0.48 s; the first prompt after a start is slower); at 131,072, 1,640 at 8.4K,
   1,449 at 36K and 1,077 at 112K (1 m 44 s). `--fit-context` found 128,000-136,192 plain, 113,664-116,736 with DSpark,
   101,376-105,472 with vision and 80,896-87,040 with both, depending on what the desktop held; `rk4v4` fits all
-  262,144 with DSpark and vision. `--max-concurrency 8`: 277 tok/s aggregate (224 at 4, 150 at 2).
+  262,144 with DSpark and vision. `--max-concurrency 8`: 277 tok/s aggregate (224 at 4, 150 at 2; 16 is NOT RUN on the 3090).
 - **DSpark** gains less here than on the V100, because plain decode is already fast: 103.5 against 103.3 tok/s on
   the 12 chats, 115.5 on a code prompt, but 73-74 against 98 for a short reply after a 1.2K-token prompt. Leave it off
   unless the work is mostly code.

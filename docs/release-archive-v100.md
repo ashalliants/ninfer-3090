@@ -62,7 +62,7 @@ The endpoint is OpenAI- and Anthropic-compatible, so anything that speaks `/v1/c
 ```
 
 Inkling-2-Mini has no launcher profile yet: you start `ninfer-serve` on its artifact directly, as above.
-`--max-concurrency 8` serves up to eight requests at once (DSpark then applies to a single request).
+`--max-concurrency 16` serves up to sixteen requests at once (DSpark then applies to a single request).
 [Its model card](https://github.com/ashalliants/ninfer-3090/blob/master/model-cards/Inkling-2-Mini-NInfer-V100/README.md)
 has the measured figures and options.
 

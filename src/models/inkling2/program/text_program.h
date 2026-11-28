@@ -111,9 +111,11 @@ inline constexpr std::int32_t kLocalAttentionSlice = 256;
 [[nodiscard]] constexpr std::int32_t local_ring_chunk(std::int32_t max_chunk) {
     return max_chunk < kLocalAttentionSlice + kTensorCoreMinColumns ? max_chunk : kLocalAttentionSlice + kTensorCoreMinColumns - 1;
 }
-// The most slots forward_batch() takes at once: every column of a decode forward then keeps its one-column bits
-// (the split attention's limit, ops::kSplitMaxColumns; far below kTensorCoreMinColumns).
-inline constexpr std::int32_t kMaxBatchColumns = 8;
+// The most slots forward_batch() takes at once. Every column of a decode forward keeps its one-column bits: the
+// attention runs in groups of ops::kSplitMaxColumns columns, and the projections stay below kTensorCoreMinColumns.
+inline constexpr std::int32_t kMaxBatchColumns = 16;
+// The most drafts one DSpark round verifies (the drafter's block of 8 less its anchor); prompt lookup proposes as many.
+inline constexpr std::int32_t kMaxRoundDrafts = 7;
 
 // Columns [column, column + values.ne[1]) of a forward that take `values` as their input in place of their tokens'
 // normed embeddings: FP32 [hidden, n] on the device, columns contiguous (an image's embeddings; their tokens are
