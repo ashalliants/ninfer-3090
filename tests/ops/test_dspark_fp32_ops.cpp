@@ -731,6 +731,148 @@ void test_projection_a8q4(int n, int k, int cols, double tol) {
     }
 }
 
+// Candidate drafting: the row-major copy is the transpose, the candidates each tile's top 8 of base + hb, and the pick
+// the best candidate by the decoded Q8 P (within FP32 rounding of the host's best score).
+void test_candidates(int v, int valid, int n) {
+    using ninfer::ops::kCandidatesPerTile;
+    using ninfer::ops::kCandidateTile;
+    const std::string label = "candidates V " + std::to_string(v) + " valid " + std::to_string(valid) + " n " + std::to_string(n);
+    const int r = 256;
+    const auto base = randoms(static_cast<std::size_t>(v) * n, -8, 8), hb = randoms(v, -1, 1);
+    const auto pt = randoms(static_cast<std::size_t>(r) * v, -0.2F, 0.2F), latent = randoms(r, -1, 1);
+    Buf dbase(base), dhb(hb), dpt(pt), dlat(latent);
+    Tensor tb = dbase.tensor({v, n}), th = dhb.tensor({v}), tp = dpt.tensor({v, r}), tl = dlat.tensor({r});
+    using ninfer::ops::MarkovForm;
+    const std::size_t code_bytes = ninfer::ops::markov_head_code_bytes(MarkovForm::Q8, v, r), scale_bytes = ninfer::ops::markov_head_scale_bytes(MarkovForm::Q8, v, r);
+    ninfer::DeviceBuffer codes(code_bytes), scales(scale_bytes), rc(static_cast<std::size_t>(v) * r), rs(static_cast<std::size_t>(v) * r / 32 * 4);
+    const ninfer::ops::MarkovHead head{MarkovForm::Q8, codes.p, static_cast<const float*>(scales.p), v, r};
+    ninfer::ops::dspark_markov_quantize(tp, head, nullptr);
+    ninfer::ops::markov_rows_from_q8(head, static_cast<std::int8_t*>(rc.p), static_cast<float*>(rs.p), nullptr);
+    std::vector<std::int8_t> hc(code_bytes), hrc(static_cast<std::size_t>(v) * r);
+    std::vector<float> hs(scale_bytes / 4), hrs(static_cast<std::size_t>(v) * r / 32);
+    codes.copy_to_host(hc.data(), hc.size());
+    scales.copy_to_host(hs.data(), hs.size() * 4);
+    rc.copy_to_host(hrc.data(), hrc.size());
+    rs.copy_to_host(hrs.data(), hrs.size() * 4);
+    bool rows_ok = true;
+    for (int i = 0; i < v; ++i) {
+        for (int k = 0; k < r; ++k) {
+            rows_ok = rows_ok && hrc[static_cast<std::size_t>(i) * r + k] == hc[static_cast<std::size_t>(k) * v + i];
+            if (k % 32 == 0) { rows_ok = rows_ok && hrs[static_cast<std::size_t>(i) * (r / 32) + k / 32] == hs[static_cast<std::size_t>(k / 32) * v + i]; }
+        }
+    }
+    check(rows_ok, label + ": the row-major copy is not the transpose");
+    const int tiles = (valid + kCandidateTile - 1) / kCandidateTile, count = tiles * kCandidatesPerTile;
+    ninfer::DeviceBuffer cand(static_cast<std::size_t>(count) * n * 4), work(16), out(4), scores(static_cast<std::size_t>(count) * 4), prob(4);
+    const float cap = 30.0F;
+    work.fill(0);
+    Tensor tc(cand.p, DType::I32, {count, n});
+    ninfer::ops::dspark_tile_candidates(tb, th, valid, tc, nullptr);
+    std::vector<std::int32_t> hcand(static_cast<std::size_t>(count) * n);
+    cand.copy_to_host(hcand.data(), hcand.size() * 4);
+    bool cand_ok = true, pick_ok = true;
+    for (int c = 0; c < n; ++c) {
+        for (int t = 0; t < tiles; ++t) {
+            std::vector<std::pair<float, int>> rows;
+            for (int i = t * kCandidateTile; i < std::min(valid, (t + 1) * kCandidateTile); ++i) {
+                rows.emplace_back(-(base[static_cast<std::size_t>(c) * v + i] + hb[i]), i);
+            }
+            std::sort(rows.begin(), rows.end());
+            for (int k = 0; k < kCandidatesPerTile; ++k) {
+                const int want = rows[std::min<std::size_t>(k, rows.size() - 1)].second;
+                cand_ok = cand_ok && hcand[static_cast<std::size_t>(c) * count + t * kCandidatesPerTile + k] == want;
+            }
+        }
+        Tensor col = tb.slice(1, c, 1).reshape({v});
+        ninfer::ops::dspark_candidate_pick(col, th, static_cast<const std::int8_t*>(rc.p), static_cast<const float*>(rs.p), r, tl,
+                                           static_cast<const std::int32_t*>(cand.p) + static_cast<std::size_t>(c) * count, count,
+                                           cap, static_cast<float*>(scores.p), static_cast<std::uint64_t*>(work.p),
+                                           static_cast<std::int32_t*>(out.p), static_cast<float*>(prob.p), nullptr);
+        std::int32_t got = -1;
+        float gp = 0;
+        out.copy_to_host(&got, 4);
+        prob.copy_to_host(&gp, 4);
+        const auto score = [&](int i) {
+            double s = double(base[static_cast<std::size_t>(c) * v + i]) + hb[i];
+            for (int k = 0; k < r; ++k) { s += double(hs[static_cast<std::size_t>(k / 32) * v + i]) * hc[static_cast<std::size_t>(k) * v + i] * latent[k]; }
+            return s;
+        };
+        double best = -1e30;
+        for (int k = 0; k < count; ++k) { best = std::max(best, score(hcand[static_cast<std::size_t>(c) * count + k])); }
+        bool listed = false;
+        for (int k = 0; k < count; ++k) { listed = listed || hcand[static_cast<std::size_t>(c) * count + k] == got; }
+        std::vector<int> ids(hcand.begin() + static_cast<std::ptrdiff_t>(c) * count, hcand.begin() + static_cast<std::ptrdiff_t>(c + 1) * count);
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        const double lmax = cap * std::tanh(best / cap);
+        double sum = 0;
+        for (const int i : ids) { sum += std::exp(cap * std::tanh(score(i) / cap) - lmax); }
+        pick_ok = pick_ok && listed && score(got) >= best - 1e-4 && std::fabs(gp - 1.0 / sum) <= 1e-4 + 1e-3 / sum;
+    }
+    std::uint64_t hw[2] = {1, 1};
+    work.copy_to_host(hw, 16);
+    check(cand_ok, label + ": the candidates are not each tile's top 8");
+    check(pick_ok, label + ": the pick is not the best candidate");
+    check(hw[0] == 0 && hw[1] == 0, label + ": the work words are not left zeroed");
+    std::printf("%s: %s\n", label.c_str(), cand_ok && pick_ok ? "ok" : "differs");
+    if (std::getenv("NINFER_BENCH_A8") != nullptr) {
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0), cudaEventCreate(&e1);
+        float ms = 0;
+        cudaEventRecord(e0);
+        for (int i = 0; i < 20; ++i) { ninfer::ops::dspark_tile_candidates(tb, th, valid, tc, nullptr); }
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        cudaEventElapsedTime(&ms, e0, e1);
+        std::printf("  dspark_tile_candidates: %.1f us\n", ms * 50);
+        Tensor col = tb.slice(1, 0, 1).reshape({v});
+        cudaEventRecord(e0);
+        for (int i = 0; i < 20; ++i) {
+            ninfer::ops::dspark_candidate_pick(col, th, static_cast<const std::int8_t*>(rc.p), static_cast<const float*>(rs.p), r, tl,
+                                               static_cast<const std::int32_t*>(cand.p), count, cap, static_cast<float*>(scores.p),
+                                               static_cast<std::uint64_t*>(work.p), static_cast<std::int32_t*>(out.p),
+                                               static_cast<float*>(prob.p), nullptr);
+        }
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        cudaEventElapsedTime(&ms, e0, e1);
+        std::printf("  dspark_candidate_pick (%d candidates): %.1f us\n", count, ms * 50);
+        cudaEventDestroy(e0), cudaEventDestroy(e1);
+    }
+}
+
+// The ordering edge cases: a tile of NaN (its first id, never a pick), and -0 / +0 as one score (the lower id first).
+void test_candidate_edges() {
+    using ninfer::ops::kCandidatesPerTile;
+    using ninfer::ops::kCandidateTile;
+    const int v = 2 * kCandidateTile, r = 256;
+    std::vector<float> base(v, -5.0F), hb(v, 0.0F);
+    for (int i = 0; i < kCandidateTile; ++i) { base[i] = std::numeric_limits<float>::quiet_NaN(); }
+    base[kCandidateTile + 10] = -0.0F;
+    base[kCandidateTile + 20] = 0.0F;
+    const std::vector<float> latent(r, 0.0F);
+    Buf dbase(base), dhb(hb), dlat(latent);
+    Tensor tb = dbase.tensor({v, 1}), th = dhb.tensor({v}), tl = dlat.tensor({r});
+    const int count = 2 * kCandidatesPerTile;
+    ninfer::DeviceBuffer cand(count * 4), work(16), out(4), rc(static_cast<std::size_t>(v) * r), rs(static_cast<std::size_t>(v) * r / 32 * 4);
+    rc.fill(0), rs.fill(0), work.fill(0);
+    Tensor tc(cand.p, DType::I32, {count, 1});
+    ninfer::ops::dspark_tile_candidates(tb, th, v, tc, nullptr);
+    std::vector<std::int32_t> hc(count);
+    cand.copy_to_host(hc.data(), count * 4);
+    bool ok = true;
+    for (int k = 0; k < kCandidatesPerTile; ++k) { ok = ok && hc[k] == 0; } // the NaN tile: its first id
+    ok = ok && hc[kCandidatesPerTile] == kCandidateTile + 10 && hc[kCandidatesPerTile + 1] == kCandidateTile + 20;
+    ninfer::ops::dspark_candidate_pick(tb.slice(1, 0, 1).reshape({v}), th, static_cast<const std::int8_t*>(rc.p), static_cast<const float*>(rs.p), r,
+                                       tl, static_cast<const std::int32_t*>(cand.p), count, 30.0F, nullptr, static_cast<std::uint64_t*>(work.p),
+                                       static_cast<std::int32_t*>(out.p), nullptr, nullptr);
+    std::int32_t got = -1;
+    out.copy_to_host(&got, 4);
+    ok = ok && got == kCandidateTile + 10;
+    check(ok, "candidates: a NaN tile or a signed-zero tie is not ordered by the contract");
+    std::printf("candidate edges: %s\n", ok ? "ok" : "differs");
+}
+
 int main() {
     try {
         test_projection(true, 3072, 2304, 8, false, 1e-7);
@@ -751,6 +893,9 @@ int main() {
         }
         test_projection_a8(1000, 128, 3, true, 5e-3); // rows not a multiple of a block's
         test_copy_runs();
+        test_candidates(5000, 4999, 3);
+        test_candidate_edges();
+        test_candidates(201088, 201088 - 64, 7);
         test_projection_a8q4(1000, 2304, 3, 5e-3);
         test_projection_a8q4(2048, 2304, 8, 5e-3);
         if (std::getenv("NINFER_BENCH_A8") != nullptr) {

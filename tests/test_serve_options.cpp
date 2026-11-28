@@ -1,3 +1,4 @@
+#include "product/speculative_options.h"
 #include "serve/generation_service.h"
 #include "serve/operational_log.h"
 #include "serve/props.h"
@@ -917,10 +918,11 @@ int main() {
         } catch (const std::exception&) { refused = true; }
         failures += check(refused, "--prefill-math accepted an unknown form");
     }
-    // --spec dspark drafts 3 per round unless --draft-tokens says otherwise (1..7).
+    // --spec dspark drafts the build's default per round (7 on sm_70, else 3) unless --draft-tokens says otherwise (1..7).
     const ninfer::EngineOptions dspark = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark"}));
-    failures += check(dspark.speculative.backend == ninfer::SpeculativeBackend::DSpark && dspark.speculative.draft_tokens == 3,
-                      "--spec dspark does not default to 3 drafts");
+    failures += check(dspark.speculative.backend == ninfer::SpeculativeBackend::DSpark &&
+                          dspark.speculative.draft_tokens == ninfer::product::kDSparkDefaultDraftTokens,
+                      "--spec dspark does not take the default draft count");
     const ninfer::EngineOptions dspark2 =
         make_engine_options(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "2"}));
     failures += check(dspark2.speculative.draft_tokens == 2, "--spec dspark --draft-tokens 2 did not reach the Engine options");

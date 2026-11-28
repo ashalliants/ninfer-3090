@@ -1,3 +1,4 @@
+#include "product/speculative_options.h"
 #include "options.h"
 
 #include <cmath>
@@ -219,9 +220,11 @@ int main() {
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).experts_mxfp8 == ninfer::ExpertsMxfp8::Auto &&
                           rejects([&] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--mxfp8-experts", "yes"}); }),
                       "CLI --mxfp8-experts was not parsed, or an unknown form accepted");
-    // --spec dspark: an omitted --draft-tokens takes 3; an explicit one is kept and must be in [1,7].
-    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark"}).speculative.draft_tokens == 3,
-                      "CLI --spec dspark did not default to 3 drafts");
+    // --spec dspark: an omitted --draft-tokens takes the build's default (7 on sm_70, else 3); an explicit one is kept
+    // and must be in [1,7].
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark"}).speculative.draft_tokens ==
+                          ninfer::product::kDSparkDefaultDraftTokens,
+                      "CLI --spec dspark did not take the default draft count");
     {
         const auto d = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark"}).speculative;
         const auto f = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dspark", "--draft-min-p", "0.2",

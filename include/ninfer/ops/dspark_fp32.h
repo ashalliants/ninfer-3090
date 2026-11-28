@@ -272,4 +272,30 @@ inline constexpr std::int32_t kDraftPickCandidates = 1024;
 void dspark_draft_pick(const Tensor& logits, std::int32_t valid_rows, const DraftPick& pick, const double* canonical, Tensor& id,
                        Tensor& prob, cudaStream_t stream);
 
+/**
+ * Candidate drafting (greedy drafts; lossy only in which token is proposed, never the target's output).
+ *
+ * markov_rows_from_q8: a row-major copy of a Q8 MarkovHead (codes int8 [V][R], scales FP32 [V][R / 32]) so one
+ * vocabulary row is R contiguous bytes. rows_codes holds V * R bytes, rows_scales V * R / 32 floats.
+ *
+ * dspark_tile_candidates: for each column t of base FP32 [V, n] (with hb FP32 [V]), the kCandidatesPerTile ids with the
+ * largest base + hb in each tile of kCandidateTile rows below `valid` (lowest id among equals; NaN never chosen):
+ * cand int32 [tiles * kCandidatesPerTile, n], tiles = ceil(valid / kCandidateTile). -0 and +0 are one score. A tile
+ * with fewer valid non-NaN rows than kCandidatesPerTile repeats its last pick (its first id when every row is NaN).
+ *
+ * dspark_candidate_pick: out[0] = the candidate c of cand FP32 column (count ids) with the largest
+ *   base[c] + hb[c] + sum_g scale[c, g] * sum_{r in g} code[c, r] * latent[r]
+ * (lowest id among equals): the argmax dspark_markov_logits + argmax_fp32 give, restricted to the candidates (the
+ * softcap is monotone). work: 2 uint64 of device memory, zeroed before the first call and left zeroed by each call.
+ * With prob (then scores, count floats of device scratch, too): *prob = the winner's softmax probability over the
+ * candidates' capped logits cap * tanh(score / cap), each id once: the drafter's probability with the vocabulary
+ * outside the candidates left out (a little high), for --draft-min-p.
+ */
+inline constexpr std::int32_t kCandidateTile = 2048, kCandidatesPerTile = 8;
+void markov_rows_from_q8(const MarkovHead& head, std::int8_t* rows_codes, float* rows_scales, cudaStream_t stream);
+void dspark_tile_candidates(const Tensor& base, const Tensor& hb, std::int32_t valid, Tensor& cand, cudaStream_t stream);
+void dspark_candidate_pick(const Tensor& base, const Tensor& hb, const std::int8_t* rows_codes, const float* rows_scales, std::int32_t r,
+                           const Tensor& latent, const std::int32_t* cand, std::int32_t count, float cap, float* scores,
+                           std::uint64_t* work, std::int32_t* out, float* prob, cudaStream_t stream);
+
 } // namespace ninfer::ops
