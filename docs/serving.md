@@ -159,7 +159,7 @@ different from the Qwen3.5 models:
   tenth of its top token's probability, and extends a round with text copied from earlier in the request (copied
   tokens are verified exactly). Output can differ from the default's and from run to run; `--max-concurrency` above 1
   is refused. Tesla V100: 163.5 against 133.1 tok/s structured, 109.8 against 101.2 over 12 chats; see
-  [cli.md](cli.md) and [the Inkling-2 notes](maintainer/inkling2-model.md#speed-fast).
+  [the Inkling-2 notes](maintainer/inkling2-model.md#speed-fast).
 - **MTP speculation** (`--spec mtp --draft-tokens N`, N from 1 to 7) needs an artifact converted
   with the drafter (`--mtp-gguf`, [weight-conversion.md](weight-conversion.md)); a plain artifact
   refuses with that instruction. The output is the same as without it, token for token (greedy).

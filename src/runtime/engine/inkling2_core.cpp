@@ -1291,7 +1291,6 @@ void Inkling2Core::run(Job& job) {
     const auto lookup_match = static_cast<std::int64_t>(options_.speculative.dspark_lookup_match);
     const float greedy_keep = options_.speculative.dspark_greedy_keep;
     std::vector<TokenId> lookup;
-    std::int32_t round_dspark = 0; // the drafter's own drafts of the current round
     bool round_lookup = false, forward_was_lookup = false;
     // An index of every N-gram's latest start, filled as the sequence grows (once over the prompt, then a few entries a
     // step), so a round's lookup is one hash probe rather than a scan of the history.
@@ -1382,7 +1381,6 @@ void Inkling2Core::run(Job& job) {
         extend_drafter(*drafter, taps_of(), kept);
         count_round();
         if (width && !round_lookup) { width->observe(round_drafts, col); }
-        if (width && round_lookup && round_dspark > 0) { width->observe(round_dspark, std::min(col, round_dspark)); }
         accept_ema = 0.8 * accept_ema + 0.2 * col;
         in_round   = false;
     };
@@ -1455,7 +1453,6 @@ void Inkling2Core::run(Job& job) {
                 while (keep < drafted.size() && draft_probs[keep] >= draft_min_p) { ++keep; }
                 drafted.resize(keep);
             }
-            round_dspark = static_cast<std::int32_t>(drafted.size());
             if (!drafted.empty() && lookup.size() > drafted.size() && std::equal(drafted.begin(), drafted.end(), lookup.begin())) {
                 drafted            = lookup;
                 round_lookup       = true;
