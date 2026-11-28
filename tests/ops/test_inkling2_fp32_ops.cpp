@@ -2215,6 +2215,10 @@ int main() {
         return 77;
     }
     try {
+        // The experts' e2m1 decode equals the decode it replaced on every 32-bit word, bit for bit.
+        const unsigned long long decode_mismatches = ninfer::ops::nvfp4_e2m1_decode_mismatches();
+        check(decode_mismatches == 0, "nvfp4 e2m1 decode: " + std::to_string(decode_mismatches) + " values differ from the biased decode");
+        std::printf("%-44s bit-exact on all 2^32 words\n", "nvfp4 e2m1 register decode");
         test_workspace_queries();
         test_many_columns();
         test_wide_bits();
