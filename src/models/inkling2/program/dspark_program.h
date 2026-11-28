@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -92,6 +93,7 @@ private:
     cudaStream_t stream_;
     DeviceBuffer state_memory_;
     DeviceArena workspace_;
+    bool a8_ = [] { const char* e = std::getenv("NINFER_DSPARK_A8"); return e == nullptr || e[0] != '0'; }(); // int8-activation drafter projections
     std::vector<Layer> layers_;
     std::vector<std::int32_t> window_; // per layer: the keys it attends over (0: every context position)
     Tensor masks_;      // FP32 [hidden, block]: column 0 unused, the rest the mask embedding
@@ -114,6 +116,7 @@ private:
     DeviceBuffer markov_memory_;
     DeviceBuffer head_memory_;
     ops::Q8Weight head_q8_{};
+    ops::Q4Matrix head_q4_{};   // the drafter's own 4-bit head copy (the default copy)
     ops::DenseMatrix head_bf16_{}; // the base logits' head when there is no Q8 one
     // The Q8_0 matrices in the split form (same values; a faster projection kernel), by their artifact address.
     DeviceBuffer split_memory_, copy_memory_;

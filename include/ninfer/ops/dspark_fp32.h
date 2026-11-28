@@ -50,6 +50,43 @@ void split_q8_0(const void* blocks, std::int32_t rows, std::int32_t cols, void* 
 void dense_projection_fp32(const Tensor& x, const DenseMatrix& w, const Tensor* bias, Tensor& out, cudaStream_t stream);
 
 /**
+ * Op: dense_projection_a8_fp32 (the drafter's fast form; not exact)
+ *
+ *   out[n, t] = sum_j d_n,j e_t,j sum_{i in block j} q[n, i] p[i, t] + (bias ? bias[n] : 0)
+ *
+ * dense_projection_fp32 over a Q8_G32_FP16 matrix, with x first rounded per 32 values of a column to int8
+ * (p = round(x / e), e = max |x| / 127) and each block's products summed exactly in int32 (dp4a). The rounding of x
+ * makes it differ from dense_projection_fp32 by about 0.4% of the terms' magnitude, so only the DSpark drafter uses
+ * it (its drafts are verified by the target). x comes from a8_quantize_fp32 (one rounding serves every
+ * matrix that reads the same x). Shapes as dense_projection_fp32, W Q8_G32_FP16 only.
+ */
+struct A8Columns {
+    const std::int8_t* codes = nullptr; // [T, K]
+    const float* scales      = nullptr; // [T, K / 32]
+    const float* sums        = nullptr; // [T, K / 32]: each block's scale times its codes' sum
+    std::int32_t k = 0, t = 0;
+};
+[[nodiscard]] std::size_t a8_columns_bytes(std::int32_t k, std::int32_t t) noexcept;
+// x FP32 [K, T] (K a multiple of 128) rounded into `storage` (a8_columns_bytes(K, T), 256-byte aligned device memory).
+A8Columns a8_quantize_fp32(const Tensor& x, void* storage, std::size_t storage_bytes, cudaStream_t stream);
+void dense_projection_a8_fp32(const A8Columns& x, const DenseMatrix& w, const Tensor* bias, Tensor& out, cudaStream_t stream);
+
+/// A matrix [rows, cols] in 4 bits a value (quantize_q4_rows): per row, cols / 32 blocks of 16 bytes (codes c + 8,
+/// c in [-7, 7]; 8-value group g one 32-bit word, byte j holding c[8g + j] | c[8g + j + 4] << 4) and an FP16 scale
+/// each ([rows, cols / 32]): w = d * c.
+struct Q4Matrix {
+    const void* codes  = nullptr;
+    const void* scales = nullptr;
+    std::int32_t rows = 0, cols = 0;
+};
+/// w BF16 [K, N] contiguous (row n's K values at n * K) into codes (N * K / 2 bytes, 16-byte aligned) and scales
+/// (N * K / 32 halves): d = fp16(max |w| / 7) per 32, c = clamp(rint(w / d), -7, 7). Lossy (the drafter's copy).
+void quantize_q4_rows(const Tensor& w, void* codes, void* scales, cudaStream_t stream);
+/// out[n, t] = sum_j d_n,j (e_t,j sum_i c[n, i] p[i, t]) over a Q4Matrix and a8_quantize_fp32's x: the drafter's
+/// base logits from its 4-bit head copy (only the drafts can change). out FP32 [N, T] contiguous.
+void dense_projection_a8q4_fp32(const A8Columns& x, const Q4Matrix& w, Tensor& out, cudaStream_t stream);
+
+/**
  * Op: head_rmsnorm_rope_fp32 (in place)
  *
  *   per head h and column t (position p = start + t):

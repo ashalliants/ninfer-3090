@@ -139,12 +139,18 @@ DSparkProgram::DSparkProgram(const Model& model, std::int32_t max_context, std::
         head_q8_ = *head_q8;
     } else if (!head_copy) {
         head_bf16_ = head_matrix;
-    } else {
+    } else if (const char* e = std::getenv("NINFER_DSPARK_HEAD"); e != nullptr && e[0] == '8') {
         const std::size_t values = padded(std::size_t(v) * h);
         head_memory_ = DeviceBuffer(values + std::size_t(v) * (h / 32) * 2);
         auto* codes  = static_cast<std::int8_t*>(head_memory_.p);
         head_q8_     = ops::Q8Weight{codes, static_cast<std::byte*>(head_memory_.p) + values, i32(h), i32(v)};
         ops::quantize_q8_g32(head, codes, static_cast<std::byte*>(head_memory_.p) + values, stream_);
+    } else {
+        // The drafter's own copy in 4 bits (a scale per 32): half a Q8 copy's bytes, read by int8 activations.
+        const std::size_t codes = padded(std::size_t(v) * h / 2);
+        head_memory_ = DeviceBuffer(codes + std::size_t(v) * (h / 32) * 2);
+        head_q4_     = ops::Q4Matrix{head_memory_.p, static_cast<std::byte*>(head_memory_.p) + codes, i32(v), i32(h)};
+        ops::quantize_q4_rows(head, head_memory_.p, static_cast<std::byte*>(head_memory_.p) + codes, stream_);
     }
     const Tensor bo = model_.tensor(w.hidden_out_bias, {i32(h), 1});
     ops::dense_projection_fp32(bo, head_matrix, nullptr, hb_, stream_);
@@ -223,8 +229,17 @@ void DSparkProgram::extend(std::span<const Tensor> taps, std::int32_t n) {
         const Tensor norm           = model_.tensor(l.context_norm, {h});
         ops::dspark_fuse_taps_fp32(pointers, fuse, static_cast<int>(i), norm, c.rms_norm_eps, ctx, stream_);
         Tensor k = workspace_.alloc(DType::FP32, {kv, n}), v = workspace_.alloc(DType::FP32, {kv, n});
-        ops::dense_projection_fp32(ctx, matrix(model_.matrix(l.context_k)), nullptr, k, stream_);
-        ops::dense_projection_fp32(ctx, matrix(model_.matrix(l.context_v)), nullptr, v, stream_);
+        const ops::DenseMatrix mk = matrix(model_.matrix(l.context_k)), mv = matrix(model_.matrix(l.context_v));
+        if (a8_ && mk.format == QType::Q8_G32_FP16 && mv.format == QType::Q8_G32_FP16) {
+            const std::size_t bytes = ops::a8_columns_bytes(h, n);
+            Tensor storage          = workspace_.alloc(DType::U8, {i32(bytes)});
+            const ops::A8Columns ca = ops::a8_quantize_fp32(ctx, storage.data, bytes, stream_);
+            ops::dense_projection_a8_fp32(ca, mk, nullptr, k, stream_);
+            ops::dense_projection_a8_fp32(ca, mv, nullptr, v, stream_);
+        } else {
+            ops::dense_projection_fp32(ctx, mk, nullptr, k, stream_);
+            ops::dense_projection_fp32(ctx, mv, nullptr, v, stream_);
+        }
         ops::head_rmsnorm_rope_fp32(k, i32(c.head_dim), model_.tensor(l.context_k_norm, {i32(c.head_dim)}), c.rms_norm_eps, true,
                                     position_, c.rope_theta, stream_);
         // Columns into the ring slots (position mod capacity). FP16 rings round through dspark_ring_write; FP32 rings
@@ -291,11 +306,20 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
         const Tensor embed_norm = model_.tensor(model_.weights().embedding_norm, {h});
         ops::rmsnorm_fp32(first, &embed_norm, text_.rms_norm_eps, first, stream_);
     }
-    // A block projection: K <= 3072 (all but the MLP's down) by BF16 activations into projection_q8_fp32 over the split
-    // Q8_0 values (the same weights; the activations rounded to BF16), the rest by dense_projection_fp32.
-    const auto project = [&](const Tensor& in, WeightId id, Tensor& out) {
+    // A block projection over the split Q8_0 values: by int8 activations (a8_quantize_fp32 once per input, dp4a sums;
+    // only the drafts can change, and the target verifies them), or with NINFER_DSPARK_A8=0 as before: K <= 3072 by
+    // BF16 activations into projection_q8_fp32, the rest by dense_projection_fp32.
+    const auto quantize = [&](const Tensor& in) {
+        if (!a8_) { return ops::A8Columns{}; }
+        const std::size_t bytes = ops::a8_columns_bytes(i32(in.ne[0]), i32(in.ne[1]));
+        Tensor storage          = workspace_.alloc(DType::U8, {i32(bytes)});
+        return ops::a8_quantize_fp32(in, storage.data, bytes, stream_);
+    };
+    const auto project = [&](const Tensor& in, const ops::A8Columns& xa, WeightId id, Tensor& out) {
         const ops::DenseMatrix m = matrix(model_.matrix(id));
-        if (m.format == QType::Q8_G32_FP16 && m.cols <= 3072) {
+        if (xa.codes != nullptr && m.format == QType::Q8_G32_FP16) {
+            ops::dense_projection_a8_fp32(xa, m, nullptr, out, stream_);
+        } else if (m.format == QType::Q8_G32_FP16 && m.cols <= 3072) {
             Tensor xb16 = workspace_.alloc(DType::BF16, {in.ne[0], in.ne[1]});
             ops::cast_fp32_to_bf16(in, xb16, stream_);
             const ops::Q8Weight q{static_cast<const std::int8_t*>(m.data), m.scales, m.cols, m.rows};
@@ -310,9 +334,10 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
         Tensor n                    = workspace_.alloc(DType::FP32, {h, b});
         ops::rmsnorm_fp32(x, &attn_norm, c.rms_norm_eps, n, stream_);
         Tensor qt = workspace_.alloc(DType::FP32, {q, b}), kt = workspace_.alloc(DType::FP32, {kv, b}), vt = workspace_.alloc(DType::FP32, {kv, b});
-        project(n, l.q, qt);
-        project(n, l.k, kt);
-        project(n, l.v, vt);
+        const ops::A8Columns na = quantize(n);
+        project(n, na, l.q, qt);
+        project(n, na, l.k, kt);
+        project(n, na, l.v, vt);
         ops::head_rmsnorm_rope_fp32(qt, i32(c.head_dim), model_.tensor(l.q_norm, {i32(c.head_dim)}), c.rms_norm_eps, true, position_,
                                     c.rope_theta, stream_);
         ops::head_rmsnorm_rope_fp32(kt, i32(c.head_dim), model_.tensor(l.k_norm, {i32(c.head_dim)}), c.rms_norm_eps, true, position_,
@@ -322,25 +347,31 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
         Tensor parts = workspace_.alloc(DType::FP32, {i32(ops::dspark_block_attention_workspace_bytes(shape, b) / 4)});
         ops::dspark_block_attention_fp32(qt, layers_[i].k_ring, layers_[i].v_ring, kt, vt, position_, shape, attn, parts, stream_);
         Tensor o = workspace_.alloc(DType::FP32, {h, b});
-        project(attn, l.output, o);
+        project(attn, quantize(attn), l.output, o);
         ops::add_fp32(x, o, x, stream_);
         const Tensor ffn_norm = model_.tensor(l.ffn_norm, {h});
         ops::rmsnorm_fp32(x, &ffn_norm, c.rms_norm_eps, n, stream_);
         Tensor g = workspace_.alloc(DType::FP32, {f, b}), u = workspace_.alloc(DType::FP32, {f, b});
-        project(n, l.gate, g);
-        project(n, l.up, u);
+        const ops::A8Columns fa = quantize(n);
+        project(n, fa, l.gate, g);
+        project(n, fa, l.up, u);
         ops::silu_mul_fp32(g, u, g, stream_);
-        project(g, l.down, o);
+        project(g, quantize(g), l.down, o);
         ops::add_fp32(x, o, x, stream_);
     }
     const Tensor out_norm = model_.tensor(w.output_norm, {h});
     ops::rmsnorm_fp32(x, &out_norm, c.rms_norm_eps, x, stream_);
     // The base logits of the drafted columns 1 .. n through the text head, as the target computes its own (BF16
     // activations, FP32 sums); column i of `base` is block position i + 1.
-    Tensor xb = workspace_.alloc(DType::BF16, {h, n_drafts});
-    ops::cast_fp32_to_bf16(x.slice(1, 1, n_drafts), xb, stream_);
     Tensor base = workspace_.alloc(DType::FP32, {vocab, n_drafts});
-    if (head_q8_.values != nullptr) {
+    if (head_q4_.codes != nullptr) {
+        const std::size_t bytes = ops::a8_columns_bytes(h, n_drafts);
+        Tensor storage          = workspace_.alloc(DType::U8, {i32(bytes)});
+        const ops::A8Columns xa = ops::a8_quantize_fp32(x.slice(1, 1, n_drafts), storage.data, bytes, stream_);
+        ops::dense_projection_a8q4_fp32(xa, head_q4_, base, stream_);
+    } else if (head_q8_.values != nullptr) {
+        Tensor xb = workspace_.alloc(DType::BF16, {h, n_drafts});
+        ops::cast_fp32_to_bf16(x.slice(1, 1, n_drafts), xb, stream_);
         ops::projection_q8_fp32(xb, std::span<const ops::Q8Weight>(&head_q8_, 1), base, stream_);
     } else {
         ops::dense_projection_fp32(x.slice(1, 1, n_drafts), head_bf16_, nullptr, base, stream_);

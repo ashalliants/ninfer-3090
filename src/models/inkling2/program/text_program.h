@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer::models::inkling2 {
@@ -268,6 +269,14 @@ private:
     // save_async: the histories' device staging, an event per sliding visit once its rings are copied and one for the
     // whole copy, the first position the copy reads, and (during one forward) whether visits wait for their copy.
     DeviceBuffer hist_stage_;
+    // The verify path's history copies as copy_runs tables, per state slot (state_.data()): save runs then keep runs.
+    struct HistoryRuns {
+        DeviceBuffer table;
+        std::int32_t count = 0; // runs of each kind; 0: CopyBatch instead
+    };
+    std::unordered_map<const VisitState*, HistoryRuns> history_runs_;
+    const HistoryRuns& history_runs();
+    void save_histories(); // a verification's history saves, before its forward
     PinnedHostBuffer copy_descriptors_; // the copy kernels' GatherCopy list (host_gather.h)
     std::vector<cudaEvent_t> ring_copied_;
     cudaEvent_t state_ready_ = nullptr, copy_done_ = nullptr;
