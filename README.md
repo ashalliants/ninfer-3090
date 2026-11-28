@@ -775,9 +775,10 @@ BF16 weights would leave under 4 GiB free; a V100 build always does, as the MXFP
   unless the work is mostly code.
 
 ```bash
-scripts/download-model.sh inkling2-mini      # WarlaxZ/Inkling-2-Mini-NInfer-V100, 22.3 GiB, pinned and verified
+scripts/download-model.sh inkling2-mini      # WarlaxZ/Inkling-2-Mini-NInfer-V100, 22.3 GiB, and the DFlash2 drafter, pinned and verified
 #   on Windows: scripts\download-model.bat inkling2-mini
-ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark                        # Tesla V100
+ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dflash2 --draft-model models/inkling2-dflash2   # Tesla V100, fastest
+ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark                        # Tesla V100, no drafter download
 ninfer-serve models/inkling2-mini-q8.ninfer --vision --max-context 65536                  # RTX 3090
 ```
 

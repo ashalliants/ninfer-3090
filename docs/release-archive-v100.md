@@ -57,8 +57,8 @@ The endpoint is OpenAI- and Anthropic-compatible, so anything that speaks `/v1/c
 ./download-model.sh qwen36-35b-a3b      # 21.2 GiB, the 256-expert MoE with vision
 ./run-v100.sh qwen36-35b-a3b            # MTP3, rk4v4, the Vision tower resident in VRAM
 
-./download-model.sh inkling2-mini       # 22.3 GiB, exact conversion of Unsloth's UD-Q8_K_XL
-./ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark --host 0.0.0.0 --api-key <a secret>
+./download-model.sh inkling2-mini       # 22.3 GiB, exact conversion of Unsloth's UD-Q8_K_XL, and the DFlash2 drafter
+./ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dflash2 --draft-model models/inkling2-dflash2 --host 0.0.0.0 --api-key <a secret>
 ```
 
 Inkling-2-Mini has no launcher profile yet: you start `ninfer-serve` on its artifact directly, as above.

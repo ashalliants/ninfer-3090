@@ -122,7 +122,7 @@ Get [NInfer-3090](https://github.com/ashalliants/ninfer-3090) and build it for t
 ```bash
 git clone https://github.com/ashalliants/ninfer-3090 && cd ninfer-3090
 BUILD_DIR=$HOME/build-v100 scripts/v100_build.sh ninfer ninfer-serve
-scripts/download-model.sh inkling2-mini                         # this repository, pinned and verified
+scripts/download-model.sh inkling2-mini                         # this repository and the DFlash2 drafter, pinned and verified
 ~/build-v100/apps/ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dspark   # DSpark, up to 7 drafts a round
 ```
 
@@ -167,12 +167,12 @@ re-encoded at load and checked exact: every output is the same, bit for bit (`--
 `off` keeps BF16). `--fit-context MIN` starts at the largest context that
 fits. On Windows, `scripts\download-model.bat inkling2-mini` downloads and verifies this file.
 
-For faster drafting, download Inco's DFlash2 drafter (about 1 GB, Apache-2.0; tested at the revision below, model.safetensors
-sha256 `217980ab...54ee`) and point the server at its folder. The output stays
-the same; only the speed changes:
+For faster drafting, point the server at Inco's DFlash2 drafter (about 1 GB, Apache-2.0). `download-model.sh
+inkling2-mini` (and `download-model.bat`) fetch it into `models/inkling2-dflash2`, pinned to revision `4f9088ea` and
+checked by sha256 (`NINFER_DFLASH2=off` skips it). The output stays the same; only the speed changes:
 
 ```bash
-hf download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors --revision 4f9088ea66c21f2b99ed657d1941c306b03e84d2 --local-dir models/inkling2-dflash2
+# or by hand: hf download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors --revision 4f9088ea66c21f2b99ed657d1941c306b03e84d2 --local-dir models/inkling2-dflash2
 ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dflash2 --draft-model models/inkling2-dflash2
 ```
 

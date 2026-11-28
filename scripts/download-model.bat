@@ -232,6 +232,7 @@ set "EXPECTED_SIZE=23914098432"
 set "EXPECTED_SHA256=2167c0c0ff2ebb5d9dcf7ea5c8289ce13239bdc5104aac053af79a3b8cf009c1"
 set "LABEL=the Inkling-2-Mini model for the RTX 3090 (22.3 GiB)"
 set "TESTS_VARIABLE=NINFER_TEST_INKLING2_ARTIFACT"
+set "DFLASH2=1"
 goto :model_selected
 
 :model_selected
@@ -276,12 +277,32 @@ echo Model ready: !MODEL!
 if defined NGRAM_NAME call :ngram_summary
 if defined TESTS_VARIABLE echo Point the tests at it with:  set %TESTS_VARIABLE%=!MODEL!
 call :fetch_graft
+if defined DFLASH2 call :fetch_dflash2
+if defined DFLASH2 if not "!FETCH_OK!"=="1" exit /b 1
 exit /b 0
 :model_dir_rejected
 echo The model folder "!MODEL_DIR!" has a percent sign, caret or exclamation mark in its name, which 1>&2
 echo this script cannot pass on safely. Set NINFER_MODEL_DIR to a folder without those, or move this 1>&2
 echo script, and run this file again. 1>&2
 exit /b 1
+
+rem Inkling-2-Mini's DFlash2 drafter: Inco's release folder (config.json and model.safetensors, Apache-2.0),
+rem which ninfer-serve reads as it is (--spec dflash2 --draft-model <folder>), into inkling2-dflash2\ beside
+rem the model. Pinned like the model; NINFER_DFLASH2=off skips it (FETCH_OK stays 1).
+:fetch_dflash2
+set "FETCH_OK=1"
+if /i "%NINFER_DFLASH2%"=="off" exit /b 0
+set "DFLASH2_DIR=!MODEL_DIR!\inkling2-dflash2"
+if not exist "!DFLASH2_DIR!" mkdir "!DFLASH2_DIR!"
+set "OWNER=incoai"
+set "REPO=Inkling-2-Mini-DFlash2"
+call :fetch_file "!DFLASH2_DIR!" config.json 1311 d094e435eb939e01fca6297f637c5af35e3da4b552f8e1ab0a181cd278a1cefa 4f9088ea66c21f2b99ed657d1941c306b03e84d2 "the DFlash2 drafter's config" drafter
+if not "!FETCH_OK!"=="1" exit /b 0
+call :fetch_file "!DFLASH2_DIR!" model.safetensors 989975616 217980ab00d116693fa5946df7bbfd967caf5fac1f529afd541fbd470ddb54ee 4f9088ea66c21f2b99ed657d1941c306b03e84d2 "the DFlash2 drafter (944 MiB)" drafter
+if not "!FETCH_OK!"=="1" exit /b 0
+echo DFlash2 drafter ready: "!DFLASH2_DIR!"
+echo Serve with:  --spec dflash2 --draft-model "!DFLASH2_DIR!"
+exit /b 0
 
 rem Fetches one pinned file: folder %1, name %2, size %3, sha256 %4, revision %5, description %6, and
 rem kind %7 (model, part or volume). Sets FETCH_OK=1 once the file is at its final name and verified.
