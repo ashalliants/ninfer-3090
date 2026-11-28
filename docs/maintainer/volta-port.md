@@ -328,6 +328,29 @@ alone runs 65-71). One lane's output is bit-identical. The changes also make a r
 depend less on whether a second lane is running: the two prompts matched their one-lane output for
 the first 42 and 123 of 256 tokens before, 243 and 256 after.
 
+**Ternary decode and verify on dp4a (`NINFER_SM70_T2_DP4A`, on by default in an `sm_70` build).**
+The ternary profile's integer policy sends T = 1..192 to `t2_small_t_i8.cuh`, whose m16n8k32 s8
+`mma` is emulated on Volta: Ternary Bonsai 2.5 27B decoded at 22-23 tok/s, ~15% of the weight
+stream. `t2_small_t_dp4a.cuh` keeps the same activation planes (s8 per 64-k group), parents and
+epilogues and replaces the tile with native `dp4a`: a lane takes a 32-k chunk (8 code bytes of a
+row, the warp reading 256 contiguous bytes), expands its codes once with one `prmt` per four
+against the {0, +1, -2, -1} byte table, and reuses them for every column of the launch (up to 8,
+wider T in 8-column launches); each column's 32 activation bytes are reused for the warp's 4 rows
+(`NINFER_SM70_T2_DP4A_ROWS=1|2|4|8`). The int32 chunk sum is converted by riding on the bit pattern
+of 1.5 x 2^23 (one FADD instead of a quarter-rate I2F) and scaled by row x column group scale in
+FP32. A column's result depends only on K, so a verify round reproduces decode bit for bit
+(decode-path KLD at T = 1 and T = 3 identical). Operator, CMP 100-210, random weights against an
+FP64 oracle (max relative error 1.1e-5), T = 1: 34,816 x 5,120 693 GB/s, 5,120 x 17,408 619,
+12,288 x 5,120 616, vocabulary head 248,320 x 5,120 794 GB/s; T = 2 470-670, T = 4 300-460, T = 8
+130-240 on the large shapes (latency-bound at ~120 registers, 16 warps per SM). Serve (Ternary Bonsai 2.5 27B,
+CMP 100-210 = V100 silicon, 68 SMs, 120 W cap, `ninfer-serve --fit-context 1024 --kv-dtype int8
+--max-concurrency 2`, 128-token greedy answers): one stream 23.2 -> 59.1 tok/s (2K context), 22.2 -> 54.7
+(8K), 41.2 at 36.5K; two streams 39.6 -> 68.3 tok/s aggregate. Decode-path KLD against the old
+route (8 chunks of 512, half teacher-forced through decode): mean 5.6e-4, same top-1 98.5%, PPL
+7.9011 -> 7.9060 (measured with the ternary FP16 cuBLAS prefill change also in the binary, which
+moves the teacher-forced first halves). `NINFER_SM70_T2_DP4A=0` restores the emulated
+kernel.
+
 ### Decode: Qwen3.8-Flash-Next
 
 Same card at 250 W, Flash-Next IQ2_XS (`qwen4exp-iq2xs-mtp-vision.ninfer`), INT8 KV, 8K context,

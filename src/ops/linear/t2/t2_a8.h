@@ -29,6 +29,9 @@ inline constexpr std::int32_t kT2I8SmallMaxTokens = 192;
 [[nodiscard]] std::int32_t t2_a8_min_tokens();
 
 [[nodiscard]] bool t2_a8_admits(LinearPolicy policy);
+// Whether the small-T band runs the dp4a kernel of t2_small_t_dp4a.cuh: sm_70 builds, where the
+// m16n8k32 s8 mma of t2_small_t_i8.cuh is emulated, unless NINFER_SM70_T2_DP4A=0.
+[[nodiscard]] bool t2_a8_small_t_dp4a();
 [[nodiscard]] bool t2_a8_shape_supported(std::int32_t output_rows, std::int32_t input_rows);
 [[nodiscard]] bool t2_a8_supported(const Weight& w, std::int32_t tokens);
 // Activation planes for T in [1, max_tokens]; zero when no admitted call can take the route.
