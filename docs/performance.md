@@ -17,6 +17,21 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Inkling-2-Mini cheaper DSpark rounds (2026-11-28)
+
+The DSpark drafter's projections now run on int8 activations with dp4a, its copy of the head is 4 bits, and a
+verify's history copies go in one launch. Only the drafts change; greedy output is the same (same md5 on the
+12 chats). Measured at 200 W, untraced, on the same box and day:
+
+| Configuration | master | this change |
+|---|---|---|
+| 12 chats, `--max-context 262144 --vision --kv-dtype int8 --spec dspark` | 99.4 | **108.9** (+9.5%) |
+| 12 chats, `--max-context 8192 --spec dspark` | 100.0 | **109.6** |
+| Lapilli's conv / prose / struct prompts, 8,192 context | 86.0 / 73.3 / 131.8 | **93.7 / 75.5 / 140.7** |
+| `--speed fast --mxfp8-experts on --dense-q8 all` (lossy), 12 chats / struct | 111.1 / 157.5 | **116.9 / 166.5** |
+
+RTX 3090: NOT RUN. Details in the [maintainer spec](maintainer/inkling2-model.md), "Cheaper rounds".
+
 ## Tesla V100 (`sm_70`): Inkling-2-Mini `--speed fast`, an opt-in lossy decode mode (2026-11-27)
 
 `--speed fast` (off by default) drafts up to 7 tokens a round, lets a greedy round keep a draft the model gives at least
