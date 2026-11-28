@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 732" width="960" height="732" role="img" aria-label="Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata&#x27;s reported figures: 1.34x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 732" width="960" height="732" role="img" aria-label="Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata&#x27;s reported figures: 1.83x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).">
   <title>One Tesla V100 32 GB: faster than the next-best engine</title>
-  <desc>Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata&#x27;s reported figures: 1.34x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).</desc>
+  <desc>Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata&#x27;s reported figures: 1.83x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).</desc>
 
   <style>
     .surface { fill: #fcfcfb; stroke: rgba(11,11,11,0.10); }
@@ -72,10 +72,10 @@
   <text x="32.0" y="510.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Inkling-2-Mini</text>
   <text x="32.0" y="529.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs Strata, reported on its model card</text>
   <text x="32.0" y="544.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">(the fastest other figure found)</text>
-  <path class="rep" d="M302.0,499.0 h225.0 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-225.0 z"><title>Inkling-2-Mini, Decode: 1.80x</title></path>
+  <path class="rep" d="M302.0,499.0 h225.0 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-225.0 z"><title>Inkling-2-Mini, Decode: 1.83x</title></path>
   <line x1="445.1" y1="494.0" x2="445.1" y2="522.0" class="ref" stroke-width="1.5"/>
-  <text x="538.0" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.80x</text>
-  <text x="302.0" y="535.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: the DFlash2 drafter (110.5 with DSpark),</text>
+  <text x="538.0" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.83x</text>
+  <text x="302.0" y="535.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: the DFlash2 drafter (112.5 with DSpark),</text>
   <text x="302.0" y="549.0" class="t3" font-size="11" font-weight="400" text-anchor="start">12-chat average at 262,144 context, full</text>
   <text x="302.0" y="563.0" class="t3" font-size="11" font-weight="400" text-anchor="start">Q8_K_XL (23.9 GB). Strata runs smaller packs</text>
   <text x="302.0" y="577.0" class="t3" font-size="11" font-weight="400" text-anchor="start">(SQ-20 19.4 GB / SQ-10 10.5 GB); its decode</text>

@@ -819,7 +819,8 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
         load_.notes.push_back("experts | " + std::to_string(model_->mxfp8_expert_layers()) + " BF16 layers held as MXFP8 (exact, " +
                               std::to_string(model_->mxfp8_expert_bytes() >> 20) + " MiB" +
                               (options_.experts_mxfp8 == ExpertsMxfp8::On ? ", --mxfp8-experts on"
-                                                                          : ": the BF16 weights would leave under 4 GiB free; --mxfp8-experts off keeps BF16") +
+                               : device_.sm() / 10 == 7                     ? ": faster than BF16 on sm_70; --mxfp8-experts off keeps BF16"
+                                                                            : ": the BF16 weights would leave under 4 GiB free; --mxfp8-experts off keeps BF16") +
                               ")");
     }
     const bool fp32_prefill   = prefill_is_fp32(options_.kv_rings, options_.prefill_math);

@@ -6,6 +6,7 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -1255,6 +1256,23 @@ constexpr std::size_t kNarrowShared = kMaxShared - 2 * 1024 - 64;
 // expert-major at 8: concurrent entries of one expert mostly hit the L2, and the per-entry kernels hold four blocks
 // an SM (64 registers) against one for the NVFP4 expert-major kernels.
 constexpr int kNarrowMinEntries = 64;
+// NVFP4 on sm_70: the per-entry kernels stay faster than expert-major up to 11 columns at top 8 (V100 op sweep,
+// NINFER_INKLING2_OP_SWEEP=1, 2026-11-28: T = 8 374 against 416 us, T = 9 432 against 478, T = 12 591 against 603,
+// T = 16 804 against 753), which covers DSpark's 8-column verify. BF16 and other targets keep kNarrowMinEntries (BF16
+// expert-major is faster from T = 8 on the V100; the RTX 3090 is not measured). Both routes give the same bits.
+constexpr int kNarrowMinEntriesNvfp4Sm70 = 96;
+int narrow_min_entries(bool nvfp4) {
+    if (!nvfp4) { return kNarrowMinEntries; }
+    static std::atomic<int> major_of[32] = {};
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 32) { return kNarrowMinEntries; }
+    int major = major_of[device].load(std::memory_order_relaxed);
+    if (major == 0) {
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) { return kNarrowMinEntries; }
+        major_of[device].store(major, std::memory_order_relaxed);
+    }
+    return major == 7 ? kNarrowMinEntriesNvfp4Sm70 : kNarrowMinEntries;
+}
 
 template <int C>
 bool configure_narrow() {
@@ -1534,7 +1552,7 @@ void moe_situ_experts(const SituExpertBank& bank, const Tensor& z, const Tensor&
         list_bytes + (b.nvfp4 ? staged(bank.intermediate, columns) + planes : static_cast<std::size_t>(columns) * bank.intermediate * 4);
     const bool whole_planes =
         !b.nvfp4 || (bank.intermediate % (kNarrowPlanes * kGateRows) == 0 && bank.hidden % (kNarrowPlanes * kDownRows) == 0);
-    if (cols >= 2 && entries >= kNarrowMinEntries && bank.experts <= kMaxExperts && whole_planes &&
+    if (cols >= 2 && entries >= narrow_min_entries(b.nvfp4) && bank.experts <= kMaxExperts && whole_planes &&
         std::max(narrow_gate_shared, narrow_down_shared) <= kNarrowShared) {
         const int slots = std::min(entries, bank.experts);
         const int gate_rows = b.nvfp4 ? kWarps * kNarrowPlanes * kGateRows : kWarps * kBf16Rows;

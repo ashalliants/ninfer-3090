@@ -29,16 +29,16 @@
   <text x="32.0" y="167.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vision and INT8 KV. Drafted output equals plain greedy output.</text>
   <text x="32.0" y="206.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours, DFlash2 drafter</text>
   <text x="213.2" y="206.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">12-chat average, --spec dflash2 --draft-model</text>
-  <path class="ours" d="M32.0,212.0 h679.0 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-679.0 z"><title>Ours, DFlash2 drafter 12-chat average, --spec dflash2 --draft-model: 127.1</title></path>
-  <text x="721.0" y="223.5" class="t1" font-size="12" font-weight="600" text-anchor="start">127.1</text>
+  <path class="ours" d="M32.0,212.0 h689.2 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-689.2 z"><title>Ours, DFlash2 drafter 12-chat average, --spec dflash2 --draft-model: 129</title></path>
+  <text x="731.2" y="223.5" class="t1" font-size="12" font-weight="600" text-anchor="start">129</text>
   <text x="32.0" y="250.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours, DSpark</text>
   <text x="139.0" y="250.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">12-chat average</text>
-  <path class="alt" d="M32.0,256.0 h589.8 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-589.8 z"><title>Ours, DSpark 12-chat average: 110.5</title></path>
-  <text x="631.8" y="267.5" class="t1" font-size="12" font-weight="600" text-anchor="start">110.5</text>
+  <path class="alt" d="M32.0,256.0 h600.5 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-600.5 z"><title>Ours, DSpark 12-chat average: 112.5</title></path>
+  <text x="642.5" y="267.5" class="t1" font-size="12" font-weight="600" text-anchor="start">112.5</text>
   <text x="32.0" y="294.0" class="t1" font-size="12.5" font-weight="600" text-anchor="start">Ours, plain</text>
   <text x="130.8" y="294.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">no drafts</text>
-  <path class="alt" d="M32.0,300.0 h416.2 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-416.2 z"><title>Ours, plain no drafts: 78.2</title></path>
-  <text x="458.2" y="311.5" class="t1" font-size="12" font-weight="600" text-anchor="start">78.2</text>
+  <path class="alt" d="M32.0,300.0 h424.8 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-424.8 z"><title>Ours, plain no drafts: 79.8</title></path>
+  <text x="466.8" y="311.5" class="t1" font-size="12" font-weight="600" text-anchor="start">79.8</text>
   <text x="32.0" y="338.0" class="t2" font-size="12.5" font-weight="400" text-anchor="start">Strata</text>
   <text x="83.5" y="338.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">smaller pack (SQ-20 19.4 GB or SQ-10 10.5 GB, not stated); draft decoding</text>
   <path class="rep" d="M32.0,344.0 h374.8 a4,4 0 0 1 4,4 v6.0 a4,4 0 0 1 -4,4 h-374.8 z"><title>Strata smaller pack (SQ-20 19.4 GB or SQ-10 10.5 GB, not stated); draft decoding: 70.5</title></path>
@@ -87,6 +87,6 @@
   <text x="32.0" y="887.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">are mostly not stated. Strata&#x27;s card still carried &quot;VERIFY before publishing&quot; comments in its source. Strata&#x27;s packs are smaller than</text>
   <text x="32.0" y="902.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">ours: SQ-20 is 19.35 GB and SQ-10 10.47 GB, against our full Q8_K_XL at 23.9 GB (Strata reports SQ-20 matching the original on its own</text>
   <text x="32.0" y="917.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">tests; SQ-10 drifts, perplexity +0.32). Smaller quants usually decode faster.</text>
-  <text x="32.0" y="938.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM · 200 W limit · 2026-11-25 · ours: decode 2026-11-28 (master</text>
-  <text x="32.0" y="953.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">feb203752; DFlash2 on its branch), prefill since #596 (2026-11-24) · competitors measured on this box unless marked “reported”</text>
+  <text x="32.0" y="938.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM · 200 W limit · 2026-11-25 · ours: decode 2026-11-28 (MXFP8</text>
+  <text x="32.0" y="953.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">experts), prefill since #596 (2026-11-24) · competitors measured on this box unless marked “reported”</text>
 </svg>

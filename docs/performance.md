@@ -21,17 +21,38 @@
 
 `--spec dflash2 --draft-model DIR` drafts with Inco's DFlash2 drafter (`incoai/Inkling-2-Mini-DFlash2`, read from its
 release directory) in DSpark's place, with the same rounds and options. It accepts more drafts a round (3.4 against
-2.4 of 7 in a reference run). Same output as plain decode (same md5 on every set). 200 W, untraced, DSpark on master
-`feb203752` the same day:
+2.4 of 7 in a reference run). Same output as plain decode (same md5 on every set). 200 W, untraced, the same build
+(MXFP8 experts):
 
 | Configuration | DSpark | DFlash2 |
 |---|---|---|
-| 12 chats, 262,144 context, vision, INT8 KV | 110.5 | **127.1** |
-| 12 chats, 8,192 | 111.4 | **128.3** |
-| Lapilli's conv / prose / struct prompts | 92.3 / 74.3 / 170.2 | **104.5** / **90.7** / **171.7** |
-| `--speed fast` (lossy): 12 chats | 125.8 | **138.8** |
+| 12 chats, 262,144 context, vision, INT8 KV | 112.5 | **129.0** |
+| 12 chats, 8,192 | 111.8 | **130.6** |
+| Lapilli's conv / prose / struct prompts | 94.4 / 76.0 / 172.7 | **106.0** / **92.6** / **172.7** |
+| `--speed fast` (lossy): 12 chats | 125.8 (before MXFP8 experts) | **140.5** |
 
 RTX 3090: NOT RUN. Details in the [maintainer spec](maintainer/inkling2-model.md#dflash2-drafter).
+
+## Tesla V100 (`sm_70`): Inkling-2-Mini MXFP8 experts and per-entry NVFP4 verify (2026-11-28)
+
+V100 builds now hold layers 20-23's experts as MXFP8 by default (`--mxfp8-experts auto`; they are the checkpoint's
+MXFP8 values, re-encoded at load and checked exact; 4.0 GiB instead of 7.6 GiB of BF16), and run NVFP4 expert calls of
+up to 11 columns on the per-entry kernels instead of the expert-major ones (so DSpark's 8-column verify). Same output,
+bit for bit (same md5 on every set). 200 W, untraced, against master `feb203752` on the same box and day:
+
+| Configuration | master | now |
+|---|---|---|
+| 12 chats, 262,144 context, vision, INT8 KV, DSpark | 110.5 | **112.5** |
+| 12 chats, 262,144 context, vision, INT8 KV, plain | 78.2 | **79.8** |
+| 12 chats, 8,192, DSpark | 111.3 | **111.8** (111.8 / 111.8) |
+| 12 chats, 8,192, plain | 78.9 (78.95 / 78.94) | **80.1** |
+| Lapilli's conv / prose / struct prompts, DSpark | 92.1 / 74.5 / 171.4 | **94.4** / **76.0** / **172.7** (93.0 / 75.7 / 172.5) |
+| Prefill, 6.4K-token prompts, default chunk | 2,403-2,412 | 2,389-2,413 (the same) |
+
+The 3.6 GiB it frees also lets 262,144 with DSpark and vision (FP16 KV) start at chunk 2048 with the drafter's 4-bit
+head and whole-context window (before: chunk 2048, the target's head and a 16,384 window). RTX 3090: NOT RUN (it
+already holds MXFP8 when memory is short, and keeps the expert-major threshold at 64 entries). Details in the
+[maintainer spec](maintainer/inkling2-model.md#mxfp8-experts).
 
 ## Tesla V100 (`sm_70`): Inkling-2-Mini DSpark candidate picks, up to 7 drafts (2026-11-28)
 
