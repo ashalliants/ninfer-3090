@@ -749,6 +749,210 @@ __global__ void __launch_bounds__(kDraftPickCandidates) draft_pick_kernel(const 
     *prob_out = static_cast<float>(exp((cand_v[chosen] - best) / t) / sum / total);
 }
 
+
+// ------------------------------------------------------------------------------------- A8 projection (drafter only)
+
+constexpr int kA8Warps = 8, kA8Cols = 8;
+
+// grid (ceil(K / 256), T): warp w of block (b, t) quantizes the 32 values k = 256b + 32w .. + 31 of column t to int8
+// with d = max |x| / 127 (q = round(x / d); d = 0 gives q = 0).
+__global__ void __launch_bounds__(256) a8_quantize_kernel(const float* __restrict__ x, std::int64_t xs, std::int8_t* __restrict__ xq,
+                                                          float* __restrict__ xd, float* __restrict__ xsum, int k_cols) {
+    const int k = blockIdx.x * 256 + threadIdx.x, t = blockIdx.y;
+    if (k >= k_cols) { return; } // k_cols is a multiple of 32: a warp is whole or absent
+    const float v = x[t * xs + k];
+    float m       = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) { m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFU, m, o)); }
+    const float d = m / 127.0F;
+    const int q   = d > 0.0F ? __float2int_rn(v / d) : 0;
+    xq[static_cast<std::int64_t>(t) * k_cols + k] = static_cast<std::int8_t>(q);
+    int sum = q;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) { sum += __shfl_xor_sync(0xFFFFFFFFU, sum, o); }
+    if ((threadIdx.x & 31) == 0) {
+        const std::int64_t j = static_cast<std::int64_t>(t) * (k_cols / 32) + k / 32;
+        xd[j]   = d;
+        xsum[j] = d * static_cast<float>(sum);
+    }
+}
+
+// grid (ceil(N / (8 R / S)), ceil(T / 8)): the block's 8 warps form 8 / S row groups of R rows; the S warps of a group
+// split K, warp s taking the 512-value chunks s, s + S, ... over columns [8c, 8c + 8). Lane l takes the 16 values
+// 16l of a chunk (one 16-byte load; they share one 32-block's scale), summed exactly in int32 by 4 dp4a per column,
+// then scaled by both blocks' scales into an FP32 sum; the group's S partial sums add in a fixed order.
+template <int R, int S>
+__global__ void __launch_bounds__(kA8Warps * 32)
+dense_projection_a8_kernel(const std::int8_t* __restrict__ xq, const float* __restrict__ xd, const std::int8_t* __restrict__ w,
+                           const __half* __restrict__ scales, const float* __restrict__ bias, float* __restrict__ out, int n_rows,
+                           int k_cols, int t_cols) {
+    __shared__ float partial[kA8Warps][R][kA8Cols];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, group = warp / S, part = warp % S;
+    const int n0 = (blockIdx.x * (kA8Warps / S) + group) * R, t0 = blockIdx.y * kA8Cols;
+    const int cols = min(kA8Cols, t_cols - t0), kb = k_cols / 32;
+    float acc[R][kA8Cols];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int c = 0; c < kA8Cols; ++c) { acc[r][c] = 0.0F; }
+    }
+    const std::int8_t* rows[R];
+    const __half* row_scales[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int n   = min(n0 + r, n_rows - 1);
+        rows[r]       = w + static_cast<std::int64_t>(n) * k_cols;
+        row_scales[r] = scales + static_cast<std::int64_t>(n) * kb;
+    }
+    const std::int8_t* xt = xq + static_cast<std::int64_t>(t0) * k_cols;
+    const float* dt       = xd + static_cast<std::int64_t>(t0) * kb;
+#pragma unroll 2
+    for (int k = 512 * part + 16 * lane; k < k_cols; k += 512 * S) {
+        int4 wv[R];
+        float wd[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            wv[r] = __ldg(reinterpret_cast<const int4*>(rows[r] + k));
+            wd[r] = __half2float(row_scales[r][k >> 5]);
+        }
+#pragma unroll
+        for (int c = 0; c < kA8Cols; ++c) {
+            if (c < cols) {
+                const int4 xv = __ldg(reinterpret_cast<const int4*>(xt + static_cast<std::int64_t>(c) * k_cols + k));
+                const float d = __ldg(dt + c * kb + (k >> 5));
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const int s = __dp4a(wv[r].w, xv.w, __dp4a(wv[r].z, xv.z, __dp4a(wv[r].y, xv.y, __dp4a(wv[r].x, xv.x, 0))));
+                    acc[r][c]   = fmaf(wd[r] * d, static_cast<float>(s), acc[r][c]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int c = 0; c < kA8Cols; ++c) {
+            const float v = warp_sum(acc[r][c]);
+            if (lane == 0) { partial[warp][r][c] = v; }
+        }
+    }
+    __syncthreads();
+    // Thread i < (8 / S) R 8 writes output (row group i / (8 R), row (i / 8) % R, column i % 8).
+    const int i = threadIdx.x;
+    if (i < (kA8Warps / S) * R * kA8Cols) {
+        const int g = i / (R * kA8Cols), r = (i / kA8Cols) % R, c = i % kA8Cols, n = (blockIdx.x * (kA8Warps / S) + g) * R + r;
+        if (n < n_rows && c < cols) {
+            float v = 0.0F;
+#pragma unroll
+            for (int q = 0; q < S; ++q) { v += partial[g * S + q][r][c]; }
+            out[static_cast<std::int64_t>(t0 + c) * n_rows + n] = v + (bias ? bias[n] : 0.0F);
+        }
+    }
+}
+
+// grid (ceil(blocks / 256)): thread i rounds 32-block i of a BF16 matrix (rows of k contiguous values) to 4 bits:
+// d = fp16(max |w| / 7), c = clamp(rint(w / d), -7, 7) + 8 (8 when d is 0); 8-value group g of the block is one
+// 32-bit word whose byte j holds c[8g + j] | c[8g + j + 4] << 4.
+__global__ void __launch_bounds__(256) q4_quantize_rows_kernel(const __nv_bfloat16* __restrict__ w, std::int64_t blocks,
+                                                               uint4* __restrict__ codes, __half* __restrict__ scales) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * 256 + threadIdx.x;
+    if (i >= blocks) { return; }
+    const __nv_bfloat16* src = w + i * 32;
+    float v[32], m = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) { v[j] = __bfloat162float(src[j]), m = fmaxf(m, fabsf(v[j])); }
+    const __half dh = __float2half(m / 7.0F);
+    const float d   = __half2float(dh);
+    unsigned word[4];
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        word[g] = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int lo = d > 0.0F ? max(-7, min(7, __float2int_rn(v[8 * g + j] / d))) + 8 : 8;
+            const int hi = d > 0.0F ? max(-7, min(7, __float2int_rn(v[8 * g + j + 4] / d))) + 8 : 8;
+            word[g] |= static_cast<unsigned>(lo | hi << 4) << (8 * j);
+        }
+    }
+    codes[i]  = make_uint4(word[0], word[1], word[2], word[3]);
+    scales[i] = dh;
+}
+
+// As dense_projection_a8_kernel over 4-bit rows: lane l takes the 32 values 32l of a 1024-value chunk (one 16-byte
+// load, one scale); per column 8 dp4a over the codes (stored + 8), less 8 times the block's x sum.
+template <int R, int S>
+__global__ void __launch_bounds__(kA8Warps * 32)
+dense_projection_a8q4_kernel(const std::int8_t* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xsum,
+                             const uint4* __restrict__ w, const __half* __restrict__ scales, float* __restrict__ out, int n_rows, int k_cols,
+                             int t_cols) {
+    __shared__ float partial[kA8Warps][R][kA8Cols];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, group = warp / S, part = warp % S;
+    const int n0 = (blockIdx.x * (kA8Warps / S) + group) * R, t0 = blockIdx.y * kA8Cols;
+    const int cols = min(kA8Cols, t_cols - t0), kb = k_cols / 32;
+    float acc[R][kA8Cols];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int c = 0; c < kA8Cols; ++c) { acc[r][c] = 0.0F; }
+    }
+    std::int64_t row_block[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) { row_block[r] = static_cast<std::int64_t>(min(n0 + r, n_rows - 1)) * kb; }
+    const std::int8_t* xt = xq + static_cast<std::int64_t>(t0) * k_cols;
+    const float* dt       = xd + static_cast<std::int64_t>(t0) * kb;
+    const float* st       = xsum + static_cast<std::int64_t>(t0) * kb;
+#pragma unroll 2
+    for (int b = 32 * part + lane; b < kb; b += 32 * S) {
+        uint4 wv[R];
+        float wd[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            wv[r] = __ldg(w + row_block[r] + b);
+            wd[r] = __half2float(scales[row_block[r] + b]);
+        }
+#pragma unroll
+        for (int c = 0; c < kA8Cols; ++c) {
+            if (c < cols) {
+                const int4* xp = reinterpret_cast<const int4*>(xt + static_cast<std::int64_t>(c) * k_cols + 32 * b);
+                const int4 x0 = __ldg(xp), x1 = __ldg(xp + 1);
+                const float d = __ldg(dt + c * kb + b), sx = __ldg(st + c * kb + b);
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const unsigned m = 0x0F0F0F0FU;
+                    int p = __dp4a(static_cast<int>(wv[r].x & m), x0.x, 0);
+                    p     = __dp4a(static_cast<int>((wv[r].x >> 4) & m), x0.y, p);
+                    p     = __dp4a(static_cast<int>(wv[r].y & m), x0.z, p);
+                    p     = __dp4a(static_cast<int>((wv[r].y >> 4) & m), x0.w, p);
+                    p     = __dp4a(static_cast<int>(wv[r].z & m), x1.x, p);
+                    p     = __dp4a(static_cast<int>((wv[r].z >> 4) & m), x1.y, p);
+                    p     = __dp4a(static_cast<int>(wv[r].w & m), x1.z, p);
+                    p     = __dp4a(static_cast<int>((wv[r].w >> 4) & m), x1.w, p);
+                    acc[r][c] = fmaf(wd[r], fmaf(d, static_cast<float>(p), -8.0F * sx), acc[r][c]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int c = 0; c < kA8Cols; ++c) {
+            const float v = warp_sum(acc[r][c]);
+            if (lane == 0) { partial[warp][r][c] = v; }
+        }
+    }
+    __syncthreads();
+    const int i = threadIdx.x;
+    if (i < (kA8Warps / S) * R * kA8Cols) {
+        const int g = i / (R * kA8Cols), r = (i / kA8Cols) % R, c = i % kA8Cols, n = (blockIdx.x * (kA8Warps / S) + g) * R + r;
+        if (n < n_rows && c < cols) {
+            float v = 0.0F;
+#pragma unroll
+            for (int q = 0; q < S; ++q) { v += partial[g * S + q][r][c]; }
+            out[static_cast<std::int64_t>(t0 + c) * n_rows + n] = v;
+        }
+    }
+}
+
 } // namespace
 
 void dense_projection_fp32(const Tensor& x, const DenseMatrix& w, const Tensor* bias, Tensor& out, cudaStream_t stream) {
@@ -778,6 +982,94 @@ void dense_projection_fp32(const Tensor& x, const DenseMatrix& w, const Tensor* 
     } else {
         dense_projection_kernel<false><<<grid, kProjWarps * 32, 0, stream>>>(xp, xc.stride, wp, bp, op_out, w.rows, w.cols, xc.cols);
     }
+    check_launch(op);
+}
+
+std::size_t a8_columns_bytes(std::int32_t k, std::int32_t t) noexcept {
+    const std::size_t codes = (static_cast<std::size_t>(k) * t + 255) / 256 * 256;
+    return codes + static_cast<std::size_t>(k / 32) * t * 8;
+}
+
+A8Columns a8_quantize_fp32(const Tensor& x, void* storage, std::size_t storage_bytes, cudaStream_t stream) {
+    constexpr const char* op = "a8_quantize_fp32";
+    const Columns xc = columns(x, op, "x");
+    require(xc.rows > 0 && xc.rows % 128 == 0 && xc.cols > 0 && xc.cols <= 65535, op, "x must be [K, T], K a multiple of 128");
+    require(storage != nullptr && storage_bytes >= a8_columns_bytes(xc.rows, xc.cols) && reinterpret_cast<std::uintptr_t>(storage) % 256 == 0,
+            op, "storage must hold a8_columns_bytes(K, T), 256-byte aligned");
+    auto* scales = reinterpret_cast<float*>(static_cast<std::byte*>(storage) + (static_cast<std::size_t>(xc.rows) * xc.cols + 255) / 256 * 256);
+    auto* sums   = scales + static_cast<std::size_t>(xc.rows / 32) * xc.cols;
+    A8Columns a{static_cast<std::int8_t*>(storage), scales, sums, xc.rows, xc.cols};
+    a8_quantize_kernel<<<dim3((xc.rows + 255) / 256, xc.cols), 256, 0, stream>>>(static_cast<const float*>(x.data), xc.stride,
+                                                                               static_cast<std::int8_t*>(storage), scales, sums, xc.rows);
+    check_launch(op);
+    return a;
+}
+
+void dense_projection_a8_fp32(const A8Columns& x, const DenseMatrix& w, const Tensor* bias, Tensor& out, cudaStream_t stream) {
+    constexpr const char* op = "dense_projection_a8_fp32";
+    const Columns oc = columns(out, op, "out", true);
+    require(w.format == QType::Q8_G32_FP16 && w.data != nullptr && w.scales != nullptr && w.rows > 0 && w.cols > 0 && w.cols % 128 == 0 &&
+                reinterpret_cast<std::uintptr_t>(w.data) % 16 == 0,
+            op, "W must be split Q8_0 with cols a multiple of 128 and 16-byte aligned values");
+    require(x.codes != nullptr && x.scales != nullptr && x.k == w.cols && oc.rows == w.rows && oc.cols == x.t, op, "shapes differ");
+    if (bias != nullptr) { require(columns(*bias, op, "bias", true).rows == w.rows && bias->ne[1] == 1, op, "bias must be [N]"); }
+    const int k = w.cols, t = x.t;
+    const std::int8_t* xq = x.codes;
+    const float* xd       = x.scales;
+    const auto* wp = static_cast<const std::int8_t*>(w.data);
+    const auto* sp = static_cast<const __half*>(w.scales);
+    const auto* bp = bias ? static_cast<const float*>(bias->data) : nullptr;
+    auto* o        = static_cast<float*>(out.data);
+    const int ty   = (t + kA8Cols - 1) / kA8Cols;
+    // R rows a warp group, S warps splitting K: R = 2 from 2048 rows, S the least of 1, 2, 4, 8 that gives 480 or more
+    // blocks (the V100's 80 SMs several times over) while each warp keeps a 512-value chunk.
+    const int r_rows = w.rows >= 2048 ? 2 : 1;
+    int split = 1;
+    while (split < 8 && static_cast<std::int64_t>(w.rows) * split / (kA8Warps * r_rows) < 480 && k / 512 >= 2 * split) { split *= 2; }
+    const auto launch = [&](auto kernel, int rows_per_block) {
+        kernel<<<dim3((w.rows + rows_per_block - 1) / rows_per_block, ty), kA8Warps * 32, 0, stream>>>(xq, xd, wp, sp, bp, o, w.rows, k, t);
+    };
+    if (r_rows == 2) {
+        if (split == 1) { launch(dense_projection_a8_kernel<2, 1>, 16); }
+        else if (split == 2) { launch(dense_projection_a8_kernel<2, 2>, 8); }
+        else if (split == 4) { launch(dense_projection_a8_kernel<2, 4>, 4); }
+        else { launch(dense_projection_a8_kernel<2, 8>, 2); }
+    } else {
+        if (split == 1) { launch(dense_projection_a8_kernel<1, 1>, 8); }
+        else if (split == 2) { launch(dense_projection_a8_kernel<1, 2>, 4); }
+        else if (split == 4) { launch(dense_projection_a8_kernel<1, 4>, 2); }
+        else { launch(dense_projection_a8_kernel<1, 8>, 1); }
+    }
+    check_launch(op);
+}
+
+void quantize_q4_rows(const Tensor& w, void* codes, void* scales, cudaStream_t stream) {
+    constexpr const char* op = "quantize_q4_rows";
+    require(w.data != nullptr && w.dtype == DType::BF16 && w.is_contiguous() && w.ne[0] % 32 == 0 && w.ne[2] == 1 && w.ne[3] == 1, op,
+            "w must be contiguous BF16 [K, N], K a multiple of 32");
+    require(codes != nullptr && scales != nullptr && reinterpret_cast<std::uintptr_t>(codes) % 16 == 0 &&
+                reinterpret_cast<std::uintptr_t>(scales) % 2 == 0,
+            op, "codes 16-byte and scales 2-byte aligned");
+    const std::int64_t blocks = static_cast<std::int64_t>(w.ne[0] / 32) * w.ne[1];
+    q4_quantize_rows_kernel<<<static_cast<unsigned>((blocks + 255) / 256), 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(w.data), blocks, static_cast<uint4*>(codes), static_cast<__half*>(scales));
+    check_launch(op);
+}
+
+void dense_projection_a8q4_fp32(const A8Columns& x, const Q4Matrix& w, Tensor& out, cudaStream_t stream) {
+    constexpr const char* op = "dense_projection_a8q4_fp32";
+    const Columns oc = columns(out, op, "out", true);
+    require(w.codes != nullptr && w.scales != nullptr && w.rows > 0 && w.cols > 0 && w.cols % 32 == 0 &&
+                reinterpret_cast<std::uintptr_t>(w.codes) % 16 == 0,
+            op, "W must be 4-bit rows (quantize_q4_rows), cols a multiple of 32, 16-byte aligned codes");
+    require(x.codes != nullptr && x.scales != nullptr && x.sums != nullptr && x.k == w.cols && oc.rows == w.rows && oc.cols == x.t, op,
+            "shapes differ");
+    const int ty = (x.t + kA8Cols - 1) / kA8Cols;
+    const auto* wp = static_cast<const uint4*>(w.codes);
+    const auto* sp = static_cast<const __half*>(w.scales);
+    auto* o        = static_cast<float*>(out.data);
+    dense_projection_a8q4_kernel<4, 1><<<dim3((w.rows + 31) / 32, ty), kA8Warps * 32, 0, stream>>>(x.codes, x.scales, x.sums, wp, sp, o, w.rows,
+                                                                                                   w.cols, x.t);
     check_launch(op);
 }
 

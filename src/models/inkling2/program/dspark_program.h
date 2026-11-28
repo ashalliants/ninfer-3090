@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -29,7 +30,7 @@ public:
     // drafts can change, never the verified output. global_window, when positive and under max_context: the global
     // layers attend over only their last global_window context positions, held in a ring of that many (a fraction of
     // the bytes at a long context; again only the drafts can change). head_copy false (and no head_q8): the base
-    // logits read the target's BF16 head instead of the drafter's Q8 copy of it (492 MB less, a slower draft).
+    // logits read the target's BF16 head instead of the drafter's 4-bit copy of it (261 MB less, a slower draft).
     // workspace, when given (at least workspace_bytes(model, max_chunk)), is borrowed instead of allocated: a region
     // nothing else holds data in while extend() or draft() runs (the text Program's lent region, TextProgram::lent());
     // neither leaves anything there once it returns.
@@ -114,6 +115,7 @@ private:
     DeviceBuffer markov_memory_;
     DeviceBuffer head_memory_;
     ops::Q8Weight head_q8_{};
+    ops::Q4Matrix head_q4_{};   // the drafter's own 4-bit head copy (the default copy)
     ops::DenseMatrix head_bf16_{}; // the base logits' head when there is no Q8 one
     // The Q8_0 matrices in the split form (same values; a faster projection kernel), by their artifact address.
     DeviceBuffer split_memory_, copy_memory_;

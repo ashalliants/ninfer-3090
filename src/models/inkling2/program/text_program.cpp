@@ -14,6 +14,7 @@
 #include "ninfer/ops/tensor_core_fp32.h"
 
 #include "core/copy_batch.h"
+#include "ninfer/ops/copy_runs.h"
 #include "core/host_gather.h"
 
 #include <algorithm>
@@ -573,20 +574,70 @@ void TextProgram::save_input(Tensor& saved, const Tensor& x) {
     }
 }
 
-void TextProgram::keep(std::int32_t n) {
-    if (n < 1 || n > last_cols_) { throw std::invalid_argument("inkling2: keep() outside 1..the last forward's tokens"); }
-    if (n == last_cols_) { return; }
-    if (last_cols_ > limits_.max_rollback) { throw std::invalid_argument("inkling2: the last forward cannot be cut back"); }
-    // History after the first n inputs: columns n .. n + K - 2 of [old history | inputs].
+void TextProgram::save_histories() {
+    // Each history before a verification, ahead of the inputs save_input() appends: one copy_runs launch (the driver's
+    // batch of these few hundred copies held the host, with the GPU idle, ~0.5 ms a verify).
+    if (const HistoryRuns& runs = history_runs(); runs.count > 0) {
+        ops::copy_runs(static_cast<const ops::CopyRun*>(runs.table.p), runs.count, 0, stream_);
+        return;
+    }
     CopyBatch copies(stream_);
     for (auto& s : state_) {
         for (auto [hist, saved] : {std::pair{&s.k_hist, &s.k_saved}, std::pair{&s.v_hist, &s.v_saved},
                                    std::pair{&s.attn_hist, &s.attn_saved}, std::pair{&s.mlp_hist, &s.mlp_saved}}) {
-            const std::size_t column = static_cast<std::size_t>(hist->ne[0]) * 4;
-            copies.add(hist->data, static_cast<const std::byte*>(saved->data) + static_cast<std::size_t>(n) * column, hist->bytes());
+            copies.add(saved->data, hist->data, hist->bytes());
         }
     }
     copies.flush();
+}
+
+const TextProgram::HistoryRuns& TextProgram::history_runs() {
+    const auto found = history_runs_.find(state_.data());
+    if (found != history_runs_.end()) { return found->second; }
+    static const HistoryRuns none;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream_, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone) { return none; } // no upload
+    // The selected slot's save runs (each history into its saved buffer), then its keep runs (saved + n columns back
+    // into the history: src_step one column); count 0 when one is not 16-byte aligned (CopyBatch then).
+    std::vector<ops::CopyRun> save, keep;
+    bool aligned = true;
+    for (auto& s : state_) {
+        for (auto [hist, saved] : {std::pair{&s.k_hist, &s.k_saved}, std::pair{&s.v_hist, &s.v_saved},
+                                   std::pair{&s.attn_hist, &s.attn_saved}, std::pair{&s.mlp_hist, &s.mlp_saved}}) {
+            save.push_back({saved->data, hist->data, hist->bytes(), 0});
+            keep.push_back({hist->data, saved->data, hist->bytes(), static_cast<std::uint64_t>(hist->ne[0]) * 4});
+            aligned = aligned && ops::copy_run_aligned(save.back()) && ops::copy_run_aligned(keep.back());
+        }
+    }
+    HistoryRuns& runs = history_runs_[state_.data()];
+    if (!aligned || save.empty() || save.size() > 65535) { return runs; }
+    save.insert(save.end(), keep.begin(), keep.end());
+    runs.table = DeviceBuffer(save.size() * sizeof(ops::CopyRun));
+    if (cudaMemcpy(runs.table.p, save.data(), save.size() * sizeof(ops::CopyRun), cudaMemcpyHostToDevice) != cudaSuccess) {
+        throw std::runtime_error("inkling2: history copy table upload failed");
+    }
+    runs.count = static_cast<std::int32_t>(keep.size());
+    return runs;
+}
+
+void TextProgram::keep(std::int32_t n) {
+    if (n < 1 || n > last_cols_) { throw std::invalid_argument("inkling2: keep() outside 1..the last forward's tokens"); }
+    if (n == last_cols_) { return; }
+    if (last_cols_ > limits_.max_rollback) { throw std::invalid_argument("inkling2: the last forward cannot be cut back"); }
+    // History after the first n inputs: columns n .. n + K - 2 of [old history | inputs], in one copy_runs launch.
+    if (const HistoryRuns& runs = history_runs(); runs.count > 0) {
+        ops::copy_runs(static_cast<const ops::CopyRun*>(runs.table.p) + runs.count, runs.count, n, stream_);
+    } else {
+        CopyBatch copies(stream_);
+        for (auto& s : state_) {
+            for (auto [hist, saved] : {std::pair{&s.k_hist, &s.k_saved}, std::pair{&s.v_hist, &s.v_saved},
+                                       std::pair{&s.attn_hist, &s.attn_saved}, std::pair{&s.mlp_hist, &s.mlp_saved}}) {
+                const std::size_t column = static_cast<std::size_t>(hist->ne[0]) * 4;
+                copies.add(hist->data, static_cast<const std::byte*>(saved->data) + static_cast<std::size_t>(n) * column, hist->bytes());
+            }
+        }
+        copies.flush();
+    }
     position_ -= last_cols_ - n;
     last_cols_ = n;
 }
@@ -1030,15 +1081,7 @@ Tensor TextProgram::forward(std::span<const std::int32_t> tokens, std::span<cons
     }
     saving_ = cols >= 2 && cols <= limits_.max_rollback;
     if (saving_) {
-        // Each history before the forward, ahead of the inputs save_input() appends.
-        CopyBatch copies(stream_);
-        for (auto& s : state_) {
-            for (auto [hist, saved] : {std::pair{&s.k_hist, &s.k_saved}, std::pair{&s.v_hist, &s.v_saved},
-                                       std::pair{&s.attn_hist, &s.attn_saved}, std::pair{&s.mlp_hist, &s.mlp_saved}}) {
-                copies.add(saved->data, hist->data, hist->bytes());
-            }
-        }
-        copies.flush();
+        save_histories();
     }
     last_cols_ = 0;
     Tensor logits;

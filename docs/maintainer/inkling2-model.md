@@ -348,10 +348,13 @@ compact, lossy forms:
 
 - `P = W_head W_o` as Q8 (int8 codes with an FP32 scale per vocabulary row and 32 of R: 58 MB instead of 206 MB of
   FP32 per Markov step; `ops::dspark_markov_quantize`, `ops::dspark_markov_logits`, which also take BF16 and Q4);
-- the base logits through a Q8 copy of the text head (`ops::quantize_q8_g32` at start, 492 MB of VRAM; 926 MB of BF16
-  read per round becomes 492 MB);
-- the block's projections with K up to 3072 (all but the MLP's down) as BF16 activations into
-  `ops::projection_q8_fp32` over the artifact's Q8_0 values, and the joint (BF16) through `ops::projection_fp32`.
+- the base logits through a 4-bit copy of the text head (`ops::quantize_q4_rows` at start, a scale per 32: 261 MB of
+  VRAM, read by int8 activations in `ops::dense_projection_a8q4_fp32`; 926 MB of BF16 read per round becomes 261 MB;
+  until 2026-11-28 a Q8 copy, 492 MB) when the target reads its BF16 head; with `--dense-q8` the target's Q8 head;
+- the block's and the context's projections by int8 activations over the artifact's split Q8_0 values
+  (`ops::a8_quantize_fp32` once per input, then `ops::dense_projection_a8_fp32`: dp4a sums, split-K so the 8-column
+  block fills the card; until 2026-11-28 BF16 activations into `ops::projection_q8_fp32` and FP32 ones into
+  `ops::dense_projection_fp32`), and the joint (BF16) through `ops::projection_fp32`.
 
 Measured (`ninfer_inkling2_dspark_test` at its defaults, 3 drafts and 128 tokens on the four golden prompts; `NINFER_INKLING2_SPEC_DRAFTS=all` drafts the whole block; V100):
 
@@ -1550,11 +1553,40 @@ The MVP (phases 1-3) is about 2.5 weeks. Everything after it is optional orderin
 
 ## Context with DSpark and vision
 
+**Cheaper rounds (2026-11-28).** Traced against Lapilli's Inkling port on the same V100, the plain step was within
+about 7% (nsys inflates both engines by 12-17%, so compare untraced), and the gap with drafting was the round: their
+drafter took ~1.35 ms a round, ours ~3.3 ms (FP32 and BF16-activation projections at 102-180 us each, the Q8 head
+copy at 830 us), and the GPU idled ~0.9 ms a verify while `cudaMemcpyBatchAsync` queued ~190 history copies on the
+host. Three changes, all drafter-side or copy-only (greedy output unchanged, md5 `d740eaf34d9b` on the 12 chats):
+
+- int8 activations for the drafter's block and context projections (`ops::a8_quantize_fp32`, a scale per 32, then
+  `ops::dense_projection_a8_fp32`: 16-byte loads, 4 dp4a a lane, split-K over the 8 warps of a block so T=8 fills the
+  card; 9216x2304 at T=8 60 us from 122, 2304x9216 78 us from 211);
+- the 4-bit head copy (`ops::dense_projection_a8q4_fp32`: 201,088x2304 in 325 us at T=1, 387 at T=3, against 830 for
+  the Q8 copy);
+- a verify's history saves and `keep()` as one `ops::copy_runs` launch over a device table built once per slot
+  (falls back to `CopyBatch` while capturing or for unaligned runs).
+
+Measured (`--max-context 8192 --spec dspark`, 200 W, untraced; Lapilli's conv / prose / struct prompts and the
+12-chat set):
+
+| Build | conv | prose | struct | 12 chats |
+|---|---|---|---|---|
+| master `15a1765de` | 86.0 | 73.3 | 131.8 | 100.0 |
+| + int8 drafter projections | 88.3 | ~74 | 135.3 | 104.6 |
+| + `copy_runs` | 90.0 | 74.3 | 137.8 | 106.9 |
+| + 4-bit head copy | **93.7** | **75.5** | **140.7** | **109.6** |
+
+Tried and dropped: the Markov P in Q4 (106.5 vs 106.9, no gain); drafting from the first 65,536 ids only (77.3:
+common tokens sit above it); a vectorised argmax (31 us either way); CUDA graphs for the 2..8-column verify (107.9
+graphs vs 109.5 eager, cause not investigated; the WIP is in the `ninfer-inkfast` worktree, commit `84802669b`). Lapilli on the same prompts: 108 / 99 / 211 (lossy: 8-bit dense and head, a 2-bit
+screening head, wider drafts).
+
 At startup the engine picks the widest prefill chunk whose programs fit beside `--max-context` with 256 MiB to spare
 (`kStartupSpare`). With `--spec dspark` it tries, for each chunk, the drafter at its best and then gives up what costs
 it least, never the output:
 
-1. the drafter's Q8 copy of the text head (492 MB); without it the base logits read the target's BF16 head
+1. the drafter's 4-bit copy of the text head (261 MB); without it the base logits read the target's BF16 head
    (`DSparkProgram`'s `head_copy`), a slower draft;
 2. with `--dspark-window auto` (the default), the whole context for the last 32768, then 16384 positions of the
    drafter's global layer (`SpeculativeOptions::dspark_window`; its FP16 ring then holds that many positions at

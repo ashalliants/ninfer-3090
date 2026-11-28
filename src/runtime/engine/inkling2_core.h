@@ -120,7 +120,7 @@ private:
     std::vector<std::unique_ptr<models::inkling2::DeviceAblation>> grafts_;
     std::vector<std::uint64_t> lora_digests_, graft_digests_;
     std::int32_t chunk_ = 256; // prompt tokens per forward, chosen at startup
-    bool drafter_head_copy_ = true; // the drafter's Q8 copy of the head, unless memory is short
+    bool drafter_head_copy_ = true; // the drafter's 4-bit copy of the head, unless memory is short
     std::uint32_t drafter_window_ = 0; // the drafter's global window (0: the whole context), chosen at startup
     std::int32_t slots_ = 1;           // max_concurrency: the text Program's slots
     std::uint32_t requested_context_ = 0; // max_context as asked, before fitting the slots

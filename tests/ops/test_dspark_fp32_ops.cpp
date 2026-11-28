@@ -8,6 +8,7 @@
 // thousand terms); a projection within 1e-7 * (1 + sum |terms|) (its random terms cancel, so |ref| says little);
 // argmax exact.
 
+#include "ninfer/ops/copy_runs.h"
 #include "ninfer/ops/dspark_fp32.h"
 
 #include "ops/op_tester.h"
@@ -20,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -588,6 +590,147 @@ void test_draft_pick() {
 
 } // namespace
 
+// dense_projection_a8_fp32 against the FP64 oracle (tolerance from the int8 rounding of x), and its time against
+// dense_projection_fp32 on the same split matrix.
+void test_projection_a8(int n, int k, int cols, bool bias, double tol) {
+    const std::string label = "dense_projection_a8_fp32 [" + std::to_string(n) + ", " + std::to_string(k) + "] T " + std::to_string(cols) +
+                              (bias ? " + bias" : "");
+    const Matrix m = make_matrix(true, n, k);
+    const int stride = k + 32;
+    const auto x = randoms(static_cast<std::size_t>(stride) * cols, -2, 2);
+    const auto b = randoms(n, -1, 1);
+    auto dw      = bytes_to_device(m.bytes);
+    Buf dx(x), db(b), out(static_cast<std::size_t>(n) * cols * 4);
+    Tensor tx = dx.tensor({stride, cols}).slice(0, 0, k);
+    Tensor tb = db.tensor({n}), to = out.tensor({n, cols});
+    ninfer::DeviceBuffer values(static_cast<std::size_t>(n) * k), scales(static_cast<std::size_t>(n) * k / 32 * 2);
+    ninfer::ops::split_q8_0(dw.p, n, k, values.p, scales.p, nullptr);
+    const ninfer::ops::DenseMatrix w{values.p, ninfer::QType::Q8_G32_FP16, n, k, scales.p};
+    const std::size_t sb = ninfer::ops::a8_columns_bytes(k, cols);
+    ninfer::DeviceBuffer scratch(sb);
+    const ninfer::ops::A8Columns xa = ninfer::ops::a8_quantize_fp32(tx, scratch.p, sb, nullptr);
+    ninfer::ops::dense_projection_a8_fp32(xa, w, bias ? &tb : nullptr, to, nullptr);
+    Vec want(static_cast<std::size_t>(n) * cols), magnitude(want.size());
+    for (int c = 0; c < cols; ++c) {
+        for (int r = 0; r < n; ++r) {
+            double s = bias ? b[r] : 0.0, a = bias ? std::fabs(b[r]) : 0.0;
+            for (int i = 0; i < k; ++i) {
+                const double term = m.values[static_cast<std::size_t>(r) * k + i] * x[static_cast<std::size_t>(c) * stride + i];
+                s += term;
+                a += std::fabs(term);
+            }
+            want[static_cast<std::size_t>(c) * n + r]      = s;
+            magnitude[static_cast<std::size_t>(c) * n + r] = a;
+        }
+    }
+    compare(label, out.get(want.size()), want, tol, &magnitude);
+    if (std::getenv("NINFER_BENCH_A8") != nullptr) {
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0), cudaEventCreate(&e1);
+        const auto time = [&](auto&& run) {
+            for (int i = 0; i < 5; ++i) { run(); }
+            cudaEventRecord(e0);
+            for (int i = 0; i < 50; ++i) { run(); }
+            cudaEventRecord(e1);
+            cudaEventSynchronize(e1);
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e0, e1);
+            return ms * 1000.0F / 50;
+        };
+        const float a8 = time([&] { ninfer::ops::dense_projection_a8_fp32(xa, w, nullptr, to, nullptr); });
+        const float qz = time([&] { (void)ninfer::ops::a8_quantize_fp32(tx, scratch.p, sb, nullptr); });
+        const float f32 = time([&] { ninfer::ops::dense_projection_fp32(tx, w, nullptr, to, nullptr); });
+        std::printf("  %s: a8 %.1f us (+ quantize %.1f), fp32 %.1f us (%.0f GB/s a8)\n", label.c_str(), a8, qz, f32, double(n) * k * 1.0625 / a8 / 1e3);
+        cudaEventDestroy(e0), cudaEventDestroy(e1);
+    }
+}
+
+// copy_runs: three runs (one with a source step and offset 2) against the host's byte copies.
+void test_copy_runs() {
+    const std::size_t bytes = 1 << 16;
+    std::vector<float> host(bytes / 4);
+    for (std::size_t i = 0; i < host.size(); ++i) { host[i] = static_cast<float>(i); }
+    Buf src(host), dst(std::vector<float>(host.size(), -1.0F));
+    auto* s = static_cast<unsigned char*>(src.b.p);
+    auto* d = static_cast<unsigned char*>(dst.b.p);
+    const std::vector<ninfer::ops::CopyRun> runs = {{d, s + 4096, 8192, 0}, {d + 16384, s, 48, 1024}, {d + 32768, s + 160, 20000 / 16 * 16, 16}};
+    ninfer::DeviceBuffer table(runs.size() * sizeof(ninfer::ops::CopyRun));
+    table.copy_from_host(runs.data(), table.bytes);
+    ninfer::ops::copy_runs(static_cast<const ninfer::ops::CopyRun*>(table.p), 3, 2, nullptr);
+    const auto got = dst.get(host.size());
+    std::vector<float> want(host.size(), -1.0F);
+    const auto copy = [&](std::size_t to, std::size_t from, std::size_t n) { std::memcpy(reinterpret_cast<unsigned char*>(want.data()) + to, reinterpret_cast<const unsigned char*>(host.data()) + from, n); };
+    copy(0, 4096, 8192);
+    copy(16384, 2048, 48);
+    copy(32768, 160 + 32, 20000 / 16 * 16);
+    check(std::memcmp(got.data(), want.data(), bytes) == 0, "copy_runs copies each run's bytes from src + offset * src_step");
+    std::printf("copy_runs: %s\n", std::memcmp(got.data(), want.data(), bytes) == 0 ? "exact" : "differs");
+}
+
+// quantize_q4_rows then dense_projection_a8q4_fp32 against the FP64 product of the host-decoded 4-bit matrix (the
+// tolerance from the int8 rounding of x), and its time.
+void test_projection_a8q4(int n, int k, int cols, double tol) {
+    const std::string label = "dense_projection_a8q4_fp32 [" + std::to_string(n) + ", " + std::to_string(k) + "] T " + std::to_string(cols);
+    const Matrix m = make_matrix(false, n, k); // BF16 words
+    const auto x   = randoms(static_cast<std::size_t>(k) * cols, -2, 2);
+    auto dw        = bytes_to_device(m.bytes);
+    Buf dx(x), out(static_cast<std::size_t>(n) * cols * 4);
+    Tensor tw(dw.p, DType::BF16, {k, n});
+    Tensor tx = dx.tensor({k, cols}), to = out.tensor({n, cols});
+    ninfer::DeviceBuffer codes(static_cast<std::size_t>(n) * k / 2), scales(static_cast<std::size_t>(n) * k / 32 * 2);
+    ninfer::ops::quantize_q4_rows(tw, codes.p, scales.p, nullptr);
+    const std::size_t sb = ninfer::ops::a8_columns_bytes(k, cols);
+    ninfer::DeviceBuffer scratch(sb);
+    const ninfer::ops::A8Columns xa = ninfer::ops::a8_quantize_fp32(tx, scratch.p, sb, nullptr);
+    const ninfer::ops::Q4Matrix w{codes.p, scales.p, n, k};
+    ninfer::ops::dense_projection_a8q4_fp32(xa, w, to, nullptr);
+    std::vector<std::uint32_t> hc(static_cast<std::size_t>(n) * k / 8);
+    std::vector<std::uint16_t> hs(static_cast<std::size_t>(n) * k / 32);
+    codes.copy_to_host(hc.data(), hc.size() * 4);
+    scales.copy_to_host(hs.data(), hs.size() * 2);
+    Vec want(static_cast<std::size_t>(n) * cols), magnitude(want.size());
+    bool codes_ok = true;
+    for (int r = 0; r < n; ++r) {
+        std::vector<double> row(k);
+        for (int b = 0; b < k / 32; ++b) {
+            const double d = __half2float(__ushort_as_half(hs[static_cast<std::size_t>(r) * (k / 32) + b]));
+            for (int g = 0; g < 4; ++g) {
+                const std::uint32_t word = hc[(static_cast<std::size_t>(r) * (k / 32) + b) * 4 + g];
+                for (int j = 0; j < 4; ++j) {
+                    const int lo = static_cast<int>((word >> (8 * j)) & 15U) - 8, hi = static_cast<int>((word >> (8 * j + 4)) & 15U) - 8;
+                    row[32 * b + 8 * g + j]     = d * lo;
+                    row[32 * b + 8 * g + j + 4] = d * hi;
+                    codes_ok = codes_ok && lo >= -7 && hi >= -7;
+                }
+            }
+        }
+        for (int i = 0; i < k; ++i) { codes_ok = codes_ok && std::fabs(row[i] - m.values[static_cast<std::size_t>(r) * k + i]) <= 0.05 / 7 + 1e-6; }
+        for (int c = 0; c < cols; ++c) {
+            double sum = 0, a = 0;
+            for (int i = 0; i < k; ++i) {
+                const double term = row[i] * x[static_cast<std::size_t>(c) * k + i];
+                sum += term, a += std::fabs(term);
+            }
+            want[static_cast<std::size_t>(c) * n + r] = sum, magnitude[static_cast<std::size_t>(c) * n + r] = a;
+        }
+    }
+    check(codes_ok, label + ": the codes are not the rounding rule's");
+    compare(label, out.get(want.size()), want, tol, &magnitude);
+    if (std::getenv("NINFER_BENCH_A8") != nullptr) {
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0), cudaEventCreate(&e1);
+        for (int i = 0; i < 3; ++i) { ninfer::ops::dense_projection_a8q4_fp32(xa, w, to, nullptr); }
+        cudaEventRecord(e0);
+        for (int i = 0; i < 20; ++i) { ninfer::ops::dense_projection_a8q4_fp32(xa, w, to, nullptr); }
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        std::printf("  %s: %.1f us (%.0f GB/s)\n", label.c_str(), ms * 50, double(n) * k * 0.5625 / (ms * 50) / 1e3);
+        cudaEventDestroy(e0), cudaEventDestroy(e1);
+    }
+}
+
 int main() {
     try {
         test_projection(true, 3072, 2304, 8, false, 1e-7);
@@ -599,6 +742,20 @@ int main() {
         test_projection(true, 2304, 9216, 8, false, 1e-7, true);
         test_projection(true, 1000, 128, 3, true, 1e-7, true);  // rows not a multiple of the block's 32
         test_projection(true, 768, 5120, 20, true, 1e-7, true); // 3 column tiles
+        for (const int t : {1, 3, 8, 33}) {
+            test_projection_a8(9216, 2304, t, false, 5e-3);
+            test_projection_a8(2304, 9216, t, false, 5e-3);
+            test_projection_a8(3072, 2304, t, false, 5e-3);
+            test_projection_a8(1024, 2304, t, false, 5e-3);
+            test_projection_a8(2304, 3072, t, false, 5e-3);
+        }
+        test_projection_a8(1000, 128, 3, true, 5e-3); // rows not a multiple of a block's
+        test_copy_runs();
+        test_projection_a8q4(1000, 2304, 3, 5e-3);
+        test_projection_a8q4(2048, 2304, 8, 5e-3);
+        if (std::getenv("NINFER_BENCH_A8") != nullptr) {
+            for (const int t : {1, 3, 7}) { test_projection_a8q4(201088, 2304, t, 5e-3); }
+        }
         test_head_norm_rope();
         test_silu();
         test_fuse_taps();
