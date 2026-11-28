@@ -166,6 +166,15 @@ card the engine holds them as MXFP8 (3.9 GiB), re-encoded at load and checked ex
 for bit (`--mxfp8-experts auto`, the default; `off` keeps BF16). `--fit-context MIN` starts at the largest context that
 fits. On Windows, `scripts\download-model.bat inkling2-mini` downloads and verifies this file.
 
+For faster drafting, download Inco's DFlash2 drafter (about 1 GB, Apache-2.0; tested at the revision below, model.safetensors
+sha256 `217980ab...54ee`) and point the server at its folder. The output stays
+the same; only the speed changes:
+
+```bash
+hf download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors --revision 4f9088ea66c21f2b99ed657d1941c306b03e84d2 --local-dir models/inkling2-dflash2
+ninfer-serve models/inkling2-mini-q8.ninfer --vision --spec dflash2 --draft-model models/inkling2-dflash2
+```
+
 ## Performance (one Tesla V100-PCIE-32GB, 2026-11-22 and 2026-11-23)
 
 Measured through `ninfer-serve` built from NInfer master `dad1623b`, on a V100 at its 250 W power limit (peak
@@ -180,6 +189,7 @@ clean run first, then the typical range across repeated or ABBA legs.
 | **Decode, DSpark** | **120.7 tok/s** | maths prompt, greedy, 300 tokens, `--spec dspark` | 114.3-120.7 on maths, 105.5-115.4 on code, 81.2-99.8 on prose and lists |
 | **Decode, DSpark, 12 chats** | **94.4 tok/s** | 12 chat requests of 300 tokens, greedy, mean of each request's tok/s | 93.4-94.4 over four legs, 60.5-60.7% of drafts accepted; plain 78.5-78.8 |
 | **Decode, 12 chats at 262,144** (200 W) | **110.7 tok/s** DSpark, **78.0** plain | the 12 chats, `--max-context 262144 --vision --kv-dtype int8 --spec dspark` (2026-11-28, cheaper drafting rounds and candidate picks; 99.4 on master `eb265563e` the same day, 108.9 on `f7e751dd4`; same greedy output) | DSpark 91.7-138.9 per chat; plain 78.03-78.04 (master `dc867300`, 2026-11-23; the plain path is unchanged) |
+| **Decode, DFlash2 drafter** (200 W) | **127.1 tok/s** | the 12 chats at 262,144 with vision and INT8 KV, `--spec dflash2 --draft-model DIR` (Inco's `incoai/Inkling-2-Mini-DFlash2`, downloaded separately); same greedy output | 104.3-151.8 per chat; 128.3 at 8,192; 104.5 / 90.7 / 171.7 on Lapilli's conv, prose and struct prompts |
 | **Decode, `--speed fast`** (opt-in, lossy) | **163.5 tok/s** | structured output, greedy, 8,069 tokens; 12 chats **109.3-110.3** against 101.1-101.3 exact (2026-11-27, 200 W, `perf/inkling-speed-fast` at `42b5ec8e7`) | +23% on struct, +8.5% on the 12 chats, +2-6% on sampled prose; see Accuracy |
 | **Decode, DSpark, sampled** | **83.5 tok/s** | the same 12 chats at temperature 0.8, top-p 0.95, seeded | 83.4-83.5; plain sampled 74.9 |
 | **Decode, plain** | **78.8 tok/s** | the 12 chats, greedy | 78.2-78.8 |

@@ -712,7 +712,10 @@ Gen3 x4 eGPU) unless a figure says 200 W:
   4-bit drafter head copy, one-launch history copies; greedy output unchanged) raise DSpark to **108.9 tok/s** in the
   same configuration (99.4 on the master build before them, same box and day).
   Candidate picks and up to 7 drafts a round on V100 builds (2026-11-28, same output) take it to **110.7 tok/s**, and
-  structured output from 140.7 to **170.2** at 8,192 context.
+  structured output from 140.7 to **170.2** at 8,192 context. Inco's DFlash2 drafter (`--spec dflash2 --draft-model
+  DIR`, read from its `incoai/Inkling-2-Mini-DFlash2` release, same output) reaches **127.1 tok/s** in that
+  configuration, and 104.5 / 90.7 / 171.7 on Lapilli's conv, prose and struct prompts (92.3 / 74.3 / 170.2 with
+  DSpark).
 - **Prefill** (200 W, 2026-11-24, real-text prompts; the `--prefill-cublas` default of a V100 build: the
   prefill's controllers, router and busiest experts on cuBLAS, and layers 20-23's BF16-bank experts on the
   tensor-core kernels): up to **2,727 tok/s** (a 7,974-token prompt, TTFT 2.92 s, at

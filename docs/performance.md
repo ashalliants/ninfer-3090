@@ -17,6 +17,22 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Inkling-2-Mini DFlash2 drafter (2026-11-28)
+
+`--spec dflash2 --draft-model DIR` drafts with Inco's DFlash2 drafter (`incoai/Inkling-2-Mini-DFlash2`, read from its
+release directory) in DSpark's place, with the same rounds and options. It accepts more drafts a round (3.4 against
+2.4 of 7 in a reference run). Same output as plain decode (same md5 on every set). 200 W, untraced, DSpark on master
+`feb203752` the same day:
+
+| Configuration | DSpark | DFlash2 |
+|---|---|---|
+| 12 chats, 262,144 context, vision, INT8 KV | 110.5 | **127.1** |
+| 12 chats, 8,192 | 111.4 | **128.3** |
+| Lapilli's conv / prose / struct prompts | 92.3 / 74.3 / 170.2 | **104.5** / **90.7** / **171.7** |
+| `--speed fast` (lossy): 12 chats | 125.8 | **138.8** |
+
+RTX 3090: NOT RUN. Details in the [maintainer spec](maintainer/inkling2-model.md#dflash2-drafter).
+
 ## Tesla V100 (`sm_70`): Inkling-2-Mini DSpark candidate picks, up to 7 drafts (2026-11-28)
 
 Each draft step now scores ~800 candidate tokens (each 2048-id tile's top 8 by the base logits) instead of all

@@ -9,7 +9,8 @@
 // - relaxed drafting, which DSpark does not implement, and draft counts outside 1..7 are refused;
 // - --draft-min-p and --dspark-adaptive yield plain greedy's tokens too;
 // - reported, not judged: rounds, drafts accepted, plain fallback steps, and decode tok/s of both Engines.
-// Skips without NINFER_TEST_INKLING2_ARTIFACT. NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default 3, the serving default);
+// Skips without NINFER_TEST_INKLING2_ARTIFACT. NINFER_TEST_INKLING2_DFLASH2 (the DFlash2 release directory) runs every
+// check with --spec dflash2 --draft-model in DSpark's place. NINFER_INKLING2_SPEC_DRAFTS: drafts per round (default 3, the serving default);
 // NINFER_INKLING2_SPEC_TOKENS: output tokens per prompt (default 256).
 
 #include "ninfer/engine.h"
@@ -60,6 +61,16 @@ const std::vector<std::string> kPrompts = {
     "Explain what this C code prints and why:\n\n#include <stdio.h>\nint main(void) {\n    int a[5] = {1, 2, 3, 4, 5};\n"
     "    int s = 0;\n    for (int i = 0; i < 5; ++i) s += a[i] * a[i];\n    printf(\"%d\\n\", s);\n    return 0;\n}",
 };
+
+// The drafter under test: DSpark, or DFlash2 from NINFER_TEST_INKLING2_DFLASH2.
+void set_drafter(ninfer::SpeculativeOptions& spec) {
+    if (const char* dir = std::getenv("NINFER_TEST_INKLING2_DFLASH2"); dir != nullptr && *dir != '\0') {
+        spec.backend     = ninfer::SpeculativeBackend::DFlash2;
+        spec.draft_model = dir;
+    } else {
+        spec.backend = ninfer::SpeculativeBackend::DSpark;
+    }
+}
 
 struct Run {
     std::vector<std::vector<ninfer::TokenId>> tokens;
@@ -136,7 +147,7 @@ int main() {
             stop.stop.strings.push_back({.text = "def ", .channel = ninfer::OutputChannel::Content});
             plain_stop = engine.generate(engine.prepare(user_turn(kPrompts[0])), stop).generated_token_ids;
         }
-        options.speculative.backend      = ninfer::SpeculativeBackend::DSpark;
+        set_drafter(options.speculative);
         options.speculative.draft_tokens = drafts;
         // As ninfer serve normalizes it (an LM-head proposal for every backend), which DSpark has no use for.
         ninfer::product::apply_speculative_defaults(options.speculative);
@@ -309,7 +320,7 @@ int main() {
         const auto s1 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
         const auto s2 = engine.generate(engine.prepare(user_turn(kPrompts[2])), sampled);
         check(s1.speculative.rounds > 0 && s1.generated_token_ids == s2.generated_token_ids, "a sampled request speculates and repeats");
-        check(s1.speculative.backend == ninfer::SpeculativeBackend::DSpark && s1.speculative.draft_window == drafts,
+        check(s1.speculative.backend == options.speculative.backend && s1.speculative.draft_window == drafts,
               "a sampled request reports the configured backend");
         // A sampled request's output is the plain Engine's under the same seed, and a greedy request after it drafts
         // and yields plain greedy's tokens.
@@ -330,7 +341,7 @@ int main() {
         ninfer::EngineOptions options;
         options.artifact_path               = artifact_path;
         options.max_context                 = 4096;
-        options.speculative.backend         = ninfer::SpeculativeBackend::DSpark;
+        set_drafter(options.speculative);
         options.speculative.draft_tokens    = 5;
         options.speculative.draft_min_p     = 0.5F;
         options.speculative.dspark_adaptive = true;
@@ -365,7 +376,7 @@ int main() {
         q8_plain.dense_q8      = ninfer::DenseQ8::Head;
         q8_plain.prefill_chunk_auto = true;
         auto q8_spec           = q8_plain;
-        q8_spec.speculative.backend      = ninfer::SpeculativeBackend::DSpark;
+        set_drafter(q8_spec.speculative);
         q8_spec.speculative.draft_tokens = drafts;
         ninfer::product::apply_speculative_defaults(q8_spec.speculative);
         Run want;

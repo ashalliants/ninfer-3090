@@ -8,6 +8,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "models/inkling2/model.h"
+#include "models/inkling2/program/drafter.h"
 #include "ninfer/ops/dspark_fp32.h"
 #include "ninfer/ops/projection_fp32.h"
 
@@ -21,7 +22,7 @@
 
 namespace ninfer::models::inkling2 {
 
-class DSparkProgram {
+class DSparkProgram final : public Drafter {
 public:
     // max_context sizes the global layer's ring; max_chunk is the most positions one extend() takes. head_q8, when
     // the target runs its head over an 8-bit re-encoding (DenseWeightsQ8::head, a view of the owner both Programs read), is
@@ -39,36 +40,32 @@ public:
                   bool head_copy = true, DeviceSpan workspace = {});
     // The workspace extend() (of up to max_chunk positions) and draft() take.
     [[nodiscard]] static std::size_t workspace_bytes(const Model& model, std::int32_t max_chunk);
-    [[nodiscard]] std::int32_t max_chunk() const noexcept { return max_chunk_; }
-    ~DSparkProgram();
+    [[nodiscard]] std::int32_t max_chunk() const noexcept override { return max_chunk_; }
+    [[nodiscard]] std::int32_t max_drafts() const noexcept override { return static_cast<std::int32_t>(config_.block_size) - 1; }
+    ~DSparkProgram() override;
     DSparkProgram(const DSparkProgram&)            = delete;
     DSparkProgram& operator=(const DSparkProgram&) = delete;
 
-    void reset() noexcept { position_ = 0; }
+    void reset() noexcept override { position_ = 0; }
 
     // The drafter's state at position() (prefix reuse, as TextProgram::Snapshot): its rings (the sliding layers', and the
     // global layers' under a global_window) and the anchor context. Unwindowed global rings are indexed by position and
     // not copied.
-    // In pinned host memory, as TextProgram::Snapshot.
-    struct Snapshot {
-        PinnedHostBuffer memory;    // snapshot_bytes()
-        std::int64_t position = -1; // -1: holds nothing
-    };
-    [[nodiscard]] std::size_t snapshot_bytes() const;
-    void save(Snapshot& snapshot);
+    [[nodiscard]] std::size_t snapshot_bytes() const override;
+    void save(Snapshot& snapshot) override;
     // As TextProgram::save_async: the anchor context staged on the device in stream order, then the copy on `copy`
     // while this Program's stream goes on; extend() (which writes the rings), restore() and the next save wait for it.
-    void save_async(Snapshot& snapshot, cudaStream_t copy);
-    void restore(const Snapshot& snapshot);
+    void save_async(Snapshot& snapshot, cudaStream_t copy) override;
+    void restore(const Snapshot& snapshot) override;
     // Target positions committed so far; the next anchor sits here.
-    [[nodiscard]] std::int64_t position() const noexcept { return position_; }
+    [[nodiscard]] std::int64_t position() const noexcept override { return position_; }
     // The target visits whose hidden states extend() takes, in order (the TextProgram's tap_visits).
-    [[nodiscard]] const std::vector<std::uint32_t>& tap_visits() const noexcept { return config_.target_visits; }
+    [[nodiscard]] const std::vector<std::uint32_t>& tap_visits() const noexcept override { return config_.target_visits; }
 
     // Commits the next n target positions: tap i is the target's hidden state at tap_visits()[i] for them, FP32
     // [hidden, >= n] (columns 0 .. n - 1 are used). Writes each draft layer's context K/V and keeps the Markov
     // head's context (the last position's).
-    void extend(std::span<const Tensor> taps, std::int32_t n);
+    void extend(std::span<const Tensor> taps, std::int32_t n) override;
 
     // The first `n` (1 .. block_size - 1) tokens drafted after `anchor`, the target's next token at position() (>= 1).
     // The block forward always takes all block_size positions (its attention is non-causal); only the Markov chain
@@ -79,7 +76,7 @@ public:
     // probability of each draft (ops::dspark_draft_pick's prob). Greedy without probs drafts by argmax_fp32, the same
     // tokens as a greedy pick.
     std::vector<std::int32_t> draft(std::int32_t anchor, std::int32_t n, const ops::DraftPick* pick = nullptr,
-                                    std::span<const double> canonical = {}, std::vector<float>* probs = nullptr);
+                                    std::span<const double> canonical = {}, std::vector<float>* probs = nullptr) override;
 
 private:
     struct Layer {

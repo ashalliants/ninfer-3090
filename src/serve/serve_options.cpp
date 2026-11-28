@@ -259,7 +259,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--no-exit-on-engine-failure] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|nvfp4|k8v4|<per-layer INT8-family runs, e.g. rk4v4x12,int8x4>|fp16|fp32 (Inkling-2: fp16|fp32, or lossy opt-in global rings int8|rk8v4|rk4v4)] [--speed exact|fast (Inkling-2; fast is lossy)] [--dense-q8 head|all (lossy)] [--mxfp8-experts auto|on|off] [--no-split-attention] [--prefill-math tc|fp32] "
-           "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N] [--draft-min-p P] [--dspark-adaptive on|off]] "
+           "[--spec mtp|dflash|dflash2 --draft-tokens N | --spec dspark [--draft-tokens N] [--dspark-window N] [--draft-min-p P] [--dspark-adaptive on|off] | --spec dflash2 --draft-model DIR (Inkling-2)] "
            "[--ngram-draft-tokens 0|15] [--ngram-min-match N] [--adaptive-draft-tokens 0|3] "
            "[--relaxed-drafting [P]] [--draft-context-rows N] "
            "[--default-max-tokens N] [--max-output-tokens N] [--default-thinking-budget N] "
@@ -1093,6 +1093,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
             given.draft_tokens               = true;
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = require_value("--draft-model");
         } else if (arg == "--dspark-window") {
             const char* form = require_value("--dspark-window");
             options.speculative.dspark_window_explicit = true;
@@ -1673,8 +1675,8 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
         // not set explicitly takes the preset's value.
         auto& spec = options.speculative;
         if (spec.backend == SpeculativeBackend::None) { spec.backend = SpeculativeBackend::DSpark; }
-        if (spec.backend != SpeculativeBackend::DSpark) {
-            throw std::invalid_argument("--speed fast is for Inkling-2 and drafts with its DSpark drafter (--spec dspark)");
+        if (!is_block_drafter(spec)) {
+            throw std::invalid_argument("--speed fast is for Inkling-2 and drafts with its block drafter (--spec dspark, or --spec dflash2 --draft-model)");
         }
         if (options.max_concurrency > 1) {
             // Batched Inkling-2 decode runs without the drafter, which is what --speed fast changes.

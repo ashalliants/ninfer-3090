@@ -110,7 +110,7 @@ struct SpeculativeCliGiven {
 
 // Only an omitted value takes the default; an explicit 0 stays 0 (for validation to refuse, for --draft-tokens).
 inline void apply_speculative_cli_defaults(SpeculativeOptions& options, const SpeculativeCliGiven& given) {
-    if (options.backend != SpeculativeBackend::DSpark) { return; }
+    if (!is_block_drafter(options)) { return; }
     if (!given.draft_tokens) { options.draft_tokens = kDSparkDefaultDraftTokens; }
     if (!given.draft_min_p) { options.draft_min_p = kDSparkDefaultDraftMinP; }
     if (!given.dspark_adaptive) { options.dspark_adaptive = true; }
@@ -123,8 +123,11 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options, 
         throw std::invalid_argument("--draft-min-p takes a probability in [0,1)");
     }
     if ((options.draft_min_p != 0.0F || options.dspark_adaptive || given.draft_min_p || given.dspark_adaptive) &&
-        options.backend != SpeculativeBackend::DSpark) {
-        throw std::invalid_argument("--draft-min-p and --dspark-adaptive need --spec dspark");
+        !is_block_drafter(options)) {
+        throw std::invalid_argument("--draft-min-p and --dspark-adaptive need --spec dspark (or Inkling-2's --spec dflash2 --draft-model)");
+    }
+    if (!options.draft_model.empty() && options.backend != SpeculativeBackend::DFlash2) {
+        throw std::invalid_argument("--draft-model is Inkling-2's DFlash2 drafter and needs --spec dflash2");
     }
     validate_ngram_cli_options(options);
     validate_adaptive_cli_options(options);
@@ -149,6 +152,16 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options, 
         }
         return;
     case SpeculativeBackend::DFlash2:
+        if (!options.draft_model.empty()) { // Inkling-2's DFlash2: DSpark's rounds (a block of 8)
+            if (options.draft_tokens == 0 || options.draft_tokens > 7) {
+                throw std::invalid_argument("--spec dflash2 --draft-model takes --draft-tokens in [1,7] (default " +
+                                            std::to_string(kDSparkDefaultDraftTokens) + ")");
+            }
+            if (options.ngram_draft_tokens != 0 || options.adaptive_draft_tokens != 0) {
+                throw std::invalid_argument("--spec dflash2 --draft-model takes no n-gram or adaptive draft windows");
+            }
+            return;
+        }
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
         }
