@@ -74,8 +74,8 @@ Inkling-2-Mini runs on the RTX 3090 as well, on Windows and Linux, with 137,216 
 >   sampled request draws the same tokens plain sampling draws under the same seed, on every DSpark request
 >   measured ([model card](model-cards/Inkling-2-Mini-NInfer-V100/README.md)). Unsloth's DSpark notes for llama.cpp
 >   say its greedy output with the drafter "is not guaranteed to be bit identical to a run without it".
-> - **Faster on the same card.** On one Tesla V100 32 GB at 200 W, NInfer decodes **110.7 tok/s** with DSpark and
->   **78.0** plain (12-chat averages at the full 262,144-token context with images and INT8 KV; **120.7** on maths at
+> - **Faster on the same card.** On one Tesla V100 32 GB at 200 W, NInfer decodes **112.5 tok/s** with DSpark and
+>   **79.8** plain (12-chat averages at the full 262,144-token context with images and INT8 KV; **120.7** on maths at
 >   250 W), and prefills **2,727 tok/s** at 8K with `--prefill-chunk 8192` (131,072 context), 2,170 at the default
 >   chunk (2,125 with DSpark and images at the full 262,144). The other published V100 port, Csavoldi's Inkling port onto Lapilli
 >   ([report](https://github.com/chris83-dev/lapilli-v100/blob/f9b7dd093a9ff018bc68f177f81a1d27d3ffec91/docs/community/inkling2-mini.md),
@@ -102,7 +102,7 @@ Decode is one stream unless the column says otherwise.
 | Qwen3.8-Flash-Next | Tesla V100 32 GB | 262,144 | ~990 tok/s at 3.8K (250 W) | **129.6 tok/s** (MTP7 + draft vocabulary, code); 103-106 thinking, 82-83 story, 81 Chinese, 77 French (200 W); flat from 10K to 221K context | |
 | Qwen3.6-35B-A3B (MoE) | Tesla V100 32 GB | 65,536 tested | **3,984 tok/s** at 4.2K, 3,118 at 40.2K (200 W) | **253.7 tok/s** on code, 265 thinking, 303 structured JSON, 172.6-192.7 story, Chinese, French and conversation (MTP3 + draft head, 200 W); **319 structured JSON** with DFlash K7; 155 plain | 197-200 tok/s at C2 (MTP3, story + code) |
 | **Inkling-2-Mini** (new) | RTX 3090 | **137,216** plain, 89,088 with DSpark and vision; **262,144** with both on `--kv-dtype rk4v4` (lossy, opt-in) | **2,421 tok/s** at 8.4K, 65,536 context with vision (Windows; 2,410 under WSL); 2,416 at 1.2K | **104 tok/s** plain (12 chats, WSL; 101.8 on Windows); 115.5 best with DSpark (code) | **282 tok/s** at C8 (plain, WSL; 277 on Windows) |
-| **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **2,727 tok/s** at 8K, 131,072 context, `--prefill-chunk 8192` (200 W); 2,170 at the default chunk (1,962 at 1K, 1,339 at 100K); 2,125 at 8K at the full 262,144 with DSpark and vision | **120.7 tok/s** (DSpark, maths, 250 W); 110.7 average over 12 chats, 78.0 plain (262,144 with vision, INT8 KV, 200 W) | **198 tok/s** at C8 (plain) |
+| **Inkling-2-Mini** (new) | Tesla V100 32 GB | **262,144** with DSpark and vision | **2,727 tok/s** at 8K, 131,072 context, `--prefill-chunk 8192` (200 W); 2,170 at the default chunk (1,962 at 1K, 1,339 at 100K); 2,125 at 8K at the full 262,144 with DSpark and vision | **120.7 tok/s** (DSpark, maths, 250 W); 112.5 average over 12 chats, 79.8 plain (262,144 with vision, INT8 KV, 200 W) | **198 tok/s** at C8 (plain) |
 
 RTX 3090 rows use the Linux launcher defaults (`rk4v4` KV) unless marked Windows. The 27B's code,
 chat, 98K-context and 315 W C8 figures were measured on 2026-11-26 under Windows at a 315 W limit
@@ -712,7 +712,9 @@ Gen3 x4 eGPU) unless a figure says 200 W:
   4-bit drafter head copy, one-launch history copies; greedy output unchanged) raise DSpark to **108.9 tok/s** in the
   same configuration (99.4 on the master build before them, same box and day).
   Candidate picks and up to 7 drafts a round on V100 builds (2026-11-28, same output) take it to **110.7 tok/s**, and
-  structured output from 140.7 to **170.2** at 8,192 context.
+  structured output from 140.7 to **170.2** at 8,192 context. MXFP8 experts and per-entry NVFP4 verify on V100
+  builds (2026-11-28, same output) take it to **112.5 tok/s** (110.5 on master the same day) and plain to **79.8**
+  (78.2) in that configuration, and struct to **172.7** at 8,192.
 - **Prefill** (200 W, 2026-11-24, real-text prompts; the `--prefill-cublas` default of a V100 build: the
   prefill's controllers, router and busiest experts on cuBLAS, and layers 20-23's BF16-bank experts on the
   tensor-core kernels): up to **2,727 tok/s** (a 7,974-token prompt, TTFT 2.92 s, at
@@ -746,7 +748,7 @@ Gen3 x4 eGPU) unless a figure says 200 W:
 **On an RTX 3090** (24 GB) the same artifact runs, measured under WSL on 2026-11-23 (315 W limit). Its layers 20-23
 experts, 7.6 GiB of BF16 in the file, are the checkpoint's MXFP8 values: the 3090 holds them as MXFP8 (3.9 GiB),
 re-encoded at load and checked exact, so every output is the same, bit for bit (`--mxfp8-experts`, automatic when the
-BF16 weights would leave under 4 GiB free; the V100 keeps BF16).
+BF16 weights would leave under 4 GiB free; a V100 build always does, as the MXFP8 kernels are faster there).
 
 - **Decode:** **104 tok/s** plain, the mean over 12 greedy chats (103.3-103.9 at 64K and 131K context). 2.9% faster
   than holding the experts in BF16 (100.6), since a token reads half the bytes for those layers.

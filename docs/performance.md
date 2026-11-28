@@ -17,6 +17,27 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Inkling-2-Mini MXFP8 experts and per-entry NVFP4 verify (2026-11-28)
+
+V100 builds now hold layers 20-23's experts as MXFP8 by default (`--mxfp8-experts auto`; they are the checkpoint's
+MXFP8 values, re-encoded at load and checked exact; 4.0 GiB instead of 7.6 GiB of BF16), and run NVFP4 expert calls of
+up to 11 columns on the per-entry kernels instead of the expert-major ones (so DSpark's 8-column verify). Same output,
+bit for bit (same md5 on every set). 200 W, untraced, against master `feb203752` on the same box and day:
+
+| Configuration | master | now |
+|---|---|---|
+| 12 chats, 262,144 context, vision, INT8 KV, DSpark | 110.5 | **112.5** |
+| 12 chats, 262,144 context, vision, INT8 KV, plain | 78.2 | **79.8** |
+| 12 chats, 8,192, DSpark | 111.3 | **111.8** (111.8 / 111.8) |
+| 12 chats, 8,192, plain | 78.9 (78.95 / 78.94) | **80.1** |
+| Lapilli's conv / prose / struct prompts, DSpark | 92.1 / 74.5 / 171.4 | **94.4** / **76.0** / **172.7** (93.0 / 75.7 / 172.5) |
+| Prefill, 6.4K-token prompts, default chunk | 2,403-2,412 | 2,389-2,413 (the same) |
+
+The 3.6 GiB it frees also lets 262,144 with DSpark and vision (FP16 KV) start at chunk 2048 with the drafter's 4-bit
+head and whole-context window (before: chunk 2048, the target's head and a 16,384 window). RTX 3090: NOT RUN (it
+already holds MXFP8 when memory is short, and keeps the expert-major threshold at 64 entries). Details in the
+[maintainer spec](maintainer/inkling2-model.md#mxfp8-experts).
+
 ## Tesla V100 (`sm_70`): Inkling-2-Mini DSpark candidate picks, up to 7 drafts (2026-11-28)
 
 Each draft step now scores ~800 candidate tokens (each 2048-id tile's top 8 by the base logits) instead of all

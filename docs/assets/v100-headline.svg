@@ -72,9 +72,9 @@
   <text x="32.0" y="510.0" class="t1" font-size="15" font-weight="700" text-anchor="start">Inkling-2-Mini</text>
   <text x="32.0" y="529.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">vs Strata, reported on its model card</text>
   <text x="32.0" y="544.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">(the fastest other figure found)</text>
-  <path class="rep" d="M302.0,499.0 h187.4 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-187.4 z"><title>Inkling-2-Mini, Decode: 1.34x</title></path>
+  <path class="rep" d="M302.0,499.0 h224.4 a4,4 0 0 1 4,4 v10.0 a4,4 0 0 1 -4,4 h-224.4 z"><title>Inkling-2-Mini, Decode: 1.60x</title></path>
   <line x1="445.1" y1="494.0" x2="445.1" y2="522.0" class="ref" stroke-width="1.5"/>
-  <text x="500.4" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.34x</text>
+  <text x="537.4" y="514.0" class="t1" font-size="17" font-weight="700" text-anchor="start">1.60x</text>
   <text x="302.0" y="535.0" class="t3" font-size="11" font-weight="400" text-anchor="start">ours: DSpark, 12-chat average at 262,144</text>
   <text x="302.0" y="549.0" class="t3" font-size="11" font-weight="400" text-anchor="start">context, full Q8_K_XL (23.9 GB). Strata runs</text>
   <text x="302.0" y="563.0" class="t3" font-size="11" font-weight="400" text-anchor="start">smaller packs (SQ-20 19.4 GB / SQ-10 10.5 GB);</text>
@@ -89,5 +89,5 @@
   <text x="32.0" y="623.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Per-model charts, prompts, quants and the pinned sources for every competitor figure: docs/tesla-v100.md, &quot;Methodology and sources&quot;.</text>
   <text x="32.0" y="638.0" class="t2" font-size="11.5" font-weight="400" text-anchor="start">Competitor versions: llama.cpp 36d818e16 with ggml-org Q4_K_M and its MTP / DFlash Q8_0 sidecars; Lapilli f9b7dd09.</text>
   <text x="32.0" y="659.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">One Tesla V100-PCIE-32GB on a PCIe Gen3 x4 eGPU link, 59 GiB host RAM · 200 W limit · 2026-11-25 · ours: 35B-A3B #614/#618/#621, 27B</text>
-  <text x="32.0" y="674.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">d309f3d8, Flash-Next fdcac347 (#611), Inkling-2-Mini dc867300 and #596 · competitors measured on this box unless marked “reported”</text>
+  <text x="32.0" y="674.0" class="t3" font-size="11.5" font-weight="400" text-anchor="start">d309f3d8, Flash-Next fdcac347 (#611), Inkling-2-Mini 2026-11-28 and #596 · competitors measured on this box unless marked “reported”</text>
 </svg>

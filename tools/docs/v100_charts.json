@@ -11,7 +11,7 @@
       "title": "One Tesla V100 32 GB: faster than the next-best engine",
       "subtitle": "Speed of ashalliants/ninfer-3090 divided by the fastest other engine we could run or find for each model on the same card. Above 1.0x means ours is faster. Decode is the geometric mean over the prompts in each model's chart.",
       "desc": "Speed-up of ashalliants/ninfer-3090 over the next-best engine on one Tesla V100 32 GB. Qwen3.6-35B-A3B vs llama.cpp: 1.34x decode, 1.20x prefill. Qwen3.8-27B vs Lapilli: 1.21x decode, 1.38x prefill. Qwen3.8-Flash-Next vs Lapilli: 1.02x decode, prefill not compared. Inkling-2-Mini vs Strata's reported figures: 1.34x decode, 1.19x prefill with an 8192-token chunk (0.95x at the default chunk).",
-      "build": "35B-A3B #614/#618/#621, 27B d309f3d8, Flash-Next fdcac347 (#611), Inkling-2-Mini dc867300 and #596",
+      "build": "35B-A3B #614/#618/#621, 27B d309f3d8, Flash-Next fdcac347 (#611), Inkling-2-Mini 2026-11-28 and #596",
       "panels": [
         {"type": "ratio", "columns": ["Decode", "Prefill"], "max": 1.6,
          "rows": [
@@ -31,7 +31,7 @@
            {"section": "Third-party reported figures (hatched): different boxes and conditions"},
            {"model": "Inkling-2-Mini", "versus": "vs Strata, reported on its model card (the fastest other figure found)",
             "cells": [
-              {"ours": [94.3], "theirs": [70.5], "reported": true, "detail": "ours: DSpark, 12-chat average at 262,144 context, full Q8_K_XL (23.9 GB). Strata runs smaller packs (SQ-20 19.4 GB / SQ-10 10.5 GB); its decode figure doesn't say which"},
+              {"ours": [112.5], "theirs": [70.5], "reported": true, "detail": "ours: DSpark, 12-chat average at 262,144 context, full Q8_K_XL (23.9 GB). Strata runs smaller packs (SQ-20 19.4 GB / SQ-10 10.5 GB); its decode figure doesn't say which"},
               {"ours": [2727], "theirs": [2287], "reported": true, "detail": "ours: 8K prompt with --prefill-chunk 8192. At the default chunk 2048 (2,170) it is 0.95x: Strata's reported prefill is higher"}]}
          ]}
       ],
@@ -132,13 +132,13 @@
       "title": "Inkling-2-Mini on one Tesla V100 32 GB",
       "subtitle": "ashalliants/ninfer-3090 measured on this card, against every other single-V100 32 GB figure we found. Those are third-party reported (hatched): other machines, quants and prompts, not re-run by us.",
       "desc": "Inkling-2-Mini decode and prefill on one Tesla V100: ashalliants/ninfer-3090 measured, Strata, Lapilli-Inkling and llama.cpp as reported.",
-      "build": "decode master dc867300 (2026-11-23), prefill since #596 (2026-11-24)",
+      "build": "decode 2026-11-28 (MXFP8 experts), prefill since #596 (2026-11-24)",
       "panels": [
         {"type": "rows", "title": "Decode, one request (tok/s)",
          "note": "Ours: UD-Q8_K_XL repacked byte-exact, the largest quant here, average over 12 chats, greedy, 300 tokens, at 262,144 context with vision and INT8 KV. DSpark output equals plain greedy output.",
          "rows": [
-           {"label": "Ours, DSpark", "detail": "12-chat average", "value": 94.3, "kind": "ours"},
-           {"label": "Ours, plain", "detail": "no drafts", "value": 78.0, "kind": "alt"},
+           {"label": "Ours, DSpark", "detail": "12-chat average", "value": 112.5, "kind": "ours"},
+           {"label": "Ours, plain", "detail": "no drafts", "value": 79.8, "kind": "alt"},
            {"label": "Strata", "detail": "smaller pack (SQ-20 19.4 GB or SQ-10 10.5 GB, not stated); draft decoding", "value": 70.5, "kind": "reported"},
            {"label": "Lapilli-Inkling (Csavoldi)", "detail": "NVFP4 experts, empty context, no drafts", "value": 69, "kind": "reported"},
            {"label": "llama.cpp, realugbun fork", "detail": "UD-Q4_K_XL, tg128", "value": 50.7, "kind": "reported"},

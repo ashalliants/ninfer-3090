@@ -228,9 +228,10 @@ int main() {
             check(r.generated_token_ids == alone[0].generated_token_ids, "the fitted Engine decodes the solo output");
         }
         if (std::getenv("NINFER_INKLING2_BATCH_FIT") == nullptr || std::string(std::getenv("NINFER_INKLING2_BATCH_FIT")) != "0") {
-            // One slot with --fit-context, DSpark (its whole-context window) and the vision tower resident: the full
-            // 262,144 does not fit on a 24 or 32 GB card this way (the V100's largest is 238,592), so the search runs, with
-            // the drafter sized at each candidate. The fit is a multiple of 1024 and the Engine decodes the solo output.
+            // One slot with --fit-context, DSpark (its whole-context window), the vision tower resident and BF16 experts
+            // (--mxfp8-experts off): the full 262,144 does not fit on a 24 or 32 GB card this way (the V100's largest is
+            // 238,592; with the MXFP8 experts a V100 build holds by default it fits whole), so the search runs, with the
+            // drafter sized at each candidate. The fit is a multiple of 1024 and the Engine decodes the solo output.
             const auto one_slot = [&](std::uint32_t floor) {
                 auto options                                = base_options(artifact);
                 options.max_context                         = 262144;
@@ -241,6 +242,7 @@ int main() {
                 options.speculative.draft_tokens            = 3;
                 options.speculative.dspark_window           = 0;
                 options.speculative.dspark_window_explicit  = true;
+                options.experts_mxfp8                       = ninfer::ExpertsMxfp8::Off;
                 return options;
             };
             {

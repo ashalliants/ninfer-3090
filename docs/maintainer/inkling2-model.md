@@ -887,8 +887,23 @@ checkpoint's MXFP8 values (see "GGUF mapping"), so `--mxfp8-experts on` (`Engine
   (`test_mxfp8_experts`) checks every route bit for bit, and greedy chats through `ninfer-serve` give the same text.
 - **Auto** (the default) re-encodes when the device bytes the BF16 form binds (the text model, and the vision tower
   when resident) leave less than 4 GiB of free device memory (`kMxfp8AutoRoom`). On the RTX 3090 (24 GiB, about 1.5
-  GiB taken by the desktop) that is always; on the Tesla V100 32 GB it never is, so the V100 runs the BF16 kernels it
-  was tuned with. `on` and `off` force either form. The V100 has not been measured with `on`.
+  GiB taken by the desktop) that is always. On `sm_70` (Tesla V100) `auto` always re-encodes, whatever the memory:
+  there the MXFP8 kernels are faster than the BF16 ones (below). `on` and `off` force either form.
+
+Measured on the Tesla V100 (2026-11-28, 200 W, `ninfer-serve`, against master `feb203752`, which kept BF16 on the
+V100; the branch also moves NVFP4 calls of 64-95 entries to the per-entry kernels, see "Batched decode"; the same md5
+on every set):
+
+| | BF16 (master) | MXFP8 |
+|---|---|---|
+| 12 chats, 8,192, plain | 78.95 / 78.94 | **80.09** |
+| 12 chats, 8,192, DSpark | 111.32 | **111.83 / 111.84** |
+| Lapilli's conv / prose / struct, DSpark | 92.1 / 74.5 / 171.4 | 93.0-94.4 / 75.7-76.0 / 172.5-172.7 |
+| 12 chats at 262,144, vision, INT8 KV: DSpark / plain | 110.46 / 78.21 | **112.45 / 79.79** |
+| prefill, 6.4K-token prompts (chunk 2048) | 2,403-2,412 | 2,389-2,413 |
+
+The 3.6 GiB saved also lets
+262,144 with DSpark and vision start with the drafter's 4-bit head and whole-context window at chunk 2048.
 
 Measured on the RTX 3090 (2026-11-23, WSL, 315 W power limit, PCIe Gen4 x16, `ninfer-serve`, 12 greedy chats of
 300 tokens plus a maths prompt; power capping but no thermal slowdown during the legs):
@@ -1665,6 +1680,7 @@ Measured on the V100 (2026-11-21, `ninfer-serve` startup, FP16 rings, tensor-cor
 | neither DSpark nor vision | 307,200 | chunk 256 (262,144: chunk 1024) |
 | DSpark and vision, before this stack's drafter and vision changes | 217,088 | chunk 256 |
 | DSpark and vision, `--dspark-window 0` | 238,592 | chunk 256, the target's head |
+| DSpark and vision, MXFP8 experts (`auto` on a V100 since 2026-11-28) | 262,144 | chunk 2048, the drafter's 4-bit head, whole-context window |
 | DSpark and vision, `--dspark-window 32768` | 260,096 | chunk 256, the target's head |
 | DSpark and vision, `auto` (default) | 262,144 (265,216 fails) | chunk 256, the target's head, window 16384 |
 | same, the snapshots in host memory (2026-11-22) | 262,144 | chunk 2048, the target's head, window 16384; up to 222,720 the drafter's Q8 head copy and the whole context |
@@ -1814,7 +1830,12 @@ Exactness: each request's tokens and logits are bit-identical to its solo run.
   - Calls of fewer than 64 entries (up to 7 columns at top 8, so batched decode up to B = 7 and DSpark verify) also
     run per entry. Entries of one expert run at the same time, so its second read mostly hits the L2, and the
     per-entry kernels' occupancy (64 registers, four blocks an SM) beats the expert-major kernels at these widths.
-  - From 64 entries the call runs expert-major. Block (g, s) takes row group g of the s-th distinct expert in order
+    NVFP4 calls on `sm_70` stay per entry up to 95 entries (11 columns, so DSpark's 8-column verify and batched decode
+    up to B = 11): the V100 op sweep (`NINFER_INKLING2_OP_SWEEP=1`, 2026-11-28) measured T = 8 at 374 against 416 us
+    expert-major, T = 9 432 against 478, T = 12 591 against 603 and T = 16 804 against 753. BF16 there, and every
+    format on other targets (the RTX 3090 is not measured), keep 64: V100 BF16 expert-major is faster from T = 8
+    (966 against 1,011 us).
+  - From 64 entries (NVFP4 on `sm_70`: 96) the call runs expert-major. Block (g, s) takes row group g of the s-th distinct expert in order
     of first appearance, lists that expert's entries itself (no grouping launch), and stages up to 4 of them at a
     time. A tile computes exactly its entries, with the per-entry kernel's arithmetic for each.
   - This replaced the grouped kernels, which computed 4 columns per tile whatever the expert's count and held one
