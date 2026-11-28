@@ -150,7 +150,7 @@ server. Never pass `-DNINFER_CUDA_LINEINFO=ON` to a release tree; both packagers
 it on (any value CMake treats as true). **The V100 tree also builds without PTX** (`NINFER_CUDA_PTX`, `AUTO` by
 default, which is off for `CMAKE_CUDA_ARCHITECTURES=70` even in a tree first configured for 86; a V100 never runs
 the PTX), and `package-release.sh` refuses a V100 tree that embeds it. Leave `NINFER_CUDA_PTX` at `AUTO`. The sm_86 trees keep PTX so they still run on newer cards. V100 `ninfer-serve`: 1,473 MB with
-both, 448 MB without. The first build of each tree after the switch recompiles
+both, 524 MB without (v0.21.0 release tree; quote the figure from the tree you ship). The first build of each tree after the switch recompiles
 every CUDA object (the flags changed, so ccache misses): allow about twice the usual build time once. The GPU is usually
 loaded by the user's server, but compiling needs none (the V100 build needs no V100 either).
 
