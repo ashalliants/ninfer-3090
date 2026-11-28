@@ -300,9 +300,12 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
         const Tensor embed_norm = model_.tensor(model_.weights().embedding_norm, {h});
         ops::rmsnorm_fp32(first, &embed_norm, text_.rms_norm_eps, first, stream_);
     }
-    // A block projection over the split Q8_0 values by int8 activations (a8_quantize_fp32 once per input, dp4a sums;
-    // only the drafts can change, and the target verifies them); another format by dense_projection_fp32.
-    const auto quantize = [&](const Tensor& in) {
+    // A block projection over the split Q8_0 values by int8 activations (a8_quantize_fp32 once per input, shared by
+    // the projections that read it, and only when one of them is Q8_0; dp4a sums; only the drafts can change, and the
+    // target verifies them); another format (BF16) by dense_projection_fp32 over the FP32 input.
+    const auto quantize = [&](const Tensor& in, std::initializer_list<WeightId> ids) {
+        const bool q8 = std::any_of(ids.begin(), ids.end(), [&](WeightId id) { return matrix(model_.matrix(id)).format == QType::Q8_G32_FP16; });
+        if (!q8) { return ops::A8Columns{}; }
         const std::size_t bytes = ops::a8_columns_bytes(i32(in.ne[0]), i32(in.ne[1]));
         Tensor storage          = workspace_.alloc(DType::U8, {i32(bytes)});
         return ops::a8_quantize_fp32(in, storage.data, bytes, stream_);
@@ -321,7 +324,7 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
         Tensor n                    = workspace_.alloc(DType::FP32, {h, b});
         ops::rmsnorm_fp32(x, &attn_norm, c.rms_norm_eps, n, stream_);
         Tensor qt = workspace_.alloc(DType::FP32, {q, b}), kt = workspace_.alloc(DType::FP32, {kv, b}), vt = workspace_.alloc(DType::FP32, {kv, b});
-        const ops::A8Columns na = quantize(n);
+        const ops::A8Columns na = quantize(n, {l.q, l.k, l.v});
         project(n, na, l.q, qt);
         project(n, na, l.k, kt);
         project(n, na, l.v, vt);
@@ -334,16 +337,16 @@ std::vector<std::int32_t> DSparkProgram::draft(std::int32_t anchor, std::int32_t
         Tensor parts = workspace_.alloc(DType::FP32, {i32(ops::dspark_block_attention_workspace_bytes(shape, b) / 4)});
         ops::dspark_block_attention_fp32(qt, layers_[i].k_ring, layers_[i].v_ring, kt, vt, position_, shape, attn, parts, stream_);
         Tensor o = workspace_.alloc(DType::FP32, {h, b});
-        project(attn, quantize(attn), l.output, o);
+        project(attn, quantize(attn, {l.output}), l.output, o);
         ops::add_fp32(x, o, x, stream_);
         const Tensor ffn_norm = model_.tensor(l.ffn_norm, {h});
         ops::rmsnorm_fp32(x, &ffn_norm, c.rms_norm_eps, n, stream_);
         Tensor g = workspace_.alloc(DType::FP32, {f, b}), u = workspace_.alloc(DType::FP32, {f, b});
-        const ops::A8Columns fa = quantize(n);
+        const ops::A8Columns fa = quantize(n, {l.gate, l.up});
         project(n, fa, l.gate, g);
         project(n, fa, l.up, u);
         ops::silu_mul_fp32(g, u, g, stream_);
-        project(g, quantize(g), l.down, o);
+        project(g, quantize(g, {l.down}), l.down, o);
         ops::add_fp32(x, o, x, stream_);
     }
     const Tensor out_norm = model_.tensor(w.output_norm, {h});
