@@ -157,7 +157,9 @@ std::size_t workspace_bytes(const TextConfig& c, const ProgramLimits& l, QType e
     };
     std::size_t most          = 0;
     for (const std::int32_t cols : {l.max_chunk, std::min(l.max_chunk, narrow), std::min(l.max_chunk, ops::kSplitMaxColumns)}) {
-        const bool split = l.split_attention && cols <= ops::kSplitMaxColumns, saving = cols >= 2 && cols <= l.max_rollback;
+        // A batched decode attends in groups of kSplitMaxColumns, each group splitting its keys.
+        const bool batch = l.slots > 1 && cols <= kMaxBatchColumns;
+        const bool split = l.split_attention && (cols <= ops::kSplitMaxColumns || batch), saving = cols >= 2 && cols <= l.max_rollback;
         most = std::max(most, forward_bytes(c, cols, logit_cols(cols), split, saving, l.max_context, l.prefill_tc, expert_format, l.dense));
         // The lent region sits above every result.
         if (l.lend_bytes > 0) { most = std::max(most, result_bytes(c, cols, logit_cols(cols)) + padded(l.lend_bytes)); }
@@ -909,11 +911,24 @@ Tensor TextProgram::visit(std::uint32_t v, const Tensor& cur, std::vector<Tensor
         ops::RelativeBiasAttentionShape shape{heads, i32(c.kv_heads), d, i32(c.d_rel), local ? i32(c.sliding_window) : 0};
         const Tensor rel_bias = model_.tensor(w.rel_bias, {i32(c.d_rel), i32(c.rel_extent_of(p))});
         Tensor gated = workspace_.alloc(DType::BF16, {q, cols}); // the attention output times sigmoid(gate)
+        // A batched decode wider than the split attention's column limit attends in groups of that many columns:
+        // every column's attention reads only its own slot, so a group computes each column's solo bits.
+        const std::int32_t group = columns_ != nullptr ? std::min(cols, ops::kSplitMaxColumns) : cols;
         const std::size_t split_bytes =
-            limits_.split_attention && graph_split_ ? ops::relative_bias_attention_split_bytes(shape, cols, st.k_cache.ne[1]) : 0;
+            limits_.split_attention && graph_split_ ? ops::relative_bias_attention_split_bytes(shape, group, st.k_cache.ne[1]) : 0;
         const Tensor split = split_bytes > 0 ? workspace_.alloc(DType::FP32, {i32(split_bytes / 4)}) : Tensor{};
         const bool tiled = limits_.prefill_tc.attention && cols >= kTensorCoreMinColumns;
-        if (pieces.size() == 1) {
+        if (columns_ != nullptr && cols > group) {
+            for (std::int32_t g0 = 0; g0 < cols; g0 += group) {
+                const std::int32_t n = std::min(group, cols - g0);
+                const ops::ColumnSequences sub{columns_->positions + g0, columns_->slots + g0, columns_->slot_stride};
+                const Tensor qg = q_t.slice(1, g0, n), rg = r_t.slice(1, g0, n), sg = sink.slice(1, g0, n), gg = gate.slice(1, g0, n);
+                Tensor og = gated.slice(1, g0, n);
+                ops::relative_bias_sink_attention(shape, qg, rg, sg, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gg, og,
+                                                  stream_, split_bytes > 0 ? &split : nullptr,
+                                                  split_bytes > 0 ? static_cast<std::int32_t*>(split_counters_.p) : nullptr, false, &sub);
+            }
+        } else if (pieces.size() == 1) {
             ops::relative_bias_sink_attention(shape, q_t, r_t, sink, nullptr, nullptr, rel_bias, st.k_cache, st.v_cache, start, start_offset_, &gate,
                                               gated, stream_, split_bytes > 0 ? &split : nullptr,
                                               split_bytes > 0 ? static_cast<std::int32_t*>(split_counters_.p) : nullptr, tiled, columns_);
@@ -1250,7 +1265,7 @@ Tensor TextProgram::forward_graph(std::int32_t token) {
 Tensor TextProgram::forward_batch(std::span<const std::int32_t> slots, std::span<const std::int32_t> tokens) {
     const auto cols = static_cast<std::int32_t>(slots.size());
     if (cols < 1 || cols > std::min(kMaxBatchColumns, limits_.max_chunk) || tokens.size() != slots.size()) {
-        throw std::invalid_argument("inkling2: forward_batch takes 1 to 8 (slot, token) pairs, at most max_chunk");
+        throw std::invalid_argument("inkling2: forward_batch takes 1 to " + std::to_string(kMaxBatchColumns) + " (slot, token) pairs, at most max_chunk");
     }
     wait_copy();
     struct Step {

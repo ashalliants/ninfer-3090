@@ -21,6 +21,10 @@ namespace ninfer {
 using TokenId = std::int32_t;
 
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
+// Inkling-2's batched decode takes more requests at once than the other routes (Inkling2Core).
+inline constexpr std::uint32_t kMaximumInkling2Concurrency = 16;
+// The most lanes RuntimeStats reports: the widest route's.
+inline constexpr std::uint32_t kMaximumReportedLanes = kMaximumInkling2Concurrency;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
@@ -2229,7 +2233,7 @@ struct RuntimeStats {
     std::uint32_t capture_pending_requests  = 0;
     std::uint32_t terminal_pending_requests = 0;
     // Per lane, gauges like the counts above: lanes[0, lane_count) are the Engine's lanes.
-    std::array<RuntimeLaneStats, kMaximumConcurrency> lanes{};
+    std::array<RuntimeLaneStats, kMaximumReportedLanes> lanes{};
     std::uint8_t lane_count = 0;
     // The first kMaximumReportedWaitingRequests waiting requests, oldest first.
     std::vector<RuntimeWaitingStats> waiting;

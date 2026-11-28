@@ -1633,8 +1633,9 @@ ServeOptions parse_arguments(int argc, char** argv, const std::vector<WordOrigin
                                         "--kv-capacity unset or equal to --max-context");
         }
     }
-    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("--max-concurrency must be in [1,8]");
+    // The Engine refuses more than 8 for any model but Inkling-2 (up to kMaximumInkling2Concurrency).
+    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumInkling2Concurrency) {
+        throw std::invalid_argument("--max-concurrency must be in [1,16] (Inkling-2; other models [1,8])");
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");

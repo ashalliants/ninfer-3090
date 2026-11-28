@@ -17,6 +17,20 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Inkling-2-Mini batched decode of up to 16 requests (2026-11-28)
+
+`--max-concurrency` now takes up to 16 for Inkling-2 (other models stay at 8). The batched decode attends in groups of
+8 columns (the split attention's limit), so each request still gets its solo output, token for token. 200 W, 8,192
+context, N different greedy chats of 256 tokens at once (prefill included), two runs each, interleaved with master
+`592337dcc`:
+
+| `--max-concurrency` | master | this build |
+|---|---|---|
+| 8 | 210.5-210.8 | 210.6-210.8 |
+| 16 | refused | **246.7-248.2** (17.2 tok/s per request) |
+
+Every request's output equals its one-at-a-time output (16 of 16). RTX 3090: NOT RUN. Details in the
+[maintainer spec](maintainer/inkling2-model.md#batched-decode).
 ## Tesla V100 (`sm_70`): Inkling-2-Mini DFlash2 drafter (2026-11-28)
 
 `--spec dflash2 --draft-model DIR` drafts with Inco's DFlash2 drafter (`incoai/Inkling-2-Mini-DFlash2`, read from its

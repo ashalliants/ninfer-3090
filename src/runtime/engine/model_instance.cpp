@@ -66,6 +66,13 @@ void validate_relaxed_drafting(const EngineOptions& options) {
 
 } // namespace
 
+namespace {
+// Inkling-2's batched decode takes up to kMaximumInkling2Concurrency requests; every other route kMaximumConcurrency.
+std::uint32_t max_concurrency_for(const EngineOptions& options) {
+    return artifact_is_inkling2(options.artifact_path) ? kMaximumInkling2Concurrency : kMaximumConcurrency;
+}
+} // namespace
+
 void validate_engine_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
@@ -139,8 +146,8 @@ void validate_engine_options(const EngineOptions& options) {
     if (options.suspend.enabled && options.purpose != EnginePurpose::Generation) {
         throw std::invalid_argument("model suspend applies to Generation only");
     }
-    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+    if (options.max_concurrency == 0 || options.max_concurrency > max_concurrency_for(options)) {
+        throw std::invalid_argument("Engine max_concurrency must be in [1," + std::to_string(max_concurrency_for(options)) + "]");
     }
     validate_relaxed_drafting(options);
     validate_draft_context_rows(options);
@@ -388,8 +395,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
                 "scoring_decode_window supports one device; drop the pipeline device list");
         }
     }
-    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+    if (options.max_concurrency == 0 || options.max_concurrency > max_concurrency_for(options)) {
+        throw std::invalid_argument("Engine max_concurrency must be in [1," + std::to_string(max_concurrency_for(options)) + "]");
     }
     validate_relaxed_drafting(options);
     validate_draft_context_rows(options);

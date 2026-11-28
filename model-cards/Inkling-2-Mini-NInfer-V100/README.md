@@ -134,7 +134,7 @@ calls (`parallel_tool_calls` honoured), reasoning and thinking budgets, stop str
   tokens (1 to 3 on builds other than the V100's), picked from the request's recent acceptance (`--dspark-adaptive on`), and drops drafts the drafter gives
   under 0.5 probability (`--draft-min-p 0.5`). Greedy output equals plain greedy decode, and a sampled request
   draws the tokens plain sampling draws under the same seed. Both held on every DSpark request measured below.
-- **Several requests at once:** `--max-concurrency N` (2 to 8) decodes up to N requests together. Each request's
+- **Several requests at once:** `--max-concurrency N` (2 to 16) decodes up to N requests together. Each request's
   tokens are its one-at-a-time tokens. At N > 1 requests decode without DSpark, and `--lora`/`--graft` are refused.
 - **Prefix reuse** is on by default. A prompt that starts with the same tokens and images resumes from a snapshot
   kept in pinned host memory (one per request slot: 236 MiB with DSpark, 163 MiB per slot at `--max-concurrency N`),
@@ -194,7 +194,7 @@ clean run first, then the typical range across repeated or ABBA legs.
 | **Decode, `--speed fast`** (opt-in, lossy) | **163.5 tok/s** | structured output, greedy, 8,069 tokens; 12 chats **109.3-110.3** against 101.1-101.3 exact (2026-11-27, 200 W, `perf/inkling-speed-fast` at `42b5ec8e7`) | +23% on struct, +8.5% on the 12 chats, +2-6% on sampled prose; see Accuracy |
 | **Decode, DSpark, sampled** | **83.5 tok/s** | the same 12 chats at temperature 0.8, top-p 0.95, seeded | 83.4-83.5; plain sampled 74.9 |
 | **Decode, plain** | **80.1 tok/s** | the 12 chats, greedy, 8,192 context, 200 W (2026-11-28) | 80.0-80.5 per chat; 78.9 on master `feb203752` before MXFP8 experts |
-| **Batched decode, aggregate** | **198.2 tok/s** | `--max-concurrency 8`, 8 greedy chats of 256 tokens at once, prefill included | 196.8-198.2 at N = 8 (26.4 tok/s each); 170.5 at N = 4, 121.8 at N = 2 |
+| **Batched decode, aggregate** | **248.2 tok/s** | `--max-concurrency 16`, 16 greedy chats of 256 tokens at once, prefill included (2026-11-28) | 246.7-248.2 at N = 16 (17.2 tok/s each); 210.5-210.8 at N = 8, 179.4 at N = 4 |
 | **Prefill** (200 W) | **2,727 tok/s** | 7,974-token prompt, TTFT 2.92 s, `--max-context 131072 --prefill-chunk 8192` | 2,682-2,727 over ABBA legs (2,657-2,694 with layers 20-23's experts on cuBLAS); 2,227 at 34,674 and 1,577 at 100,074 tokens. Chunk 4096 (2026-11-23, before the layers 20-23 change): 2,360-2,394 at 8K, 2,004 at 34K, 1,459 at 100K |
 | **Prefill, default chunk** (200 W) | **2,170 tok/s** | 7,974-token prompt, TTFT 3.68 s, `--max-context 131072` (chunk 2048, picked by the engine) | 2,153-2,170; 1,954-1,962 at 1,074 (0.55 s), 1,839 at 34,674 (18.9 s), 1,339 at 100,074 (74.8 s). With layers 20-23's experts on cuBLAS: 2,052-2,071, 1,799-1,807, 1,764, 1,300. With `--no-prefill-cublas` (2026-11-23): 1,885-1,893, 1,703-1,719, 1,644, 1,226 |
 | **Prefill at 262,144** (200 W) | **2,125 tok/s** | 7,974-token prompt, TTFT 3.75 s, `--max-context 262144 --spec dspark --vision`, the default chunk 2048 | 2,114-2,125; 1,922-1,930 at 1,074 (0.56 s), 1,809 at 34,674 (19.2 s), 1,324 at 100,074 (75.6 s). With layers 20-23's experts on cuBLAS: 2,017-2,033, 1,771-1,779, 1,734, 1,285. With `--no-prefill-cublas` (2026-11-23): 1,854-1,860, 1,680-1,694, 1,613, 1,212. A wider chunk does not fit here with FP16 KV; with `--kv-dtype int8` chunk 4096 and 8192 fit |
@@ -226,7 +226,10 @@ tokens), so DSpark mostly takes plain steps and decodes at plain speed.
 | 1 | 77.1 | 79.1 |
 | 2 | 121.8 | 63.0 |
 | 4 | 170.5 | 45.6 |
-| 8 | **198.2** | 26.4 |
+| 8 | 198.2 | 26.4 |
+| 16 | **248.2** | 17.2 |
+
+N = 1 to 8: master `dad1623b` (2026-11-22). N = 16: 2026-11-28, when 8 gave 210.8 (27.9 each) by the same method.
 
 **Adapters** make decode 4-5% slower for the requests that select one (12 chats, greedy, ABBA in one server):
 none 78.8, `"lora"` 75.4, `"graft"` 75.2 tok/s. With DSpark: none 94.1-94.4, `"lora"` 90.8-91.7, `"graft"`

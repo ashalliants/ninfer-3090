@@ -264,7 +264,7 @@ Qwen3.5 GDN conv state, only smaller.
 `src/models/inkling2` binds a converted artifact (`inkling2_gguf` recipe, UD-Q8_K_XL) and runs the
 48-visit schedule for one sequence. It is the correctness baseline the V100 kernels of phase 4 are
 measured against. The public Engine and `ninfer-serve` run it one request at a time by default (see "Serving"); `--max-concurrency N`
-(N > 1, opt-in) batches the decode of up to 8 requests (see "Batched decode").
+(N > 1, opt-in) batches the decode of up to 16 requests (see "Batched decode").
 The DSpark drafter runs speculative decoding on greedy and sampled requests (see "DSpark drafter").
 
 | Piece | Where | What it does now |
@@ -727,7 +727,7 @@ run first, then the range over repeated or ABBA legs:
 | Prefill (200 W, 2026-11-24, `--prefill-cublas`; `--max-context 262144 --spec dspark --vision`, chunk 2048) | 2,125 tokens/s at 7,974 tokens, TTFT 3.75 s | 2,114-2,125 at 7,974; 1,922-1,930 at 1,074 (0.56 s); 1,803-1,809 at 34,674 (19.2 s); 1,321-1,324 at 100,074 (75.6 s). With the BF16-bank experts on cuBLAS: 2,017-2,033, 1,771-1,779, 1,730-1,734 and 1,283-1,285. `--no-prefill-cublas` (2026-11-23): 1,854-1,860, 1,680-1,694, 1,607-1,613 and 1,211-1,212. Before the snapshots moved to the host the engine picked chunk 256 here: 699-703, 782-786, 739-743 and 629-632 (see "Context with DSpark and vision"). Chunks 4096 and 8192 do not fit here with FP16 KV |
 | Second turn of a chat (prefix reuse, same server; 200 W, 262,144 with DSpark, vision and `--kv-dtype int8`) | TTFT 1.03 s at 7,988 tokens, 6,144 reused (chunk 2048) | against 3.93 s cold; chunk 4096: 1.77 s (4,096 reused) against 3.38 s; chunk 8192: 3.04 s (nothing reused). With FP16 KV at chunk 2048: 1.02 s against 3.89 s. At 250 W: 1.51 s against 21.4 s at 34,699 tokens (32,768 reused); the output equals the cold request's. The restore copies 198 MiB host to device in 62 ms |
 | Decode after a long prompt (128 tokens, summarize) | 91.2 tokens/s, DSpark at 7,979 | DSpark 84.9-91.2 at 7,979, 88.0-89.8 at 9,798, 47.4-47.8 at 100,107; plain 71.5, 70.7 and 48.1 |
-| Batched aggregate | 198.2 tokens/s at `--max-concurrency 8` | see "Batched decode" |
+| Batched aggregate | 248.2 tokens/s at `--max-concurrency 16` (2026-11-28) | 210.8 at 8; see "Batched decode" |
 | Image prompt, llama.cpp's `test-1.jpeg` (640 x 488), 230 tokens | TTFT 375 ms (vision and prefill) | 375-398 ms over three requests at 262,144 (382-425 at 131,072); decode 100-105 tokens/s with DSpark |
 
 As first published (2026-11-21): load 9.1 s, decode 71.3
@@ -1881,7 +1881,9 @@ by prompt, either way), and the 12 chats decode at 78.87-78.89 plain and 90.00-9
 
 ## Batched decode
 
-`--max-concurrency N` (2 to 8; default 1) runs up to N requests at once. Each request gets its own slot in the text
+`--max-concurrency N` (2 to 16; default 1) runs up to N requests at once. Inkling-2 takes up to 16
+(`ninfer::kMaximumInkling2Concurrency`); every other model's route stays at 8 (`kMaximumConcurrency`), and the Engine
+refuses more there. Each request gets its own slot in the text
 Program, and every decode step is one forward with one column per decoding request
 (`TextProgram::forward_batch`, `Inkling2Core::worker_batched`). The default (N = 1) is unchanged: one request at a
 time on the single-sequence decode graph, with DSpark when configured.
@@ -1920,13 +1922,16 @@ Exactness: each request's tokens and logits are bit-identical to its solo run.
     splits exactly when a one-column call at that position would (more than `kSplitMinKeys` visible keys); otherwise
     block z = 0 runs the single block's loop and store. So a batch can mix columns of 100 and 100,000 keys and each
     keeps its solo bits.
-- B is at most 8 (`kMaxBatchColumns`, the split attention's column limit), far below the tensor-core width, so decode
-  never takes a tensor-core route.
+- B is at most 16 (`kMaxBatchColumns`), far below the tensor-core width, so decode never takes a tensor-core route.
+  The split attention takes at most 8 columns (`ops::kSplitMaxColumns`), so a batch wider than that attends in groups
+  of 8 (`TextProgram::visit`), each group with its own slice of the `ColumnSequences` table. A column's attention
+  reads only its own slot, so its bits do not depend on the group it falls in.
 - Tested by `ninfer_inkling2_batch_test`, which compares every logit byte for byte against each prompt's solo run.
-  Requests arrive staggered at 2, 4 and 8 in flight, the prompt lengths straddle the split threshold and the sliding
+  Requests arrive staggered at 2, 4, 8 and 16 in flight, the prompt lengths straddle the split threshold and the sliding
   window, and slots are reused.
 - `ninfer_inkling2_engine_batch_test` checks the same through the public Engine: concurrent requests (greedy, a seeded
-  sample, a thinking budget, a stop string, streaming and cancellation) give their one-at-a-time outputs.
+  sample, a thinking budget, a stop string, streaming and cancellation) give their one-at-a-time outputs, at 4 slots
+  and at 16 (20 requests at once), and a 17th slot is refused.
 - `ninfer_inkling2_fp32_ops_test` (`test_column_sequences`) checks the three ops' column mode against one-column
   calls, with no artifact needed.
 
@@ -1966,6 +1971,20 @@ section's earlier measurement:
 | 2 | 113.5 | 121.7 / 121.8 | 63.0 | 113.6 |
 | 4 | 169.0 | 169.1 / 170.5 | 45.6 | 176.5 |
 | 8 | 169.8 | **196.8 / 198.2** | 26.4 | 198.6 |
+
+2026-11-28, master `592337dcc` (MXFP8 experts) against the 16-wide build, the same method and 200 W, two runs each,
+interleaved; every request's output the same as its solo run (16 of 16):
+
+| N | aggregate tok/s, master | aggregate tok/s, 16-wide build | per request tok/s | step bench, aggregate |
+|---|---|---|---|---|
+| 4 | | 179.4 | 46.8 | 176.8 |
+| 8 | 210.5-210.8 | 210.6-210.8 | 27.9 | 220.0 |
+| 12 | | | | 232.9 |
+| 16 | (refused) | **246.7-248.2** | 17.2 | 263.3 |
+
+From 8 to 16 the aggregate gains 17.6%: the step takes 60.8 ms at B = 16 against 36.4 ms at B = 8 (the step bench),
+because the experts of 16 diverse columns cover most of each layer's 128 and are read once a step whatever the width.
+RTX 3090: N = 16 NOT RUN.
 
 - Serve: `ninfer-serve --max-concurrency N` at 8,192 context, N concurrent greedy chat requests of 256 tokens with
   different prompts. Aggregate is all completion tokens over the wall time, prefill included; per request is the

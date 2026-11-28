@@ -460,8 +460,16 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     if (options_.devices.size() > 1) { throw std::invalid_argument("Inkling-2 runs on one device"); }
     const auto start = Clock::now();
     // max_concurrency N > 1: N slots of the text Program decoded together (Inkling2Core::worker_batched), no drafter.
+    static_assert(static_cast<std::uint32_t>(ink::kMaxBatchColumns) == kMaximumInkling2Concurrency);
     if (options_.max_concurrency < 1 || options_.max_concurrency > static_cast<std::uint32_t>(ink::kMaxBatchColumns)) {
         throw std::invalid_argument("Inkling-2 takes --max-concurrency 1 to " + std::to_string(ink::kMaxBatchColumns));
+    }
+    // A batched decode step is one forward of up to N columns, which the prefill chunk bounds: the chunk is at most
+    // the context and an explicit --prefill-chunk (the automatic ones are 256 and up), so both must take N.
+    if (options_.max_concurrency > 1 &&
+        (options_.max_context < options_.max_concurrency || (!options_.prefill_chunk_auto && options_.prefill_chunk < options_.max_concurrency))) {
+        throw std::invalid_argument("Inkling-2 --max-concurrency " + std::to_string(options_.max_concurrency) +
+                                    " needs --max-context and --prefill-chunk of at least " + std::to_string(options_.max_concurrency));
     }
     slots_             = static_cast<std::int32_t>(options_.max_concurrency);
     requested_context_ = options_.max_context;
@@ -1369,7 +1377,7 @@ void Inkling2Core::run(Job& job) {
         out.speculative.enabled      = true;
         out.speculative.draft_window = static_cast<std::uint32_t>(n_drafts);
         out.speculative.accepted_per_position.assign(static_cast<std::size_t>(n_drafts), 0);
-        if (lookup_match > 0) { out.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(ink::kMaxBatchColumns - 1); }
+        if (lookup_match > 0) { out.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(ink::kMaxRoundDrafts); }
     }
     // Positions whose inputs the loop has consumed (a round's unread columns are not yet the sequence's).
     const auto committed = [&] {
@@ -1458,7 +1466,7 @@ void Inkling2Core::run(Job& job) {
         lookup.clear();
         if (round && lookup_match > 0) {
             const std::int64_t room = static_cast<std::int64_t>(options_.max_context) - program.position() - 1;
-            find_lookup(std::min<std::int64_t>({ink::kMaxBatchColumns - 1, budget_left - 1, room}));
+            find_lookup(std::min<std::int64_t>({ink::kMaxRoundDrafts, budget_left - 1, room}));
         }
         forward_at         = now;
         forward_was_round  = round;

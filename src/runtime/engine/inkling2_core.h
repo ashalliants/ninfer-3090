@@ -143,8 +143,8 @@ private:
     // request. Taken alone or after mutex_, never before it.
     mutable std::mutex stats_mutex_;
     RuntimeStats totals_;   // the counters; its gauges and lanes are filled in by runtime_stats()
-    std::array<RuntimeLaneStats, kMaximumConcurrency> lanes_{}; // per slot; Idle between requests
-    std::array<std::chrono::steady_clock::time_point, kMaximumConcurrency> lane_first_token_{};
+    std::array<RuntimeLaneStats, kMaximumInkling2Concurrency> lanes_{}; // per slot; Idle between requests
+    std::array<std::chrono::steady_clock::time_point, kMaximumInkling2Concurrency> lane_first_token_{};
     std::thread thread_;
 };
 
