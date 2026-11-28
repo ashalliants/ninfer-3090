@@ -158,6 +158,74 @@ int main() {
             } catch (const std::invalid_argument&) { refused = true; }
             check(refused, "DSpark with " + std::to_string(bad) + " drafts is refused");
         }
+        {
+            // --speed fast's settings need the drafter: refused on a plain Engine.
+            for (const bool keep : {true, false}) {
+                auto plain_fast        = options;
+                plain_fast.speculative = ninfer::SpeculativeOptions{};
+                if (keep) { plain_fast.speculative.dspark_greedy_keep = 0.1F; } else { plain_fast.speculative.dspark_lookup_match = 3; }
+                bool refused = false;
+                try {
+                    ninfer::Engine refused_engine(plain_fast);
+                } catch (const std::invalid_argument&) { refused = true; }
+                check(refused, keep ? "a greedy keep fraction without DSpark is refused" : "prompt lookup without DSpark is refused");
+            }
+            // Prompt lookup alone (as --speed fast runs it: up to 7 drafts) only changes which rounds run: greedy output is
+            // plain greedy's.
+            auto lookup                            = options;
+            lookup.speculative.draft_tokens        = 7;
+            lookup.speculative.dspark_lookup_match = 3;
+            lookup.speculative.dspark_adaptive     = true; // as --speed fast runs: rounds draft 1 .. 7, so a copy can be longer
+            lookup.speculative.draft_min_p         = 0.5F;
+            {
+                ninfer::Engine lookup_engine(lookup);
+                std::printf("dspark, 7 drafts per round, prompt lookup on 3 tokens:\n");
+                const Run with_lookup = run_all(lookup_engine, tokens);
+                for (std::size_t i = 0; i < kPrompts.size(); ++i) {
+                    check(with_lookup.tokens[i] == plain.tokens[i], "prompt " + std::to_string(i) + ": prompt lookup changed greedy output");
+                }
+                const std::uint64_t lookup_rounds = lookup_engine.runtime_stats().speculative_ngram_rounds;
+                std::printf("  lookup rounds %llu\n", static_cast<unsigned long long>(lookup_rounds));
+                check(lookup_rounds > 0, "no round verified a prompt lookup copy");
+                {
+                    const auto st = lookup_engine.runtime_stats();
+                    check(st.speculative_ngram_draft_tokens > 0 && st.speculative_ngram_accepted_tokens <= st.speculative_ngram_draft_tokens &&
+                              st.speculative_ngram_draft_tokens <= st.speculative_draft_tokens &&
+                              st.speculative_ngram_accepted_tokens <= st.speculative_accepted_tokens,
+                          "the lookup rounds' drafted and accepted tokens are counted, a subset of the rounds'");
+                }
+            } // one Engine on the device at a time
+            // One slot only: batched decode runs without the drafter.
+            {
+                auto batched            = lookup;
+                batched.max_concurrency = 2;
+                bool refused            = false;
+                try {
+                    ninfer::Engine refused_engine(batched);
+                } catch (const std::invalid_argument&) { refused = true; }
+                check(refused, "prompt lookup with more than one slot is refused");
+            }
+            // The whole --speed fast set (lookup and greedy keep): drafts are kept, and the per-request n-gram counts sum to
+            // the Engine's.
+            auto fast                           = lookup;
+            fast.speculative.dspark_greedy_keep = 0.1F;
+            ninfer::Engine fast_engine(fast);
+            std::uint64_t kept = 0, ngram_rounds = 0, ngram_drafted = 0, ngram_accepted = 0;
+            for (const std::string& prompt : kPrompts) {
+                const auto r = fast_engine.generate(fast_engine.prepare(user_turn(prompt)), greedy(tokens));
+                check(!r.generated_token_ids.empty(), "--speed fast's settings generate");
+                check(r.speculative.ngram_draft_tokens == 7, "a lookup request reports its copy window");
+                kept += r.speculative.relaxed_kept, ngram_rounds += r.speculative.ngram_rounds;
+                ngram_drafted += r.speculative.ngram_drafted_tokens, ngram_accepted += r.speculative.ngram_accepted_tokens;
+            }
+            const auto fs = fast_engine.runtime_stats();
+            std::printf("  lookup and keep: %llu kept, %llu lookup rounds\n", static_cast<unsigned long long>(kept),
+                        static_cast<unsigned long long>(ngram_rounds));
+            check(kept > 0 && fs.speculative_relaxed_kept == kept, "the greedy keep took drafts and counted them");
+            check(fs.speculative_ngram_rounds == ngram_rounds && fs.speculative_ngram_draft_tokens == ngram_drafted &&
+                      fs.speculative_ngram_accepted_tokens == ngram_accepted,
+                  "the Engine's n-gram counters sum the requests'");
+        }
         ninfer::Engine engine(options);
         std::printf("dspark, %u drafts per round:\n", drafts);
         const Run spec = run_all(engine, tokens);

@@ -831,6 +831,38 @@ int main() {
                           make_engine_options(parse({"ninfer-serve", "model.ninfer", "--dense-q8", "all"})).dense_q8 == ninfer::DenseQ8::All &&
                           make_engine_options(parse({"ninfer-serve", "model.ninfer"})).dense_q8 == ninfer::DenseQ8::Off,
                       "--dense-q8 did not reach the Engine options");
+    // --speed fast (Inkling-2, lossy) sets what the command line left: DSpark, 7 drafts, the greedy keep fraction,
+    // prompt lookup and the 8-bit dense head; --speed exact (the default) sets none of them.
+    {
+        const ninfer::EngineOptions fast = make_engine_options(parse({"ninfer-serve", "model.ninfer", "--speed", "fast"}));
+        failures += check(fast.speculative.backend == ninfer::SpeculativeBackend::DSpark && fast.speculative.draft_tokens == 7 &&
+                              fast.speculative.dspark_greedy_keep == 0.1F && fast.speculative.dspark_lookup_match == 3 &&
+                              fast.dense_q8 == ninfer::DenseQ8::Head,
+                          "--speed fast did not set its preset");
+        const ninfer::EngineOptions own =
+            make_engine_options(parse({"ninfer-serve", "model.ninfer", "--speed", "fast", "--draft-tokens", "3", "--dense-q8", "all"}));
+        failures += check(own.speculative.draft_tokens == 3 && own.dense_q8 == ninfer::DenseQ8::All,
+                          "--speed fast overrode an explicit --draft-tokens or --dense-q8");
+        for (const auto& args : {std::vector<std::string>{"ninfer-serve", "model.ninfer"},
+                                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--speed", "exact", "--spec", "dspark"}}) {
+            const ninfer::EngineOptions exact = make_engine_options(parse(args));
+            failures += check(exact.speculative.dspark_greedy_keep == 0.0F && exact.speculative.dspark_lookup_match == 0 &&
+                                  exact.dense_q8 == ninfer::DenseQ8::Off,
+                              "--speed exact changed the output settings");
+        }
+        for (const auto& args : {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--speed", "quick"},
+                                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--speed", "fast", "--spec", "mtp"},
+                                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--speed", "fast", "--max-concurrency", "2"}}) {
+            bool refused = false;
+            try {
+                (void)parse(args);
+            } catch (const std::invalid_argument&) {
+                refused = true;
+            }
+            failures += check(refused, "an invalid --speed was accepted");
+        }
+        failures += check(kv_help.find("--speed exact|fast") != std::string::npos, "serve help omits --speed");
+    }
     // --mxfp8-experts auto|on|off reaches the Engine options (Inkling-2's exact MXFP8 experts); auto by default.
     failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer", "--mxfp8-experts", "on"})).experts_mxfp8 == ninfer::ExpertsMxfp8::On &&
                           make_engine_options(parse({"ninfer-serve", "model.ninfer", "--mxfp8-experts", "off"})).experts_mxfp8 == ninfer::ExpertsMxfp8::Off &&

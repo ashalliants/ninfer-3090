@@ -154,6 +154,12 @@ different from the Qwen3.5 models:
   sampled at temperature 0.8 against 74.9 plain (the same tokens). The defaults beat a fixed 3 drafts by 8.4%
   (88.8 against 81.9 tok/s, 2026-11-21) ([measurements](maintainer/inkling2-model.md#draft-floor-and-adaptive-width)).
   With `--max-concurrency` above 1 requests decode without DSpark.
+- **Speed fast** (Inkling-2, `--speed fast`; **lossy**, opt-in, one request at a time): sets `--spec dspark`,
+  `--draft-tokens 7` and `--dense-q8 head` unless given, keeps a greedy round's draft the target gives at least a
+  tenth of its top token's probability, and extends a round with text copied from earlier in the request (copied
+  tokens are verified exactly). Output can differ from the default's and from run to run; `--max-concurrency` above 1
+  is refused. Tesla V100: 163.5 against 133.1 tok/s structured, 109.8 against 101.2 over 12 chats; see
+  [the Inkling-2 notes](maintainer/inkling2-model.md#speed-fast).
 - **MTP speculation** (`--spec mtp --draft-tokens N`, N from 1 to 7) needs an artifact converted
   with the drafter (`--mtp-gguf`, [weight-conversion.md](weight-conversion.md)); a plain artifact
   refuses with that instruction. The output is the same as without it, token for token (greedy).

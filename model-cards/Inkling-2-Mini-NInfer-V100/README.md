@@ -180,6 +180,7 @@ clean run first, then the typical range across repeated or ABBA legs.
 | **Decode, DSpark** | **120.7 tok/s** | maths prompt, greedy, 300 tokens, `--spec dspark` | 114.3-120.7 on maths, 105.5-115.4 on code, 81.2-99.8 on prose and lists |
 | **Decode, DSpark, 12 chats** | **94.4 tok/s** | 12 chat requests of 300 tokens, greedy, mean of each request's tok/s | 93.4-94.4 over four legs, 60.5-60.7% of drafts accepted; plain 78.5-78.8 |
 | **Decode, 12 chats at 262,144** (200 W) | **94.3 tok/s** DSpark, **78.0** plain | the 12 chats, `--max-context 262144 --vision --kv-dtype int8 --spec dspark --draft-tokens 3`, both adapters loaded but unused (master `dc867300`, 2026-11-23) | DSpark 94.32-94.37 over two ABBA legs, 61.0% of drafts accepted, 78.7-119.8 per chat; plain 78.03-78.04; greedy output identical across all four legs |
+| **Decode, `--speed fast`** (opt-in, lossy) | **163.5 tok/s** | structured output, greedy, 8,069 tokens; 12 chats **109.3-110.3** against 101.1-101.3 exact (2026-11-27, 200 W, `perf/inkling-speed-fast` at `42b5ec8e7`) | +23% on struct, +8.5% on the 12 chats, +2-6% on sampled prose; see Accuracy |
 | **Decode, DSpark, sampled** | **83.5 tok/s** | the same 12 chats at temperature 0.8, top-p 0.95, seeded | 83.4-83.5; plain sampled 74.9 |
 | **Decode, plain** | **78.8 tok/s** | the 12 chats, greedy | 78.2-78.8 |
 | **Batched decode, aggregate** | **198.2 tok/s** | `--max-concurrency 8`, 8 greedy chats of 256 tokens at once, prefill included | 196.8-198.2 at N = 8 (26.4 tok/s each); 170.5 at N = 4, 121.8 at N = 2 |
@@ -276,6 +277,12 @@ Checked against CPU llama.cpp built from Unsloth's Inkling-2 pull request (`unsl
 - **Batched decode:** each request's tokens and logits are bit-identical to its one-at-a-time run (tested at 2, 4
   and 8 in flight).
 
+
+**`--speed fast` (opt-in, lossy).** It drafts up to 7 tokens a round, lets a greedy round keep a draft the model
+gives at least a tenth of its top token's probability, verifies prompt lookup copies and reads an 8-bit copy of the
+output head. Greedy text differs from the default's on some requests and can differ slightly between runs; on 40
+maths word problems both modes get 40 right, and 10 of 10 JSON outputs parse (9 of 10 exact). The default is
+unchanged. See the [spec](https://github.com/ashalliants/ninfer-3090/blob/master/docs/maintainer/inkling2-model.md#speed-fast).
 
 **Low-bit KV rings (opt-in, lossy).** `--kv-dtype int8 | rk8v4 | rk4v4` codes the 8 global KV rings in 8 or 4 bits
 (the sliding rings and the default stay FP16). Teacher-forced KLD from the FP16 rings over 30,840 tokens: `int8`

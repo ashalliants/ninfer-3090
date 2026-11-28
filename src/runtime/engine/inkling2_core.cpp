@@ -1285,6 +1285,41 @@ void Inkling2Core::run(Job& job) {
     std::vector<double> uniforms;
     std::vector<float> draft_probs;
     bool forward_unmeasured = false; // a step that drafted and then ran plain (every draft under --draft-min-p)
+    // Prompt lookup (dspark_lookup_match = N): the tokens after the latest earlier occurrence of the sequence's last N
+    // (prompt and output). A round whose drafts begin that copy verifies the rest of it too; such a round is kept out of
+    // the drafter's width and cost statistics (its width is not the drafter's).
+    const auto lookup_match = static_cast<std::int64_t>(options_.speculative.dspark_lookup_match);
+    const float greedy_keep = options_.speculative.dspark_greedy_keep;
+    std::vector<TokenId> lookup;
+    bool round_lookup = false, forward_was_lookup = false;
+    // An index of every N-gram's latest start, filled as the sequence grows (once over the prompt, then a few entries a
+    // step), so a round's lookup is one hash probe rather than a scan of the history.
+    std::unordered_map<std::uint64_t, std::int64_t> lookup_index;
+    std::int64_t lookup_indexed = 0; // N-grams starting before this are in the index
+    const auto find_lookup = [&](std::int64_t max_n) {
+        lookup.clear();
+        const auto& pt = prompt.tokens;
+        const auto& gt = out.generated_token_ids;
+        const auto np = static_cast<std::int64_t>(pt.size()), len = np + static_cast<std::int64_t>(gt.size());
+        const auto at = [&](std::int64_t i) { return i < np ? pt[static_cast<std::size_t>(i)] : gt[static_cast<std::size_t>(i - np)]; };
+        if (lookup_match <= 0 || max_n < 1 || len < lookup_match + 1) { return; }
+        const auto key = [&](std::int64_t start) {
+            std::uint64_t h = 1469598103934665603ULL; // FNV-1a over the N tokens
+            for (std::int64_t k = 0; k < lookup_match; ++k) {
+                h = (h ^ static_cast<std::uint32_t>(at(start + k))) * 1099511628211ULL;
+            }
+            return h;
+        };
+        // A match ends before the suffix: starts up to len - N - 1.
+        for (; lookup_indexed <= len - lookup_match - 1; ++lookup_indexed) { lookup_index[key(lookup_indexed)] = lookup_indexed; }
+        const auto hit = lookup_index.find(key(len - lookup_match));
+        if (hit == lookup_index.end()) { return; }
+        const std::int64_t start = hit->second;
+        for (std::int64_t k = 0; k < lookup_match; ++k) {
+            if (at(start + k) != at(len - lookup_match + k)) { return; } // a hash collision
+        }
+        for (std::int64_t i = start + lookup_match; i < len && static_cast<std::int64_t>(lookup.size()) < max_n; ++i) { lookup.push_back(at(i)); }
+    };
     std::vector<TokenId> drafted; // the last forward's inputs at columns 1 ..
     std::vector<std::int32_t> argmax_host; // the last forward's greedy tokens from column argmax_from, when not stale
     std::int32_t argmax_from = 0;
@@ -1306,6 +1341,7 @@ void Inkling2Core::run(Job& job) {
         out.speculative.enabled      = true;
         out.speculative.draft_window = static_cast<std::uint32_t>(n_drafts);
         out.speculative.accepted_per_position.assign(static_cast<std::size_t>(n_drafts), 0);
+        if (lookup_match > 0) { out.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(ink::kMaxBatchColumns - 1); }
     }
     // Positions whose inputs the loop has consumed (a round's unread columns are not yet the sequence's).
     const auto committed = [&] {
@@ -1321,20 +1357,30 @@ void Inkling2Core::run(Job& job) {
         ++out.speculative.rounds;
         out.speculative.drafted_tokens += static_cast<std::uint64_t>(round_drafts);
         out.speculative.accepted_tokens += static_cast<std::uint64_t>(col);
-        for (std::int32_t i = 0; i < col; ++i) { ++out.speculative.accepted_per_position[static_cast<std::size_t>(i)]; }
+        if (!round_lookup) { // copy rounds count only in the n-gram counters (SpeculativeStats)
+            for (std::int32_t i = 0; i < col && i < n_drafts; ++i) { ++out.speculative.accepted_per_position[static_cast<std::size_t>(i)]; }
+        }
         std::lock_guard lock(stats_mutex_);
         ++totals_.speculative_rounds;
         totals_.speculative_draft_tokens += static_cast<std::uint64_t>(round_drafts);
         totals_.speculative_accepted_tokens += static_cast<std::uint64_t>(col);
         lanes_[0].drafted_tokens += static_cast<std::uint64_t>(round_drafts);
         lanes_[0].accepted_tokens += static_cast<std::uint64_t>(col);
+        if (round_lookup) { // a lookup round's counts are also the n-gram ones
+            ++out.speculative.ngram_rounds;
+            out.speculative.ngram_drafted_tokens += static_cast<std::uint64_t>(round_drafts);
+            out.speculative.ngram_accepted_tokens += static_cast<std::uint64_t>(col);
+            ++totals_.speculative_ngram_rounds;
+            totals_.speculative_ngram_draft_tokens += static_cast<std::uint64_t>(round_drafts);
+            totals_.speculative_ngram_accepted_tokens += static_cast<std::uint64_t>(col);
+        }
     };
     const auto close_round = [&] {
         const std::int32_t kept = col + 1; // the anchor and the drafts consumed
         program.keep(kept);
         extend_drafter(*drafter, taps_of(), kept);
         count_round();
-        if (width) { width->observe(round_drafts, col); }
+        if (width && !round_lookup) { width->observe(round_drafts, col); }
         accept_ema = 0.8 * accept_ema + 0.2 * col;
         in_round   = false;
     };
@@ -1347,7 +1393,7 @@ void Inkling2Core::run(Job& job) {
         }
         if (in_round) { close_round(); }
         const auto now = Clock::now();
-        if (forward_at != Clock::time_point{} && !forward_unmeasured) {
+        if (forward_at != Clock::time_point{} && !forward_unmeasured && !forward_was_lookup) {
             double& cost = forward_was_round ? round_seconds : plain_seconds;
             const double elapsed = seconds_between(forward_at, now);
             cost = cost == 0.0 ? elapsed : 0.8 * cost + 0.2 * elapsed;
@@ -1378,8 +1424,15 @@ void Inkling2Core::run(Job& job) {
             }
         }
         if (round && pays) { since_probe = 0, probe_interval = 8; }
-        forward_at        = now;
-        forward_was_round = round;
+        round_lookup = false;
+        lookup.clear();
+        if (round && lookup_match > 0) {
+            const std::int64_t room = static_cast<std::int64_t>(options_.max_context) - program.position() - 1;
+            find_lookup(std::min<std::int64_t>({ink::kMaxBatchColumns - 1, budget_left - 1, room}));
+        }
+        forward_at         = now;
+        forward_was_round  = round;
+        forward_was_lookup = false;
         {
             std::lock_guard lock(stats_mutex_);
             ++totals_.decode_rounds; // a DSpark round or a plain step: one forward
@@ -1399,6 +1452,11 @@ void Inkling2Core::run(Job& job) {
                 std::size_t keep = 0;
                 while (keep < drafted.size() && draft_probs[keep] >= draft_min_p) { ++keep; }
                 drafted.resize(keep);
+            }
+            if (!drafted.empty() && lookup.size() > drafted.size() && std::equal(drafted.begin(), drafted.end(), lookup.begin())) {
+                drafted            = lookup;
+                round_lookup       = true;
+                forward_was_lookup = true;
             }
             round_width  = drafts;
             round_drafts = static_cast<std::int32_t>(drafted.size());
@@ -1471,6 +1529,29 @@ void Inkling2Core::run(Job& job) {
                 next = argmax_host[static_cast<std::size_t>(col - argmax_from)];
                 if (next == ops::kSamplerNonFiniteToken) {
                     throw RequestError(RequestErrorKind::NumericalFailure, "inkling2: the logits are not finite");
+                }
+                // dspark_greedy_keep (lossy, opt-in): a round's draft the target gives at least that fraction of its
+                // top token's probability is taken in place of the top token, so the round goes on. Never into or out of
+                // a stop token, and never in a lookup round (its drafts are the copy, verified exactly).
+                if (greedy_keep > 0.0F && in_round && !round_lookup && col < static_cast<std::int32_t>(drafted.size()) &&
+                    drafted[static_cast<std::size_t>(col)] != next) {
+                    const TokenId d = drafted[static_cast<std::size_t>(col)];
+                    const bool stops = std::find(stop_ids.begin(), stop_ids.end(), d) != stop_ids.end() ||
+                                       std::find(stop_ids.begin(), stop_ids.end(), next) != stop_ids.end();
+                    if (!stops && d >= 0 && d < static_cast<TokenId>(text_cfg.unpadded_vocab_size)) {
+                        const auto* column = reinterpret_cast<const float*>(static_cast<const char*>(logits.data) +
+                                                                            static_cast<std::size_t>(col) * static_cast<std::size_t>(logits.nb[1]));
+                        float pair[2];
+                        check_cuda(cudaMemcpyAsync(&pair[0], column + d, 4, cudaMemcpyDeviceToHost, stream_), "greedy keep");
+                        check_cuda(cudaMemcpyAsync(&pair[1], column + next, 4, cudaMemcpyDeviceToHost, stream_), "greedy keep");
+                        check_cuda(cudaStreamSynchronize(stream_), "greedy keep");
+                        if (std::isfinite(pair[0]) && std::exp(pair[0] - pair[1]) >= greedy_keep) {
+                            next = d;
+                            ++out.speculative.relaxed_kept;
+                            std::lock_guard lock(stats_mutex_);
+                            ++totals_.speculative_relaxed_kept;
+                        }
+                    }
                 }
             } else {
                 const Tensor last = logits.slice(1, col, 1);

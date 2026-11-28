@@ -74,6 +74,9 @@ struct ServeOptions {
     // A per-layer KV cache (--kv-dtype rk4v4x8,int8x8): EngineOptions::kv_layers.
     std::vector<KvCacheStorage> kv_layers;
     DenseQ8 dense_q8                       = DenseQ8::Off; // --dense-q8 head|all (Inkling-2)
+    // --speed exact|fast (Inkling-2). fast is lossy: the 8-bit dense head, drafts a greedy round keeps at a tenth of the
+    // top token's probability, up to 7 drafts a round and prompt lookup (apply_speed_preset).
+    bool speed_fast = false;
     ExpertsMxfp8 experts_mxfp8             = ExpertsMxfp8::Auto; // --mxfp8-experts auto|on|off (Inkling-2)
     bool split_attention                   = true;         // --no-split-attention: false (Inkling-2)
     KvRings kv_rings                       = KvRings::Default; // --kv-dtype fp16|fp32 (Inkling-2)

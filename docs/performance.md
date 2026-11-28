@@ -17,6 +17,16 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
+## Tesla V100 (`sm_70`): Inkling-2-Mini `--speed fast`, an opt-in lossy decode mode (2026-11-27)
+
+`--speed fast` (off by default) drafts up to 7 tokens a round, lets a greedy round keep a draft the model gives at least
+a tenth of its top token's probability, verifies prompt lookup copies that extend the drafts and reads the 8-bit dense
+head. On one V100 at 200 W against `--spec dspark` at its defaults (two ABAB legs, `perf/inkling-speed-fast` at
+`42b5ec8e7`): structured output **163.5 tok/s against 133.1 (+23%)**, the 12 greedy chats 109.3-110.3 against
+101.1-101.3 (+8.5%), sampled prose 76.0-76.2 against 71.7-74.5, sampled conversation about the same. Greedy text
+differs from the default's on some requests and can differ slightly between runs; 40 of 40 maths answers and 10 of 10
+JSON outputs held (9 of 10 exact). RTX 3090: NOT RUN. Details: [Inkling-2-Mini spec, "Speed fast"](maintainer/inkling2-model.md#speed-fast).
+
 ## Tesla V100 (`sm_70`): flash prompt attention over rk8v4 / rk4v4 KV (2026-11-25)
 
 In a V100 build prompt attention over an `rk8v4` or `rk4v4` cache takes the FP16 tensor-core flash

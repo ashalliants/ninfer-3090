@@ -254,6 +254,14 @@ struct SpeculativeOptions {
     // DSpark (--dspark-adaptive): each round drafts 1 .. draft_tokens, the count a request's recent acceptance and the
     // measured round costs favour. Only speed changes, never the output.
     bool dspark_adaptive = false;
+    // DSpark, lossy (--speed fast; CHANGES THE OUTPUT): a greedy round keeps a draft whose target probability is at
+    // least this fraction of the target's top token's, in place of the top token (0: exact). Never into or out of a
+    // stop token, and never for sampled or constrained requests.
+    float dspark_greedy_keep = 0.0F;
+    // DSpark (--speed fast): when the drafter's drafts are the start of what followed the latest earlier occurrence of
+    // the sequence's last N tokens (prompt or output), the round also verifies the rest of that copy, up to 7 drafts
+    // (0: off). Only speed changes, never the output.
+    std::uint32_t dspark_lookup_match = 0;
 };
 
 enum class StartupPhase : std::uint8_t {
