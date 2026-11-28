@@ -610,8 +610,8 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
                 }
             }
         };
-        // Each chunk first with the drafter at its best, then giving up what costs it least: its Q8 copy of the head
-        // (492 MB; the drafts read the target's BF16 head, a slower draft), then (--dspark-window auto) the whole
+        // Each chunk first with the drafter at its best, then giving up what costs it least: its 4-bit copy of the head
+        // (261 MB; the drafts read the target's BF16 head, a slower draft), then (--dspark-window auto) the whole
         // context for the last 32768 or 16384 positions (fewer drafts may be accepted). Never the output.
         struct Attempt {
             std::int32_t chunk;
@@ -796,7 +796,7 @@ Inkling2Core::Inkling2Core(const EngineOptions& options, DeviceContext& device) 
     check_cuda(cudaMemGetInfo(&device_free, &device_total), "memory info");
     load_.notes.push_back("prefill | chunk " + std::to_string(chunk_) + (options_.prefill_chunk_auto ? " (widest that fits)" : " (--prefill-chunk)") +
                           " | workspace " + std::to_string(programs_->text.workspace().capacity() >> 20) + " MiB" +
-                          (programs_->drafter ? std::string(drafter_head_copy_ ? " | drafter head Q8 copy" : " | drafter head: the target's BF16") +
+                          (programs_->drafter ? std::string(drafter_head_copy_ ? " | drafter head 4-bit copy" : " | drafter head: the target's BF16") +
                                                     " | drafter window " + (drafter_window_ == 0 ? std::string("whole context") : std::to_string(drafter_window_))
                                               : std::string()) +
                           " | " + (fp32_prefill ? "FP32"

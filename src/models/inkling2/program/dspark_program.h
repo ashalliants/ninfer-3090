@@ -30,7 +30,7 @@ public:
     // drafts can change, never the verified output. global_window, when positive and under max_context: the global
     // layers attend over only their last global_window context positions, held in a ring of that many (a fraction of
     // the bytes at a long context; again only the drafts can change). head_copy false (and no head_q8): the base
-    // logits read the target's BF16 head instead of the drafter's Q8 copy of it (492 MB less, a slower draft).
+    // logits read the target's BF16 head instead of the drafter's 4-bit copy of it (261 MB less, a slower draft).
     // workspace, when given (at least workspace_bytes(model, max_chunk)), is borrowed instead of allocated: a region
     // nothing else holds data in while extend() or draft() runs (the text Program's lent region, TextProgram::lent());
     // neither leaves anything there once it returns.
@@ -93,7 +93,6 @@ private:
     cudaStream_t stream_;
     DeviceBuffer state_memory_;
     DeviceArena workspace_;
-    bool a8_ = [] { const char* e = std::getenv("NINFER_DSPARK_A8"); return e == nullptr || e[0] != '0'; }(); // int8-activation drafter projections
     std::vector<Layer> layers_;
     std::vector<std::int32_t> window_; // per layer: the keys it attends over (0: every context position)
     Tensor masks_;      // FP32 [hidden, block]: column 0 unused, the rest the mask embedding
