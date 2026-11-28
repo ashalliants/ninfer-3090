@@ -96,8 +96,9 @@ DFlash2Config parse_dflash2_config(const std::string& config_json, const TextCon
     require(dimension(v, "vocab_size") == text.vocab_size, "vocab_size differs from the text model's");
     require(c.mask_token_id < text.unpadded_vocab_size, "mask_token_id is not a token");
     require(c.final_logit_softcap > 0, "final_logit_softcapping must be positive");
-    require(!c.target_visits.empty() && c.target_visits.size() <= 8 && c.target_visits.back() <= text.num_layer_visits,
-            "one to eight taps, none past the final state");
+    // As DSpark's (config.cpp): the last tap is the final normed state, which the drafter's fusion expects.
+    require(!c.target_visits.empty() && c.target_visits.size() <= 8 && c.target_visits.back() == text.num_layer_visits,
+            "one to eight taps, the last the final state (target_layer_ids ending in " + std::to_string(text.num_layer_visits) + ")");
     for (std::size_t i = 1; i < c.target_visits.size(); ++i) { require(c.target_visits[i] > c.target_visits[i - 1], "the taps must increase"); }
     return c;
 }

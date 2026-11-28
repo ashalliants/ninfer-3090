@@ -18,9 +18,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -151,6 +154,39 @@ int main() {
         options.speculative.draft_tokens = drafts;
         // As ninfer serve normalizes it (an LM-head proposal for every backend), which DSpark has no use for.
         ninfer::product::apply_speculative_defaults(options.speculative);
+        {
+            // A release directory with the artifact's DSpark would be silently unused: refused.
+            auto stray                          = options;
+            stray.speculative.backend           = ninfer::SpeculativeBackend::DSpark;
+            stray.speculative.draft_model       = "some-dflash2-release";
+            bool stray_refused                  = false;
+            try {
+                ninfer::Engine stray_engine(stray);
+            } catch (const std::invalid_argument& e) { stray_refused = std::string(e.what()).find("--spec dflash2") != std::string::npos; }
+            check(stray_refused, "--draft-model with --spec dspark is refused");
+        }
+        if (const char* dir = std::getenv("NINFER_TEST_INKLING2_DFLASH2"); dir != nullptr && *dir != '\0') {
+            // A release whose taps do not end in the final state (here [5, 23, 41]) is refused at load.
+            namespace fs          = std::filesystem;
+            const fs::path broken = fs::temp_directory_path() / "ninfer-dflash2-taps-test";
+            fs::remove_all(broken);
+            fs::create_directories(broken);
+            std::ifstream in(fs::path(dir) / "config.json");
+            std::string config((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            const std::string cut = std::regex_replace(config, std::regex(R"(,\s*48\s*\])"), "]");
+            check(cut != config, "the release config lists tap 48 last");
+            config = cut;
+            std::ofstream(broken / "config.json") << config;
+            fs::create_symlink(fs::absolute(fs::path(dir) / "model.safetensors"), broken / "model.safetensors");
+            auto taps                    = options;
+            taps.speculative.draft_model = broken.string();
+            bool taps_refused            = false;
+            try {
+                ninfer::Engine taps_engine(taps);
+            } catch (const std::invalid_argument& e) { taps_refused = std::string(e.what()).find("final state") != std::string::npos; }
+            fs::remove_all(broken);
+            check(taps_refused, "a DFlash2 release whose taps miss the final state is refused");
+        }
         {
             auto relaxed             = options;
             relaxed.relaxed_drafting = 0.5F;

@@ -755,6 +755,10 @@ private:
         options.context_cache.host_capacity_bytes = 0;
         // max_concurrency requests run at once (1: one at a time, the drafter's; more: batched decode, each in its
         // own slot of the text Program); the rest wait in the max_pending_requests queue.
+        // A release directory is read only by --spec dflash2: with any other backend it would be silently unused.
+        if (!options.speculative.draft_model.empty() && options.speculative.backend != SpeculativeBackend::DFlash2) {
+            throw std::invalid_argument("--draft-model names a DFlash2 release: use it with --spec dflash2");
+        }
         if (options.speculative.backend != SpeculativeBackend::None && !is_block_drafter(options.speculative)) {
             throw std::invalid_argument("Inkling-2 speculates with its DSpark drafter (--spec dspark) or a DFlash2 release "
                                         "(--spec dflash2 --draft-model DIR)");
